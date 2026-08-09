@@ -126,6 +126,38 @@ also a known, logged limitation.
 The first run downloads a Chromium build if crawl4ai has never launched one on this
 machine (`uv run crawl4ai-setup` does it ahead of time).
 
+The search tool needs a real SearXNG instance, so it isn't exercised by `uv run pytest`
+either. `harness.toml`'s `[search] base_url` is currently the literal `"TODO"` and must
+be set to a real instance first. To check it, run:
+
+```
+PYTHONIOENCODING=utf-8 uv run --env-file .env python -c "
+import asyncio
+from harness.config import load_config
+from harness.tools.search import build_search_tool
+
+async def main():
+    search_web = build_search_tool(load_config())
+    message = await search_web.ainvoke({
+        'name': 'search_web',
+        'args': {'query': 'solar panel efficiency', 'max_results': 5},
+        'id': 'live-check',
+        'type': 'tool_call',
+    })
+    print(message.content)
+
+asyncio.run(main())
+"
+```
+
+Print `message.content`, not the artifact: on the failure half the artifact is a single
+`SearchFailure`, and iterating a pydantic model yields `(key, value)` tuples rather than
+results — the rendered content is the one form that reads correctly either way.
+
+Expect real results back from the configured SearXNG. Then point `[search] base_url` at a
+dead URL (e.g. `http://localhost:1`) and re-run — expect a `SearchFailure` with reason
+`unreachable` printed as plain text, never a traceback.
+
 ## Commands
 
 - Lint: `uv run ruff check .`
