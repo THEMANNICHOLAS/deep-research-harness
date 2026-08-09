@@ -293,7 +293,7 @@ during planning:
 
 ## Progress
 
-- [ ] Phase 1: Skeleton, dependencies, and config surface
+- [x] Phase 1: Skeleton, dependencies, and config surface
 - [ ] Phase 2: Source registry and citation rendering
 - [ ] Phase 3: Fetch tool
 - [ ] Phase 4: Search tool
@@ -395,12 +395,12 @@ actually testing the pairing before writing it down.
    `docs/decisions.md`.
 
 **Acceptance criteria:**
-- [ ] The step-3 smoke check is recorded in `docs/decisions.md` with the observed
+- [x] The step-3 smoke check is recorded in `docs/decisions.md` with the observed
       result and the resulting `browser.backend` default. If crawl4ai could not drive
       Lightpanda, the entry says so and the default is `playwright`.
-- [ ] `uv run pytest` runs and passes from the repo root.
-- [ ] `uv run mypy .` no longer exits with "no .py[i] files".
-- [ ] `docs/guides/setup.md` lists the literal `docker run` commands for SearXNG and
+- [x] `uv run pytest` runs and passes from the repo root.
+- [x] `uv run mypy .` no longer exits with "no .py[i] files".
+- [x] `docs/guides/setup.md` lists the literal `docker run` commands for SearXNG and
       Lightpanda and the current `.env` variable set.
 
 ### Phase 2: Source registry and citation rendering
@@ -849,5 +849,25 @@ decision rather than to review cleanup. Revisit when the loop plan first constru
 chat model from a provider — that is the first code that actually reads `api_key`.
 
 ## Phase Handoff Log
+
+### 2026-08-08 — Phase 1: Skeleton, dependencies, and config surface
+- Done: `harness/config.py` (pydantic models + `load_config`, every failure a
+  `ConfigError` naming the offending field), `harness/__init__.py`, `harness.toml`,
+  `tests/` with 15 passing tests, deps added and pinned (`crawl4ai==0.9.2`),
+  `.env.example` reduced to keys, and `docs/{decisions,backlog,guides/setup}.md`
+  updated. Committed as `e816371`; baseline scaffolding is `578e492`.
+- Learned: **Risk #1 is settled — Lightpanda is out.** crawl4ai attaches over CDP fine,
+  but `Page.goto` never resolves (no lifecycle event); Playwright control returns 200.
+  `browser.backend = "playwright"`. Also: `uv` resolved the venv to Python **3.14** while
+  mypy targets 3.12 (numpy stubs abort under 3.11) — so `requires-python = ">=3.11"` is
+  not verified by anything. Nothing loads `.env`; use `uv run --env-file .env`.
+  `harness.toml` ships literal `TODO` values that are **not** validated.
+- Drift: two amendments in `## Reconciliations` (steps 2/3 swapped; `pydantic-settings`
+  not added). One finding deferred to `## Discoveries` (`api_key` → `SecretStr`, a
+  contract change).
+- Watch-next: Phase 2 (`harness/sources.py`) is unflagged, offline, and depends on
+  nothing from Phase 1 but the package layout — a clean start. Mirror `harness/config.py`:
+  `ConfigDict(extra="forbid")`, explicit named exceptions, messages that name the
+  offending value.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
