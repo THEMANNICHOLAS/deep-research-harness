@@ -1,0 +1,37 @@
+# Harness config surface (D3, docs/plans/PLAN-harness-substrate.md).
+#
+# The `TODO` values below are deployment facts not established anywhere in this
+# repo — the OpenCode base URL, the exact model IDs, and the developer's SearXNG
+# URL. Fill them in before `load_config()` will produce a usable runtime config.
+# Secrets are never stored here — each provider names an environment variable
+# (see `.env.example`), resolved at load time.
+
+[providers.opencode]
+base_url = "TODO"                    # TODO: OpenCode API base URL, e.g. https://<host>/v1
+api_key_env = "OPENCODE_API_KEY"
+
+[providers.cerebras]
+base_url = "https://api.cerebras.ai/v1"
+api_key_env = "CEREBRAS_API_KEY"
+
+[roles.head]
+provider = "opencode"
+model = "TODO"                       # TODO: OpenCode head-model ID, e.g. glm-5.2
+
+[roles.subagent]
+provider = "cerebras"
+model = "TODO"                       # TODO: Cerebras worker-model ID, e.g. gemma-4-31b
+
+[browser]
+# Default is playwright, not lightpanda — see docs/decisions.md for the
+# crawl4ai<->Lightpanda smoke-check outcome that settled this.
+backend = "playwright"
+
+[fetch]
+page_timeout_ms = 15000
+max_concurrency = 5
+per_page_char_cap = 12000
+
+[search]
+base_url = "TODO"                    # TODO: self-hosted SearXNG base URL, e.g. http://<host>:8080
+default_max_results = 10

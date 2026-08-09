@@ -317,7 +317,7 @@ actually testing the pairing before writing it down.
 **Diff budget:** ~180-260 lines across 8 files (most of it config models and tests).
 
 **Files:**
-- `pyproject.toml` — modify: add runtime deps (`pydantic`, `pydantic-settings`,
+- `pyproject.toml` — modify: add runtime deps (`pydantic`, ~~`pydantic-settings`,~~
   `langchain-core`, `crawl4ai`, `httpx`) and dev deps (`pytest`, `pytest-asyncio`);
   add `[tool.pytest.ini_options]` with `asyncio_mode`.
 - `harness/__init__.py` — new: package marker. Reason: nothing can import from the
@@ -380,14 +380,14 @@ actually testing the pairing before writing it down.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
-2. Run the smoke check: start `lightpanda/browser` in Docker, then drive a minimal
+2. Add dependencies to `pyproject.toml` and `uv sync`.
+3. Run the smoke check: start `lightpanda/browser` in Docker, then drive a minimal
    crawl4ai run against it over CDP (`BrowserConfig(browser_mode="custom",
    cdp_url=...)`) on one simple public page. Record the outcome.
-3. Add dependencies to `pyproject.toml` and `uv sync`.
 4. Create `harness/__init__.py` and `harness/config.py` with the pydantic models and
    `load_config` per **Contracts**.
 5. Write `harness.toml` with the OpenCode and Cerebras providers, the `head` and
-   `subagent` roles, and the browser backend defaulted to whichever the step-2 smoke
+   `subagent` roles, and the browser backend defaulted to whichever the step-3 smoke
    check proved viable.
 6. Update `.env.example` to keys only.
 7. Run the tests; confirm they PASS (green).
@@ -395,7 +395,7 @@ actually testing the pairing before writing it down.
    `docs/decisions.md`.
 
 **Acceptance criteria:**
-- [ ] The step-2 smoke check is recorded in `docs/decisions.md` with the observed
+- [ ] The step-3 smoke check is recorded in `docs/decisions.md` with the observed
       result and the resulting `browser.backend` default. If crawl4ai could not drive
       Lightpanda, the entry says so and the default is `playwright`.
 - [ ] `uv run pytest` runs and passes from the repo root.
@@ -772,7 +772,7 @@ variable.
     documents the two together. Lightpanda is Beta, implements only a
     Page/Network/Runtime/DOM subset, errors on commands outside it, and does not
     populate navigation timing (which has already broken at least one Playwright
-    client). Phase 1 step 2 exists specifically to settle this before code depends on
+    client). Phase 1 step 3 exists specifically to settle this before code depends on
     it. Mitigation is already designed in: `BrowserSettings.backend` selects
     `playwright` instead, and nothing else in the plan moves. If the smoke check
     fails, record it in `docs/decisions.md`, default to `playwright`, and add
@@ -811,9 +811,42 @@ variable.
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+### 2026-08-08 — Phase 1: step order and `pydantic-settings`
+
+Two corrections, both approved by the developer before any Phase 1 code was written.
+
+**1. Steps 2 and 3 are swapped.** As written, step 2 drove a crawl4ai smoke check while
+crawl4ai was not installed until step 3 (`uv sync`) — the step could not be executed in
+the stated order. Dependencies now install first; the smoke check is step 3. References
+to "the step-2 smoke check" in step 5 and in the acceptance criteria are updated to
+"step-3". No contract, requirement, or acceptance criterion changes.
+
+**2. `pydantic-settings` is not added.** The **Files** entry named it as a runtime
+dependency, but nothing in this phase's **Contracts** — nor anywhere else in this plan —
+calls it: config loading is stdlib `tomllib`, plain pydantic v2 models, and `os.environ`
+for resolving `api_key_env`. Adding it would be a dependency with no present call site,
+which the right-sizing rule forbids. Struck through in **Files**. If the loop plan later
+wants env-driven settings, it adds the dependency then, with a real caller.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+
+### 2026-08-08 — Phase 1: `ProviderConfig.api_key` should probably be a `SecretStr`
+
+**Deferred — needs a contract decision, not a cleanup.** The 3F review noted that
+`api_key` is declared as a real *input* field, so two things follow: a literal
+`api_key = "sk-..."` written into the checked-in `harness.toml` is accepted by
+`extra="forbid"` and then silently overwritten by the env-resolved value, and the
+resolved secret appears in `repr(config)` and `model_dump()`. `SecretStr`, or
+`Field(repr=False, exclude=True)`, would fit the project's "no keys in files" invariant
+better.
+
+Not acted on because Phase 1's **Contracts** freeze `ProviderConfig(base_url: str,
+api_key_env: str)` with `api_key: str`, and Phases 3-5 plus the loop plan are written
+against that shape. Changing it is a contract amendment, so it belongs to a deliberate
+decision rather than to review cleanup. Revisit when the loop plan first constructs a
+chat model from a provider — that is the first code that actually reads `api_key`.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
