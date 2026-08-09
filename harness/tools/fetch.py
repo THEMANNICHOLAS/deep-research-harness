@@ -23,7 +23,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import BrowserSettings, HarnessConfig
-from harness.sources import SourceRegistry
+from harness.sources import SourceRegistry, normalize_url
 
 FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
 
@@ -164,6 +164,17 @@ async def _fetch(
     urls: list[str], config: HarnessConfig, registry: SourceRegistry
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL, returning model-facing markdown and the full per-URL artifact."""
+    # The registry dedups by normalized URL, so crawl each canonical URL exactly once —
+    # otherwise two spellings of one page (trailing slash, fragment, case) would render
+    # duplicate [Sn] headings over independently-fetched, possibly different bodies.
+    seen: set[str] = set()
+    unique_urls: list[str] = []
+    for url in urls:
+        normalized = normalize_url(url)
+        if normalized not in seen:
+            seen.add(normalized)
+            unique_urls.append(url)
+    urls = unique_urls
     if not urls:
         return "", []
 
@@ -236,7 +247,8 @@ def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseToo
 
         Failures (blocked, timed out, non-HTML, or otherwise unfetchable pages) are
         reported per URL with their outcome rather than raising, so one bad URL never
-        fails the whole batch.
+        fails the whole batch. URLs that are equivalent spellings of the same page
+        (trailing slash, fragment, case) are fetched once and reported once.
         """
         return await _fetch(urls, config, registry)
 

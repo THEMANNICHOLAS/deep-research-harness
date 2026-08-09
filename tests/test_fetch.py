@@ -26,7 +26,6 @@ class _FakeResult:
         self,
         url: str,
         *,
-        success: bool = True,
         error_message: str | None = None,
         status_code: int | None = 200,
         response_headers: dict | None = None,
@@ -34,7 +33,6 @@ class _FakeResult:
         markdown: _FakeMarkdown | None = None,
     ) -> None:
         self.url = url
-        self.success = success
         self.error_message = error_message
         self.status_code = status_code
         self.response_headers = response_headers
@@ -69,11 +67,22 @@ def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
     return _FakeCrawler
 
 
-async def test_empty_url_list_returns_empty_content_and_artifact(monkeypatch, make_config):
+@pytest.fixture
+def install_crawler(monkeypatch):
+    """Patch fetch's AsyncWebCrawler with a fake serving canned results; returns the class."""
+
+    def _install(results: list[_FakeResult]) -> type:
+        fake_cls = _make_fake_crawler_class(results)
+        monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+        return fake_cls
+
+    return _install
+
+
+async def test_empty_url_list_returns_empty_content_and_artifact(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
-    fake_cls = _make_fake_crawler_class([])
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    fake_cls = install_crawler([])
 
     content, pages = await fetch._fetch([], config, registry)
 
@@ -82,7 +91,7 @@ async def test_empty_url_list_returns_empty_content_and_artifact(monkeypatch, ma
 
 
 async def test_mixed_batch_returns_one_entry_per_url_with_successes_intact(
-    monkeypatch, make_config
+    install_crawler, make_config
 ):
     config = make_config()
     registry = SourceRegistry()
@@ -93,7 +102,6 @@ async def test_mixed_batch_returns_one_entry_per_url_with_successes_intact(
         ),
         _FakeResult(
             "https://b.test",
-            success=False,
             error_message="boom",
             status_code=500,
             markdown=None,
@@ -103,8 +111,7 @@ async def test_mixed_batch_returns_one_entry_per_url_with_successes_intact(
             markdown=_FakeMarkdown(raw_markdown="C content", fit_markdown="C content"),
         ),
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    install_crawler(results)
 
     content, pages = await fetch._fetch(
         ["https://a.test", "https://b.test", "https://c.test"], config, registry
@@ -136,35 +143,35 @@ def test_classification_rules(status_code, error_message, content_type, markdown
     assert fetch.classify(status_code, error_message, content_type, markdown) == expected
 
 
-async def test_every_page_has_a_registered_source_id_and_duplicates_share_one(
-    monkeypatch, make_config
+async def test_equivalent_url_spellings_are_fetched_once_with_one_source_id(
+    install_crawler, make_config
 ):
     config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult(
-            "https://dup.test",
+            "https://dup.test/a",
             markdown=_FakeMarkdown(raw_markdown="one", fit_markdown="one"),
         ),
-        _FakeResult(
-            "https://dup.test",
-            markdown=_FakeMarkdown(raw_markdown="two", fit_markdown="two"),
-        ),
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    fake_cls = install_crawler(results)
 
-    _, pages = await fetch._fetch(["https://dup.test", "https://dup.test"], config, registry)
+    content, pages = await fetch._fetch(
+        ["https://dup.test/a", "https://dup.test/a/", "https://dup.test/a#frag"],
+        config,
+        registry,
+    )
 
-    assert len(pages) == 2
-    for page in pages:
-        assert registry.get(page.source_id) is not None
-    assert pages[0].source_id == pages[1].source_id
+    # One crawl, one page, one heading — never two [Sn] blocks over one identity.
+    assert fake_cls.calls[0].urls == ["https://dup.test/a"]
+    assert len(pages) == 1
+    assert registry.get(pages[0].source_id) is not None
     assert len(registry.all()) == 1
+    assert content.count(f"## [{pages[0].source_id}]") == 1
 
 
 async def test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text(
-    monkeypatch, make_config
+    install_crawler, make_config
 ):
     cap = 50
     config = make_config(per_page_char_cap=cap)
@@ -176,8 +183,7 @@ async def test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text(
             markdown=_FakeMarkdown(raw_markdown=long_markdown, fit_markdown=long_markdown),
         )
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    install_crawler(results)
 
     content, pages = await fetch._fetch(["https://long.test"], config, registry)
 
@@ -186,7 +192,7 @@ async def test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text(
     assert pages[0].markdown == long_markdown
 
 
-async def test_content_has_a_heading_for_every_url_including_failures(monkeypatch, make_config):
+async def test_content_has_a_heading_for_every_url_including_failures(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
     results = [
@@ -196,14 +202,12 @@ async def test_content_has_a_heading_for_every_url_including_failures(monkeypatc
         ),
         _FakeResult(
             "https://fail.test",
-            success=False,
             error_message="server exploded",
             status_code=500,
             markdown=None,
         ),
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    install_crawler(results)
 
     content, pages = await fetch._fetch(["https://ok.test", "https://fail.test"], config, registry)
 
@@ -212,7 +216,7 @@ async def test_content_has_a_heading_for_every_url_including_failures(monkeypatc
         assert page.outcome in content
 
 
-async def test_config_limits_reach_the_crawl4ai_call(monkeypatch, make_config):
+async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_config):
     config = make_config(page_timeout_ms=1234, max_concurrency=3)
     registry = SourceRegistry()
     results = [
@@ -221,8 +225,7 @@ async def test_config_limits_reach_the_crawl4ai_call(monkeypatch, make_config):
             markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"),
         )
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    fake_cls = install_crawler(results)
 
     await fetch._fetch(["https://a.test"], config, registry)
 
@@ -232,14 +235,13 @@ async def test_config_limits_reach_the_crawl4ai_call(monkeypatch, make_config):
     assert recorded.dispatcher.max_session_permit == 3
 
 
-async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(monkeypatch, make_config):
+async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"))
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    fake_cls = install_crawler(results)
 
     await fetch._fetch(["https://a.test"], config, registry)
 
@@ -250,7 +252,7 @@ async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(monkeypatc
 
 
 async def test_built_tool_exposes_the_pinned_contract_and_returns_content_and_artifact(
-    monkeypatch, make_config
+    install_crawler, make_config
 ):
     config = make_config()
     registry = SourceRegistry()
@@ -261,8 +263,7 @@ async def test_built_tool_exposes_the_pinned_contract_and_returns_content_and_ar
             markdown=_FakeMarkdown(raw_markdown="raw body", fit_markdown="clean body"),
         )
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    install_crawler(results)
 
     fetch_pages = fetch.build_fetch_tool(config, registry)
 
@@ -302,7 +303,7 @@ def test_build_browser_config_maps_backend_to_browser_mode():
     assert playwright.browser_mode == "dedicated"
 
 
-async def test_fit_markdown_is_preferred_over_raw_markdown(monkeypatch, make_config):
+async def test_fit_markdown_is_preferred_over_raw_markdown(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
     results = [
@@ -314,8 +315,7 @@ async def test_fit_markdown_is_preferred_over_raw_markdown(monkeypatch, make_con
             ),
         )
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    install_crawler(results)
 
     content, pages = await fetch._fetch(["https://pruned.test"], config, registry)
 
@@ -323,7 +323,7 @@ async def test_fit_markdown_is_preferred_over_raw_markdown(monkeypatch, make_con
     assert "Footer links" not in content
 
 
-async def test_raw_markdown_is_used_when_fit_markdown_is_empty(monkeypatch, make_config):
+async def test_raw_markdown_is_used_when_fit_markdown_is_empty(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
     results = [
@@ -332,8 +332,7 @@ async def test_raw_markdown_is_used_when_fit_markdown_is_empty(monkeypatch, make
             markdown=_FakeMarkdown(raw_markdown="Only raw survived.", fit_markdown=""),
         )
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    install_crawler(results)
 
     _, pages = await fetch._fetch(["https://unpruned.test"], config, registry)
 
@@ -342,7 +341,7 @@ async def test_raw_markdown_is_used_when_fit_markdown_is_empty(monkeypatch, make
 
 
 async def test_title_from_result_metadata_reaches_the_page_and_the_registry(
-    monkeypatch, make_config
+    install_crawler, make_config
 ):
     config = make_config()
     registry = SourceRegistry()
@@ -353,8 +352,7 @@ async def test_title_from_result_metadata_reaches_the_page_and_the_registry(
             markdown=_FakeMarkdown(raw_markdown="body", fit_markdown="body"),
         )
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    install_crawler(results)
 
     _, pages = await fetch._fetch(["https://titled.test"], config, registry)
 
@@ -364,7 +362,30 @@ async def test_title_from_result_metadata_reaches_the_page_and_the_registry(
     assert source.title == "An Article Title"
 
 
-async def test_result_whose_url_differs_from_the_input_is_still_paired(monkeypatch, make_config):
+async def test_content_type_header_on_the_result_drives_non_html_classification(
+    install_crawler, make_config
+):
+    config = make_config()
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://pdf.test/doc",
+            response_headers={"Content-Type": "application/pdf"},
+            markdown=_FakeMarkdown(raw_markdown="%PDF junk", fit_markdown="%PDF junk"),
+        )
+    ]
+    install_crawler(results)
+
+    _, pages = await fetch._fetch(["https://pdf.test/doc"], config, registry)
+
+    # Exercises _content_type's case-insensitive header lookup through the real
+    # pipeline — the classify() unit tests bypass it with a plain string.
+    assert pages[0].outcome == "non_html"
+
+
+async def test_result_whose_url_differs_from_the_input_is_still_paired(
+    install_crawler, make_config
+):
     config = make_config()
     registry = SourceRegistry()
     results = [
@@ -375,8 +396,7 @@ async def test_result_whose_url_differs_from_the_input_is_still_paired(monkeypat
             ),
         )
     ]
-    fake_cls = _make_fake_crawler_class(results)
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    install_crawler(results)
 
     _, pages = await fetch._fetch(["https://original.test/start"], config, registry)
 
