@@ -11,10 +11,9 @@ def test_build_tools_returns_the_frozen_tool_set(make_config):
 
     tools = build_tools(config, SourceRegistry())
 
-    names = [tool.name for tool in tools]
-    assert set(names) == {"fetch_pages", "search_web"}
-    assert len(names) == 2
-    assert len(set(names)) == len(names)
+    # Ordered, not a set: the explicit builder list in harness/tools/__init__.py is
+    # part of the documented contract.
+    assert [tool.name for tool in tools] == ["fetch_pages", "search_web"]
 
 
 def test_every_tool_exposes_description_and_json_schema(make_config):

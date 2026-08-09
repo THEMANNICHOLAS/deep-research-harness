@@ -44,6 +44,25 @@ def test_unknown_prompt_name_raises_prompt_error_naming_it(prompt_dir):
     assert "does_not_exist" in str(exc_info.value)
 
 
+@pytest.mark.parametrize("name", ["../escape", "sub/dir", "sub\\dir"])
+def test_path_traversal_shaped_names_raise_prompt_error(prompt_dir, name):
+    with pytest.raises(PromptError) as exc_info:
+        render(name)
+
+    assert "invalid prompt name" in str(exc_info.value)
+
+
+def test_malformed_placeholder_in_the_file_raises_prompt_error_not_value_error(prompt_dir):
+    (prompt_dir / "broken.md").write_text("Ends with a bare $", encoding="utf-8")
+
+    with pytest.raises(PromptError) as exc_info:
+        render("broken")
+
+    message = str(exc_info.value)
+    assert "broken" in message
+    assert "placeholder" in message
+
+
 def test_required_variables_reports_exactly_the_placeholders(prompt_dir):
     (prompt_dir / "vars.md").write_text(
         "First $alpha, second $beta, third $alpha again. Literal $$ sign.",
