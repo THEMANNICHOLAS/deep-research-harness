@@ -4,12 +4,15 @@
 
 - **Deployment:** self-hosted homelab Linux machine, operated interactively
   over SSH. No cloud/container deployment.
-- **Status:** greenfield — no source code yet.
-- **Integrations:** SearXNG (existing Docker instance, JSON API — configured),
-  self-hosted Lightpanda via crawl4ai over CDP (TODO — deploy), Cerebras API
-  for worker-model triage (TODO — key), OpenCode API for orchestrator/
-  synthesis models (TODO — key). All keys/endpoints via `.env` (see
-  docs/guides/setup.md), never hardcoded.
+- **Status:** harness substrate built — config, source registry, fetch and search
+  tools, prompt loader, and the tool list. No agent loop yet.
+- **Integrations:** SearXNG (existing Docker instance, JSON API — needs
+  `formats: [html, json]`; a stock container is HTML-only), crawl4ai over
+  crawl4ai-managed Playwright/Chromium (Lightpanda was tried and retired — see
+  docs/decisions.md), Cerebras API for worker-model triage (TODO — key),
+  OpenCode API for orchestrator/synthesis models (TODO — key). API **keys** live
+  in `.env`; **endpoints, model IDs and limits** live in `harness.toml` (see
+  docs/guides/setup.md). Neither is ever hardcoded.
 - **Constraints:** Python; no shell tool in the tool registry; file writes
   confined to a designated workspace + reports directory; model routing
   (orchestrator + fallback + worker) is config-driven, not hardcoded.
@@ -29,4 +32,7 @@
 
 | Resource | Location | Purpose |
 |---|---|---|
-| (none yet) | — | — |
+| Config models | @harness/config.py | TOML-backed `HarnessConfig` and settings, secrets by env var |
+| Source registry | @harness/sources.py | Per-run registry assigning `[Sn]` citation IDs to fetched pages |
+| Prompt loader | @harness/prompts.py | Loads/renders `harness/prompts/*.md` `$variable` templates |
+| Tool registry | @harness/tools/ | `build_tools` and the per-tool `build_<name>_tool` factories |

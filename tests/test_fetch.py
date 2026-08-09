@@ -1,20 +1,12 @@
 """Behavioral tests for harness.tools.fetch."""
 
 from types import SimpleNamespace
-from typing import Literal
 
 import pytest
 from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter  # type: ignore[import-untyped]
 from langchain_core.tools import BaseTool
 
-from harness.config import (
-    BrowserSettings,
-    FetchSettings,
-    HarnessConfig,
-    ProviderConfig,
-    RoleConfig,
-    SearchSettings,
-)
+from harness.config import BrowserSettings
 from harness.sources import SourceRegistry
 from harness.tools import fetch
 
@@ -77,39 +69,8 @@ def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
     return _FakeCrawler
 
 
-def _make_config(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    backend: Literal["lightpanda", "playwright"] = "playwright",
-    cdp_url: str | None = None,
-    page_timeout_ms: int = 15000,
-    max_concurrency: int = 5,
-    per_page_char_cap: int = 12000,
-) -> HarnessConfig:
-    """Build a valid HarnessConfig by constructing the pydantic models directly (no TOML)."""
-    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
-    return HarnessConfig(
-        providers={
-            "opencode": ProviderConfig(
-                base_url="https://example.test/v1", api_key_env="OPENCODE_API_KEY"
-            )
-        },
-        roles={
-            "head": RoleConfig(provider="opencode", model="test-model"),
-            "subagent": RoleConfig(provider="opencode", model="test-model"),
-        },
-        browser=BrowserSettings(backend=backend, cdp_url=cdp_url),
-        fetch=FetchSettings(
-            page_timeout_ms=page_timeout_ms,
-            max_concurrency=max_concurrency,
-            per_page_char_cap=per_page_char_cap,
-        ),
-        search=SearchSettings(base_url="http://localhost:8080"),
-    )
-
-
-async def test_empty_url_list_returns_empty_content_and_artifact(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_empty_url_list_returns_empty_content_and_artifact(monkeypatch, make_config):
+    config = make_config()
     registry = SourceRegistry()
     fake_cls = _make_fake_crawler_class([])
     monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
@@ -120,8 +81,10 @@ async def test_empty_url_list_returns_empty_content_and_artifact(monkeypatch):
     assert fake_cls.constructed_with == []
 
 
-async def test_mixed_batch_returns_one_entry_per_url_with_successes_intact(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_mixed_batch_returns_one_entry_per_url_with_successes_intact(
+    monkeypatch, make_config
+):
+    config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -173,8 +136,10 @@ def test_classification_rules(status_code, error_message, content_type, markdown
     assert fetch.classify(status_code, error_message, content_type, markdown) == expected
 
 
-async def test_every_page_has_a_registered_source_id_and_duplicates_share_one(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_every_page_has_a_registered_source_id_and_duplicates_share_one(
+    monkeypatch, make_config
+):
+    config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -198,9 +163,11 @@ async def test_every_page_has_a_registered_source_id_and_duplicates_share_one(mo
     assert len(registry.all()) == 1
 
 
-async def test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text(monkeypatch):
+async def test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text(
+    monkeypatch, make_config
+):
     cap = 50
-    config = _make_config(monkeypatch, per_page_char_cap=cap)
+    config = make_config(per_page_char_cap=cap)
     registry = SourceRegistry()
     long_markdown = "x" * 500
     results = [
@@ -219,8 +186,8 @@ async def test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text(monk
     assert pages[0].markdown == long_markdown
 
 
-async def test_content_has_a_heading_for_every_url_including_failures(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_content_has_a_heading_for_every_url_including_failures(monkeypatch, make_config):
+    config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -245,8 +212,8 @@ async def test_content_has_a_heading_for_every_url_including_failures(monkeypatc
         assert page.outcome in content
 
 
-async def test_config_limits_reach_the_crawl4ai_call(monkeypatch):
-    config = _make_config(monkeypatch, page_timeout_ms=1234, max_concurrency=3)
+async def test_config_limits_reach_the_crawl4ai_call(monkeypatch, make_config):
+    config = make_config(page_timeout_ms=1234, max_concurrency=3)
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -265,8 +232,8 @@ async def test_config_limits_reach_the_crawl4ai_call(monkeypatch):
     assert recorded.dispatcher.max_session_permit == 3
 
 
-async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(monkeypatch, make_config):
+    config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"))
@@ -282,8 +249,10 @@ async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(monkeypatc
     assert isinstance(recorded.markdown_generator.content_filter, PruningContentFilter)
 
 
-async def test_built_tool_exposes_the_pinned_contract_and_returns_content_and_artifact(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_built_tool_exposes_the_pinned_contract_and_returns_content_and_artifact(
+    monkeypatch, make_config
+):
+    config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -333,8 +302,8 @@ def test_build_browser_config_maps_backend_to_browser_mode():
     assert playwright.browser_mode == "dedicated"
 
 
-async def test_fit_markdown_is_preferred_over_raw_markdown(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_fit_markdown_is_preferred_over_raw_markdown(monkeypatch, make_config):
+    config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -354,8 +323,8 @@ async def test_fit_markdown_is_preferred_over_raw_markdown(monkeypatch):
     assert "Footer links" not in content
 
 
-async def test_raw_markdown_is_used_when_fit_markdown_is_empty(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_raw_markdown_is_used_when_fit_markdown_is_empty(monkeypatch, make_config):
+    config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -372,8 +341,10 @@ async def test_raw_markdown_is_used_when_fit_markdown_is_empty(monkeypatch):
     assert pages[0].outcome == "fetched"
 
 
-async def test_title_from_result_metadata_reaches_the_page_and_the_registry(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_title_from_result_metadata_reaches_the_page_and_the_registry(
+    monkeypatch, make_config
+):
+    config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -393,8 +364,8 @@ async def test_title_from_result_metadata_reaches_the_page_and_the_registry(monk
     assert source.title == "An Article Title"
 
 
-async def test_result_whose_url_differs_from_the_input_is_still_paired(monkeypatch):
-    config = _make_config(monkeypatch)
+async def test_result_whose_url_differs_from_the_input_is_still_paired(monkeypatch, make_config):
+    config = make_config()
     registry = SourceRegistry()
     results = [
         _FakeResult(

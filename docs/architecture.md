@@ -11,7 +11,12 @@ choice proves rate-limit-constrained in practice.
 
 ## Directory Structure
 
-To be documented as code is written.
+`harness/` holds the source: @harness/config.py (TOML config models),
+@harness/sources.py (per-run source registry), @harness/prompts.py (prompt
+loader) with its `.md` files in @harness/prompts/, and @harness/tools/ (the
+tool registry and one module per tool). Tests live in `tests/`, mirroring
+the source modules. `harness.toml` sits at the repo root. Reports will be
+timestamped markdown files on disk (not yet built).
 
 ## Principles & Invariants
 
@@ -20,11 +25,21 @@ subset is in @docs/INDEX.md → CLAUDE.md `## Invariants`.
 
 ## Key Patterns
 
-To be documented as code is written.
+Tools are LangChain-native async callables: built with `@tool`, declared
+`response_format="content_and_artifact"`, and always driven with `ainvoke`.
+Each tool is built by a `build_<name>_tool(config, ...)` factory in its own
+module, and @harness/tools/__init__.py lists every one explicitly in
+`build_tools` — adding a tool means a new module plus one line there. Tool
+boundaries return typed failure values instead of raising exceptions. A
+per-run @harness/sources.py `SourceRegistry` assigns `[Sn]` citation IDs as
+pages are fetched. Config is TOML (@harness/config.py), with secrets named
+by env var and never inlined.
 
 ## Dependencies
 
-To be documented as code is written.
+Runtime: `pydantic`, `langchain-core`, `crawl4ai` (pinned 0.9.2), `httpx`.
+Dev: `pytest`, `pytest-asyncio`, `ruff`, `mypy`. Deliberately not depended
+on: `deepagents`, `langchain`, `langgraph`, `pydantic-settings`.
 
 ## Failure Modes
 
