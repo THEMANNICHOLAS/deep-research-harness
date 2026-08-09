@@ -73,6 +73,59 @@ are never stored here — each provider names an environment variable
   `/bin/lightpanda` argument gets rewritten into a Windows path and the container
   exits 127.
 
+## Manual live check
+
+The fetch tool needs a real browser and network, so it isn't exercised by `uv run
+pytest`. To check it against live URLs, run (Windows needs `PYTHONIOENCODING=utf-8` —
+crawl4ai prints box-drawing characters that crash the default `cp1252` console):
+
+The three URLs are chosen to exercise one outcome each: an ordinary article, a URL that
+returns 403, and a PDF. The tool is driven with `ainvoke` in its tool-call form, which is
+how the agent loop will call it (D1) and what surfaces the artifact alongside the
+model-facing content.
+
+```
+PYTHONIOENCODING=utf-8 uv run --env-file .env python -c "
+import asyncio
+from harness.config import load_config
+from harness.sources import SourceRegistry
+from harness.tools.fetch import build_fetch_tool
+
+async def main():
+    registry = SourceRegistry()
+    fetch_pages = build_fetch_tool(load_config(), registry)
+    message = await fetch_pages.ainvoke({
+        'name': 'fetch_pages',
+        'args': {'urls': [
+            'https://en.wikipedia.org/wiki/Web_scraping',
+            'https://httpbin.org/status/403',
+            'https://www.africau.edu/images/default/sample.pdf',
+        ]},
+        'id': 'live-check',
+        'type': 'tool_call',
+    })
+    for page in message.artifact:
+        print(page.source_id, page.outcome, page.status_code, page.url)
+    print('--- first 800 chars of model-facing content ---')
+    print(message.content[:800])
+
+asyncio.run(main())
+"
+```
+
+Expect `fetched 200` for the article and `blocked 403` for the httpbin URL. The PDF lands
+in `fetched` (crawl4ai extracts its text) or `error` (the browser starts a download
+instead of navigating) depending on how the server serves it — **not** `non_html`. That is
+a known limitation, not a regression: see the PDF entry in `docs/backlog.md`.
+
+The printed content should open with the article's prose under its `## [S1] <url>` heading,
+with no Wikipedia sidebar, personal tools, navigation menu, or license footer. A tail of
+category links and a "Search / N languages" fragment does survive the pruning filter —
+also a known, logged limitation.
+
+The first run downloads a Chromium build if crawl4ai has never launched one on this
+machine (`uv run crawl4ai-setup` does it ahead of time).
+
 ## Commands
 
 - Lint: `uv run ruff check .`
