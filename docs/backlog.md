@@ -43,6 +43,17 @@ to address.
   tuning work: adjust `PruningContentFilter`'s threshold or extend `_EXCLUDED_TAGS` in
   `harness/tools/fetch.py`, measured against real fetched pages rather than in the abstract.
 
+- **`harness.toml`'s `TODO` placeholders load as valid config.** The literal `"TODO"`
+  strings shipped for the OpenCode `base_url` and both role model IDs pass `load_config()`
+  — they are well-formed strings and nothing in the substrate reads them. This bites at the
+  future agent loop's first model call, which would fail with an HTTP error instead of the
+  startup `ConfigError` R7 intends. Deliberately kept (per review decision 2026-08-09):
+  validating at load would reject the checked-in file and block the fetch/search tools,
+  which never read provider values. Pinned visible by
+  `test_shipped_harness_toml_loads_with_its_todo_placeholders` in @tests/test_config.py.
+  To address when the loop lands: validate `base_url` shape and non-`TODO` model IDs
+  wherever roles are first consumed.
+
 - **An HTTP 404 that serves a real HTML body classifies as `fetched`.** Observed in the
   final end-to-end sanity check: a Wikipedia URL returning 404 came back
   `outcome=fetched, status_code=404` with the "page does not exist" body as its markdown,

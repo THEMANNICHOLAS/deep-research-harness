@@ -228,6 +228,77 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
     assert setting in str(excinfo.value)
 
 
+def test_literal_api_key_in_the_file_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML.replace(
+        'api_key_env = "OPENCODE_API_KEY"',
+        'api_key_env = "OPENCODE_API_KEY"\napi_key = "sk-live-oops"',
+    )
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    message = str(excinfo.value)
+    assert "api_key" in message
+    assert "OPENCODE_API_KEY" in message
+
+
+@pytest.mark.parametrize(
+    ("section", "blocks"),
+    [
+        (
+            "providers",
+            [
+                '[providers.opencode]\nbase_url = "https://opencode.example/v1"\n'
+                'api_key_env = "OPENCODE_API_KEY"\n\n',
+                '[providers.cerebras]\nbase_url = "https://api.cerebras.ai/v1"\n'
+                'api_key_env = "CEREBRAS_API_KEY"\n\n',
+            ],
+        ),
+        (
+            "roles",
+            [
+                '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\n\n',
+                '[roles.subagent]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n',
+            ],
+        ),
+        ("browser", ['[browser]\nbackend = "playwright"\n\n']),
+    ],
+)
+def test_missing_top_level_table_raises_config_error_naming_it(
+    tmp_path, monkeypatch, section, blocks
+):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML
+    for block in blocks:
+        assert block in toml_content, "fixture drifted from VALID_TOML — update the block"
+        toml_content = toml_content.replace(block, "")
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert section in str(excinfo.value)
+
+
+def test_shipped_harness_toml_loads_with_its_todo_placeholders(monkeypatch):
+    """Deliberate, disclosed gap: literal "TODO" endpoint/model IDs are well-formed
+    strings, so the checked-in harness.toml loads while nothing reads those values.
+    Validation moves to startup when the agent loop first consumes them — see
+    docs/backlog.md. This test keeps the gap visible instead of accidental.
+    """
+    monkeypatch.setenv("OPENCODE_API_KEY", "any")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "any")
+
+    config = load_config()
+
+    assert config.providers["opencode"].base_url == "TODO"
+    assert config.roles["head"].model == "TODO"
+
+
 def test_missing_head_role_raises_config_error_naming_head(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")

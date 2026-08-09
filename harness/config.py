@@ -17,12 +17,30 @@ class ConfigError(Exception):
     """Raised for any failure loading or validating the harness config."""
 
 
-class ProviderConfig(BaseModel):
+class _StrictModel(BaseModel):
+    """Shared strictness for every config model: an unknown key is a typo, not data."""
+
     model_config = ConfigDict(extra="forbid")
 
+
+class ProviderConfig(_StrictModel):
     base_url: str
     api_key_env: str
     api_key: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_literal_api_key(cls, data: object) -> object:
+        # Raw input only (revalidation of a built instance passes through): a literal
+        # key in the file would sit in version control while being silently ignored
+        # in favor of the env var — reject it outright.
+        if isinstance(data, dict) and data.get("api_key"):
+            env_name = data.get("api_key_env", "api_key_env")
+            raise ValueError(
+                "api_key must never be set in the config file — set the environment "
+                f"variable named by api_key_env ({env_name!r}) instead"
+            )
+        return data
 
     @model_validator(mode="after")
     def _resolve_api_key(self) -> "ProviderConfig":
@@ -35,16 +53,12 @@ class ProviderConfig(BaseModel):
         return self
 
 
-class RoleConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class RoleConfig(_StrictModel):
     provider: str
     model: str
 
 
-class BrowserSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class BrowserSettings(_StrictModel):
     backend: Literal["lightpanda", "playwright"]
     cdp_url: str | None = None
 
@@ -55,9 +69,7 @@ class BrowserSettings(BaseModel):
         return self
 
 
-class FetchSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class FetchSettings(_StrictModel):
     # Bounded, not merely typed: these cross the config trust boundary into crawl4ai's
     # dispatcher and the per-page truncation cap, where 0 or a negative is nonsense.
     page_timeout_ms: int = Field(default=15000, gt=0)
@@ -65,16 +77,12 @@ class FetchSettings(BaseModel):
     per_page_char_cap: int = Field(default=12000, gt=0)
 
 
-class SearchSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class SearchSettings(_StrictModel):
     base_url: str
     default_max_results: int = Field(default=10, gt=0)
 
 
-class HarnessConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class HarnessConfig(_StrictModel):
     providers: dict[str, ProviderConfig]
     roles: dict[str, RoleConfig]
     browser: BrowserSettings
