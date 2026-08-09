@@ -294,7 +294,7 @@ during planning:
 ## Progress
 
 - [x] Phase 1: Skeleton, dependencies, and config surface
-- [ ] Phase 2: Source registry and citation rendering
+- [x] Phase 2: Source registry and citation rendering
 - [ ] Phase 3: Fetch tool
 - [ ] Phase 4: Search tool
 - [ ] Phase 5: Tool list and prompt loader
@@ -467,7 +467,7 @@ clickable markdown links purely mechanically, with no model involvement.
 4. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `uv run ruff check .` and `uv run mypy .` are clean for `harness/sources.py`.
+- [x] `uv run ruff check .` and `uv run mypy .` are clean for `harness/sources.py`.
 
 ### Phase 3: Fetch tool
 
@@ -848,6 +848,23 @@ against that shape. Changing it is a contract amendment, so it belongs to a deli
 decision rather than to review cleanup. Revisit when the loop plan first constructs a
 chat model from a provider — that is the first code that actually reads `api_key`.
 
+### 2026-08-08 — Phase 2: `link()` does not escape the URL destination
+
+**Deferred — needs a contract decision, not a cleanup.** The 3F review noted that
+`SourceRegistry.link()` renders `f"[{label}]({source.url})"` with no escaping, so a real
+URL containing a space or an unbalanced `)` — both legal in practice — produces a broken
+markdown link. That is precisely what R4 promises works ("renders as a clickable markdown
+link").
+
+Not acted on because the `[domain](url)` shape is frozen in Phase 2's **Contracts** and
+matched by later phases. Both plausible fixes change it: percent-encoding the destination
+alters the URL text a reader sees and copies, and the angle-bracket form `[label](<url>)`
+changes the literal output later phases assert against. Revisit when the report writer
+first renders citations into a delivered document — that is the first place a broken link
+is actually user-visible. The three other Phase 2 review findings (IPv6 bracket loss,
+`normalize_url` raising on a malformed port, and missing `get()`/title coverage) were
+fixed in this phase rather than deferred.
+
 ## Phase Handoff Log
 
 ### 2026-08-08 — Phase 1: Skeleton, dependencies, and config surface
@@ -869,5 +886,25 @@ chat model from a provider — that is the first code that actually reads `api_k
   nothing from Phase 1 but the package layout — a clean start. Mirror `harness/config.py`:
   `ConfigDict(extra="forbid")`, explicit named exceptions, messages that name the
   offending value.
+### 2026-08-08 — Phase 2: Source registry and citation rendering
+- Done: `harness/sources.py` (`normalize_url`, `Source`, `SourceRegistry` with
+  `add`/`get`/`all`/`link`/`resolve`/`unresolved_ids`) and `tests/test_sources.py` — 17
+  tests, suite now 32 green. All Phase 2 contracts landed exactly as frozen; nothing
+  outside the two planned files changed.
+- Learned: **`normalize_url` is now total — it never raises.** A URL too malformed to
+  parse (unterminated IPv6 literal, non-numeric or out-of-range port) is its own
+  canonical form. Phase 3 can call `registry.add()` on model-supplied URLs without
+  guarding, which R2 requires. IPv6 hosts keep their brackets (`.hostname` strips them).
+  Identity collapses scheme/host case, trailing slash, default port and fragment;
+  **query strings are preserved** — differing query = different source. `link()` labels
+  with the bare hostname, `www.` NOT stripped.
+- Drift: none. Three 3F findings fixed in-phase (IPv6 brackets, `normalize_url`
+  totality, missing `get()`/title coverage); one deferred to `## Discoveries`
+  (`link()` does not escape the URL destination — a frozen-contract question).
+- Watch-next: Phase 3 (fetch tool) is flagged (!#1, !#2, !#3) and is the first phase with
+  real external dependencies. Risk #1 is already settled — `browser.backend =
+  "playwright"`, Lightpanda is out (see `docs/decisions.md`); do not re-attempt the CDP
+  pairing. Assign IDs by calling `SourceRegistry.add()` — never mint IDs inside the fetch
+  tool — and read every limit from `FetchSettings`/`BrowserSettings`, no literals.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
