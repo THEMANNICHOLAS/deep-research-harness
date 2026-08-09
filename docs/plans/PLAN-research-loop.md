@@ -495,10 +495,11 @@ retry already applied, failing loud and specific before any research starts.
 6. Add the live-check command to `docs/guides/setup.md`.
 
 **Acceptance criteria:**
-- [ ] Manual live check: one call through `build_chat_model(config, "head")` reaches Kimi K3
+- [x] Manual live check: one call through `build_chat_model(config, "head")` reaches Kimi K3
       on OpenCode and returns text; ~~then with the key unset, the same call raises
       `ModelError` naming the role and provider rather than a library traceback.~~ (See
-      `## Reconciliations` 2026-08-09.)
+      `## Reconciliations` 2026-08-09.) **Run 2026-08-09: PASSED** — `preflight` returns clean
+      for both `head` and `subagent`, and the head role answered in text.
 - [x] `docs/decisions.md` records the pinned `deepagents` version and the observed default
       middleware set and backend, as read from the installed package.
 - [x] `harness.toml` contains no `TODO` values.
@@ -1132,7 +1133,21 @@ phase). Append-only, empty at plan creation. -->
   (4) `make_config` now defaults the workspace to `tmp_path`, and `.gitignore` covers
   `workspace/` and `reports/` — real runs from Phase 3 write there.
 - Drift: none.
-- Watch-next: the Phase 1 live check is STILL unrun and now blocks Phase 3, which is the
+- Live check (run at this gate, 2026-08-09): **PASSED.** `preflight` returns clean for both
+  roles against the real endpoint, and the head role answers in text — so the inferred
+  `base_url` `https://opencode.ai/zen/go/v1` and both model IDs (`kimi-k3`, `gpt-5.6-luna`) are
+  confirmed correct, and R6 is verified live, not just under fakes. Two findings for Phase 3:
+  `usage_metadata` IS populated on responses from this endpoint (`input_tokens`/`output_tokens`/
+  `total_tokens`), which is the mechanism R7's token baseline depends on and the plan left to
+  be confirmed in Phase 3 — it is confirmed. And `kimi-k3` is a **reasoning** model: "Say hi in
+  five words or fewer" cost 119 output tokens of which 96 were reasoning, so the Phase 3 token
+  baseline will be dominated by reasoning tokens and must be recorded with that split visible,
+  or the pyramid gets priced against a misleading number.
+- Watch-next: ~~the Phase 1 live check is STILL unrun and now blocks Phase 3~~ — done, passed.
+  Operational gotcha for any live check from a git worktree: `.env` is gitignored, so it does
+  NOT exist inside the worktree — point uv at the main checkout's copy
+  (`uv run --env-file ../../../.env ...`) or the run fails with "No environment file found".
+  Phase 3 is still the
   heaviest phase in the plan (flagged !#1/!#2/!#3/!#8, ~300-420 lines, 8 files) and the first
   to touch deepagents. Before starting it, note two Phase 1 findings that bear directly on it:
   `SubAgentMiddleware` is in deepagents' DEFAULT stack (the general-purpose subagent must be
