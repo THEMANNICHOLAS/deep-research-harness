@@ -42,3 +42,14 @@ to address.
   stripping quality outside the acceptance gate ("tuning quality is iterative"), so this is
   tuning work: adjust `PruningContentFilter`'s threshold or extend `_EXCLUDED_TAGS` in
   `harness/tools/fetch.py`, measured against real fetched pages rather than in the abstract.
+
+- **An HTTP 404 that serves a real HTML body classifies as `fetched`.** Observed in the
+  final end-to-end sanity check: a Wikipedia URL returning 404 came back
+  `outcome=fetched, status_code=404` with the "page does not exist" body as its markdown,
+  so the model would receive an error page as if it were a source. This follows the frozen
+  classification rules in @docs/plans/PLAN-harness-substrate.md — D7 concludes `blocked`
+  from 403/429/503 alone and nothing else inspects status — so the classifier was NOT
+  widened, consistent with that plan's risk #2 stance. To address: decide whether a 4xx/5xx
+  other than the three `blocked` codes deserves its own outcome, or whether the caller
+  should read `FetchedPage.status_code` (already carried in the artifact) and judge for
+  itself. The information is not lost, only unclassified.

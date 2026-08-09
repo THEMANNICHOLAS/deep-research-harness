@@ -742,18 +742,32 @@ variable.
 
 ## Verification
 
-- [ ] `uv run pytest` — all tests pass from the repo root.
-- [ ] `uv run ruff check .` — clean.
-- [ ] `uv run ruff format --check .` — clean.
-- [ ] `uv run mypy .` — clean.
-- [ ] Manual end-to-end sanity (not automated, not an agent run): in a Python shell,
+- [x] `uv run pytest` — all tests pass from the repo root. (80 passed.)
+- [x] `uv run ruff check .` — clean.
+- [x] `uv run ruff format --check .` — clean.
+- [x] `uv run mypy .` — clean. (15 source files.)
+- [ ] **PARTIAL — the search half is blocked, same cause as Phase 4 AC1.** Manual
+      end-to-end sanity (not automated, not an agent run): in a Python shell,
       load the config, build a `SourceRegistry`, call `build_tools`, then
       `await search_web.ainvoke({"query": ..., "max_results": 3})` and feed three of
       the returned URLs to `await fetch_pages.ainvoke({"urls": [...]})`. Confirm the
       fetch content carries `[Sn]` headings and that `registry.resolve()` turns those
       markers into clickable links.
-- [ ] `.env.example` and `harness.toml` between them name every setting the code
+      Run 2026-08-09 and observed: `build_tools` → `['fetch_pages', 'search_web']`;
+      `fetch_pages` → `S1 fetched 200`-class article and `S2 blocked 403`, model-facing
+      content carrying `## [S1] <url>` / `## [S2] <url>` headings; `registry.resolve()`
+      turning `[S1]`/`[S2]` into `[en.wikipedia.org](...)` / `[httpbin.org](...)` and
+      leaving unknown `[S99]` verbatim; both prompts rendering. **Not** observed: real
+      search results feeding the fetch, because `[search] base_url` is still `"TODO"` —
+      `search_web` returned a typed `SearchFailure(reason="unreachable")` with no
+      traceback, which does satisfy the second half of Phase 4's AC1 but is not this
+      check. Needs a real SearXNG with `formats: [html, json]`.
+- [x] `.env.example` and `harness.toml` between them name every setting the code
       reads, and no endpoint, model ID, or key appears as a literal in `harness/`.
+      (Audited 2026-08-09: no URL, host, port, model ID or key literal in `harness/*.py`;
+      the five settings read — `fetch.page_timeout_ms`, `fetch.max_concurrency`,
+      `fetch.per_page_char_cap`, `search.base_url`, `search.default_max_results` — are all
+      declared in `harness.toml`.)
 
 ## Notes
 
