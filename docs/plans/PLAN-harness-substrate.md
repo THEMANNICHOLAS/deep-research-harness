@@ -299,7 +299,7 @@ during planning:
 - [x] Phase 2: Source registry and citation rendering
 - [x] Phase 3: Fetch tool
 - [x] Phase 4: Search tool (live check AC pending — see phase)
-- [ ] Phase 5: Tool list and prompt loader
+- [x] Phase 5: Tool list and prompt loader
 - [ ] Final verification
 
 ## Phases
@@ -734,10 +734,10 @@ variable.
 6. Update `docs/architecture.md`.
 
 **Acceptance criteria:**
-- [ ] `docs/architecture.md` documents the directory structure, the tool-contract
+- [x] `docs/architecture.md` documents the directory structure, the tool-contract
       pattern, and the dependency list as actually built — no "to be documented"
       placeholders left in those three sections.
-- [ ] `docs/INDEX.md` Shared Resources table lists `harness/config.py`,
+- [x] `docs/INDEX.md` Shared Resources table lists `harness/config.py`,
       `harness/sources.py`, `harness/prompts.py` and `harness/tools/`.
 
 ## Verification
@@ -937,6 +937,21 @@ is actually user-visible. The three other Phase 2 review findings (IPv6 bracket 
 `normalize_url` raising on a malformed port, and missing `get()`/title coverage) were
 fixed in this phase rather than deferred.
 
+### 2026-08-09 — Phase 5: the `_make_config` test helper is duplicated per test file
+
+**Acted on — developer chose extraction over a third copy.** `tests/test_fetch.py` and
+`tests/test_search.py` each define their own local `_make_config(monkeypatch, ...)` building a
+valid `HarnessConfig` from pydantic models; Phase 5's `tests/test_tools_registry.py` needed a
+third. Extracted to a `make_config` factory fixture in a new `tests/conftest.py`, with the two
+existing files refactored onto it — three real present call sites, so the extraction clears the
+right-sizing bar rather than anticipating a future one.
+
+This adds `tests/conftest.py` to Phase 5's **Files** and touches `tests/test_fetch.py` and
+`tests/test_search.py`, neither of which the phase lists. No contract, requirement, or
+acceptance criterion changes, and the refactor is assertion-preserving: the suite must stay at
+its pre-refactor count of 68 before any new test is written. `tests/test_config.py` and
+`tests/test_sources.py` do not use the helper and were not touched.
+
 ## Phase Handoff Log
 
 ### 2026-08-08 — Phase 1: Skeleton, dependencies, and config surface
@@ -1022,5 +1037,30 @@ fixed in this phase rather than deferred.
   over `string.Template`, two prompt `.md` files, two test files, and fills in
   `docs/architecture.md`. Call `build_fetch_tool(config, registry)` and
   `build_search_tool(config)` exactly as pinned — do not change their signatures.
+### 2026-08-09 — Phase 5: Tool list and prompt loader
+- Done: `build_tools` added to the existing `harness/tools/__init__.py` (explicit two-builder
+  list, D8), `harness/prompts.py` over `string.Template`, `harness/prompts/{orchestrator,
+  subagent}.md`, `tests/test_prompts.py` (7 tests) and `tests/test_tools_registry.py`
+  (4 tests), plus a new `tests/conftest.py` `make_config` fixture with `test_fetch`/
+  `test_search` refactored onto it. `docs/architecture.md` and `docs/INDEX.md` filled in.
+  Suite 68 → 80 green. Committed as `ec118aa`.
+- Learned: **`harness/prompts.py` and `harness/prompts/` are deliberate siblings** — the real
+  `.py` module wins the import over the same-named namespace-package directory, and mypy is
+  clean on it (both verified empirically). The directory must stay `.md`-only; an `__init__.py`
+  there would shadow the module. That guard now lives as a comment in `prompts.py`. Also:
+  `Template.get_identifiers()` dedupes and ignores `$$`, and `KeyError.args[0]` is the missing
+  variable name. **Do not assert `"$" not in rendered`** on a shipped prompt — `$$` legitimately
+  renders to a literal `$`; assert `Template(rendered).get_identifiers() == []` instead, which
+  is what "no `$` placeholders remaining" actually means.
+- Drift: none against the PLAN. One defect in the phase's own impl plan (test 7's assertion
+  contradicted the mandated `$$` escape) was caught by the worker and corrected; one Discovery
+  logged and acted on (`tests/conftest.py` extraction).
+- Watch-next: only **Final verification** remains. Two items are known-unfinished and are NOT
+  Phase 5's doing: Phase 4's AC1 live check is still PENDING (needs a real SearXNG with
+  `formats: [html, json]`), and `harness.toml` still ships literal `TODO` values for the
+  OpenCode `base_url`, both role `model` IDs, and `[search] base_url` — none of which are
+  validated, so `load_config()` accepts them. The `## Verification` manual end-to-end sanity
+  check needs both fixed first. Note CLAUDE.md `## Stack` still claims Lightpanda/CDP and
+  `## Quality Gate` still omits pytest and mypy — both stale.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
