@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+
+# Workflow session state (transient — see docs/guides/setup.md)
+docs/plans/.impl/
+.claude/planning-mode
+.claude/implement-state.json
+.claude/iterate-state.json
+.claude/iterate-ledger.md
+.claude/handoff.md
+.claude/handoff.prev.md

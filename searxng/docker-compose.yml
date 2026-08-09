@@ -1,0 +1,25 @@
+# Local SearXNG for harness development. Start from the repo root with:
+#   docker compose --env-file .env -f searxng/docker-compose.yml up -d
+#
+# `--env-file .env` supplies SEARXNG_SECRET from the repo-root .env (see
+# .env.example) — compose otherwise only reads .env next to this file.
+# The harness reads this instance's URL from harness.toml's `[search] base_url`,
+# never from here. See docs/guides/setup.md.
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      # Loopback only — with the limiter off, the JSON API is unauthenticated and
+      # must not be reachable from the LAN.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Mounted read-write: the image writes uwsgi.ini into this directory on first
+      # run if it is absent. settings.yml here overrides the shipped defaults.
+      - ./:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+      # Signs SearXNG's cookies; kept out of git. Compose fails loudly if unset.
+      - SEARXNG_SECRET=${SEARXNG_SECRET:?generate with `openssl rand -hex 32` and set it in .env}
+    restart: unless-stopped

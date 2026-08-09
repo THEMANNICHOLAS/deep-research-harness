@@ -1,0 +1,28 @@
+# SearXNG overrides for the harness's local development instance.
+#
+# `use_default_settings: true` merges these keys over the image's shipped defaults,
+# so only the harness-specific deviations live here.
+#
+# Two deviations matter, and both exist because the harness calls the JSON API:
+#   - `search.formats` must include `json`. The stock image ships `[html]` only and
+#     serves HTML even when asked for `format=json`, which the search tool cannot
+#     parse (see docs/decisions.md).
+#   - `server.limiter` must be off. The bot limiter answers unauthenticated API
+#     calls with HTTP 403, which the fetch/search taxonomy would report as `blocked`.
+#
+# SCOPE: this file configures a localhost-only, unauthenticated dev instance —
+# docker-compose.yml binds it to 127.0.0.1 and supplies `server.secret_key` through
+# the SEARXNG_SECRET environment variable (see .env.example), so no key lives in
+# git. Do not reuse this file for a network-exposed deployment without turning the
+# limiter back on.
+
+use_default_settings: true
+
+server:
+  limiter: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
