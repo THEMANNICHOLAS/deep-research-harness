@@ -44,8 +44,10 @@ def normalize_url(url: str) -> str:
         hostname = f"[{hostname}]"
 
     userinfo = ""
-    if parts.username:
-        userinfo = parts.username
+    if parts.username or parts.password:
+        # An empty-but-present username (`http://:pw@host`) must still keep its
+        # password — dropping it would conflate URLs differing only by credential.
+        userinfo = parts.username or ""
         if parts.password:
             userinfo += f":{parts.password}"
         userinfo += "@"
@@ -110,7 +112,12 @@ class SourceRegistry:
         if source is None:
             raise KeyError(f"unknown source id {source_id!r}")
 
-        label = urlsplit(source.url).hostname or source.url
+        try:
+            label = urlsplit(source.url).hostname or source.url
+        except ValueError:
+            # `add` stores a URL `normalize_url` could not parse verbatim, so the
+            # same ValueError surfaces here; the raw URL is the only label there is.
+            label = source.url
         return f"[{label}]({source.url})"
 
     def resolve(self, text: str) -> str:

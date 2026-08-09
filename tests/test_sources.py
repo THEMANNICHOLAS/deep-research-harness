@@ -143,3 +143,29 @@ def test_malformed_url_normalizes_to_itself_instead_of_raising(malformed):
 
     assert source is not None
     assert source.url == malformed
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "http://example.com:notaport/x",
+        "http://example.com:99999/x",
+        "http://[::1/x",
+    ],
+)
+def test_link_and_resolve_never_raise_for_a_registered_malformed_url(malformed):
+    registry = SourceRegistry()
+    source_id = registry.add(malformed)
+
+    link = registry.link(source_id)
+
+    assert link.endswith(f"]({malformed})")
+    assert registry.resolve(f"See [{source_id}].") == f"See {link}."
+
+
+def test_urls_differing_only_by_password_stay_distinct_sources():
+    registry = SourceRegistry()
+
+    assert normalize_url("http://:secret@example.com/x") == "http://:secret@example.com/x"
+    assert registry.add("http://:a@example.com/x") != registry.add("http://:b@example.com/x")
+    assert len(registry.all()) == 2
