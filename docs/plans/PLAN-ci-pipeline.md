@@ -227,7 +227,7 @@ ruled out:
 | R7 | Runs isolated; new push cancels in-progress run | MUST | Phase 2 |
 
 ## Progress
-- [ ] Phase 1: Tracer bullet — prove CI-Runner executes a job
+- [x] Phase 1: Tracer bullet — prove CI-Runner executes a job
 - [ ] Phase 2: Full gate set
 - [ ] Phase 3: Coverage gate
 - [ ] Phase 4: Record the runner
@@ -275,13 +275,18 @@ install, locked sync, one lint gate — before any further gates are built on th
 - Branch protection / required status checks — plan non-goal.
 
 **Manual verification:**
-- [ ] Push `feat/ci-pipeline` and open a PR to `main`; the Actions run's job page names
+- [x] Push `feat/ci-pipeline` and open a PR to `main`; the Actions run's job page names
       `CI-Runner` as the executor — not a GitHub-hosted runner.
-- [ ] `uv sync --locked` succeeds with no lockfile-drift error.
-- [ ] The sync log shows Python 3.12 selected, confirming `.python-version` took effect.
-- [ ] **Prove the gate can fail:** push a commit adding an unused import, confirm the run
+      *PR #2; run 31342810201 job `quality` → `runner_name: CI-Runner`.*
+- [x] `uv sync --locked` succeeds with no lockfile-drift error. *`Resolved 117 packages in 0.71ms`.*
+- [x] The sync log shows Python 3.12 selected, confirming `.python-version` took effect.
+      *`Using CPython 3.12.3 interpreter at: /usr/bin/python3.12`.*
+- [x] **Prove the gate can fail:** push a commit adding an unused import, confirm the run
       goes red at the `ruff check` step, then revert and confirm green. A gate that has
       never failed is unverified.
+      *Run 31342882589 (`58e3560`) failed at step 5 `ruff check`; revert `65905b3` →
+      run 31342921361 green in 7s. Probe was `ci_probe.py` at repo root, not under
+      `harness/`/`tests/` (out of scope).*
 
 **Steps:**
 1. Create branch `feat/ci-pipeline` from `origin/main`.
@@ -293,9 +298,10 @@ install, locked sync, one lint gate — before any further gates are built on th
 5. Push, open the PR, and work the Manual verification list.
 
 **Acceptance criteria:**
-- [ ] The check run appears on the PR and was executed by `CI-Runner`.
-- [ ] A deliberate lint violation turns the run red; removing it turns it green.
-- [ ] No `uv: command not found` — the systemd PATH trap is confirmed bypassed (D5).
+- [x] The check run appears on the PR and was executed by `CI-Runner`.
+- [x] A deliberate lint violation turns the run red; removing it turns it green.
+- [x] No `uv: command not found` — the systemd PATH trap is confirmed bypassed (D5).
+      *`Successfully installed uv version 0.12.3` — setup-uv delivered uv per-run.*
 
 **Diff budget:** ~30-45 lines across 2 new files.
 
@@ -559,9 +565,43 @@ the other three, defeating D2 and R6. Harmless while `quality` has a single gate
 **Phase 2 must apply `if: ${{ !cancelled() }}` to all FOUR gate steps, not just the three it
 adds.** Developer decision: defer to Phase 2.
 
+### 2026-08-09 — Phase 1 — SHA-pinning setup-uv does not pin uv itself (ACT in Phase 2)
+
+Run 31342810201 logged: *"Could not determine uv version from uv.toml or pyproject.toml.
+Falling back to latest"*, then fetched uv **0.12.3**. The workstation runs uv **0.11.6**. So
+D5's consequence — "Bumping uv is a deliberate SHA change" — is **false as implemented**: the
+SHA pins the *action*, not the *uv binary*, which floats to latest on every run. Phase 1's
+Contract (SHA + trailing version comment) was met exactly; the gap is in D5's rationale, and it
+weakens R5's rebuild-the-VM story. Developer decision: pin uv via `required-version` under
+`[tool.uv]` in `pyproject.toml` — the file setup-uv already probes, and the only option that
+also constrains the workstation — folded into **Phase 2**. Exact specifier TBD there
+(see the open note in the Phase 1 handoff entry).
+
 ## Phase Handoff Log
 
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so
 never add a section below it. -->
+
+### 2026-08-09 — Phase 1: Tracer bullet
+- Done: `.github/workflows/ci.yml` (job `quality`, PR-to-main trigger, checkout → setup-uv →
+  `uv sync --locked` → `uv run ruff check .`) and `.python-version` = 3.12. Both actions
+  SHA-pinned (checkout v7.0.1 `3d3c42e5`, setup-uv v9.0.0 `c771a70e`) — the checkout pin was a
+  developer addition beyond the plan's Contracts. Commit `c206bc1`; PR #2 opened.
+  Risk #1 is RETIRED: `CI-Runner` executed all three runs, uv installed per-run, git 2.43.0
+  present, outbound HTTPS fine.
+- Learned: (a) setup-uv does NOT pin the uv binary — it logs "Could not determine uv version
+  from uv.toml or pyproject.toml. Falling back to latest" and fetched uv 0.12.3, while the
+  workstation runs 0.11.6. D5's consequence "bumping uv is a deliberate SHA change" is false as
+  written; see `## Discoveries`. (b) The runner's `~/.cache/uv` was already warm — the feared
+  slow first `crawl4ai` sync never materialized; whole job was 14s, 7s once warm. (c) The
+  runner resolves 3.12 to the VM's system `/usr/bin/python3.12` (3.12.3), not a uv-downloaded
+  build; workstation downloaded 3.12.13. Same minor, different patch — fine for now, worth
+  knowing if a 3.12.x-specific issue ever appears. (d) All four gates already pass locally on
+  3.12, so Phase 2's risk #2 is partly de-risked — Linux-vs-Windows remains the untested half.
+- Drift: none. (One `## Discoveries` entry deferred to Phase 2: the `ruff check` step still
+  needs `if: ${{ !cancelled() }}`.)
+- Watch-next: Phase 2 MUST add `if: ${{ !cancelled() }}` to all FOUR gate steps — the existing
+  `ruff check` step included, not just the three new ones. Phase 2's Steps as written only
+  cover the new three, which would leave D2/R6 unsatisfied.
