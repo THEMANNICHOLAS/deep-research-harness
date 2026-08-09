@@ -9,7 +9,7 @@ from typing import Literal
 
 import httpx
 from langchain_core.tools import BaseTool, tool
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.config import HarnessConfig
 
@@ -37,9 +37,11 @@ class SearchFailure(BaseModel):
 def _parse_results(payload: dict, max_results: int) -> list[SearchResult] | SearchFailure:
     """Extract and normalize the `results` array, slicing to `max_results` after parsing.
 
-    Skips any entry that is not a dict or has no truthy `url` — a result with no URL is
-    uncitable. `raw.get(key) or ""` maps both `None` and missing keys to `""`, matching
-    the frozen `str` fields (`engine` is declared `str | None` upstream in SearXNG).
+    Skips any entry that is not a dict, has no truthy `url`, or carries a wrong-typed
+    field — one engine emitting a non-string value must degrade to a skipped entry, not
+    an exception out of the tool call. `raw.get(key) or ""` maps both `None` and missing
+    keys to `""`, matching the frozen `str` fields (`engine` is declared `str | None`
+    upstream in SearXNG).
     """
     raw_results = payload.get("results")
     if not isinstance(raw_results, list):
@@ -52,14 +54,17 @@ def _parse_results(payload: dict, max_results: int) -> list[SearchResult] | Sear
         url = raw.get("url") or ""
         if not url:
             continue
-        results.append(
-            SearchResult(
-                title=raw.get("title") or "",
-                url=url,
-                snippet=raw.get("content") or "",
-                engine=raw.get("engine") or "",
+        try:
+            results.append(
+                SearchResult(
+                    title=raw.get("title") or "",
+                    url=url,
+                    snippet=raw.get("content") or "",
+                    engine=raw.get("engine") or "",
+                )
             )
-        )
+        except ValidationError:
+            continue
 
     return results[:max_results]
 

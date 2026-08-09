@@ -128,6 +128,41 @@ async def test_result_without_a_url_is_skipped(monkeypatch, make_config):
     assert [r.url for r in artifact] == ["https://ok.test"]
 
 
+async def test_result_with_a_wrong_typed_field_is_skipped_not_raised(monkeypatch, make_config):
+    payload = {
+        "query": "x",
+        "results": [
+            {"url": "https://bad.test", "title": 123, "content": "int title", "engine": "e"},
+            {"url": "https://ok.test", "title": "OK", "content": "good", "engine": "e"},
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    _install(monkeypatch, handler)
+    config = make_config()
+
+    content, artifact = await search._search("x", 10, config)
+
+    assert isinstance(artifact, list)
+    assert [r.url for r in artifact] == ["https://ok.test"]
+
+
+async def test_non_object_json_body_returns_malformed(monkeypatch, make_config):
+    def handler(request):
+        return httpx.Response(200, json=["a", "bare", "array"])
+
+    _install(monkeypatch, handler)
+    config = make_config()
+
+    content, artifact = await search._search("x", 10, config)
+
+    assert isinstance(artifact, search.SearchFailure)
+    assert artifact.reason == "malformed"
+    assert "not an object" in artifact.detail
+
+
 async def test_connection_error_returns_unreachable_failure(monkeypatch, make_config):
     def handler(request):
         raise httpx.ConnectError("refused")
