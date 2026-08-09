@@ -298,7 +298,7 @@ during planning:
 - [x] Phase 1: Skeleton, dependencies, and config surface
 - [x] Phase 2: Source registry and citation rendering
 - [x] Phase 3: Fetch tool
-- [ ] Phase 4: Search tool
+- [x] Phase 4: Search tool (live check AC pending — see phase)
 - [ ] Phase 5: Tool list and prompt loader
 - [ ] Final verification
 
@@ -651,10 +651,15 @@ exception.
 6. Add the live-check command to `docs/guides/setup.md`.
 
 **Acceptance criteria:**
-- [ ] Manual live check: query the real SearXNG instance for a term and observe
+- [ ] **PENDING — deferred to the developer, not verified.** Manual live check: query the
+      real SearXNG instance for a term and observe
       normalized results; then point the config at a dead URL and observe a
       `SearchFailure` with reason `unreachable` rather than a traceback.
-- [ ] `uv run ruff check .` and `uv run mypy .` are clean for the new files.
+      Blocked during implementation: `harness.toml`'s `[search] base_url` is still the
+      literal `"TODO"`, no SearXNG was reachable from the dev machine, and a stock
+      `searxng/searxng` container ships `formats: [html]` so it would not serve JSON.
+      The command to run is in `docs/guides/setup.md`.
+- [x] `uv run ruff check .` and `uv run mypy .` are clean for the new files.
 
 ### Phase 5: Tool list and prompt loader
 
@@ -995,5 +1000,27 @@ fixed in this phase rather than deferred.
   return typed `SearchFailure` values rather than raising. Note `harness.toml`'s
   `[search] base_url` is still the literal `"TODO"` — Phase 4's live check needs a real
   SearXNG URL there, though its unit tests do not.
+### 2026-08-09 — Phase 4: Search tool
+- Done: `harness/tools/search.py` (`SearchResult`, `SearchFailure`, `_parse_results`,
+  `_render`, `_search`, `build_search_tool`), 15 tests in `tests/test_search.py`, and a
+  search live-check section in `docs/guides/setup.md`. Suite 53 → 68 green. Committed as
+  `bff934e`. All contracts landed verbatim.
+- Learned: SearXNG field names were verified against upstream source, not assumed — the
+  snippet field is **`content`**, and there is **no server-side result-count parameter**,
+  so `max_results` slices client-side and the request carries only `q` and `format=json`.
+  A test pins the request path and `format=json` because `MockTransport` answers any URL
+  and SearXNG serves HTML without that param — a wrong path would stay green all the way
+  to a live instance. Also: never iterate a `content_and_artifact` artifact blindly — on
+  the failure half it is a single `SearchFailure`, and iterating a pydantic model yields
+  `(key, value)` tuples. That bug was in the documented live check before it was fixed.
+- Drift: none.
+- Watch-next: **Phase 4's AC1 (live check) is PENDING, not passed** — it needs
+  `harness.toml`'s `[search] base_url` set to a real SearXNG with `formats: [html, json]`
+  enabled; a stock container is HTML-only. Everything else in Phase 4 is verified. Phase 5
+  is flagged (!#4) and is the last: it adds `build_tools` to the existing
+  `harness/tools/__init__.py` (do NOT create a separate registry module), `harness/prompts.py`
+  over `string.Template`, two prompt `.md` files, two test files, and fills in
+  `docs/architecture.md`. Call `build_fetch_tool(config, registry)` and
+  `build_search_tool(config)` exactly as pinned — do not change their signatures.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
