@@ -10,15 +10,15 @@
 #   - `server.limiter` must be off. The bot limiter answers unauthenticated API
 #     calls with HTTP 403, which the fetch/search taxonomy would report as `blocked`.
 #
-# SCOPE: this file configures a localhost-only, unauthenticated dev instance. The
-# secret_key below signs nothing of value here and is NOT a credential — do not
-# reuse this file for a network-exposed deployment without regenerating it and
-# turning the limiter back on.
+# SCOPE: this file configures a localhost-only, unauthenticated dev instance —
+# docker-compose.yml binds it to 127.0.0.1 and supplies `server.secret_key` through
+# the SEARXNG_SECRET environment variable (see .env.example), so no key lives in
+# git. Do not reuse this file for a network-exposed deployment without turning the
+# limiter back on.
 
 use_default_settings: true
 
 server:
-  secret_key: "741f337712761ba6f9883fcecb462526e5938c49146d890f58d8831b33401fa8"
   limiter: false
   image_proxy: false
 

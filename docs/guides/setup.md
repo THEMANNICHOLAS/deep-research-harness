@@ -11,6 +11,8 @@
 4. Copy `.env.example` to `.env` and fill in:
    - `OPENCODE_API_KEY` — smart-model orchestration (GLM 5.2 / DeepSeek V4 Pro)
    - `CEREBRAS_API_KEY` — Gemma 4 31B worker triage (free tier)
+   - `SEARXNG_SECRET` — cookie signing for the local SearXNG instance; generate
+     with `openssl rand -hex 32`
 
    `SEARXNG_URL` and `LIGHTPANDA_CDP_URL` are no longer `.env` variables — they moved
    into `harness.toml` (see below). If you have an existing `.env` with those keys,
@@ -56,11 +58,15 @@ are never stored here — each provider names an environment variable
 ## Prerequisites
 
 - **SearXNG** must be reachable with its JSON API enabled. A local instance is
-  checked in — start it with:
+  checked in — start it from the repo root with:
 
   ```
-  docker compose -f searxng/docker-compose.yml up -d
+  docker compose --env-file .env -f searxng/docker-compose.yml up -d
   ```
+
+  `--env-file .env` supplies `SEARXNG_SECRET` (see step 4); compose refuses to
+  start without it. The container binds to `127.0.0.1` only, since the limiter
+  is off and the JSON API is unauthenticated.
 
   Do **not** use a bare `docker run ... searxng/searxng`. The stock image ships
   `formats: [html]` and serves HTML even when asked for `format=json`, which the
