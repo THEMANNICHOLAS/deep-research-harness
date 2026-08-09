@@ -1,0 +1,19 @@
+# Local SearXNG for harness development. Start with:
+#   docker compose -f searxng/docker-compose.yml up -d
+#
+# The harness reads this instance's URL from harness.toml's `[search] base_url`,
+# never from here. See docs/guides/setup.md.
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mounted read-write: the image writes uwsgi.ini into this directory on first
+      # run if it is absent. settings.yml here overrides the shipped defaults.
+      - ./:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    restart: unless-stopped

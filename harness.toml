@@ -33,5 +33,5 @@ max_concurrency = 5
 per_page_char_cap = 12000
 
 [search]
-base_url = "TODO"                    # TODO: self-hosted SearXNG base URL, e.g. http://<host>:8080
+base_url = "http://localhost:8080"   # local dev instance — see searxng/docker-compose.yml
 default_max_results = 10

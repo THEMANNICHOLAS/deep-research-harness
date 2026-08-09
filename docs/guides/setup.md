@@ -16,10 +16,13 @@
    into `harness.toml` (see below). If you have an existing `.env` with those keys,
    move their values into `harness.toml`'s `[search]` and `[browser]` tables and
    delete them from `.env`.
-5. Replace `harness.toml`'s `TODO` placeholders with real values (OpenCode base URL,
-   head and subagent model IDs, SearXNG base URL). These are **not** validated —
-   `TODO` is a well-formed string, so `load_config()` accepts it and the mistake
-   surfaces later as a connection or model error. Check them by eye.
+5. Replace `harness.toml`'s remaining `TODO` placeholders with real values: the
+   OpenCode base URL and the head/subagent model IDs. (`[search] base_url` is
+   already set to the local SearXNG below.) These are **not** validated — `TODO`
+   is a well-formed string, so `load_config()` accepts it and the mistake surfaces
+   later as a connection or model error. Check them by eye. Nothing reads the model
+   roles yet — they are the loop plan's concern, so the fetch and search live
+   checks below work with them still unset.
 
 ## Running with `.env`
 
@@ -52,13 +55,27 @@ are never stored here — each provider names an environment variable
 
 ## Prerequisites
 
-- **SearXNG** must be reachable with its JSON API enabled
-  (`formats: [html, json]` in its `settings.yml`) — the Phase 4 search tool cannot
-  parse the HTML-only response otherwise:
+- **SearXNG** must be reachable with its JSON API enabled. A local instance is
+  checked in — start it with:
 
   ```
-  docker run -d --name searxng -p 8080:8080 searxng/searxng
+  docker compose -f searxng/docker-compose.yml up -d
   ```
+
+  Do **not** use a bare `docker run ... searxng/searxng`. The stock image ships
+  `formats: [html]` and serves HTML even when asked for `format=json`, which the
+  search tool cannot parse; its bot limiter also answers unauthenticated API calls
+  with HTTP 403. @searxng/settings.yml overrides both. Verify with:
+
+  ```
+  curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
+    "http://localhost:8080/search?q=test&format=json"
+  ```
+
+  Expect `200 application/json`. `200 text/html` means the settings mount did not
+  take effect. Some engines (e.g. `wikidata`) may log a 403 init failure on
+  start-up; that is one upstream engine refusing this instance, not a broken
+  install — the others still return results.
 
 - **Lightpanda** — not currently used (`browser.backend` defaults to `playwright`;
   see the `docs/decisions.md` entry on why). Left here for when the backlog item is
@@ -127,8 +144,8 @@ The first run downloads a Chromium build if crawl4ai has never launched one on t
 machine (`uv run crawl4ai-setup` does it ahead of time).
 
 The search tool needs a real SearXNG instance, so it isn't exercised by `uv run pytest`
-either. `harness.toml`'s `[search] base_url` is currently the literal `"TODO"` and must
-be set to a real instance first. To check it, run:
+either. `harness.toml`'s `[search] base_url` points at the local instance above; start
+it first. To check it, run:
 
 ```
 PYTHONIOENCODING=utf-8 uv run --env-file .env python -c "

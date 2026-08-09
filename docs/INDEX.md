@@ -6,8 +6,9 @@
   over SSH. No cloud/container deployment.
 - **Status:** harness substrate built — config, source registry, fetch and search
   tools, prompt loader, and the tool list. No agent loop yet.
-- **Integrations:** SearXNG (existing Docker instance, JSON API — needs
-  `formats: [html, json]`; a stock container is HTML-only), crawl4ai over
+- **Integrations:** SearXNG (local Docker instance checked in at
+  @searxng/docker-compose.yml, JSON API enabled — a stock container is HTML-only
+  and will not work), crawl4ai over
   crawl4ai-managed Playwright/Chromium (Lightpanda was tried and retired — see
   docs/decisions.md), Cerebras API for worker-model triage (TODO — key),
   OpenCode API for orchestrator/synthesis models (TODO — key). API **keys** live

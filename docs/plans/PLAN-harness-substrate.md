@@ -1,6 +1,6 @@
 # PLAN: Harness Substrate — Tools, Prompts, and Config
 
-**Status:** In Progress
+**Status:** Complete
 **Created:** 2026-08-08
 **Type:** Single plan
 
@@ -298,9 +298,9 @@ during planning:
 - [x] Phase 1: Skeleton, dependencies, and config surface
 - [x] Phase 2: Source registry and citation rendering
 - [x] Phase 3: Fetch tool
-- [x] Phase 4: Search tool (live check AC pending — see phase)
+- [x] Phase 4: Search tool
 - [x] Phase 5: Tool list and prompt loader
-- [ ] Final verification
+- [x] Final verification
 
 ## Phases
 
@@ -651,14 +651,16 @@ exception.
 6. Add the live-check command to `docs/guides/setup.md`.
 
 **Acceptance criteria:**
-- [ ] **PENDING — deferred to the developer, not verified.** Manual live check: query the
+- [x] Manual live check: query the
       real SearXNG instance for a term and observe
       normalized results; then point the config at a dead URL and observe a
       `SearchFailure` with reason `unreachable` rather than a traceback.
-      Blocked during implementation: `harness.toml`'s `[search] base_url` is still the
-      literal `"TODO"`, no SearXNG was reachable from the dev machine, and a stock
-      `searxng/searxng` container ships `formats: [html]` so it would not serve JSON.
-      The command to run is in `docs/guides/setup.md`.
+      **Run 2026-08-09 and passed**, once a local SearXNG was stood up
+      (`searxng/docker-compose.yml`, `formats: [html, json]`, limiter off — the
+      blocker was that no instance existed, and a stock container is HTML-only).
+      Observed: `solar panel efficiency` returned 5 normalized results with title,
+      URL and snippet; re-pointed at `http://localhost:1` it returned
+      `SearchFailure(reason="unreachable")` rendered as plain text, no traceback.
 - [x] `uv run ruff check .` and `uv run mypy .` are clean for the new files.
 
 ### Phase 5: Tool list and prompt loader
@@ -746,22 +748,20 @@ variable.
 - [x] `uv run ruff check .` — clean.
 - [x] `uv run ruff format --check .` — clean.
 - [x] `uv run mypy .` — clean. (15 source files.)
-- [ ] **PARTIAL — the search half is blocked, same cause as Phase 4 AC1.** Manual
-      end-to-end sanity (not automated, not an agent run): in a Python shell,
+- [x] Manual end-to-end sanity (not automated, not an agent run): in a Python shell,
       load the config, build a `SourceRegistry`, call `build_tools`, then
       `await search_web.ainvoke({"query": ..., "max_results": 3})` and feed three of
       the returned URLs to `await fetch_pages.ainvoke({"urls": [...]})`. Confirm the
       fetch content carries `[Sn]` headings and that `registry.resolve()` turns those
       markers into clickable links.
-      Run 2026-08-09 and observed: `build_tools` → `['fetch_pages', 'search_web']`;
-      `fetch_pages` → `S1 fetched 200`-class article and `S2 blocked 403`, model-facing
-      content carrying `## [S1] <url>` / `## [S2] <url>` headings; `registry.resolve()`
-      turning `[S1]`/`[S2]` into `[en.wikipedia.org](...)` / `[httpbin.org](...)` and
-      leaving unknown `[S99]` verbatim; both prompts rendering. **Not** observed: real
-      search results feeding the fetch, because `[search] base_url` is still `"TODO"` —
-      `search_web` returned a typed `SearchFailure(reason="unreachable")` with no
-      traceback, which does satisfy the second half of Phase 4's AC1 but is not this
-      check. Needs a real SearXNG with `formats: [html, json]`.
+      **Run 2026-08-09 against the live local SearXNG and passed.** Observed:
+      `build_tools` → `['fetch_pages', 'search_web']`; `search_web` → 3 normalized
+      results; those three URLs fed straight to `fetch_pages` → `S1/S2/S3` all
+      `fetched 200` (110393 / 6498 / 23640 chars in the untruncated artifact);
+      model-facing content carrying one `## [Sn] <url>` heading per URL;
+      `registry.resolve()` turning `[S1] [S2] [S3]` into
+      `[docs.python.org](...)`, `[medium.com](...)`, `[dev.to](...)` and leaving
+      unknown `[S99]` verbatim; both prompts rendering.
 - [x] `.env.example` and `harness.toml` between them name every setting the code
       reads, and no endpoint, model ID, or key appears as a literal in `harness/`.
       (Audited 2026-08-09: no URL, host, port, model ID or key literal in `harness/*.py`;
@@ -1076,5 +1076,26 @@ its pre-refactor count of 68 before any new test is written. `tests/test_config.
   validated, so `load_config()` accepts them. The `## Verification` manual end-to-end sanity
   check needs both fixed first. Note CLAUDE.md `## Stack` still claims Lightpanda/CDP and
   `## Quality Gate` still omits pytest and mypy — both stale.
+### 2026-08-09 — Final verification (plan closed)
+- Done: all four automated gates green (80 tests, ruff, format, mypy), the config-literals
+  audit clean, and **both** outstanding live checks run and passed — Phase 4's AC1 and the
+  end-to-end sanity check. Unblocking them meant standing up SearXNG, which no phase ever
+  did: `searxng/{docker-compose.yml,settings.yml}` is now checked in, and `harness.toml`'s
+  `[search] base_url` points at it. Plan Status → Complete.
+- Learned: **no SearXNG existed on the dev machine at all** — the plan's Constraints assumed
+  one was "already deployed", and `docs/guides/setup.md` documented a bare
+  `docker run ... searxng/searxng` that *cannot* satisfy the live check printed below it:
+  the stock image ships `formats: [html]` and its bot limiter 403s unauthenticated API
+  calls. Both are overridden in `searxng/settings.yml`; the guide now points at the compose
+  file and carries a `curl` probe that distinguishes `200 application/json` from
+  `200 text/html`. A `wikidata` engine 403 on start-up is normal and not a broken install.
+  Also confirmed live: the snippet field is `content`, and `max_results` slices client-side.
+- Drift: none. One backlog entry added (an HTTP 404 serving a real HTML body classifies as
+  `fetched`; classifier deliberately not widened, per risk #2).
+- Watch-next: nothing blocks this plan. Still open for the loop plan: `harness.toml`'s
+  OpenCode `base_url` and both role `model` IDs are still `TODO` and unvalidated — nothing
+  reads them yet, so they were not needed here. Project `CLAUDE.md` is stale in two places:
+  `## Stack` still claims Lightpanda/CDP (it is Playwright) and `## Quality Gate` lists only
+  ruff, omitting `uv run pytest` and `uv run mypy .`, which are both real gates.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
