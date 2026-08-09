@@ -1,0 +1,145 @@
+"""Behavioral tests for harness.sources."""
+
+import pytest
+
+from harness.sources import SourceRegistry, normalize_url
+
+RESOLVE_TEXT = "[S1] Some claim here [S1] and another [S2] in the same sentence. End [S1]"
+
+
+def test_ids_are_assigned_sequentially_from_s1_in_insertion_order():
+    registry = SourceRegistry()
+
+    id_a = registry.add("https://example.com/a")
+    id_b = registry.add("https://example.com/b")
+    id_c = registry.add("https://example.com/c")
+
+    assert (id_a, id_b, id_c) == ("S1", "S2", "S3")
+    assert [s.id for s in registry.all()] == ["S1", "S2", "S3"]
+
+
+def test_same_url_added_twice_returns_same_id_and_one_entry():
+    registry = SourceRegistry()
+
+    first_id = registry.add("https://example.com/a")
+    second_id = registry.add("https://example.com/a")
+
+    assert first_id == second_id
+    assert len(registry.all()) == 1
+
+
+@pytest.mark.parametrize(
+    ("url_a", "url_b"),
+    [
+        ("https://example.com/a", "https://example.com/a/"),
+        ("https://example.com/a", "https://example.com:443/a"),
+        ("http://example.com/a", "http://example.com:80/a"),
+        ("https://example.com/a", "https://example.com/a#section"),
+    ],
+)
+def test_urls_differing_only_by_slash_port_or_fragment_share_an_id(url_a, url_b):
+    registry = SourceRegistry()
+
+    id_a = registry.add(url_a)
+    id_b = registry.add(url_b)
+
+    assert id_a == id_b
+    assert len(registry.all()) == 1
+
+
+def test_urls_differing_by_query_string_get_different_ids():
+    registry = SourceRegistry()
+
+    id_a = registry.add("https://example.com/a?q=1")
+    id_b = registry.add("https://example.com/a?q=2")
+
+    assert id_a != id_b
+    assert len(registry.all()) == 2
+
+
+def test_link_renders_domain_and_url_and_raises_for_unknown_id():
+    registry = SourceRegistry()
+    registry.add("https://example.com/a")
+
+    assert registry.link("S1") == "[example.com](https://example.com/a)"
+
+    with pytest.raises(KeyError) as excinfo:
+        registry.link("S9")
+    assert "S9" in str(excinfo.value)
+
+
+def test_resolve_replaces_every_known_marker():
+    registry = SourceRegistry()
+    registry.add("https://example.com/a")
+    registry.add("https://example.org/b")
+
+    result = registry.resolve(RESOLVE_TEXT)
+
+    assert "[S" not in result
+    assert result.count("[example.com](https://example.com/a)") == 3
+    assert result.count("[example.org](https://example.org/b)") == 1
+
+
+def test_resolve_leaves_unknown_marker_verbatim_and_reports_it():
+    registry = SourceRegistry()
+    registry.add("https://example.com/a")
+    text = "Known [S1] and unknown [S9] markers."
+
+    result = registry.resolve(text)
+
+    assert "[example.com](https://example.com/a)" in result
+    assert "[S9]" in result
+    assert registry.unresolved_ids(text) == ["S9"]
+
+
+def test_resolve_on_text_without_markers_returns_it_unchanged():
+    registry = SourceRegistry()
+    registry.add("https://example.com/a")
+    text = "No markers in this text at all."
+
+    assert registry.resolve(text) == text
+
+
+def test_get_returns_the_registered_source_and_none_for_an_unknown_id():
+    registry = SourceRegistry()
+    registry.add("https://example.com/a", title="An Article")
+
+    source = registry.get("S1")
+
+    assert source is not None
+    assert (source.id, source.url, source.title) == ("S1", "https://example.com/a", "An Article")
+    assert registry.get("S9") is None
+
+
+def test_re_adding_a_url_keeps_the_first_title():
+    registry = SourceRegistry()
+    registry.add("https://example.com/a", title="First")
+    registry.add("https://example.com/a", title="Second")
+
+    source = registry.get("S1")
+
+    assert source is not None
+    assert source.title == "First"
+
+
+def test_ipv6_host_keeps_its_brackets_when_normalized():
+    assert normalize_url("http://[::1]:8080/x") == "http://[::1]:8080/x"
+    assert normalize_url("HTTP://[::1]/x#frag") == "http://[::1]/x"
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "http://example.com:notaport/x",
+        "http://example.com:99999/x",
+        "http://[::1/x",
+    ],
+)
+def test_malformed_url_normalizes_to_itself_instead_of_raising(malformed):
+    assert normalize_url(malformed) == malformed
+
+    registry = SourceRegistry()
+    source = registry.get(registry.add(malformed))
+
+    assert source is not None
+    assert source.url == malformed
