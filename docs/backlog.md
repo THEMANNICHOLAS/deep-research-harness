@@ -20,3 +20,25 @@ to address.
   set when starting Lightpanda — without it the server advertises
   `webSocketDebuggerUrl: ws://0.0.0.0:9222/`, which no CDP client can dial; this is
   independent of the lifecycle-event problem and needed regardless of which fix lands.
+
+- **PDFs never classify as `non_html`.** The `non_html` outcome in
+  `harness/tools/fetch.py` assumes crawl4ai returns a successful crawl with empty markdown
+  for a PDF. Over crawl4ai-managed Playwright it does neither: a PDF that triggers a
+  browser download surfaces as `Page.goto: Download is starting` and classifies `error`,
+  while a PDF served inline gets its text extracted and classifies `fetched` (4307
+  characters, in the Phase 3 live check). This bites any caller that wants to tell "we
+  couldn't read this format" from "we failed" — right now the two are indistinguishable
+  for PDFs. Confirmed by live check, not inferred; full evidence in the Phase 3 PDF entry
+  of @docs/plans/PLAN-harness-substrate.md `## Reconciliations`. To address: dispatch on
+  the `content-type` response header before classifying, or adopt crawl4ai's
+  `PDFCrawlerStrategy` (deliberately unused in the substrate plan). Deferred rather than
+  fixed mid-phase per that plan's risk #2, which forbids widening the classifier during
+  Phase 3.
+
+- **Residual boilerplate survives the pruning filter.** `PruningContentFilter` strips
+  Wikipedia's sidebar, personal tools, navigation menu, privacy policy and license footer,
+  but a tail of category links and a "Search / N languages" fragment remains in the fetched
+  markdown. Costs tokens on every fetched page. The substrate plan's Preferences place
+  stripping quality outside the acceptance gate ("tuning quality is iterative"), so this is
+  tuning work: adjust `PruningContentFilter`'s threshold or extend `_EXCLUDED_TAGS` in
+  `harness/tools/fetch.py`, measured against real fetched pages rather than in the abstract.

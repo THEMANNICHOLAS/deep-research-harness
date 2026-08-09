@@ -110,12 +110,14 @@ translation.
 External library facts this plan is built on, each confirmed from official docs
 during planning:
 
-- **crawl4ai** — `BrowserConfig(browser_mode="custom", cdp_url=...)` attaches to an
+- **crawl4ai** — ~~`BrowserConfig(browser_mode="custom", cdp_url=...)`~~
+  `BrowserConfig(browser_mode="cdp", cdp_url=...)` attaches to an
   externally running browser over CDP instead of launching Playwright.
   `arun_many(urls, config=..., dispatcher=...)` crawls concurrently and reports
   per-URL success through `CrawlResult.success` / `.error_message` / `.status_code`
   rather than by raising. `MemoryAdaptiveDispatcher` is the default dispatcher
-  (`max_session_permit` default 10). Boilerplate stripping is
+  (~~`max_session_permit` default 10~~ — its own constructor default is 20; the 10 is
+  `arun_many`'s fallback when it builds a dispatcher itself). Boilerplate stripping is
   `CrawlerRunConfig(excluded_tags=..., markdown_generator=DefaultMarkdownGenerator(
   content_filter=PruningContentFilter(...)))`, which populates
   `result.markdown.fit_markdown` alongside `raw_markdown`. `page_timeout` is a single
@@ -295,7 +297,7 @@ during planning:
 
 - [x] Phase 1: Skeleton, dependencies, and config surface
 - [x] Phase 2: Source registry and citation rendering
-- [ ] Phase 3: Fetch tool
+- [x] Phase 3: Fetch tool
 - [ ] Phase 4: Search tool
 - [ ] Phase 5: Tool list and prompt loader
 - [ ] Final verification
@@ -570,13 +572,15 @@ fail the batch.
 7. Add the manual live-check command to `docs/guides/setup.md`.
 
 **Acceptance criteria:**
-- [ ] Manual live check: with the browser backend running, fetch three URLs — one
+- [x] Manual live check: with the browser backend running, fetch three URLs — one
       ordinary article, one known to return 403, and one PDF — and observe
-      `fetched` / `blocked` / `non_html` respectively, with the article's markdown
+      `fetched` / `blocked` / ~~`non_html`~~ (see the Phase 3 PDF entry in
+      `## Reconciliations` — a real PDF lands in `error` or `fetched`, never
+      `non_html`) respectively, with the article's markdown
       free of nav and footer text.
-- [ ] The live-check command is written down in `docs/guides/setup.md` and runs as
+- [x] The live-check command is written down in `docs/guides/setup.md` and runs as
       written.
-- [ ] `uv run ruff check .` and `uv run mypy .` are clean for the new files.
+- [x] `uv run ruff check .` and `uv run mypy .` are clean for the new files.
 
 ### Phase 4: Search tool
 
@@ -828,6 +832,69 @@ for resolving `api_key_env`. Adding it would be a dependency with no present cal
 which the right-sizing rule forbids. Struck through in **Files**. If the loop plan later
 wants env-driven settings, it adds the dependency then, with a real caller.
 
+### 2026-08-08 — Phase 3: two crawl4ai facts in `## Background` are wrong for 0.9.2
+
+Both were gathered from docs during planning and contradicted by the pinned, installed
+package (`.venv/Lib/site-packages/crawl4ai/`). Risk #3 anticipated exactly this and says
+to surface a signature mismatch rather than quietly rewrite the contract — so both are
+struck in **Background** and corrected here. No **Contract**, requirement, acceptance
+criterion, or file list changes.
+
+**1. CDP attachment is `browser_mode="cdp"`, not `"custom"`.** `BrowserConfig.browser_mode`
+accepts exactly `"builtin"`, `"dedicated"` (default), `"cdp"`, and `"docker"`
+(`async_configs.py:669-700`). `"custom"` is not a valid value. `build_browser_config` must
+therefore map `BrowserSettings.backend` → `browser_mode` itself: `"lightpanda"` →
+`browser_mode="cdp"` with `cdp_url` set, `"playwright"` → the default `"dedicated"` with
+`cdp_url` left `None`. This is latent rather than urgent — risk #1 already retired
+Lightpanda and `harness.toml` ships `backend = "playwright"` — but the phase's test list
+still requires `build_browser_config` to produce a CDP-attached config for the
+`lightpanda` value, and `"custom"` would have produced a broken one.
+
+**2. `MemoryAdaptiveDispatcher`'s `max_session_permit` default is 20, not 10.** The 10 is
+`arun_many`'s fallback when it constructs a dispatcher itself. Immaterial to the build —
+Phase 3 passes `max_concurrency` explicitly — but the stated fact was wrong.
+
+Three further API details, consistent with the plan but not spelled out in it, are
+recorded so the implementor does not rediscover them: `arun_many` returns a
+`CrawlResultContainer` (iterable and indexable, not literally a `list`) when
+`stream=False`; `CrawlResult` has **no** `title` attribute — the title lives in the
+`metadata` dict; and there is **no** `content_type` attribute — it must be read from
+`response_headers`, which is why the frozen `classify(...)` signature already takes
+`content_type` as a caller-supplied argument.
+
+### 2026-08-09 — Phase 3: a real PDF never classifies as `non_html`
+
+Found by running the phase's own live check. `## Background` states "Non-HTML responses
+are **not** content-type dispatched — a PDF URL yields empty markdown rather than an
+error." That is **false** on crawl4ai 0.9.2 over crawl4ai-managed Playwright. Observed,
+across three real PDF URLs:
+
+- `pdfobject.com/pdf/sample.pdf` → Playwright raises `Page.goto: Download is starting`.
+  crawl4ai reports it as an `error_message`, so `classify` returns **`error`**.
+- `africau.edu/images/default/sample.pdf` → served inline and crawl4ai **extracted 4307
+  characters of PDF text**, so `classify` returns **`fetched`**.
+- `w3.org/.../dummy.pdf` → 307 redirect into a Cloudflare JS challenge → **`error`**.
+
+Neither branch produces the "succeeded but empty markdown" condition that `non_html` was
+designed to catch, and no `content-type` header reaches `classify` in these cases either.
+So AC1's `non_html` expectation is unreachable with a real PDF; that expectation is struck
+above. `non_html` remains reachable for a genuinely empty successful page and for a
+non-HTML content type that renders inline — it is dead only for the PDF case.
+
+**The classifier is NOT changed.** Risk #2 anticipated exactly this and pre-authorized the
+response: "confirm during the Phase 3 live check that a real PDF and a real 403 land in
+the intended buckets, and log anything surprising to `docs/backlog.md` rather than
+widening the classifier mid-phase." Logged there accordingly. The frozen classification
+rules and the `FetchOutcome` values are untouched.
+
+Live-check results as run, for the record: article → `fetched` 200; `httpbin.org/status/403`
+→ `blocked` 403 (the status rule fired before crawl4ai's own anti-bot message, as designed);
+PDF → as above. The article's markdown had 9 of 10 probed Wikipedia nav/footer markers
+stripped (sidebar, personal tools, navigation menu, privacy policy, license footer all
+absent); a tail of category links and a "Search / N languages" fragment survives, which the
+plan's Preferences already place outside the acceptance gate ("tuning quality is iterative,
+not an acceptance gate").
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
@@ -906,5 +973,27 @@ fixed in this phase rather than deferred.
   "playwright"`, Lightpanda is out (see `docs/decisions.md`); do not re-attempt the CDP
   pairing. Assign IDs by calling `SourceRegistry.add()` — never mint IDs inside the fetch
   tool — and read every limit from `FetchSettings`/`BrowserSettings`, no literals.
+### 2026-08-09 — Phase 3: Fetch tool
+- Done: `harness/tools/fetch.py` (`classify`, `build_browser_config`, `FetchedPage`,
+  `_fetch`, `build_fetch_tool`), `harness/tools/__init__.py` as a bare package marker,
+  22 tests in `tests/test_fetch.py`, and a live-check section in `docs/guides/setup.md`.
+  Suite 32 → 53 green. The live check was actually RUN, not just written down.
+- Learned: **A real PDF never classifies as `non_html`** — it lands in `error` (browser
+  starts a download) or `fetched` (crawl4ai extracts the PDF's text). See the Phase 3 PDF
+  entry in `## Reconciliations` and the backlog. The classifier was deliberately NOT
+  widened, per risk #2. Also: `blocked` fires off the 403 status before crawl4ai's own
+  anti-bot message, as designed. `PruningContentFilter` strips Wikipedia's sidebar,
+  personal tools, nav menu, privacy policy and license footer, but leaves a category-link
+  tail — logged as tuning, outside the acceptance gate. Note the live check needs a `.env`
+  (none exists in this working copy); it was run with `OPENCODE_API_KEY`/`CEREBRAS_API_KEY`
+  supplied inline, since `load_config()` validates provider keys the fetch path never uses.
+- Drift: two amendments in `## Reconciliations` — the crawl4ai API facts (`browser_mode`
+  is `"cdp"` not `"custom"`; dispatcher default 20 not 10) and the PDF/`non_html` finding
+  that struck AC1's third expectation. Both developer-approved.
+- Watch-next: Phase 4 (search tool) is unflagged and offline-testable against a mocked
+  `httpx` transport. It must mirror `fetch.py`'s `build_<name>_tool` factory shape and
+  return typed `SearchFailure` values rather than raising. Note `harness.toml`'s
+  `[search] base_url` is still the literal `"TODO"` — Phase 4's live check needs a real
+  SearXNG URL there, though its unit tests do not.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
