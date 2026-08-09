@@ -1,26 +1,23 @@
 # Harness config surface (D3, docs/plans/PLAN-harness-substrate.md).
 #
-# The `TODO` values below are deployment facts not established anywhere in this
-# repo — the OpenCode base URL, the exact model IDs, and the developer's SearXNG
-# URL. Fill them in before `load_config()` will produce a usable runtime config.
 # Secrets are never stored here — each provider names an environment variable
-# (see `.env.example`), resolved at load time.
+# (see `.env.example`), resolved at load time. Note that EVERY declared provider
+# has its key resolved at load, whether or not a role uses it, which is why only
+# the providers actually in use are declared below.
 
+# `base_url` is the API base, not a full endpoint — the OpenAI-compatible client
+# appends `/chat/completions` itself.
 [providers.opencode]
-base_url = "TODO"                    # TODO: OpenCode API base URL, e.g. https://<host>/v1
+base_url = "https://opencode.ai/zen/go/v1"
 api_key_env = "OPENCODE_API_KEY"
-
-[providers.cerebras]
-base_url = "https://api.cerebras.ai/v1"
-api_key_env = "CEREBRAS_API_KEY"
 
 [roles.head]
 provider = "opencode"
-model = "TODO"                       # TODO: OpenCode head-model ID, e.g. glm-5.2
+model = "kimi-k3"
 
 [roles.subagent]
-provider = "cerebras"
-model = "TODO"                       # TODO: Cerebras worker-model ID, e.g. gemma-4-31b
+provider = "opencode"
+model = "gpt-5.6-luna"
 
 [browser]
 # Default is playwright, not lightpanda — see docs/decisions.md for the
@@ -35,3 +32,13 @@ per_page_char_cap = 12000
 [search]
 base_url = "http://localhost:8080"   # local dev instance — see searxng/docker-compose.yml
 default_max_results = 10
+
+[agent]
+# Frozen surface for the agent loop (Phase 3) and its workspace/report capture
+# (Phase 2) — see docs/plans/PLAN-research-loop.md.
+max_rounds = 20
+wall_clock_seconds = 1800
+workspace_dir = "workspace"
+reports_dir = "reports"
+max_retries = 2
+request_timeout_seconds = 120.0

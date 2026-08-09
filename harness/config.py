@@ -82,12 +82,27 @@ class SearchSettings(_StrictModel):
     default_max_results: int = Field(default=10, gt=0)
 
 
+class AgentSettings(_StrictModel):
+    # Frozen for later phases (Phase 3's agent loop, Phase 2's workspace capture) — see
+    # docs/plans/PLAN-research-loop.md Phase 1 Contracts.
+    max_rounds: int = Field(default=20, gt=0)  # hard cap on agent-loop rounds
+    wall_clock_seconds: int = Field(default=1800, gt=0)  # wall-clock budget, in seconds
+    workspace_dir: Path = Field(default=Path("workspace"))  # scratch dir the loop may write to
+    reports_dir: Path = Field(default=Path("reports"))  # where finished reports land
+    # Counts retries AFTER the initial attempt — maps 1:1 onto the OpenAI SDK's
+    # `max_retries`, which already applies its own bounded exponential backoff with
+    # jitter; there is no separate backoff knob here.
+    max_retries: int = Field(default=2, ge=0)
+    request_timeout_seconds: float = Field(default=120.0, gt=0)  # per-request timeout, seconds
+
+
 class HarnessConfig(_StrictModel):
     providers: dict[str, ProviderConfig]
     roles: dict[str, RoleConfig]
     browser: BrowserSettings
     fetch: FetchSettings = Field(default_factory=FetchSettings)
     search: SearchSettings
+    agent: AgentSettings = Field(default_factory=AgentSettings)
 
     @model_validator(mode="after")
     def _cross_check_roles(self) -> "HarnessConfig":

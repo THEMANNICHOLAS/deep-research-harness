@@ -391,7 +391,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R3 | No overstated evidence; per-claim check against its own source | MUST | Phase 6 (check + marking), Phase 3 (compression config) |
 | R4 | Discloses conflicts, failed fetches, dead branches, cut-short runs | MUST | Phase 6 (conflicts + gaps), Phase 5 (cut-short) |
 | R5 | Researcher and reader tier contracts frozen as artifacts | MUST | Phase 7 |
-| R6 | Roles resolve to chat clients; fail-fast incl. `TODO` placeholders; bounded retry, no switchover | MUST | Phase 1 |
+| R6 | Roles resolve to chat clients; fail-fast incl. `TODO` placeholders and an unreachable endpoint; bounded retry, no switchover | MUST | Phase 1 (config fail-fast + `preflight`), Phase 3 (`preflight` call site in `__main__`) |
 | R7 | Round cap + 30-minute wall clock; token cost recorded | MUST | Phase 5 (ceiling), Phase 3 (token baseline) |
 | R8 | Source content captured at fetch time; verification reads capture only | MUST | Phase 2 (capture), Phase 6 (consumption) |
 | R9 | Fetch call bounded to configured source count (default 4) | MUST | Phase 2 |
@@ -399,7 +399,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 
-- [ ] Phase 1: Model client and agent config
+- [x] Phase 1: Model client and agent config
 - [ ] Phase 2: Fetch amendments — URL cap and source capture
 - [ ] Phase 3: Tracer bullet — question in, report on disk
 - [ ] Phase 4: Pre-research clarification
@@ -427,8 +427,9 @@ retry already applied, failing loud and specific before any research starts.
   planning time) and `langchain-openai`.
 - `harness/config.py` — modify: add an `AgentSettings` model and its field on `HarnessConfig`.
 - `harness.toml` — modify: add the `[agent]` section; fill the three `TODO` placeholders.
-- `harness/models.py` — new: role → chat client resolution and retry. Reason: R6 is a distinct
-  concern that every later phase depends on and that is independently live-checkable.
+- `harness/models.py` — new: role → chat client resolution, retry, and the `preflight`
+  reachability check. Reason: R6 is a distinct concern that every later phase depends on and
+  that is independently live-checkable.
 - `tests/test_models.py` — new.
 - `tests/test_config.py` — modify: cover the new `[agent]` section.
 - `docs/guides/setup.md` — modify: add the manual live-check command for a single model call.
@@ -450,6 +451,12 @@ retry already applied, failing loud and specific before any research starts.
     undeclared, the API key is absent, or the role's model or its provider's `base_url` is
     the literal string `TODO` (R6's fail-fast covers unfilled placeholders). The returned
     client has retry **already applied**; callers must not wrap it again.
+  - `async def preflight(config: HarnessConfig, role: str) -> None` — R6's reachability half
+    (added during execution; see `## Discoveries` 2026-08-09). Builds via `build_chat_model`,
+    makes one completion capped at a single token, returns `None` on success, and raises
+    `ModelError` naming the role, provider, `base_url` and model — distinguishing unreachable
+    endpoint from rejected credentials from unknown model — so no `openai`/`httpx` exception
+    ever escapes. Unconditional, no config knob. Phase 3's `__main__` is its call site.
 - `harness.toml` section name `[agent]`, frozen for later phases, carrying at minimum: the
   round cap, the wall-clock budget in seconds (default 1800), the workspace directory, and
   the reports directory.
@@ -462,15 +469,19 @@ retry already applied, failing loud and specific before any research starts.
 - Do not touch `harness/tools/`, `harness/sources.py`, or `harness/prompts.py`.
 
 **Tests (write first, confirm red):**
-- [ ] A valid config resolves each declared role to a client carrying that role's model ID and
+- [x] A valid config resolves each declared role to a client carrying that role's model ID and
       its provider's base URL.
-- [ ] Every failure mode raises `ModelError` with a message naming the offending role and
+- [x] Every failure mode raises `ModelError` with a message naming the offending role and
       provider: unknown role, role pointing at an undeclared provider, absent API key, and a
       literal `TODO` left in the role's model or the provider's `base_url`.
-- [ ] The `[agent]` section loads, and each omitted value falls back to its documented default
+- [x] The `[agent]` section loads, and each omitted value falls back to its documented default
       including the 1800-second wall clock.
-- [ ] A transient failure is retried up to the configured bound and then surfaces; a
+- [x] A transient failure is retried up to the configured bound and then surfaces; a
       non-transient failure is not retried.
+- [x] `preflight` succeeds against a reachable endpoint and raises `ModelError` — never a
+      library exception — for an unreachable endpoint, rejected credentials, and an unknown
+      model, each distinguishable from the others; it inherits the client's bounded retry, and
+      its request is capped to a single completion token.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -485,11 +496,12 @@ retry already applied, failing loud and specific before any research starts.
 
 **Acceptance criteria:**
 - [ ] Manual live check: one call through `build_chat_model(config, "head")` reaches Kimi K3
-      on OpenCode and returns text; then with the key unset, the same call raises `ModelError`
-      naming the role and provider rather than a library traceback.
-- [ ] `docs/decisions.md` records the pinned `deepagents` version and the observed default
+      on OpenCode and returns text; ~~then with the key unset, the same call raises
+      `ModelError` naming the role and provider rather than a library traceback.~~ (See
+      `## Reconciliations` 2026-08-09.)
+- [x] `docs/decisions.md` records the pinned `deepagents` version and the observed default
       middleware set and backend, as read from the installed package.
-- [ ] `harness.toml` contains no `TODO` values.
+- [x] `harness.toml` contains no `TODO` values.
 
 ### Phase 2: Fetch amendments — URL cap and source capture
 
@@ -566,8 +578,9 @@ anything is built on them.
   the only place `deepagents` is imported.
 - `harness/report.py` — new: report assembly and the timestamped write. Reason: pure string
   work, kept separate so R3/R4 assembly tests need no model.
-- `harness/__main__.py` — new: argv, run, print path. Reason: R1 needs an entry point and none
-  exists.
+- `harness/__main__.py` — new: argv, `await preflight(config, "head")` before anything is
+  spent, run, print path. Reason: R1 needs an entry point and none exists, and `preflight` is
+  R6's "before any research starts" guard (see `## Discoveries` 2026-08-09).
 - `harness/prompts/orchestrator.md` — modify: rewritten as the deepagents lead prompt (D8).
 - `tests/test_agent.py` — new.
 - `tests/test_report.py` — new.
@@ -1027,10 +1040,76 @@ prompt artifacts, so a later round wires the pyramid without renegotiating the s
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+2026-08-09 — Phase 1: the acceptance criterion's unset-key live check is unreachable —
+`ProviderConfig`'s after-validator resolves `api_key` from the environment and raises when the
+variable is unset, which `load_config` wraps as `ConfigError`, so `build_chat_model` is never
+reached on that path → the struck half is replaced by: the unset-environment-variable case
+surfaces as `ConfigError` naming the variable at load time (already covered by
+`tests/test_config.py`), and `build_chat_model`'s defensive empty-`api_key` branch is covered
+by an offline test built with `ProviderConfig.model_construct`. The `## Phases` **Contracts**
+block is unchanged — all five `ModelError` failure modes are still implemented, including the
+absent key. `ProviderConfig`'s shape stays frozen (Phase 1 **Out of scope**). Residue,
+accepted knowingly: on the one path a real operator can actually hit, the `ConfigError` names
+the provider and the environment variable but **not** the role, so R6's "naming the role and
+provider" is literally satisfied only on `build_chat_model`'s defensive branch. Naming the role
+there would mean teaching `ProviderConfig` about roles, which the frozen shape forbids.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+2026-08-09 — Phase 1: removing `[providers.cerebras]` from `harness.toml` left stale references
+in `.env.example`, `docs/guides/setup.md`, `CLAUDE.md` and `docs/INDEX.md`, all describing a
+provider the runtime config no longer declares → **acted now**: all four pruned in Phase 1.
+`tests/test_config.py` keeps its own two-provider TOML fixtures and was deliberately NOT
+pruned — they are the only remaining coverage of the multi-provider path.
+
+2026-08-09 — Phase 1: R6's "unreachable endpoint fails … before any research starts" was
+covered by nothing — `build_chat_model` validates config shape only, so a well-formed but
+wrong `base_url` or model ID surfaced mid-run as a raw `openai.APIConnectionError`, the library
+traceback R6 exists to prevent (3F judgment review, Major) → **acted now**: added
+`async def preflight(config, role)` to `harness/models.py` (see Phase 1 **Contracts**), called
+from `__main__` in Phase 3 (see Phase 3 **Files**), with the `## Requirements Coverage` R6 row
+amended to name both phases.
+
+2026-08-09 — Phase 1: `AgentSettings` places `request_timeout_seconds` and `max_retries` under
+`[agent]`, making them global rather than per-provider, so a second provider needing a
+different timeout would require a reshape (3F judgment review, noted not filed) → **deferred**:
+correct while exactly one provider is declared; revisit if the pyramid reintroduces a second.
+
+2026-08-09 — Phase 1: no test pins the *jitter* property of R6's bounded backoff — swapping the
+SDK's backoff for a hand-rolled fixed sleep would keep every retry test green, since the tests
+assert attempt counts and terminal error types (3F judgment review, noted not filed) →
+**deferred**: the guarantee rests on the pinned `openai` SDK plus a code comment, which is an
+acceptable home for it; revisit only if retry is ever hand-rolled.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
+
+### 2026-08-09 — Phase 1: Model client and agent config
+- Done: `harness/models.py` with `ModelError`, `build_chat_model` (five fail-fast branches,
+  retry pre-applied via the OpenAI SDK's `max_retries`) and `async preflight` (R6's
+  reachability guard, one 1-token call, classified into `ModelError`, never leaks a library
+  exception). `AgentSettings` added to `harness/config.py` and `[agent]` to `harness.toml`.
+  `deepagents==0.7.5` and `langchain-openai>=0.3` pinned. 118 tests green; ruff/format/mypy
+  clean. Real config values are in: OpenCode serves both roles (`kimi-k3` head,
+  `gpt-5.6-luna` subagent) at `https://opencode.ai/zen/go/v1`; `[providers.cerebras]` removed.
+- Learned: (1) `TodoListMiddleware` DOES exist — in `langchain` 1.3.14, not deepagents'
+  namespace — so D9 is implementable; an earlier claim that it was missing was wrong and
+  `docs/decisions.md` now carries the corrected entry. (2) `SubAgentMiddleware` is in the
+  DEFAULT stack (general-purpose subagent auto-added), so Phase 3 must disable it explicitly
+  rather than assume its absence. (3) The default summarizer is deepagents'
+  `_DeepAgentsSummarizationMiddleware` wrapper, not langchain's plain `SummarizationMiddleware`
+  — D7's `keep` policy must be written against the wrapper. (4) `ProviderConfig` resolves the
+  API key of EVERY declared provider, used or not, so declaring a provider means setting its
+  key. (5) `base_url` is the API base — the client appends `/chat/completions` itself.
+- Drift: one Reconciliation, 2026-08-09 — Phase 1's unset-key acceptance criterion was
+  unreachable (`ConfigError` fires at load before `build_chat_model`); struck and amended. See
+  `## Reconciliations`. Also three `## Discoveries` entries, two acted on (cerebras pruning,
+  the `preflight` addition) and two deferred (global vs per-provider timeout; unpinned jitter).
+- Watch-next: the Phase 1 live check is still UNRUN — `base_url` (`https://opencode.ai/zen/go/v1`)
+  was inferred from the OpenAI-compatible convention, not read off OpenCode's docs, and the
+  model IDs are unverified against the endpoint. Run the two live checks in
+  `docs/guides/setup.md` ("Manual live check") before Phase 3 builds on them; `preflight` is
+  the fastest way to find out, and a wrong path is a one-value fix in `harness.toml`.

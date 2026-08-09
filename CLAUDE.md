@@ -47,8 +47,9 @@ not the ceiling).
 - Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium
   (Lightpanda was tried and retired — see docs/decisions.md).
 - Search: self-hosted SearXNG (JSON API).
-- Models: OpenCode API (GLM 5.2 default orchestrator, DeepSeek V4 Pro
-  fallback); Cerebras API (Gemma 4 31B default worker, config-swappable).
+- Models: OpenCode API serves both roles — `[roles.head]` = `kimi-k3`,
+  `[roles.subagent]` = `gpt-5.6-luna`. Config-swappable; no other provider is
+  declared today.
 - Deployment: homelab Linux machine, operated over SSH.
 
 ## Patterns

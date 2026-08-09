@@ -3,6 +3,7 @@
 import pytest
 
 from harness.config import (
+    AgentSettings,
     BrowserSettings,
     FetchSettings,
     HarnessConfig,
@@ -23,6 +24,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
         per_page_char_cap: int = 12000,
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
+        agent: AgentSettings | None = None,
     ) -> HarnessConfig:
         monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
         return HarnessConfig(
@@ -42,6 +44,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
                 per_page_char_cap=per_page_char_cap,
             ),
             search=SearchSettings(base_url=base_url, default_max_results=default_max_results),
+            agent=agent if agent is not None else AgentSettings(),
         )
 
     return _make

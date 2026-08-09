@@ -9,22 +9,24 @@
    (`browser.backend = "playwright"` in `harness.toml`) needs a Chromium install; this
    is not covered by `uv sync`.
 4. Copy `.env.example` to `.env` and fill in:
-   - `OPENCODE_API_KEY` — smart-model orchestration (GLM 5.2 / DeepSeek V4 Pro)
-   - `CEREBRAS_API_KEY` — Gemma 4 31B worker triage (free tier)
+   - `OPENCODE_API_KEY` — the OpenCode endpoint serving both model roles
    - `SEARXNG_SECRET` — cookie signing for the local SearXNG instance; generate
      with `openssl rand -hex 32`
+
+   Every provider declared in `harness.toml` has its key resolved at load time,
+   whether or not a role uses it — so a declared provider with no key set fails
+   `load_config()`. Only `[providers.opencode]` is declared today.
 
    `SEARXNG_URL` and `LIGHTPANDA_CDP_URL` are no longer `.env` variables — they moved
    into `harness.toml` (see below). If you have an existing `.env` with those keys,
    move their values into `harness.toml`'s `[search]` and `[browser]` tables and
    delete them from `.env`.
-5. Replace `harness.toml`'s remaining `TODO` placeholders with real values: the
-   OpenCode base URL and the head/subagent model IDs. (`[search] base_url` is
-   already set to the local SearXNG below.) These are **not** validated — `TODO`
-   is a well-formed string, so `load_config()` accepts it and the mistake surfaces
-   later as a connection or model error. Check them by eye. Nothing reads the model
-   roles yet — they are the loop plan's concern, so the fetch and search live
-   checks below work with them still unset.
+5. `harness.toml` ships with real values — no `TODO` placeholders remain. If you
+   change the endpoint or a model ID, note that a literal `TODO` still passes
+   `load_config()` (it is a well-formed string), but is rejected at startup by
+   `build_chat_model`, which raises `ModelError` naming the role, the provider, and
+   the offending value. A wrong-but-well-formed endpoint or model ID is caught by
+   `preflight` before any research starts, not mid-run.
 
 ## Running with `.env`
 
@@ -180,6 +182,38 @@ results — the rendered content is the one form that reads correctly either way
 Expect real results back from the configured SearXNG. Then point `[search] base_url` at a
 dead URL (e.g. `http://localhost:1`) and re-run — expect a `SearchFailure` with reason
 `unreachable` printed as plain text, never a traceback.
+
+The head model role needs a real provider, so it isn't exercised by `uv run pytest` either.
+This requires `OPENCODE_API_KEY` set. To check it, run:
+
+```
+uv run --env-file .env python -c "
+from harness.config import load_config
+from harness.models import build_chat_model
+
+model = build_chat_model(load_config(), 'head')
+print(model.invoke('Say hi in five words or fewer.').content)
+"
+```
+
+Expect a short sentence back. To check the R6 startup guard — an endpoint or model that is
+well-formed but wrong — point `[providers.opencode] base_url` at a dead URL (e.g.
+`http://localhost:1/v1`) and run:
+
+```
+uv run --env-file .env python -c "
+import asyncio
+from harness.config import load_config
+from harness.models import preflight
+
+asyncio.run(preflight(load_config(), 'head'))
+"
+```
+
+Expect a `ModelError` naming the role, the provider, the base URL, and the model — never a
+raw `openai` or `httpx` traceback. `base_url` is the API **base**, not a full endpoint: the
+client appends `/chat/completions` itself, so a value ending in `/chat/completions` produces
+a doubled path and fails here.
 
 ## Commands
 
