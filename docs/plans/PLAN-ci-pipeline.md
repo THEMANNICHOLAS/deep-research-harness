@@ -1,6 +1,6 @@
 # PLAN: CI Pipeline (self-hosted GitHub Actions runner)
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-09
 **Type:** Single plan
 
@@ -549,6 +549,15 @@ correction. Empty at plan creation. -->
 
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+
+### 2026-08-09 — Phase 1 — `ruff check` step needs the D2 guard retrofitted (DEFERRED to Phase 2)
+
+Phase 1's `ruff check` step ships without `if: ${{ !cancelled() }}`. D2 requires the guard on
+every gate step, but Phase 2's Steps say only to add it to the three *new* steps — so as
+written, Phase 2 would leave the first gate unguarded and a `ruff check` failure would skip
+the other three, defeating D2 and R6. Harmless while `quality` has a single gate.
+**Phase 2 must apply `if: ${{ !cancelled() }}` to all FOUR gate steps, not just the three it
+adds.** Developer decision: defer to Phase 2.
 
 ## Phase Handoff Log
 
