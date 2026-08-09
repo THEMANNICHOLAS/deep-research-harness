@@ -10,12 +10,16 @@ not the ceiling).
 
 | Command | Description |
 |---|---|
+| `uv run pytest` | Test suite (offline, fixture-based) |
 | `uv run ruff check .` | Lint |
 | `uv run ruff format --check .` | Format check |
+| `uv run mypy .` | Typecheck |
 
 ## Quality Gate
+- test: uv run pytest
 - lint: uv run ruff check .
 - format: uv run ruff format --check .
+- typecheck: uv run mypy .
 
 ## Architecture
 
@@ -37,9 +41,11 @@ not the ceiling).
 ## Stack
 
 - Language: Python (>=3.11), managed with uv.
-- Dev tooling: ruff (lint + format); mypy planned (needs source to run).
+- Dev tooling: ruff (lint + format), mypy (typecheck, targets 3.12 — see
+  docs/decisions.md), pytest.
 - No database — reports are timestamped markdown files on disk.
-- Fetch/extraction: crawl4ai over self-hosted Lightpanda (CDP).
+- Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium
+  (Lightpanda was tried and retired — see docs/decisions.md).
 - Search: self-hosted SearXNG (JSON API).
 - Models: OpenCode API (GLM 5.2 default orchestrator, DeepSeek V4 Pro
   fallback); Cerebras API (Gemma 4 31B default worker, config-swappable).
@@ -56,6 +62,12 @@ Before creating ANY new utility, helper, hook, or shared component:
 2. Check @docs/INDEX.md for documented shared resources
 3. If similar functionality exists — extend it, don't duplicate it
 If unsure whether something exists, ASK rather than creating a new one.
+
+The same applies within files and tests: repeated setup becomes a fixture
+(see tests/conftest.py), repeated model/config settings become a shared base
+class, and a constant or policy statement lives in exactly one place. If the
+same lines are about to appear a third time, factor them out instead of
+pasting them again.
 
 ## Documentation
 
