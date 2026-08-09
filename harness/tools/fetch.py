@@ -8,6 +8,8 @@ full, untruncated per-URL outcomes for anything downstream that needs them (e.g.
 resolution via `harness.sources.SourceRegistry`).
 """
 
+import sys
+from pathlib import Path
 from typing import Literal
 
 from crawl4ai import (  # type: ignore[import-untyped]
@@ -29,6 +31,11 @@ FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
 
 _BLOCKED_STATUSES = frozenset({403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
+
+
+def _sources_dir(config: HarnessConfig) -> Path:
+    """The one place the frozen `<workspace_dir>/sources` layout is built."""
+    return config.agent.workspace_dir / "sources"
 
 
 def build_browser_config(settings: BrowserSettings) -> BrowserConfig:
@@ -141,6 +148,49 @@ def _pair(urls: list[str], results: list[object]) -> list[tuple[str, object | No
     return pairs
 
 
+def _write_source_file(sources_dir: Path, page: FetchedPage) -> None:
+    """Write `page`'s full-text capture to `<sources_dir>/<source_id>.md`.
+
+    A `fetched` page gets its full untruncated markdown; any other outcome gets a stub
+    whose first line names the outcome (`FETCH FAILED: <outcome>`) so Phase 6 can treat
+    it as unusable without parsing further. Overwrites freely — a refetched URL reuses
+    its registry ID and rewrites its file rather than duplicating it (D10).
+
+    A write failure here degrades to a skipped file, never an exception into the model —
+    Phase 6 treats a missing source file exactly as it treats a stub.
+    """
+    path = sources_dir / f"{page.source_id}.md"
+    if page.outcome == "fetched":
+        heading = page.title or page.url
+        text = (
+            f"# {page.source_id}: {heading}\n\n"
+            f"- URL: {page.url}\n"
+            f"- Outcome: fetched\n\n"
+            f"{page.markdown}"
+        )
+    else:
+        lines = [
+            f"FETCH FAILED: {page.outcome}",
+            "",
+            f"- URL: {page.url}",
+            f"- Source: {page.source_id}",
+        ]
+        if page.status_code is not None:
+            lines.append(f"- Status: {page.status_code}")
+        if page.error:
+            lines.append(f"- Error: {page.error}")
+        text = "\n".join(lines)
+
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"warning: failed to write source file for {page.source_id} ({page.url}) "
+            f"to {path}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _render(page: FetchedPage, cap: int) -> str:
     """Render one page's model-facing block: heading, outcome line, capped markdown."""
     lines = [f"## [{page.source_id}] {page.url}"]
@@ -226,20 +276,35 @@ async def _fetch(
             )
         )
 
+    sources_dir = _sources_dir(config)
+    for page in pages:
+        _write_source_file(sources_dir, page)
+
     content = "\n\n".join(_render(page, config.fetch.per_page_char_cap) for page in pages)
     return content, pages
 
 
-class FetchPagesInput(BaseModel):
-    """Model-facing input schema for the `fetch_pages` tool."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    urls: list[str] = Field(description="The URLs to fetch, in the order they should be reported.")
-
-
 def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseTool:
-    """Build the `fetch_pages` tool, closing over `config` and the shared `registry`."""
+    """Build the `fetch_pages` tool, closing over `config` and the shared `registry`.
+
+    Creates `<workspace_dir>/sources` up front, so an unwritable workspace fails at
+    startup — before any research is spent — rather than silently losing captures
+    mid-run.
+    """
+    _sources_dir(config).mkdir(parents=True, exist_ok=True)
+
+    class FetchPagesInput(BaseModel):
+        """Model-facing input schema for the `fetch_pages` tool."""
+
+        model_config = ConfigDict(extra="forbid")
+
+        urls: list[str] = Field(
+            max_length=config.fetch.max_urls_per_call,
+            description=(
+                "The URLs to fetch, in the order they should be reported. "
+                f"At most {config.fetch.max_urls_per_call} URLs per call."
+            ),
+        )
 
     @tool("fetch_pages", args_schema=FetchPagesInput, response_format="content_and_artifact")
     async def fetch_pages(urls: list[str]) -> tuple[str, list[FetchedPage]]:

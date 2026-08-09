@@ -30,6 +30,7 @@ backend = "playwright"
 page_timeout_ms = 20000
 max_concurrency = 8
 per_page_char_cap = 9000
+max_urls_per_call = 6
 
 [search]
 base_url = "http://localhost:8080"
@@ -90,6 +91,7 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
     assert config.fetch.page_timeout_ms == 20000
     assert config.fetch.max_concurrency == 8
     assert config.fetch.per_page_char_cap == 9000
+    assert config.fetch.max_urls_per_call == 6
 
     assert config.search.base_url == "http://localhost:8080"
     assert config.search.default_max_results == 7
@@ -105,6 +107,7 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
     assert config.fetch.page_timeout_ms == 15000
     assert config.fetch.max_concurrency == 5
     assert config.fetch.per_page_char_cap == 12000
+    assert config.fetch.max_urls_per_call == 4
     assert config.search.default_max_results == 10
 
 
@@ -211,12 +214,18 @@ def test_typo_in_key_error_names_the_offending_key(tmp_path, monkeypatch):
         ("page_timeout_ms", 0),
         ("max_concurrency", -1),
         ("per_page_char_cap", 0),
+        ("max_urls_per_call", 0),
     ],
 )
 def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_value):
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
-    original = {"page_timeout_ms": 20000, "max_concurrency": 8, "per_page_char_cap": 9000}
+    original = {
+        "page_timeout_ms": 20000,
+        "max_concurrency": 8,
+        "per_page_char_cap": 9000,
+        "max_urls_per_call": 6,
+    }
     toml_content = VALID_TOML.replace(
         f"{setting} = {original[setting]}", f"{setting} = {bad_value}"
     )

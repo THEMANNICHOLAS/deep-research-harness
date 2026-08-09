@@ -15,6 +15,10 @@ __pycache__/
 # OS
 .DS_Store
 
+# Runtime artifacts (research-loop workspace/report output — never committable)
+workspace/
+reports/
+
 # Workflow session state (transient — see docs/guides/setup.md)
 docs/plans/.impl/
 .claude/planning-mode

@@ -75,6 +75,7 @@ class FetchSettings(_StrictModel):
     page_timeout_ms: int = Field(default=15000, gt=0)
     max_concurrency: int = Field(default=5, gt=0)
     per_page_char_cap: int = Field(default=12000, gt=0)
+    max_urls_per_call: int = Field(default=4, gt=0)
 
 
 class SearchSettings(_StrictModel):

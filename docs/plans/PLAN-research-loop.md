@@ -400,7 +400,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 
 - [x] Phase 1: Model client and agent config
-- [ ] Phase 2: Fetch amendments — URL cap and source capture
+- [x] Phase 2: Fetch amendments — URL cap and source capture
 - [ ] Phase 3: Tracer bullet — question in, report on disk
 - [ ] Phase 4: Pre-research clarification
 - [ ] Phase 5: Run ceiling and cut-short reporting
@@ -543,12 +543,12 @@ workspace file that verification later reads offline.
 - Nothing reads these files yet — Phase 6 is the consumer.
 
 **Tests (write first, confirm red):**
-- [ ] A fetch of more URLs than the cap is rejected by input validation; at the cap it
+- [x] A fetch of more URLs than the cap is rejected by input validation; at the cap it
       proceeds.
-- [ ] Each successfully fetched page writes `sources/S<n>.md` with its URL and title header
+- [x] Each successfully fetched page writes `sources/S<n>.md` with its URL and title header
       and full extracted text, under the ID the registry assigned that URL.
-- [ ] A failed or blocked fetch writes a stub naming its outcome instead of content.
-- [ ] `max_urls_per_call` defaults to 4 and loads from `[fetch]` when overridden.
+- [x] A failed or blocked fetch writes a stub naming its outcome instead of content.
+- [x] `max_urls_per_call` defaults to 4 and loads from `[fetch]` when overridden.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -556,8 +556,9 @@ workspace file that verification later reads offline.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] The substrate's pre-existing tests still pass unmodified, except any that constructed
-      an over-cap fetch.
+- [x] The substrate's pre-existing tests still pass unmodified, except any that constructed
+      an over-cap fetch. (None did — no pre-existing test fetched more than 4 URLs, so nothing
+      needed changing; `conftest.py` and `test_config.py` were extended additively.)
 
 ### Phase 3: Tracer bullet — question in, report on disk
 
@@ -1113,3 +1114,28 @@ phase). Append-only, empty at plan creation. -->
   model IDs are unverified against the endpoint. Run the two live checks in
   `docs/guides/setup.md` ("Manual live check") before Phase 3 builds on them; `preflight` is
   the fastest way to find out, and a wrong path is a one-value fix in `harness.toml`.
+
+### 2026-08-09 — Phase 2: Fetch amendments — URL cap and source capture
+- Done: `fetch.max_urls_per_call` (default 4) bounds one `fetch_pages` call through pydantic
+  `max_length` on the input schema, which moved inside `build_fetch_tool` to close over config
+  the way `build_search_tool` already does — so the bound is pre-network, not prompt guidance
+  (R9/D11). Every consulted source is now captured to `<workspace_dir>/sources/S<n>.md` at
+  fetch time: full untruncated text for a `fetched` page, a stub for anything else (R8/D10).
+  131 tests green; ruff/format/mypy clean.
+- Learned: (1) The stub carries MORE than the frozen first line — `- Status:` and `- Error:`
+  bullets are appended when the page has them, so Phase 6 must key on the first line
+  (`FETCH FAILED: `) and not assume a fixed stub length. (2) `_sources_dir(config)` in
+  `harness/tools/fetch.py` is the single home for the frozen `sources/` path — Phase 6 imports
+  it rather than rebuilding the path. (3) A per-file capture failure warns on **stderr** and
+  lets the batch continue; the file is simply absent, so Phase 6 must treat a MISSING source
+  file exactly as it treats a stub — unverifiable — since that absence is the disclosure.
+  (4) `make_config` now defaults the workspace to `tmp_path`, and `.gitignore` covers
+  `workspace/` and `reports/` — real runs from Phase 3 write there.
+- Drift: none.
+- Watch-next: the Phase 1 live check is STILL unrun and now blocks Phase 3, which is the
+  heaviest phase in the plan (flagged !#1/!#2/!#3/!#8, ~300-420 lines, 8 files) and the first
+  to touch deepagents. Before starting it, note two Phase 1 findings that bear directly on it:
+  `SubAgentMiddleware` is in deepagents' DEFAULT stack (the general-purpose subagent must be
+  disabled explicitly, not assumed absent), and the default summarizer is deepagents' own
+  `_DeepAgentsSummarizationMiddleware` wrapper rather than langchain's plain one, so D7's
+  `keep` policy must be written against the wrapper.
