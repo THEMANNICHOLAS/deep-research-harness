@@ -2,9 +2,29 @@
 
 ## Install
 
-1. Install [uv](https://docs.astral.sh/uv/).
+1. Install [uv](https://docs.astral.sh/uv/) — **exactly `0.12.3`**. `pyproject.toml`'s
+   `[tool.uv] required-version = "==0.12.3"` is a hard constraint: any other uv refuses
+   to run *every* uv command, including step 2, with a version-mismatch error rather than
+   a dependency error. A fresh installer gives you a newer uv, so pin it explicitly:
+
+   ```
+   curl -LsSf https://astral.sh/uv/0.12.3/install.sh | sh
+   ```
+
+   On Windows PowerShell:
+
+   ```
+   powershell -c "irm https://astral.sh/uv/0.12.3/install.ps1 | iex"
+   ```
+
+   Confirm with `uv --version` before step 2.
+
+   Bumping uv is a deliberate edit to that one line in `pyproject.toml`, which CI, the
+   workstation, and a rebuilt runner VM all read — CI installs its uv from the same key
+   (see `.github/workflows/ci.yml` and `docs/plans/PLAN-ci-pipeline.md` `## Discoveries`).
 2. `uv sync` — creates `.venv` and installs runtime deps (pydantic, langchain-core,
-   crawl4ai, httpx) and dev deps (ruff, mypy, pytest, pytest-asyncio).
+   crawl4ai, httpx) and dev deps (ruff, mypy, pytest, pytest-asyncio, pytest-cov).
+   Python 3.12 is used, pinned by `.python-version`; `requires-python` floor is 3.11.
 3. `uv run playwright install chromium` — the default browser backend
    (`browser.backend = "playwright"` in `harness.toml`) needs a Chromium install; this
    is not covered by `uv sync`.

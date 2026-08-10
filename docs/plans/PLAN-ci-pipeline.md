@@ -190,8 +190,11 @@ ruled out:
   undocumented property of the box, and a rebuilt VM can silently differ.
 - **Consequences:** Immune to the systemd PATH trap (the runner service does not source
   `~/.bashrc`, where a default uv install lands in `~/.local/bin`). A rebuilt VM needs only
-  the runner installed. Bumping uv is a deliberate SHA change. Self-hosted runner minutes
-  are free, so this costs nothing but a fetch.
+  the runner installed. ~~Bumping uv is a deliberate SHA change.~~ **Corrected in Phase 2:**
+  the SHA pins the *action*, not the *uv binary* — setup-uv fell back to latest until
+  `[tool.uv] required-version = "==0.12.3"` was added to `pyproject.toml`, which is now the
+  one place a uv bump happens. See `## Discoveries` (Phase 1) and `## Reconciliations`.
+  Self-hosted runner minutes are free, so this costs nothing but a fetch.
 
 ### D6: Lock enforcement — `uv sync --locked`
 - **Chosen:** `uv sync --locked`, which fails when `uv.lock` is out of date with
