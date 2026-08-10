@@ -229,7 +229,7 @@ ruled out:
 ## Progress
 - [x] Phase 1: Tracer bullet — prove CI-Runner executes a job
 - [x] Phase 2: Full gate set
-- [ ] Phase 3: Coverage gate
+- [x] Phase 3: Coverage gate
 - [ ] Phase 4: Record the runner
 - [ ] Final verification
 
@@ -419,13 +419,18 @@ absorbed.
 - Any change under `harness/`.
 
 **Manual verification:**
-- [ ] Run `uv run pytest --cov --cov-report=term-missing` locally and record the actual
-      percentage, with the date, in `## Discoveries`.
-- [ ] **Prove the gate can fail:** temporarily set `--cov-fail-under=100`, confirm the CI
+- [x] Run `uv run pytest --cov --cov-report=term-missing` locally and record the actual
+      percentage, with the date, in `## Discoveries`. *99% (376 stmts, 4 missed) — see the
+      2026-08-09 Phase 3 entry there for the per-module table.*
+- [x] **Prove the gate can fail:** temporarily set `--cov-fail-under=100`, confirm the CI
       run goes red at the pytest step, then restore 90 and confirm green.
-- [ ] `uv sync --locked` still succeeds in CI — proves the regenerated `uv.lock` was
-      actually committed (#4).
-- [ ] Plain `uv run pytest` locally still runs with no coverage gate (D4).
+      *Run 31344747771 (`f7f23b2`) failed at `pytest` with "ERROR: Coverage failure: total of
+      99 is less than fail-under=100" — the other three gates stayed green and the 96 tests
+      themselves passed, so the failure was the threshold alone. Restored to 90.*
+- [x] `uv sync --locked` still succeeds in CI — proves the regenerated `uv.lock` was
+      actually committed (#4). *Run 31344687936: "Resolved 120 packages" (was 117).*
+- [x] Plain `uv run pytest` locally still runs with no coverage gate (D4). *96 passed in
+      1.22s, no coverage output.*
 
 **Steps:**
 1. Add `pytest-cov` to the `dev` dependency group.
@@ -437,10 +442,12 @@ absorbed.
 6. Work the Manual verification list.
 
 **Acceptance criteria:**
-- [ ] Actual measured coverage, with date, recorded in `## Discoveries`.
-- [ ] `--cov-fail-under=100` turns the run red; 90 turns it green.
-- [ ] `uv sync --locked` passes on the runner after the dependency change.
-- [ ] The 90 appears in exactly one place in the repo (the workflow file).
+- [x] Actual measured coverage, with date, recorded in `## Discoveries`. *99%, 2026-08-09.*
+- [x] `--cov-fail-under=100` turns the run red; 90 turns it green. *Runs 31344747771 (red)
+      and 31344687936 / the restore run (green).*
+- [x] `uv sync --locked` passes on the runner after the dependency change. *Run 31344687936.*
+- [x] The 90 appears in exactly one place in the repo (the workflow file). *Verified by grep:
+      both hits are in `.github/workflows/ci.yml` (the flag and its adjacent comment).*
 
 **Diff budget:** ~15-25 lines across `pyproject.toml` and `ci.yml`, plus a regenerated
 `uv.lock` (machine-generated, not counted).
@@ -690,3 +697,30 @@ never add a section below it. -->
   command, and nothing currently tells a reader that. Also note Phase 3 now inherits a
   `pyproject.toml` that already has a `[tool.uv]` block; its re-lock obligation (#4) is
   unchanged and still applies to the `pytest-cov` addition.
+
+### 2026-08-09 — Phase 3: Coverage gate
+- Done: `pytest-cov==7.1.0` in the dev group, `[tool.coverage.run] source = ["harness"]` +
+  `[tool.coverage.report] show_missing = true`, regenerated `uv.lock` in the SAME commit,
+  and `--cov --cov-report=term-missing --cov-fail-under=90` on the CI pytest step. `.coverage`
+  added to `.gitignore`. Commits `86a5205`, `f7f23b2` (probe), and the restore.
+  **Both flagged risks retired:** #3 — measured coverage is 99% against a 90% bar, so nothing
+  was renegotiated and no padding tests were written; #4 — the re-lock happened in-commit and
+  CI proved it by resolving 120 packages (was 117) under `uv sync --locked`.
+- Learned: (a) Linux and Windows report identical coverage (99%, 376 stmts, 4 missed), so the
+  gate is not platform-sensitive; the margin is ~34 statements before 90% is at risk.
+  (b) `uv lock` pulled in `tomli` under a `python_full_version <= '3.11'` marker — coverage
+  needs it to read TOML config on a 3.11 clone; harmless, but it explains why the lock grew by
+  3 packages for one dependency. (c) The `implement-commit-guard.sh` hook is genuinely wired in
+  this repo — it blocked the probe commit until the 3G window was opened, which is worth
+  knowing before assuming a commit failure is a git problem.
+- Drift: none. Two review fixes applied within scope: `.coverage` added to `.gitignore` (the
+  only tool artifact from this phase the file did not already cover), and a `pyproject.toml`
+  comment reworded so the literal threshold appears only in the workflow, restoring this
+  phase's own "90 in exactly one place" criterion.
+- Watch-next: Phase 4 is documentation-only and needs facts OBSERVED on the VM over SSH —
+  systemd unit name, work directory, labels, runner version, `systemctl is-enabled` output.
+  The runner is `CI-Runner`, id 2, runner version 2.336.0, labels `self-hosted, Linux, X64`,
+  work dir `/home/sting/actions-runner/_work` (seen in CI logs), user `sting`, and the VM has
+  system Python 3.12.3 at `/usr/bin/python3.12` and git 2.43.0 — but the systemd unit name and
+  `is-enabled` state have NOT been observed yet and must not be guessed. Also carry forward
+  from Phase 2: `ci.md` must document the `required-version = "==0.12.3"` pin.
