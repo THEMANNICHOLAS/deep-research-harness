@@ -140,7 +140,9 @@ rather than restated in them.
   parent receives only the final result.** Coroutine-only `@tool` tools and `ainvoke` are
   supported (LangGraph async execution). **Backends:** `StateBackend` (default, in-memory,
   lost at process exit), `StoreBackend`, `CompositeBackend`, plus `LocalShellBackend` and
-  sandbox backends which carry a shell `execute` tool. **`TodoListMiddleware` is opt-in since
+  ~~sandbox backends which carry a shell `execute` tool~~ sandbox backends (see
+  `## Reconciliations` 2026-08-09 — Phase 3: EVERY backend gets an `execute` tool bound; only
+  sandbox backends make it functional). **`TodoListMiddleware` is opt-in since
   0.7.0.** `SummarizationMiddleware` compresses history on a configurable `trigger`
   (`("tokens", N)`, `("messages", N)`, `("fraction", f)`) with a `keep` policy for what
   survives verbatim (default `("messages", 20)`).
@@ -301,8 +303,10 @@ Inherits every `## Intent` non-goal — not re-listed.
   implementing the backend protocol with plain disk writes is written in `harness/agent.py`.
 - **Rejected:** The default `StateBackend` — in-memory, so notes evaporate at process exit and
   a cut-short run has nothing to assemble from. `LocalShellBackend` and the sandbox backends —
-  they carry a shell `execute` tool, which violates the project's no-shell-in-the-registry
-  invariant outright. `CompositeBackend` routing scratch to state and reports to disk — the
+  ~~they carry a shell `execute` tool, which violates the project's no-shell-in-the-registry
+  invariant outright~~ they make the always-bound `execute` tool actually functional, which
+  violates the project's no-shell invariant outright (see `## Reconciliations` 2026-08-09 —
+  Phase 3). `CompositeBackend` routing scratch to state and reports to disk — the
   cleanest separation, but a third configuration to get right for no present benefit.
 - **Consequences:** This is the first code satisfying the workspace invariant. Paths are
   config values, never literals. Test runs must be pointed at a temporary directory. If the
@@ -623,18 +627,19 @@ anything is built on them.
   surface it rather than editing `fetch.py` or `search.py`.
 
 **Tests (write first, confirm red):**
-- [ ] With a faked chat model, a run produces a report file at the frozen filename format and
+- [x] With a faked chat model, a run produces a report file at the frozen filename format and
       the path is the last line of stdout.
-- [ ] A run whose tools return no usable sources still produces a report stating that, and
+- [x] A run whose tools return no usable sources still produces a report stating that, and
       exits non-error.
-- [ ] The agent is constructed with the config's model, the tools from `build_tools`, a
-      disk-backed backend whose writes are confined to the configured workspace and reports
-      directories, `TodoListMiddleware` enabled (D9), and no `general-purpose` subagent.
-- [ ] Compression is configured such that source attribution survives it: a history long
+- [x] The agent is constructed with the config's model, the tools from `build_tools`, a
+      disk-backed backend whose writes are confined to the configured workspace ~~and reports
+      directories~~ (see `## Reconciliations` 2026-08-09 — Phase 3), `TodoListMiddleware`
+      enabled (D9), and no `general-purpose` subagent.
+- [x] Compression is configured such that source attribution survives it: a history long
       enough to trigger the summarizer still yields findings whose `[Sn]` associations are
       intact, with the todo plan state intact too.
-- [ ] Todo updates surface at the terminal as the run progresses (R10).
-- [ ] Token usage from the run is recorded on `RunOutcome`, summed from `usage_metadata` on
+- [x] Todo updates surface at the terminal as the run progresses (R10).
+- [x] Token usage from the run is recorded on `RunOutcome`, summed from `usage_metadata` on
       the final state.
 
 **Steps:**
@@ -655,11 +660,11 @@ anything is built on them.
 **Acceptance criteria:**
 - [ ] Manual live check: `python -m harness "<a real question>"` produces a report on disk
       whose content answers the question and cites URLs, and prints its path.
-- [ ] `docs/decisions.md` records the async-tool outcome and the prompt-composition behavior
+- [x] `docs/decisions.md` records the async-tool outcome and the prompt-composition behavior
       as observed, not as assumed. If async tools were rejected, the entry says so and names
       the workaround taken.
 - [ ] The observed token cost of one real run is written down as the delegation baseline.
-- [ ] `uv run ruff check .` and `uv run mypy .` clean for the new files.
+- [x] `uv run ruff check .` and `uv run mypy .` clean for the new files.
 
 ### Phase 4: Pre-research clarification
 
@@ -1029,9 +1034,11 @@ prompt artifacts, so a later round wires the pyramid without renegotiating the s
     role's model or its provider's `base_url` with a `ModelError` naming it (R6) — leaving
     the frozen `ProviderConfig`/`RoleConfig` shapes untouched.
 
-#8. **No shell-free disk backend may ship in 0.7.x.** Current docs list `StateBackend`,
-    `StoreBackend`, `CompositeBackend`, `LocalShellBackend`, and sandbox backends — nothing
-    named `FilesystemBackend`, and `LocalShellBackend` is forbidden here because it carries a
+#8. ~~**No shell-free disk backend may ship in 0.7.x.**~~ **RETIRED 2026-08-09 by Phase 3's
+    smoke check — `deepagents.backends.filesystem.FilesystemBackend` ships and is shell-free;
+    D6's contingency is not needed.** Original text: Current docs list `StateBackend`,
+    `StoreBackend`, `CompositeBackend`, `LocalShellBackend`, and sandbox backends — ~~nothing
+    named `FilesystemBackend`~~, and `LocalShellBackend` is forbidden here because it carries a
     shell `execute` tool. If Phase 3's smoke check finds no shell-free disk backend in the
     installed package, D6's contingency applies: a minimal custom backend — read/write/list
     confined to the two configured roots — implemented in `harness/agent.py`, with the
@@ -1055,6 +1062,44 @@ accepted knowingly: on the one path a real operator can actually hit, the `Confi
 the provider and the environment variable but **not** the role, so R6's "naming the role and
 provider" is literally satisfied only on `build_chat_model`'s defensive branch. Naming the role
 there would mean teaching `ProviderConfig` about roles, which the frozen shape forbids.
+
+2026-08-09 — Phase 3: two assumptions about deepagents' tool surface proved false against the
+installed 0.7.5, both settled empirically before any code was written.
+
+(a) **The `execute` tool is bound unconditionally, on every backend.** The plan assumed only
+`LocalShellBackend` and the sandbox backends carry it (`## Background`, D6, !#8 — all struck).
+`FilesystemMiddleware`'s tool table (`filesystem.py:1713`) always registers `execute`, so it
+appears in the compiled graph's `ToolNode.tools_by_name` even under a plain `FilesystemBackend`.
+It cannot be removed from that registry by any supported means. → **Amendment:** the invariant
+is satisfied by two independent defenses instead of absence. (1) `execute` is put out of the
+model's reach with `excluded_tools=frozenset({"execute"})` on a registered `HarnessProfile`, so
+it never enters the schema passed to `bind_tools` and the model can never emit a call to it.
+(2) `FilesystemBackend` is not a `SandboxBackendProtocol`, so even a call that somehow arrived
+returns an in-band `ToolMessage(status="error", ...)` — there is no shell to reach. Phase 3
+adds a test pinning both: `execute` absent from the model-visible tool schema, and the backend
+not sandbox-capable. `harness/tools/` — the project's own registry, which is what
+`CLAUDE.md`'s invariant names — remains shell-free and untouched.
+
+(b) **Disabling the injected `general-purpose` subagent has no kwarg**; `subagents=[]` and
+`subagents=None` are identical (`graph.py:751`). The only supported route is registering a
+`HarnessProfile(general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False))` under
+the key deepagents derives for the model — empirically `"openai:kimi-k3"`, from
+`get_model_provider()` (`ChatOpenAI` hardcodes `ls_provider="openai"` regardless of `base_url`)
+plus `get_model_identifier()`. With it registered, `SubAgentMiddleware` drops out of the stack
+entirely and the `task` tool disappears. → **Amendment:** `build_agent` performs this
+registration, deriving the key from config rather than hardcoding it, and carries both this
+and (a)'s `excluded_tools` in one `HarnessProfile`. Accepted residue, recorded knowingly: the
+profile registry is **process-global and keyed by provider:model-name only**, so the
+registration is not scoped to our `base_url` and would match any `ChatOpenAI(model="kimi-k3")`
+in the same process. Harmless for a single-agent CLI; revisit if the pyramid ever builds two
+agents wanting different profiles for the same model ID.
+
+(c) **The agent's disk root is the workspace only, not workspace + reports.** The Phase 3 test
+line said writes are confined to "the configured workspace and reports directories" (struck).
+Per D2 the agent never writes the report — Python does, after the run — so the reports
+directory is not reachable from the backend at all: `FilesystemBackend(root_dir=workspace_dir)`.
+→ **Amendment:** confinement is to the workspace directory alone, which is strictly narrower
+than the struck text, with `permissions` declared as the second layer.
 
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).

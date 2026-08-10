@@ -32,6 +32,12 @@ FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
 _BLOCKED_STATUSES = frozenset({403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
 
+# The single home for this policy string: `_write_source_file` writes it as the first
+# line of any non-`fetched` source's captured file, and `harness/report.py` imports it
+# to judge, from that same captured file, whether a registered source is usable evidence
+# (CLAUDE.md: a constant or policy statement lives in exactly one place).
+FETCH_FAILED_PREFIX = "FETCH FAILED: "
+
 
 def _sources_dir(config: HarnessConfig) -> Path:
     """The one place the frozen `<workspace_dir>/sources` layout is built."""
@@ -170,7 +176,7 @@ def _write_source_file(sources_dir: Path, page: FetchedPage) -> None:
         )
     else:
         lines = [
-            f"FETCH FAILED: {page.outcome}",
+            f"{FETCH_FAILED_PREFIX}{page.outcome}",
             "",
             f"- URL: {page.url}",
             f"- Source: {page.source_id}",

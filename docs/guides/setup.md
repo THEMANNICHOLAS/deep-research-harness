@@ -215,6 +215,29 @@ raw `openai` or `httpx` traceback. `base_url` is the API **base**, not a full en
 client appends `/chat/completions` itself, so a value ending in `/chat/completions` produces
 a doubled path and fails here.
 
+## End-to-end live check
+
+Runs the whole loop for real — model, SearXNG, and a live browser fetch — and writes a
+report. This costs real tokens, so it is not part of `uv run pytest`.
+
+```
+uv run --env-file .env python -m harness "What changed in Python 3.14's free-threading support?"
+```
+
+Expect the research plan to echo at the terminal as the agent works, and the final line of
+stdout to be the path of a timestamped report under `[agent] reports_dir`. Open that file: it
+should answer the question, carry `[Sn]` markers on its claims, and list its sources. Every
+source consulted also leaves a file under `[agent] workspace_dir` in `sources/`.
+
+**Running from a git worktree:** `.env` is gitignored, so it does not exist inside a worktree.
+Point uv at the main checkout's copy — `uv run --env-file ../../../.env python -m harness
+"..."` — or run from the main checkout instead. Without it the run fails with "No environment
+file found".
+
+Note that `[roles.head]`'s model is a reasoning model, so most of a run's output tokens are
+reasoning tokens; the report records the split rather than a single total, because a bare
+total would misprice any later delegation work against this baseline.
+
 ## Commands
 
 - Lint: `uv run ruff check .`
