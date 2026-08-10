@@ -349,7 +349,10 @@ triggers on both PRs to `main` and pushes to `main`.
       `mypy` FAILURE, `pytest` success — both failures in one run, and `pytest` still ran
       downstream of them.*
 - [x] Push again to the same PR while a run is in progress; the superseded run shows as
-      cancelled (R7). *See the Phase 2 handoff entry for the run IDs.*
+      cancelled (R7). *Run 31343905762 (`d1870a0`) → `conclusion: cancelled` when `dc2b807`
+      was pushed; the superseding run 31343912854 then completed green in 23s. Took a
+      scripted push to land inside the window — runs finish in ~23s, so two pushes issued
+      from separate commands are either too fast (no run created yet) or too slow.*
 - [x] Each failing step's name identifies which gate failed from the run summary alone,
       without opening raw logs (R6). *Step names are the gate commands verbatim —
       `ruff format --check`, `mypy`.*
@@ -364,10 +367,13 @@ triggers on both PRs to `main` and pushes to `main`.
 5. Work the Manual verification list on the live PR.
 
 **Acceptance criteria:**
-- [ ] A single run surfaces every failing gate, not only the first.
-- [ ] A superseded run on the same PR is cancelled automatically.
+- [x] A single run surfaces every failing gate, not only the first. *Run 31343717168:
+      `ruff format --check` and `mypy` both FAILURE, `pytest` still ran and passed.*
+- [x] A superseded run on the same PR is cancelled automatically. *Run 31343905762.*
 - [ ] The `push: main` trigger fires after the PR merges (verify at Final verification).
-- [ ] No tool configuration was loosened to achieve green.
+- [x] No tool configuration was loosened to achieve green. *All four gates passed on the
+      clean Linux/3.12 runner unmodified — `[tool.mypy]`, `[tool.ruff]`, `harness/` and
+      `tests/` were never touched. Risk #2 did not materialize.*
 
 **Diff budget:** ~25-40 lines, 1 file modified.
 
@@ -630,3 +636,35 @@ never add a section below it. -->
 - Watch-next: Phase 2 MUST add `if: ${{ !cancelled() }}` to all FOUR gate steps — the existing
   `ruff check` step included, not just the three new ones. Phase 2's Steps as written only
   cover the new three, which would leave D2/R6 unsatisfied.
+
+### 2026-08-09 — Phase 2: Full gate set
+- Done: all four gates now run in the one `quality` job, each guarded by
+  `!cancelled() && steps.sync.outcome == 'success'`; `push: main` trigger; `concurrency`
+  keyed on `github.ref` with `cancel-in-progress` limited to pull requests;
+  `timeout-minutes: 15`. `[tool.uv] required-version = "==0.12.3"` pins the uv binary
+  (scope amendment — see `## Reconciliations`). Commits `1935293` + this one.
+  **Risk #2 is RETIRED** — mypy and ruff both pass on the clean Linux/3.12 runner with no
+  config loosened and nothing under `harness/`/`tests/` touched.
+- Learned: (a) The uv pin works end to end — CI now logs "Found version for uv in
+  .../pyproject.toml: 0.12.3" instead of "Falling back to latest". `uv lock --check` still
+  passes, so `required-version` needs NO re-lock; and a deliberately mismatched value makes
+  uv refuse to run, so the constraint is live, not decorative. Local uv was upgraded
+  0.11.6 → 0.12.3 to satisfy it — **any clone now needs exactly 0.12.3**. (b) Two review
+  fixes beyond the plan's Steps: `!cancelled()` overrides the implicit `success()`, so
+  without the added sync condition a lock-drift failure would show four GREEN gates over a
+  red sync (`uv run` auto-syncs without `--locked`); and `cancel-in-progress` had to be
+  scoped to pull requests so two quick merges cannot leave a `main` commit verdict-less.
+  (c) Runs complete in ~23s, which makes R7's cancellation hard to observe — two pushes
+  issued as separate commands are either too fast (GitHub creates no run for the first) or
+  too slow (it already finished). It took a single script that polls for run creation then
+  pushes immediately. Reuse that approach if R7 ever needs re-proving.
+- Drift: one — Phase 2's `**Out of scope:**` ban on `pyproject.toml` changes was amended by
+  developer decision to admit `[tool.uv] required-version`. See `## Reconciliations`
+  (2026-08-09). Five empty R7-probe commits were dropped from the branch afterwards
+  (`git reset --hard 1960573` + force-push, developer-approved); the Actions runs they
+  produced remain valid evidence.
+- Watch-next: Phase 4's `docs/guides/ci.md` MUST document the `required-version = "==0.12.3"`
+  pin alongside the setup-uv SHA — a clone with any other uv version hard-errors on every uv
+  command, and nothing currently tells a reader that. Also note Phase 3 now inherits a
+  `pyproject.toml` that already has a `[tool.uv]` block; its re-lock obligation (#4) is
+  unchanged and still applies to the `pytest-cov` addition.
