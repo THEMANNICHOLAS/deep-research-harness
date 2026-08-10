@@ -19,6 +19,9 @@ dev = [
     "mypy",
     "pytest",
     "pytest-asyncio",
+    # Pinned exactly, per the project convention that requirements carry `==`
+    # rather than a `>=` floor — a floor still lets the resolved version float.
+    "pytest-cov==7.1.0",
 ]
 
 [tool.ruff]
@@ -40,6 +43,16 @@ warn_redundant_casts = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+# The measured base is `harness/` only — `tests/` is deliberately excluded (R3), and
+# this is the single place that scope is defined. The failure threshold is NOT here:
+# it is passed by the CI step alone (D4), which is the one place it is written, so a
+# local `uv run pytest` on a single test file stays fast and ungated.
+[tool.coverage.run]
+source = ["harness"]
+
+[tool.coverage.report]
+show_missing = true
 
 [tool.uv]
 package = false

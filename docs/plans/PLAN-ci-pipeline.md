@@ -596,6 +596,28 @@ the other three, defeating D2 and R6. Harmless while `quality` has a single gate
 **Phase 2 must apply `if: ${{ !cancelled() }}` to all FOUR gate steps, not just the three it
 adds.** Developer decision: defer to Phase 2.
 
+### 2026-08-09 — Phase 3 — measured coverage of `harness/` is 99% (R3 bar cleared)
+
+Measured on 2026-08-09 with `uv run pytest --cov --cov-report=term-missing` on Windows,
+CPython 3.12.13, pytest-cov 7.1.0 / coverage 7.15.4, against `[tool.coverage.run]
+source = ["harness"]`:
+
+| Module | Stmts | Miss | Cover |
+|---|---|---|---|
+| `harness/__init__.py` | 0 | 0 | 100% |
+| `harness/config.py` | 80 | 0 | 100% |
+| `harness/prompts.py` | 23 | 0 | 100% |
+| `harness/sources.py` | 72 | 0 | 100% |
+| `harness/tools/__init__.py` | 7 | 0 | 100% |
+| `harness/tools/fetch.py` | 123 | 3 | 98% (missing 197-209) |
+| `harness/tools/search.py` | 71 | 1 | 99% (missing 53) |
+| **TOTAL** | **376** | **4** | **99%** (98.94%) |
+
+**Risk #3 did not materialize** — 99% against a 90% bar, so nothing was renegotiated, no
+threshold was lowered, and no assertion-free tests were added to inflate the figure. The
+margin is ~34 statements: coverage would have to lose that many before the gate bites.
+Only four statements are unexercised, both regions being error/edge paths.
+
 ### 2026-08-09 — Phase 1 — SHA-pinning setup-uv does not pin uv itself (ACT in Phase 2)
 
 Run 31342810201 logged: *"Could not determine uv version from uv.toml or pyproject.toml.

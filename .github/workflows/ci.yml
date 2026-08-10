@@ -47,6 +47,10 @@ jobs:
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run mypy .
 
+      # `--cov-fail-under=90` lives HERE and nowhere else (D4): keeping it out of
+      # pyproject's addopts means a local `uv run pytest` on a single file is not
+      # failed by a coverage check. The measured scope (`harness/` only) is defined
+      # once, in `[tool.coverage.run]`.
       - name: pytest
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
-        run: uv run pytest
+        run: uv run pytest --cov --cov-report=term-missing --cov-fail-under=90
