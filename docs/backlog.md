@@ -54,6 +54,19 @@ to address.
   To address when the loop lands: validate `base_url` shape and non-`TODO` model IDs
   wherever roles are first consumed.
 
+- **Most dependencies are `>=` floors, not exact pins.** `pyproject.toml` declares
+  `pydantic>=2.9`, `langchain-core>=0.3`, `httpx>=0.27`, and a `dev` group
+  (`ruff`, `mypy`, `pytest`, `pytest-asyncio`) with no constraints at all; only
+  `crawl4ai==0.9.2` is pinned. A `>=` floor blocks older releases but lets the resolved
+  version float, so the workstation, the CI runner, and a rebuilt VM can each land on
+  something different — `uv.lock` holds this steady in practice, but the declared intent
+  doesn't. This bites reproducibility (R5's rebuild story in
+  @docs/plans/PLAN-ci-pipeline.md) and makes an unplanned tool upgrade look like a code
+  regression. Developer instruction (2026-08-09): **all requirements in this project should
+  be pinned exactly (`==`), never `>=`.** Only `[tool.uv] required-version` was pinned in
+  that session — converting the rest is a separate change, each pin chosen against what
+  `uv.lock` already resolves, then re-locked and pushed through CI.
+
 - **An HTTP 404 that serves a real HTML body classifies as `fetched`.** Observed in the
   final end-to-end sanity check: a Wikipedia URL returning 404 came back
   `outcome=fetched, status_code=404` with the "page does not exist" body as its markdown,

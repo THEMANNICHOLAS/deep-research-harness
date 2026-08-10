@@ -333,7 +333,9 @@ triggers on both PRs to `main` and pushes to `main`.
 - `concurrency.group` keys on the ref so runs for different PRs never cancel each other.
 
 **Out of scope:**
-- Coverage flags or any `pyproject.toml` change — Phase 3.
+- ~~Coverage flags or any `pyproject.toml` change — Phase 3.~~ **AMENDED — see
+  `## Reconciliations` (2026-08-09).** Coverage flags remain Phase 3, but ONE `pyproject.toml`
+  change is now in scope for Phase 2: `[tool.uv] required-version`, pinning the uv binary.
 - **Editing `harness/`, `tests/`, `[tool.mypy]`, or `[tool.ruff]` to make a gate pass.** If
   mypy or ruff fails on existing code in the clean Linux/3.12 environment, STOP and surface
   it — loosening a tool's config to get green is drift, not a fix (see #2).
@@ -550,6 +552,25 @@ the VM from scratch.
 <!-- Drift amendments written by /implement during execution. Append-only. Outdated phase
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
+
+### 2026-08-09 — Phase 2 scope amended to permit one `pyproject.toml` change
+
+**What contradicted the plan:** Phase 1 proved D5's consequence false — SHA-pinning
+`astral-sh/setup-uv` does not pin the uv binary, which falls back to latest (see
+`## Discoveries`). The fix belongs in `[tool.uv] required-version` in `pyproject.toml`, the
+file setup-uv already probes. But Phase 2's `**Out of scope:**` read "any `pyproject.toml`
+change — Phase 3", so the fix had nowhere to land in Phase 2.
+
+**Authoritative correction:** Phase 2 MAY edit `pyproject.toml` for the single purpose of
+adding `[tool.uv] required-version = "==0.12.3"`. Everything else about `pyproject.toml` —
+`pytest-cov`, `[tool.coverage.*]`, coverage flags — remains Phase 3. Phase 3's re-lock
+obligation (#4) is unchanged and now also covers any lock impact from this pin.
+
+**Developer decision (2026-08-09):** approved, with the standing instruction that **all
+requirements in this project be pinned exactly (`==`), never `>=`** — a `>=` floor still lets
+the resolved version float, which is the reproducibility gap this pin exists to close.
+Converting the remaining `>=` dependencies (`pydantic`, `langchain-core`, `httpx`, and the
+unpinned `dev` group) is NOT part of this plan — logged for a future session.
 
 ## Discoveries
 

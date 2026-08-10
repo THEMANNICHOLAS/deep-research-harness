@@ -43,3 +43,9 @@ testpaths = ["tests"]
 
 [tool.uv]
 package = false
+# Pinned exactly, not a `>=` floor: `astral-sh/setup-uv` reads this file to decide
+# which uv to install, and with no constraint it logs "Falling back to latest" — so
+# the action's SHA pin fixes the action, not uv itself. A floor would still float.
+# Bumping uv is now a deliberate edit here, and CI, the workstation, and a rebuilt
+# VM all run the same one. See docs/plans/PLAN-ci-pipeline.md `## Discoveries`.
+required-version = "==0.12.3"
