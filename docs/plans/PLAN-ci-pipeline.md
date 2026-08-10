@@ -222,7 +222,7 @@ ruled out:
 | R2 | Run fails on pytest / ruff check / ruff format / mypy | MUST | Phase 1 (ruff check), Phase 2 (remaining three) |
 | R3 | Run fails below 90% line coverage of `harness/` | MUST | Phase 3 |
 | R4 | All jobs execute on `CI-Runner`, never GitHub-hosted | MUST | Phase 1 |
-| R5 | Runner survives reboot; config recorded for rebuild | MUST | Phase 4 |
+| R5 | ~~Runner survives reboot; config recorded for rebuild~~ **DROPPED** | ~~MUST~~ | **NOT DELIVERED** — descoped 2026-08-09, see `## Reconciliations` |
 | R6 | Failure diagnosable from the GitHub UI alone | MUST | Phase 2 |
 | R7 | Runs isolated; new push cancels in-progress run | MUST | Phase 2 |
 
@@ -230,7 +230,7 @@ ruled out:
 - [x] Phase 1: Tracer bullet — prove CI-Runner executes a job
 - [x] Phase 2: Full gate set
 - [x] Phase 3: Coverage gate
-- [ ] Phase 4: Record the runner
+- [x] Phase 4: Record the runner — **descoped to a one-line note; R5 dropped**
 - [ ] Final verification
 
 ## Phases
@@ -456,14 +456,22 @@ absorbed.
 
 **Risk:** none
 **Test-first:** N/A — documentation only; nothing executable is produced.
-**Goal:** `docs/guides/ci.md` records the runner's real configuration well enough to rebuild
-the VM from scratch.
-**Requirements:** R5
+
+> **DESCOPED 2026-08-09 — see `## Reconciliations`.** Everything struck through below was
+> replaced by a single line in `docs/INDEX.md` noting that CI runs on a self-hosted GitHub
+> Actions runner with default tags. **R5 is not delivered.**
+
+~~**Goal:** `docs/guides/ci.md` records the runner's real configuration well enough to rebuild
+the VM from scratch.~~
+**Goal (amended):** `docs/INDEX.md` states that CI runs on a self-hosted runner with the
+default tags. Nothing about the runner host is recorded.
+~~**Requirements:** R5~~ **Requirements (amended):** none.
 
 **Files:**
-- `docs/guides/ci.md` — new. Reason: R5's written record; `docs/guides/` is the established
-  home for operational guides and `setup.md` is its exemplar (D7).
-- `docs/INDEX.md` — modify: add the new guide to the documentation map.
+- ~~`docs/guides/ci.md` — new. Reason: R5's written record; `docs/guides/` is the established
+  home for operational guides and `setup.md` is its exemplar (D7).~~ **Not created.**
+- `docs/INDEX.md` — modify: add a `**CI:**` bullet to `## Project Context`. No
+  Documentation-Map row, since no guide exists to link.
 
 **Reuse:**
 - Pattern to mirror: `docs/guides/setup.md` — same heading structure and command-block
@@ -479,25 +487,24 @@ the VM from scratch.
 - Changing the runner's registration, labels, or service configuration. This phase
   OBSERVES and RECORDS; it does not reconfigure.
 
-**Manual verification:**
-- [ ] `systemctl is-enabled <runner-service>` on the VM returns `enabled` — the runner
-      survives reboot unattended (R5). Record the literal output in the guide.
-- [ ] A cold reader can follow `docs/guides/ci.md` to re-register a runner: it names the
-      runner name, its labels, the work directory, the systemd unit name, the runner
-      version, and where the uv SHA pin lives.
-- [ ] `docs/INDEX.md` lists the new guide.
+**Manual verification (amended):**
+- ~~[ ] `systemctl is-enabled <runner-service>` on the VM returns `enabled`~~ **Dropped —
+  never run; reboot survival is unverified.**
+- ~~[ ] A cold reader can follow `docs/guides/ci.md` to re-register a runner~~ **Dropped —
+  no guide exists.**
+- [x] `docs/INDEX.md` names the runner and its default tags.
 
-**Steps:**
-1. On the VM, capture the runner's ACTUAL configuration — systemd unit name, work
-   directory, labels, runner version, OS version, and `systemctl is-enabled` output.
-2. Write `docs/guides/ci.md` from those observations only.
-3. Add the guide to `docs/INDEX.md`.
+**Steps (amended):**
+1. ~~Capture the runner's configuration on the VM.~~ **Dropped.**
+2. ~~Write `docs/guides/ci.md`.~~ **Dropped.**
+3. Add a `**CI:**` bullet to `docs/INDEX.md` `## Project Context`.
 
-**Acceptance criteria:**
-- [ ] Every value in the guide was observed on the VM, not assumed or copied from GitHub's
-      generic documentation.
+**Acceptance criteria (amended):**
+- [x] `docs/INDEX.md` states that CI runs on a self-hosted GitHub Actions runner with the
+      default tags, and points at the Reconciliations entry explaining why the runner's own
+      configuration is not recorded.
 
-**Diff budget:** ~45-65 lines: 1 new file, 1 modified.
+**Diff budget:** ~5 lines, 1 file modified (was ~45-65 across 2 files).
 
 ## Verification
 
@@ -512,8 +519,9 @@ the VM from scratch.
       Manual verification) — no gate ships unproven.
 - [ ] After merging the PR, the `push: main` trigger fires and the run on `main` is green
       (R1's second half).
-- [ ] `docs/guides/ci.md` exists, is linked from `docs/INDEX.md`, and records observed
-      values.
+- ~~[ ] `docs/guides/ci.md` exists, is linked from `docs/INDEX.md`, and records observed
+      values.~~ **Dropped 2026-08-09 — see `## Reconciliations`. Replaced by: `docs/INDEX.md`
+      names the self-hosted runner and its default tags.**
 
 ## Notes
 
@@ -569,6 +577,29 @@ the VM from scratch.
 <!-- Drift amendments written by /implement during execution. Append-only. Outdated phase
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
+
+### 2026-08-09 — Phase 4 descoped; R5 is NOT delivered by this plan
+
+**What contradicted the plan:** Phase 4 (and D7) called for a new `docs/guides/ci.md`
+recording the runner's observed configuration — systemd unit name, work directory, labels,
+runner version, OS version, and `systemctl is-enabled` output — to satisfy R5. Its single
+acceptance criterion required every value to be OBSERVED on the VM, which needed either SSH
+access to the runner host or a temporary CI probe step.
+
+**Developer decision (2026-08-09):** recording the runner is not needed. Note only that CI
+runs on a self-hosted GitHub Actions runner with default tags.
+
+**Authoritative correction:** Phase 4 produces NO `docs/guides/ci.md` and D7 does not apply.
+It adds one line to `docs/INDEX.md` naming the runner and its default labels. `docs/INDEX.md`
+gains no Documentation-Map row, because no guide is created.
+
+**Consequence — R5 is explicitly NOT satisfied.** Both halves fall away: no configuration is
+recorded well enough to rebuild the VM from scratch, and reboot survival was never verified
+(`systemctl is-enabled` was never run — the runner's systemd unit name remains unobserved).
+R1-R4, R6 and R7 are unaffected and remain delivered. If the VM is ever rebuilt, the runner
+must be re-registered from GitHub's own documentation, and the uv pin
+(`required-version = "==0.12.3"`) plus the setup-uv SHA are then the only project-side facts
+needed — both live in the repo. Logged to `docs/backlog.md` for a future session.
 
 ### 2026-08-09 — Phase 2 scope amended to permit one `pyproject.toml` change
 
@@ -724,3 +755,20 @@ never add a section below it. -->
   system Python 3.12.3 at `/usr/bin/python3.12` and git 2.43.0 — but the systemd unit name and
   `is-enabled` state have NOT been observed yet and must not be guessed. Also carry forward
   from Phase 2: `ci.md` must document the `required-version = "==0.12.3"` pin.
+
+### 2026-08-09 — Phase 4: Record the runner (descoped)
+- Done: one `**CI:**` bullet added to `docs/INDEX.md` `## Project Context`, naming the
+  self-hosted runner and its default tags and pointing at the Reconciliations entry. No
+  `docs/guides/ci.md` was created; D7 does not apply.
+- Learned: the runner's configuration was never observable from this session — the CI logs
+  give the runner name, version, labels, work directory, user, git and Python versions, but
+  the systemd unit name and `systemctl is-enabled` output need either SSH to the VM or a
+  temporary read-only step in the workflow. Neither was run.
+- Drift: yes, and it drops a MUST — see `## Reconciliations` (2026-08-09, Phase 4).
+  **R5 is NOT delivered**: nothing records the runner well enough to rebuild the VM, and
+  reboot survival is unverified. Logged to `docs/backlog.md`. The Phase 2 carry-forward about
+  documenting the uv pin in `ci.md` is void along with the guide — the pin is still described
+  in a comment at its definition site in `pyproject.toml`.
+- Watch-next: Final verification is the only thing left — merge PR #2 and confirm the
+  `push: main` trigger fires and goes green. That is Phase 2's one still-unticked acceptance
+  criterion.

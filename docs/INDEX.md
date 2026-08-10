@@ -14,6 +14,11 @@
   OpenCode API for orchestrator/synthesis models (TODO — key). API **keys** live
   in `.env`; **endpoints, model IDs and limits** live in `harness.toml` (see
   docs/guides/setup.md). Neither is ever hardcoded.
+- **CI:** GitHub Actions, running on a self-hosted runner with the default tags
+  (`self-hosted`, `Linux`, `X64`). One workflow, @.github/workflows/ci.yml, runs the four
+  quality gates plus a 90% coverage floor on pull requests to `main` and pushes to `main`.
+  The runner's own configuration is deliberately not recorded here — see the Phase 4 entry
+  in @docs/plans/PLAN-ci-pipeline.md `## Reconciliations`.
 - **Constraints:** Python; no shell tool in the tool registry; file writes
   confined to a designated workspace + reports directory; model routing
   (orchestrator + fallback + worker) is config-driven, not hardcoded.

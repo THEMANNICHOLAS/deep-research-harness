@@ -54,6 +54,19 @@ to address.
   To address when the loop lands: validate `base_url` shape and non-`TODO` model IDs
   wherever roles are first consumed.
 
+- **The CI runner's configuration is not recorded anywhere.** CI depends on a self-hosted
+  GitHub Actions runner (`CI-Runner`, default tags `self-hosted`/`Linux`/`X64`) on a Proxmox
+  VM, but its systemd unit name, work directory, runner version, and OS version are not
+  written down, and `systemctl is-enabled` was never run — so nothing confirms the runner
+  comes back unattended after a reboot. This bites if the VM is lost or rebuilt: the runner
+  must be re-registered from GitHub's own documentation, and until it is, every pull request
+  queues forever with no verdict. Deliberately descoped by the developer on 2026-08-09 (see
+  the Phase 4 entry in @docs/plans/PLAN-ci-pipeline.md `## Reconciliations`), which drops
+  requirement R5. The project-side facts a rebuild needs — the uv pin and the setup-uv SHA —
+  are both already in @pyproject.toml and @.github/workflows/ci.yml. To address: capture the
+  unit name and `systemctl is-enabled` output, either over SSH or via a temporary read-only
+  step in the workflow, since the job runs on the VM itself.
+
 - **Most dependencies are `>=` floors, not exact pins.** `pyproject.toml` declares
   `pydantic>=2.9`, `langchain-core>=0.3`, `httpx>=0.27`, and a `dev` group
   (`ruff`, `mypy`, `pytest`, `pytest-asyncio`) with no constraints at all; only
