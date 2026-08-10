@@ -1,6 +1,6 @@
 # PLAN: CI Pipeline (self-hosted GitHub Actions runner)
 
-**Status:** In Progress
+**Status:** Phases 1-4 complete; Final verification blocked on merging PR #2
 **Created:** 2026-08-09
 **Type:** Single plan
 
@@ -231,7 +231,8 @@ ruled out:
 - [x] Phase 2: Full gate set
 - [x] Phase 3: Coverage gate
 - [x] Phase 4: Record the runner — **descoped to a one-line note; R5 dropped**
-- [ ] Final verification
+- [~] Final verification — all items pass EXCEPT the `push: main` trigger, which needs
+      PR #2 merged (developer is reviewing first)
 
 ## Phases
 
@@ -508,17 +509,24 @@ default tags. Nothing about the runner host is recorded.
 
 ## Verification
 
-- [ ] Open the `feat/ci-pipeline` PR against `main`; the check run executes on `CI-Runner`
-      and reports green.
-- [ ] All four gate commands pass on the runner, matching local results:
+- [x] Open the `feat/ci-pipeline` PR against `main`; the check run executes on `CI-Runner`
+      and reports green. *PR #2, run 31342810201 onward.*
+- [x] All four gate commands pass on the runner, matching local results:
       `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy .`,
-      `uv run pytest`.
-- [ ] Coverage gate active: `uv run pytest --cov --cov-report=term-missing
-      --cov-fail-under=90` passes in CI.
-- [ ] Each gate has been observed FAILING at least once and recovering (Phases 1, 2, 3
-      Manual verification) — no gate ships unproven.
-- [ ] After merging the PR, the `push: main` trigger fires and the run on `main` is green
-      (R1's second half).
+      `uv run pytest`. *Run 31343617566; coverage identical on Linux and Windows (99%).*
+- [x] Coverage gate active: `uv run pytest --cov --cov-report=term-missing
+      --cov-fail-under=90` passes in CI. *Run 31344687936.*
+- [x] Each gate has been observed FAILING at least once and recovering (Phases 1, 2, 3
+      Manual verification) — no gate ships unproven. *`ruff check` 31342882589;
+      `ruff format --check` + `mypy` 31343717168; `pytest` 31344747771.*
+      **Caveat:** the `pytest` step was driven red by the coverage threshold
+      (`--cov-fail-under=100`), never by a genuinely failing test. The step is proven able
+      to fail; a red *test* has not been observed in CI.
+- [ ] **OUTSTANDING** — After merging the PR, the `push: main` trigger fires and the run on
+      `main` is green (R1's second half). *Deliberately not done: developer chose to review
+      PR #2 before merging (2026-08-09). The `push:` trigger is present and syntactically
+      exercised, but has never actually fired. This is also Phase 2's one unticked
+      acceptance criterion.*
 - ~~[ ] `docs/guides/ci.md` exists, is linked from `docs/INDEX.md`, and records observed
       values.~~ **Dropped 2026-08-09 — see `## Reconciliations`. Replaced by: `docs/INDEX.md`
       names the self-hosted runner and its default tags.**
