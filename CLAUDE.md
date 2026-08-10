@@ -47,9 +47,10 @@ not the ceiling).
 - Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium
   (Lightpanda was tried and retired — see docs/decisions.md).
 - Search: self-hosted SearXNG (JSON API).
-- Models: OpenCode API serves both roles — `[roles.head]` = `kimi-k3`,
+- Models: OpenCode API serves both roles — `[roles.head]` = `deepseek-v4-flash`,
   `[roles.subagent]` = `gpt-5.6-luna`. Config-swappable; no other provider is
-  declared today.
+  declared today. `deepseek-v4-flash` requires a region opt-in on the OpenCode
+  workspace dashboard — without it the endpoint 403s (see docs/decisions.md).
 - Deployment: homelab Linux machine, operated over SSH.
 
 ## Patterns

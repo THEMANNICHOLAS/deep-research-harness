@@ -4,14 +4,16 @@
 
 - **Deployment:** self-hosted homelab Linux machine, operated interactively
   over SSH. No cloud/container deployment.
-- **Status:** harness substrate built — config, source registry, fetch and search
-  tools, prompt loader, and the tool list. No agent loop yet.
+- **Status:** research loop runs end to end — `python -m harness "<question>"` drives a
+  single deepagents lead agent over the substrate's tools and writes a timestamped cited
+  report. Phases 4-7 of docs/plans/PLAN-research-loop.md (clarification, run ceiling, claim
+  verification, tier contracts) are not built yet.
 - **Integrations:** SearXNG (local Docker instance checked in at
   @searxng/docker-compose.yml, JSON API enabled — a stock container is HTML-only
   and will not work), crawl4ai over
   crawl4ai-managed Playwright/Chromium (Lightpanda was tried and retired — see
-  docs/decisions.md), OpenCode API for both model roles — `kimi-k3` for the head
-  and `gpt-5.6-luna` for the subagent. API **keys** live
+  docs/decisions.md), OpenCode API for both model roles — `deepseek-v4-flash` for the
+  head and `gpt-5.6-luna` for the subagent. API **keys** live
   in `.env`; **endpoints, model IDs and limits** live in `harness.toml` (see
   docs/guides/setup.md). Neither is ever hardcoded.
 - **Constraints:** Python; no shell tool in the tool registry; file writes

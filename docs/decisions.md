@@ -93,3 +93,14 @@ sentences each, append-only, newest last.
   graph's own message list — which is what keeps R7's token sum in @harness/__main__.py honest
   on a run long enough to compress. Shipping langchain's plain middleware would have silently
   undercounted the delegation baseline. See @harness/agent.py.
+
+- **2026-08-10 — `[roles.head]` is `deepseek-v4-flash`, and the single-agent token baseline is
+  ~796k tokens for one research run (Phase 3, PLAN-research-loop).** The head role was moved off
+  `kimi-k3` to `deepseek-v4-flash` on cost grounds; it needs an explicit region opt-in on the
+  OpenCode workspace dashboard, and without that opt-in the endpoint returns a 403 `RegionError`
+  rather than anything a config check could predict. Measured on the first passing end-to-end
+  run (one question, 19 sources consulted, 12 minutes): 773,032 input tokens and 22,883 output
+  tokens of which 16,539 were reasoning — 795,915 total. Input dominates by ~34x because the
+  whole research history is resent every turn, so the pyramid's 3-10x delegation multiplier
+  should be priced against the INPUT figure, not the total. `deepseek-v4-flash` is a reasoning
+  model like `kimi-k3` before it, so the reasoning split stays the meaningful number.

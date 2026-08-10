@@ -98,8 +98,9 @@ for reports is non-technical, which is why the report must never overstate its e
 - The default backend is in-memory `StateBackend`; workspace/report writes must be
   explicitly disk-backed, confined by `permissions`. Current 0.7.x docs list no plain disk
   backend named `FilesystemBackend` (!#8) — D6 carries the contingency.
-- Kimi K3 is served by the existing OpenCode provider, so it is a `[roles]` model value and
-  needs no new provider entry.
+- ~~Kimi K3 is~~ The head model is served by the existing OpenCode provider, so it is a
+  `[roles]` model value and needs no new provider entry. (Head moved to `deepseek-v4-flash`
+  on cost grounds at the Phase 3 gate, 2026-08-10 — see `docs/decisions.md`.)
 - Nested subagents work natively in 0.7.x (the upstream issue asking to *restrict* nesting
   closed in Feb 2026); `CompiledSubAgent(runnable=...)` remains available as an option, not
   a workaround, for the later pyramid.
@@ -405,7 +406,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 - [x] Phase 1: Model client and agent config
 - [x] Phase 2: Fetch amendments — URL cap and source capture
-- [ ] Phase 3: Tracer bullet — question in, report on disk
+- [x] Phase 3: Tracer bullet — question in, report on disk
 - [ ] Phase 4: Pre-research clarification
 - [ ] Phase 5: Run ceiling and cut-short reporting
 - [ ] Phase 6: Claim verification and disclosure
@@ -658,12 +659,16 @@ anything is built on them.
    one real run as the pyramid's baseline.
 
 **Acceptance criteria:**
-- [ ] Manual live check: `python -m harness "<a real question>"` produces a report on disk
-      whose content answers the question and cites URLs, and prints its path.
+- [x] Manual live check: `python -m harness "<a real question>"` produces a report on disk
+      whose content answers the question and cites URLs, and prints its path. **Run
+      2026-08-10: PASSED** — 19 sources consulted, `[Sn]` citations resolved to links, the
+      one failed fetch quarantined as not-usable, path printed last.
 - [x] `docs/decisions.md` records the async-tool outcome and the prompt-composition behavior
       as observed, not as assumed. If async tools were rejected, the entry says so and names
       the workaround taken.
-- [ ] The observed token cost of one real run is written down as the delegation baseline.
+- [x] The observed token cost of one real run is written down as the delegation baseline
+      (`docs/decisions.md`, 2026-08-10: 773,032 in / 22,883 out of which 16,539 reasoning /
+      795,915 total, on `deepseek-v4-flash`).
 - [x] `uv run ruff check .` and `uv run mypy .` clean for the new files.
 
 ### Phase 4: Pre-research clarification
@@ -1130,6 +1135,20 @@ assert attempt counts and terminal error types (3F judgment review, noted not fi
 **deferred**: the guarantee rests on the pinned `openai` SDK plus a code comment, which is an
 acceptable home for it; revisit only if retry is ever hand-rolled.
 
+2026-08-09 — Phase 3: a mid-run model connection failure propagates as a raw library traceback
+and yields NO report, even though the run had already written its todo plan and captured three
+sources to disk. Observed live: the first end-to-end check died on a transient DNS failure
+(`getaddrinfo failed` → `openai.APIConnectionError`) after the client's bounded retry was
+exhausted, and `__main__` let it escape. R6's fail-fast covers *startup* via `preflight`, and
+Phase 3's **Out of scope** assigns the ceiling and the cut-short report to Phase 5 — so this is
+not a Phase 3 contradiction, but it is the same failure shape !#6 describes and the same
+disclosure obligation R7/R4 carry. → **deferred to Phase 5**, whose step 3 already owns "ensure
+the partial-report path runs on expiry rather than propagating a timeout": that path must be
+entered on ANY mid-run termination, not only on wall-clock expiry, and `__main__` must convert
+a terminal model failure into a plain stderr message plus a cut-short report rather than a
+traceback. Evidence that a useful partial report was possible: the todo plan and three captured
+`sources/S<n>.md` files were already on disk when it died.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
@@ -1199,3 +1218,39 @@ phase). Append-only, empty at plan creation. -->
   disabled explicitly, not assumed absent), and the default summarizer is deepagents' own
   `_DeepAgentsSummarizationMiddleware` wrapper rather than langchain's plain one, so D7's
   `keep` policy must be written against the wrapper.
+
+### 2026-08-10 — Phase 3: Tracer bullet — question in, report on disk
+- Done: `python -m harness "<question>"` runs end to end. `harness/agent.py` (`build_agent` —
+  deepagents lead over `build_tools`, `FilesystemBackend` rooted at the workspace,
+  `TodoListMiddleware`, no general-purpose subagent, `execute` excluded from the model's
+  schema), `harness/report.py` (`RunOutcome` + `write_report`, frozen filename, usable-vs-failed
+  source split), `harness/__main__.py` (argv → `preflight` → `astream` with todo echo → report,
+  path printed last). `orchestrator.md` rewritten onto native tool calling. 153 tests green;
+  ruff/format/mypy clean. Live check PASSED 2026-08-10.
+- Learned: (1) Risks !#1, !#3 and !#8 are all retired empirically — async tools work unchanged,
+  our system prompt arrives INTACT at the head of a single system message with deepagents'
+  middleware prompts appended after it, and `FilesystemBackend` ships shell-free so D6's custom
+  backend was never needed. (2) The summarizer MUST be `deepagents.middleware.summarization.
+  SummarizationMiddleware`, not langchain's plain one — they share a `.name` so either replaces
+  the default, but only the wrapper offloads evicted history to the backend instead of deleting
+  it, and only the wrapper leaves the graph's message list intact so the R7 token sum stays
+  honest. Shipping the wrong one passes every test. (3) `execute` is bound on EVERY backend and
+  cannot be removed from the graph — only from the model's schema, via `excluded_tools` on a
+  registered `HarnessProfile`. Same registration disables the general-purpose subagent; the
+  registry is process-global and keyed `provider:model-name`. (4) The head role is now
+  `deepseek-v4-flash`, which needs a region opt-in on the OpenCode dashboard or the endpoint
+  403s. (5) Baseline: 773,032 in / 22,883 out (16,539 reasoning) / 795,915 total for one
+  19-source run — input dominates ~34x, so price delegation against INPUT.
+- Drift: one Reconciliation with three parts (2026-08-09 — Phase 3): the `execute` tool is
+  unremovable from the graph; disabling the general-purpose subagent needs a process-global
+  profile registration; and the agent's disk root is the workspace ONLY, not workspace+reports.
+  Plus one `## Discoveries` entry deferred to Phase 5 (a mid-run model failure yields no report
+  at all — see Watch-next).
+- Watch-next: **Phase 5 must widen its partial-report path.** Observed live: the first
+  end-to-end attempt died mid-run on a transient DNS failure and produced NO report and a raw
+  library traceback, even though the todo plan and three captured sources were already on disk.
+  Phase 5's step 3 currently scopes that path to wall-clock expiry only; it must cover ANY
+  mid-run termination, and `__main__` must turn a terminal model failure into a plain stderr
+  message plus a cut-short report. Also note for Phase 4: `__main__` currently drives the run
+  with `astream(stream_mode=["updates","values"])`, so the interrupt/resume loop has to be built
+  around that streaming shape rather than a single `ainvoke`.
