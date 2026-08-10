@@ -228,7 +228,7 @@ ruled out:
 
 ## Progress
 - [x] Phase 1: Tracer bullet — prove CI-Runner executes a job
-- [ ] Phase 2: Full gate set
+- [x] Phase 2: Full gate set
 - [ ] Phase 3: Coverage gate
 - [ ] Phase 4: Record the runner
 - [ ] Final verification
@@ -343,13 +343,17 @@ triggers on both PRs to `main` and pushes to `main`.
 - `docs/` updates — Phase 4.
 
 **Manual verification:**
-- [ ] Push a commit that violates formatting AND introduces a type error; **one** run
+- [x] Push a commit that violates formatting AND introduces a type error; **one** run
       reports both steps as failed, not just the first (D2, R6).
-- [ ] Push again to the same PR while a run is in progress; the superseded run shows as
-      cancelled (R7).
-- [ ] Each failing step's name identifies which gate failed from the run summary alone,
-      without opening raw logs (R6).
-- [ ] All four gates green on clean `HEAD`.
+      *Run 31343717168 (`cb3f992`): `ruff check` success, `ruff format --check` FAILURE,
+      `mypy` FAILURE, `pytest` success — both failures in one run, and `pytest` still ran
+      downstream of them.*
+- [x] Push again to the same PR while a run is in progress; the superseded run shows as
+      cancelled (R7). *See the Phase 2 handoff entry for the run IDs.*
+- [x] Each failing step's name identifies which gate failed from the run summary alone,
+      without opening raw logs (R6). *Step names are the gate commands verbatim —
+      `ruff format --check`, `mypy`.*
+- [x] All four gates green on clean `HEAD`. *Run 31343617566 (`1935293`), 24s.*
 
 **Steps:**
 1. Add `ruff format --check`, `mypy`, and `pytest` steps, each with `if: ${{ !cancelled() }}`.
