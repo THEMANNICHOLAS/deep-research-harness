@@ -407,7 +407,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Model client and agent config
 - [x] Phase 2: Fetch amendments — URL cap and source capture
 - [x] Phase 3: Tracer bullet — question in, report on disk
-- [ ] Phase 4: Pre-research clarification
+- [x] Phase 4: Pre-research clarification
 - [ ] Phase 5: Run ceiling and cut-short reporting
 - [ ] Phase 6: Claim verification and disclosure
 - [ ] Phase 7: Researcher and reader tier contracts
@@ -689,9 +689,11 @@ answers, and resume with those answers as tool results.
 - `harness/agent.py` — modify: `interrupt_on`, the `InMemorySaver` checkpointer, and a per-run
   `thread_id`.
 - `harness/__main__.py` — modify: the interrupt/resume loop.
-- `harness/prompts/orchestrator.md` — modify: confine asking to the pre-research window and
-  bound how many questions may be asked.
+- `harness/prompts/orchestrator.md` — modify: confine asking to the pre-research window ~~and
+  bound how many questions may be asked~~ (see `## Reconciliations` 2026-08-10 — Phase 4).
 - `tests/test_ask_user.py` — new; `tests/test_tools_registry.py` — modify.
+- `tests/test_agent.py` — modify: added during execution, see `## Discoveries` 2026-08-10 —
+  the checkpointer makes a `thread_id` mandatory on every existing `build_agent` invocation.
 
 **Reuse:**
 - Extend `build_tools` in `harness/tools/__init__.py` — do NOT create a second tool list.
@@ -717,16 +719,20 @@ answers, and resume with those answers as tool results.
 - Do not give `ask_user` to any subagent definition — Phase 7 freezes that exclusion.
 
 **Tests (write first, confirm red):**
-- [ ] A faked model that calls `ask_user` causes the run to interrupt rather than complete, and
+- [x] A faked model that calls `ask_user` causes the run to interrupt rather than complete, and
       the question text reaches stdout.
-- [ ] Supplying an answer resumes the run under the same `thread_id` and the answer arrives as
+- [x] Supplying an answer resumes the run under the same `thread_id` and the answer arrives as
       the tool's result.
-- [ ] A run whose model never calls `ask_user` completes without interruption, unchanged from
+- [x] A run whose model never calls `ask_user` completes without interruption, unchanged from
       Phase 3.
-- [ ] `build_tools` returns `ask_user` alongside `fetch_pages` and `search_web`, with unique
+- [x] `build_tools` returns `ask_user` alongside `fetch_pages` and `search_web`, with unique
       names and a non-empty description and schema each.
-- [ ] Interrupts are configured for `ask_user` only — a proposed `fetch_pages` call does not
+- [x] Interrupts are configured for `ask_user` only — a proposed `fetch_pages` call does not
       interrupt.
+- [x] Added at the 3F gate, beyond the plan's five: a second clarification round asks and
+      resumes again (pinning the loop, not a one-shot `if`); two `ask_user` calls in one
+      interrupt get one correctly-paired answer each and the tool body never also runs; and an
+      empty answer is disclosed rather than sent as silence. All three were mutation-tested.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -740,7 +746,9 @@ answers, and resume with those answers as tool results.
 **Acceptance criteria:**
 - [ ] Manual live check: a deliberately ambiguous question causes at least one clarifying
       question at the terminal; answering it produces a report reflecting the answer.
-- [ ] `uv run ruff check .` and `uv run mypy .` clean for the changed files.
+      (Must be run BY the developer — it blocks on typed input at a real terminal, which no
+      tool-driven run can supply.)
+- [x] `uv run ruff check .` and `uv run mypy .` clean for the changed files.
 
 ### Phase 5: Run ceiling and cut-short reporting
 
@@ -1106,9 +1114,40 @@ directory is not reachable from the backend at all: `FilesystemBackend(root_dir=
 → **Amendment:** confinement is to the workspace directory alone, which is strictly narrower
 than the struck text, with `permissions` declared as the second layer.
 
+2026-08-10 — Phase 4: the plan's Files line asked `orchestrator.md` to "bound how many
+questions may be asked" (struck). The developer chose **no bound at all** when the placement
+was put to them (prose constant vs. a new `[agent]` setting vs. none) → **Amendment:** asking
+is confined to the pre-research window (D5) and no count limit is stated anywhere — not in the
+prompt, not in config, not in code. R2 names no number, so no requirement breaks and there is
+nothing to escalate. Accepted residue, recorded knowingly: nothing stops the lead asking a long
+series of questions, each blocking the run on human input. The backstop is Phase 5's wall clock,
+which by D5 keeps running through a clarification wait — so an unattended or over-asking run
+self-terminates rather than hanging. Revisit only if a real run actually over-asks.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+
+2026-08-10 — Phase 4: Phase 4's Files list omits `tests/test_agent.py`, but adding D5's
+`InMemorySaver` checkpointer to `build_agent` makes a `thread_id` mandatory on EVERY
+invocation — a checkpointer-compiled graph raises `ValueError: Checkpointer requires one or
+more of the following 'configurable' keys: thread_id, checkpoint_ns, checkpoint_id` (verified
+against the installed langgraph before any code was written). Every existing `build_agent`
+test invoked without a config, so all of them break. The alternative that would have spared
+those tests — returning `graph.with_config({"configurable": {"thread_id": ...}})` from
+`build_agent` — was rejected: the resulting `RunnableBinding` breaks `test_agent.py`'s
+`graph.nodes["tools"]` helpers, trading a mechanical edit for a structural one, and it hides
+the thread from the caller that has to resume under it. → **acted now**: the existing
+invocations take an explicit `thread_id` config, which is also the shape production uses, and
+the Files list above gained the file. No assertion was weakened to accommodate it.
+
+2026-08-10 — Phase 4: `build_agent` now compiles with `InMemorySaver()`, which retains a
+checkpoint per superstep for the whole run. Phase 3's baseline run carried 773k input tokens of
+message state, so the retained checkpoints are not free, and D5's Consequences say nothing about
+the memory growth (3F judgment review, Minor) → **deferred to Phase 5**, which owns the run
+ceiling and is where a bound or a note belongs. Nothing observed yet: the Phase 3 baseline run
+predates the checkpointer, so there is no measurement — take one during Phase 5's live check
+before deciding whether it needs anything beyond a documented consequence.
 
 2026-08-09 — Phase 1: removing `[providers.cerebras]` from `harness.toml` left stale references
 in `.env.example`, `docs/guides/setup.md`, `CLAUDE.md` and `docs/INDEX.md`, all describing a
@@ -1254,3 +1293,39 @@ phase). Append-only, empty at plan creation. -->
   message plus a cut-short report. Also note for Phase 4: `__main__` currently drives the run
   with `astream(stream_mode=["updates","values"])`, so the interrupt/resume loop has to be built
   around that streaming shape rather than a single `ainvoke`.
+
+### 2026-08-10 — Phase 4: Pre-research clarification
+- Done: `harness/tools/ask_user.py` (`ASK_USER_TOOL_NAME`, `build_ask_user_tool` — one
+  `question` per call, mirroring `build_search_tool`'s factory shape), registered as the third
+  entry of `build_tools`. `build_agent` gained `checkpointer=InMemorySaver()` and
+  `interrupt_on={"ask_user": InterruptOnConfig(allowed_decisions=["respond"])}`. `__main__` is
+  now a resume loop: `_read_answer` (via `asyncio.to_thread`, so Phase 5's clock can still
+  fire), `_answer_questions` (one decision per action request), and a `while` around the
+  existing `astream`. `orchestrator.md`'s `# No clarification` became `# Clarification`.
+  161 tests green; ruff/format/mypy clean. Live check NOT yet run — it needs typed input at a
+  real terminal, so only the developer can run it.
+- Learned: (1) An interrupt surfaces in BOTH streams — `updates` as
+  `{"__interrupt__": (Interrupt(...),)}` whose value is a **tuple**, and `values` as the state
+  dict plus that key. Phase 3's todo echo called `.get` on every update value, so it would have
+  crashed with `AttributeError` on the first interrupt; the `isinstance(node_update, dict)`
+  guard is a real fix, mutation-proven. (2) Interrupt detection must be scoped to the CURRENT
+  pass — reading a carried-over `final_state` re-asks the same question forever. (3) `respond`
+  genuinely skips tool execution: with two `ask_user` calls in one `AIMessage` the human's two
+  answers arrive as the only two `ToolMessage`s, and the tool body's fallback string appears
+  nowhere. (4) Our `mode="allow"` filesystem `permissions` generate no interrupt entries
+  (`_build_interrupt_on_from_permissions` returns `{}` unless a rule is `mode="interrupt"`), so
+  `ask_user` is the whole interrupt surface — verified behaviorally, not assumed.
+  (5) A checkpointer makes `thread_id` mandatory on every invocation.
+- Drift: one Reconciliation, 2026-08-10 — Phase 4 (no bound on the number of clarifying
+  questions; the developer chose none when asked where the bound should live). Plus two
+  `## Discoveries` entries: `tests/test_agent.py` outside the Files list (acted now) and
+  `InMemorySaver` checkpoint growth (deferred to Phase 5).
+- Watch-next: **run the live check before building Phase 5 on this loop** —
+  `PYTHONIOENCODING=utf-8 uv run --env-file ../../../.env python -m harness "<ambiguous question>"`,
+  answer at the prompt, confirm the report reflects the answer, then tick Phase 4's first
+  acceptance criterion. Two things Phase 5 inherits from this phase: the wall clock must span
+  `_read_answer`'s wait (which is why it is `asyncio.to_thread`, not a bare `input()`), and the
+  `while` loop plus `pass_state` scoping is the structure the ceiling has to interrupt — a
+  timeout has to break out of a pass that may be blocked on human input, not just one blocked
+  on the model. Also unchanged from Phase 3 and still owed: Phase 5 must widen the
+  partial-report path to ANY mid-run termination.

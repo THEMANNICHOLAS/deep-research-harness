@@ -20,14 +20,16 @@ from deepagents._models import get_model_identifier, get_model_provider
 from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware.summarization import SummarizationMiddleware
-from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
+from langchain.agents.middleware import AgentMiddleware, InterruptOnConfig, TodoListMiddleware
 from langchain_core.runnables import Runnable
+from langgraph.checkpoint.memory import InMemorySaver
 
 from harness.config import HarnessConfig
 from harness.models import build_chat_model
 from harness.prompts import render
 from harness.sources import SourceRegistry
 from harness.tools import build_tools
+from harness.tools.ask_user import ASK_USER_TOOL_NAME
 
 # The summarizer's own policy constants (not config-driven — see D7). `trigger` matches
 # the profile-driven fallback that would apply anyway if unset (settled finding 6):
@@ -37,6 +39,15 @@ from harness.tools import build_tools
 # findings more room to survive into synthesis.
 _SUMMARIZATION_TRIGGER: tuple[Literal["tokens"], int] = ("tokens", 170_000)
 _SUMMARIZATION_KEEP: tuple[Literal["messages"], int] = ("messages", 20)
+
+# `allowed_decisions` is `["respond"]` only — the developer answers on behalf of the tool
+# and the tool never executes (Phase 4 plan, settled fact 3); and our filesystem
+# `permissions` are `mode="allow"`, which generates no filesystem interrupt entries
+# (settled fact 2), so this is the whole interrupt surface, which is what the plan's Out
+# of scope requires.
+_INTERRUPT_ON: dict[str, bool | InterruptOnConfig] = {
+    ASK_USER_TOOL_NAME: InterruptOnConfig(allowed_decisions=["respond"])
+}
 
 
 def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
@@ -92,6 +103,10 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
             FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="allow")
         ],
         middleware=_middleware(model, backend),
+        # One saver per `build_agent` call; it holds this run's thread (D5: in-memory
+        # keeps the no-database invariant — no durable, cross-invocation checkpointing).
+        checkpointer=InMemorySaver(),
+        interrupt_on=_INTERRUPT_ON,
     )
 
 

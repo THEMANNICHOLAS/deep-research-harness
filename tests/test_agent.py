@@ -57,7 +57,10 @@ async def test_build_agent_drives_research_using_the_configured_model(
     _patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
-    result = await graph.ainvoke({"messages": [HumanMessage(content="research this")]})
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
 
     # Behavioral, not structural: if build_agent ignored build_chat_model's return value
     # (or hardcoded a different model), this scripted content would never appear.
@@ -79,7 +82,8 @@ async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_
 
     graph = build_agent(config, SourceRegistry())
     await graph.ainvoke(
-        {"messages": [HumanMessage(content="What is the boiling point of gallium?")]}
+        {"messages": [HumanMessage(content="What is the boiling point of gallium?")]},
+        config={"configurable": {"thread_id": "test-thread"}},
     )
 
     assert model._received_messages, "the model was never called"
@@ -140,7 +144,10 @@ async def test_execute_is_excluded_from_the_models_tool_schema(
     _patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
-    await graph.ainvoke({"messages": [HumanMessage(content="hi")]})
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="hi")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
 
     assert model._bound_tool_names, "bind_tools was never called — nothing was asserted"
     for offered in model._bound_tool_names:
@@ -180,7 +187,10 @@ async def test_writes_through_the_agent_land_under_the_workspace_dir(
     _patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
-    await graph.ainvoke({"messages": [HumanMessage(content="write something")]})
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="write something")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
 
     written = config.agent.workspace_dir / "notes.md"
     assert written.exists()
@@ -207,7 +217,10 @@ async def test_writes_cannot_escape_the_workspace_dir(make_config, monkeypatch, 
     _patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
-    result = await graph.ainvoke({"messages": [HumanMessage(content="try to escape")]})
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="try to escape")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
 
     escaped = config.agent.workspace_dir.parent / "escape.md"
     assert not escaped.exists()
@@ -280,7 +293,10 @@ async def test_compression_offloads_evicted_history_and_preserves_todos_state(
     _patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
-    result = await graph.ainvoke({"messages": [HumanMessage(content="research this at length")]})
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this at length")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
 
     # Evidence 1: compression actually fired. Independent of anything the scripted model
     # emitted — the summarization HumanMessage is minted by the middleware itself.
