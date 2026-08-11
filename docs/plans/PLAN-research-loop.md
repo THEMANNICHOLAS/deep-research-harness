@@ -744,7 +744,7 @@ answers, and resume with those answers as tool results.
 6. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Manual live check: a deliberately ambiguous question causes at least one clarifying
+- [x] Manual live check: a deliberately ambiguous question causes at least one clarifying
       question at the terminal; answering it produces a report reflecting the answer.
       (Must be run BY the developer — it blocks on typed input at a real terminal, which no
       tool-driven run can supply.)
@@ -1320,10 +1320,18 @@ phase). Append-only, empty at plan creation. -->
   questions; the developer chose none when asked where the bound should live). Plus two
   `## Discoveries` entries: `tests/test_agent.py` outside the Files list (acted now) and
   `InMemorySaver` checkpoint growth (deferred to Phase 5).
-- Watch-next: **run the live check before building Phase 5 on this loop** —
-  `PYTHONIOENCODING=utf-8 uv run --env-file ../../../.env python -m harness "<ambiguous question>"`,
-  answer at the prompt, confirm the report reflects the answer, then tick Phase 4's first
-  acceptance criterion. Two things Phase 5 inherits from this phase: the wall clock must span
+- Live check (run at this gate, 2026-08-10): **PASSED.** `python -m harness "which model should
+  I use?"` asked one clarifying question at the terminal, blocked for typed input, took the
+  answer (`A` = an AI/LLM for coding/writing/reasoning), and resumed into a todo plan and an
+  11-source report scoped to LLMs rather than ML or non-software models — so R2 is verified
+  live, not just under fakes. No `AttributeError` from the interrupt tuple and no re-asked
+  question, confirming the `isinstance` guard and the `pass_state` scoping hold on the real
+  path. Two findings: the `PYTHONIOENCODING=utf-8` prefix was NOT needed on the developer's
+  PowerShell terminal, and the run disclosed its own degraded coverage unprompted (one fetch
+  hit a bot check, one leaderboard table had its model names stripped), which is R4's
+  best-effort-and-disclose behavior showing up without Phase 5's cut-short path built yet.
+- Watch-next: ~~run the live check before building Phase 5 on this loop~~ — done, passed.
+  Two things Phase 5 inherits from this phase: the wall clock must span
   `_read_answer`'s wait (which is why it is `asyncio.to_thread`, not a bare `input()`), and the
   `while` loop plus `pass_state` scoping is the structure the ceiling has to interrupt — a
   timeout has to break out of a pass that may be blocked on human input, not just one blocked
