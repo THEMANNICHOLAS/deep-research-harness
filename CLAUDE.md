@@ -49,9 +49,10 @@ not the ceiling).
   crawl4ai (pinned `==0.9.2`), httpx. Dev deps: ruff, mypy, pytest,
   pytest-asyncio, pytest-cov (pinned `==7.1.0`, pulls in coverage).
 - Everything not marked pinned above still carries a `>=` floor and so floats
-  on re-resolve; @uv.lock holds the resolved set and is the source of truth for
-  what is actually installed. Converting those floors to `==` is a
-  docs/backlog.md item.
+  on re-resolve; `uv.lock` holds the resolved set and is the source of truth for
+  what is actually installed (referenced by name, not `@` — an `@` prefix would
+  inline the whole ~559k-token lockfile into every session's context).
+  Converting those floors to `==` is a docs/backlog.md item.
 - No database — reports are timestamped markdown files on disk.
 - Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium
   (Lightpanda was tried and retired — see docs/decisions.md).
