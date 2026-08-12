@@ -92,7 +92,7 @@ def test_json_braces_and_dollar_escape_render_unchanged(prompt_dir):
     assert "$100" in result
 
 
-@pytest.mark.parametrize("name", ["orchestrator", "subagent"])
+@pytest.mark.parametrize("name", ["orchestrator", "subagent", "verify"])
 def test_shipped_prompts_render_with_their_declared_variables(name):
     variables = required_variables(name)
 

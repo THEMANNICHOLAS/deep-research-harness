@@ -42,9 +42,14 @@ def _usage(reasoning: int = 0, input_tokens: int = 100, output_tokens: int = 50)
     }
 
 
-def _write_usable_source_file(config, source_id: str) -> None:
-    """Write a real, `fetched`-shaped capture — `report.py` reads this to judge usability."""
-    sources_dir = _sources_dir(config)
+def _write_usable_source_file(config, registry, source_id: str) -> None:
+    """Write a real, `fetched`-shaped capture under `registry`'s run directory.
+
+    `report.py` reads this to judge usability. Takes `registry` (Phase 6 amendment —
+    see the plan's `## Reconciliations` 2026-08-12 — Phase 6) so the file lands under
+    `sources/<run_id>/`, never the flat `sources/` layout Phases 2-5 used.
+    """
+    sources_dir = _sources_dir(config, registry)
     sources_dir.mkdir(parents=True, exist_ok=True)
     (sources_dir / f"{source_id}.md").write_text(
         f"# {source_id}: Example page\n\n- Outcome: fetched\n\nSome captured body text.",
@@ -52,9 +57,9 @@ def _write_usable_source_file(config, source_id: str) -> None:
     )
 
 
-def _write_stub_source_file(config, source_id: str, outcome: str = "error") -> None:
+def _write_stub_source_file(config, registry, source_id: str, outcome: str = "error") -> None:
     """Write a failure stub — the shape `harness/tools/fetch.py` writes for a bad fetch."""
-    sources_dir = _sources_dir(config)
+    sources_dir = _sources_dir(config, registry)
     sources_dir.mkdir(parents=True, exist_ok=True)
     (sources_dir / f"{source_id}.md").write_text(
         f"{FETCH_FAILED_PREFIX}{outcome}\n", encoding="utf-8"
@@ -127,7 +132,7 @@ def test_write_report_with_usable_sources_does_not_claim_it_has_none(make_config
     config = make_config()
     registry = SourceRegistry()
     source_id = registry.add("https://example.test/tungsten", title="Tungsten facts")
-    _write_usable_source_file(config, source_id)
+    _write_usable_source_file(config, registry, source_id)
     outcome = RunOutcome(
         question="What is the airspeed velocity of an unladen swallow?",
         answer="African or European? [S1]",
@@ -153,7 +158,7 @@ def test_write_report_treats_registered_stub_sources_as_not_usable(make_config):
     config = make_config()
     registry = SourceRegistry()
     dead_id = registry.add("https://example.test/dead-link", title=None)
-    _write_stub_source_file(config, dead_id, outcome="blocked")
+    _write_stub_source_file(config, registry, dead_id, outcome="blocked")
     outcome = RunOutcome(
         question="What killed the link?",
         answer="Unable to determine — the only lead was unreachable.",
@@ -180,8 +185,8 @@ def test_write_report_lists_usable_sources_and_marks_stubs_separately(make_confi
     registry = SourceRegistry()
     good_id = registry.add("https://good.example.test/page", title="Good page")
     bad_id = registry.add("https://bad.example.test/page", title=None)
-    _write_usable_source_file(config, good_id)
-    _write_stub_source_file(config, bad_id, outcome="timeout")
+    _write_usable_source_file(config, registry, good_id)
+    _write_stub_source_file(config, registry, bad_id, outcome="timeout")
     outcome = RunOutcome(
         question="Mixed source usability",
         answer="Partial answer [S1].",
@@ -227,7 +232,7 @@ def test_write_report_body_carries_answer_reasoning_split_and_sources(make_confi
     config = make_config()
     registry = SourceRegistry()
     source_id = registry.add("https://example.test/a", title="Example A")
-    _write_usable_source_file(config, source_id)
+    _write_usable_source_file(config, registry, source_id)
     outcome = RunOutcome(
         question="reasoning split check",
         answer="Answer text with a marker [S1].",
@@ -238,7 +243,13 @@ def test_write_report_body_carries_answer_reasoning_split_and_sources(make_confi
     path = write_report(outcome, config)
     body = path.read_text(encoding="utf-8")
 
-    assert "Answer text with a marker [S1]." in body
+    # Phase 6 resolves every REGISTERED `[Sn]` marker into a clickable link (R1), so the
+    # prose survives but the raw marker must not — resolution is mechanical (substrate
+    # D4) and runs whether or not the verification pass did.
+    answer_section = _section(body, "## Answer")
+    assert "Answer text with a marker" in answer_section
+    assert "[S1]" not in answer_section
+    assert "example.test" in answer_section
     # The reasoning-token count must be visible on its own, not folded silently into a
     # bare total (finding 9: a plain total misprices the pyramid for a reasoning model).
     assert "37" in body
@@ -371,13 +382,15 @@ def test_write_report_includes_workspace_notes_when_cut_short(make_config):
     (config.agent.workspace_dir / "notes.md").write_text(
         "Vendor Acme quoted $4.20/unit, confirmed by two listings.", encoding="utf-8"
     )
-    # A captured source file, written directly to sources/ the way harness/tools/fetch.py
-    # does — never via the registry, so nothing else could surface its text.
-    _write_usable_source_file(config, "S1")
+    # A captured source file, written directly to sources/<run_id>/ the way
+    # harness/tools/fetch.py does — never via the registry, so nothing else could surface
+    # its text.
+    registry = SourceRegistry()
+    _write_usable_source_file(config, registry, "S1")
     outcome = RunOutcome(
         question="What pricing was found before the cutoff?",
         answer="",
-        registry=SourceRegistry(),
+        registry=registry,
         usage=_usage(),
         cut_short="wall_clock",
     )
@@ -500,3 +513,368 @@ def test_write_report_has_no_cut_short_sections_when_the_run_finished(make_confi
 
     assert _CUT_SHORT_HEADING not in body
     assert _NOTES_HEADING not in body
+
+
+# --- Phase 6: claim verification and disclosure ----------------------------------------
+#
+# `harness.verify` does not exist yet (Phase 6 builds it next) — its classes are imported
+# locally inside each test that needs them so a missing module fails only that test, not
+# collection of this whole file (per the plan's "Expected red" section).
+
+
+def test_write_report_marks_each_non_supported_verdict_and_leaves_supported_bare(make_config):
+    """Every verdict in the frozen vocabulary renders a visible marker except `supported`."""
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    supported = "The sky is blue."
+    unsupported = "The moon is made of cheese."
+    uncited = "Water boils at 100 degrees Celsius."
+    unresolved = "Mercury is the closest planet to the sun."
+    unverifiable = "Venus has a thick atmosphere."
+    answer = " ".join([supported, unsupported, uncited, unresolved, unverifiable])
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(claim=supported, source_id="S1", verdict="supported"),
+            ClaimCheck(
+                claim=unsupported, source_id="S1", verdict="unsupported", detail="disagrees"
+            ),
+            ClaimCheck(claim=uncited, source_id=None, verdict="uncited"),
+            ClaimCheck(claim=unresolved, source_id="S9", verdict="unresolved"),
+            ClaimCheck(
+                claim=unverifiable,
+                source_id="S2",
+                verdict="unverifiable",
+                detail="fetch failed",
+            ),
+        ]
+    )
+    outcome = RunOutcome(
+        question="Marker rendering",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "**[unsupported — S1]**" in body
+    assert "**[uncited]**" in body
+    assert "**[unresolved — S9]**" in body
+    assert "**[unverifiable — S2]**" in body
+    # Exactly the four non-supported claims carry a marker — the supported one does not.
+    assert body.count("**[") == 4
+
+
+def test_write_report_resolves_registered_markers_and_discloses_unregistered_ones(
+    make_config,
+):
+    """R1: every surviving `[Sn]` marker resolves to a link; an unresolvable one is
+    reported by `unresolved_ids` in the gaps section instead.
+    """
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/known", title="Known page")
+    _write_usable_source_file(config, registry, source_id)
+    answer = "A known fact [S1]. An unresolvable fact [S9]."
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(claim="A known fact [S1].", source_id="S1", verdict="supported"),
+            ClaimCheck(claim="An unresolvable fact [S9].", source_id="S9", verdict="unresolved"),
+        ]
+    )
+    outcome = RunOutcome(
+        question="Citation resolution",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    # Scoped to the Answer section, not the whole body: `## Sources` legitimately prints
+    # `- [S1] <link>` as its bullet label (pinned by
+    # `test_write_report_ignores_a_source_captured_under_a_different_run`), so a
+    # whole-body assertion could never pass. What matters is that no bare marker survives
+    # where the reader is reading prose.
+    answer_section = _section(body, "## Answer")
+    assert "[S1]" not in answer_section  # resolved into a markdown link, not left bare
+    assert "example.test" in answer_section
+    assert "[S9]" in answer_section  # unregistered — left visible verbatim
+    gaps = _section(body, "## Gaps and disclosures")
+    assert "S9" in gaps
+
+
+def test_write_report_conflicts_section_names_both_positions_with_no_winner(make_config):
+    """D3: a conflict states both positions and both IDs, and adjudicates nothing."""
+    from harness.verify import ClaimCheck, Conflict, VerificationResult
+
+    config = make_config()
+    registry = SourceRegistry()
+    registry.add("https://one.example.test/a", title="One")
+    registry.add("https://two.example.test/b", title="Two")
+    claim = "The vendor quoted $4.20 per unit [S1] [S2]."
+    positions = [
+        ClaimCheck(
+            claim=claim, source_id="S1", verdict="supported", detail="Source A confirms $4.20"
+        ),
+        ClaimCheck(
+            claim=claim, source_id="S2", verdict="unsupported", detail="Source B says $5.10"
+        ),
+    ]
+    verification = VerificationResult(
+        checks=positions, conflicts=[Conflict(claim=claim, positions=positions)]
+    )
+    outcome = RunOutcome(
+        question="Conflicting prices",
+        answer=claim,
+        registry=registry,
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    section = _section(body, "## Conflicting sources")
+    assert "S1" in section
+    assert "S2" in section
+    assert "Source A confirms $4.20" in section
+    assert "Source B says $5.10" in section
+    lowered = section.lower()
+    assert "correct" not in lowered
+    assert "wrong" not in lowered
+    assert "more reliable" not in lowered
+
+
+def test_write_report_gaps_section_lists_check_failures_and_uncited_count(make_config):
+    """The gaps section carries `check_failures` verbatim and the uncited claim count."""
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    failure_line = "S3: model call raised TimeoutError"
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(
+                claim="First unsupported-by-citation claim.", source_id=None, verdict="uncited"
+            ),
+            ClaimCheck(
+                claim="Second unsupported-by-citation claim.",
+                source_id=None,
+                verdict="uncited",
+            ),
+        ],
+        check_failures=[failure_line],
+    )
+    outcome = RunOutcome(
+        question="Gap disclosure",
+        answer="First unsupported-by-citation claim. Second unsupported-by-citation claim.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    gaps = _section(body, "## Gaps and disclosures")
+    assert failure_line in gaps
+    assert "2" in gaps
+    assert "uncited" in gaps.lower()
+
+
+def test_write_report_omits_both_new_sections_when_there_is_nothing_to_disclose(make_config):
+    """All-`supported`, no conflicts, no failures → neither new section appears."""
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim="Everything checks out.", source_id="S1", verdict="supported")]
+    )
+    outcome = RunOutcome(
+        question="Clean run",
+        answer="Everything checks out.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "## Conflicting sources" not in body
+    assert "## Gaps and disclosures" not in body
+
+
+def test_write_report_places_marker_for_a_lead_in_plus_bullets_claim(make_config):
+    """3F Major finding: `extract_claims` joins a bulleted block's lines with a single
+    space, so the returned claim is NOT a verbatim substring of the answer (which still
+    has its bullet markers and newlines). The marker must still land in the rendered
+    Answer section rather than silently vanishing.
+    """
+    from harness.verify import ClaimCheck, VerificationResult, extract_claims
+
+    config = make_config()
+    answer = "Key findings:\n- The vendor quoted $4.20 [S1].\n- Lead time is six weeks [S2]."
+    claims = extract_claims(answer)
+    target = next(claim for claim in claims if "vendor quoted" in claim)
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim=target, source_id="S1", verdict="unsupported", detail="mismatch")]
+    )
+    outcome = RunOutcome(
+        question="Lead-in plus bullets",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "**[unsupported — S1]**" in body
+
+
+def test_write_report_places_marker_for_a_hard_wrapped_claim(make_config):
+    """Same finding, the other shape: a claim hard-wrapped across two lines within one
+    paragraph is collapsed to a single space by `extract_claims`, so it is not a verbatim
+    substring of the answer either.
+    """
+    from harness.verify import ClaimCheck, VerificationResult, extract_claims
+
+    config = make_config()
+    answer = "The vendor quoted a price of\n$4.20 per unit [S1]. Lead time is six weeks [S2]."
+    claims = extract_claims(answer)
+    target = next(claim for claim in claims if "vendor quoted a price" in claim)
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim=target, source_id="S1", verdict="unsupported", detail="mismatch")]
+    )
+    outcome = RunOutcome(
+        question="Hard-wrapped claim",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "**[unsupported — S1]**" in body
+
+
+def test_write_report_discloses_a_verdict_whose_marker_could_not_be_placed(make_config):
+    """A claim that genuinely does not appear in the answer at all (e.g. a stale check
+    against an edited answer) must be disclosed in `## Gaps and disclosures`, never
+    dropped — this is the "never drop silently" half of the Major finding.
+    """
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    answer = "The sky is blue."
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(
+                claim="A claim that does not appear in the answer at all.",
+                source_id="S1",
+                verdict="unsupported",
+                detail="mismatch",
+            )
+        ]
+    )
+    outcome = RunOutcome(
+        question="Unplaceable claim",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    # Never silently placed somewhere wrong in the answer.
+    assert "**[" not in body
+    gaps = _section(body, "## Gaps and disclosures")
+    assert "unsupported" in gaps
+    assert "S1" in gaps
+    assert "could not be positioned" in gaps
+
+
+def test_write_report_discloses_skipped_verification_when_the_run_died(make_config):
+    """3F Minor finding 5: when a run ends `cut_short == "error"`, `__main__` skips the
+    verification pass rather than issuing near-certainly-failing model calls, and
+    discloses the skip here rather than silently omitting it.
+    """
+    from harness.verify import VerificationResult
+
+    config = make_config()
+    verification = VerificationResult(
+        check_failures=[
+            "verification skipped: the run ended in an error, so claims were not checked"
+        ]
+    )
+    outcome = RunOutcome(
+        question="What happened to the run?",
+        answer="Partial finding before the crash.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="error",
+        cut_short_detail="APIConnectionError: getaddrinfo failed",
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    gaps = _section(body, "## Gaps and disclosures")
+    assert "verification skipped" in gaps
+    assert "the run ended in an error" in gaps
+
+
+def test_write_report_with_verification_none_renders_unchanged(make_config):
+    """Backwards-compatibility guard: an unset `verification` renders exactly the report
+    every prior phase already produces — no markers, no new sections.
+    """
+    config = make_config()
+    outcome = RunOutcome(
+        question="Backwards compatibility",
+        answer="Answer text with a marker [S1].",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=None,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    # The registry is empty, so `[S1]` is UNREGISTERED and `resolve()` leaves it alone by
+    # design — this line pins "unknown markers survive verbatim", NOT "no resolution
+    # happens when verification is None". Resolution is unconditional; see
+    # `test_write_report_body_carries_answer_reasoning_split_and_sources`.
+    assert "Answer text with a marker [S1]." in body
+    assert "**[" not in body
+    assert "## Conflicting sources" not in body
+    assert "## Gaps and disclosures" not in body
+
+
+def test_write_report_ignores_a_source_captured_under_a_different_run(make_config):
+    """Regression test for the Drift (see the plan's `## Reconciliations` 2026-08-12 —
+    Phase 6): a capture written under a DIFFERENT run's directory must never be read as
+    this run's evidence, since `agent.workspace_dir` is one directory reused across runs.
+    """
+    config = make_config()
+    other_run = SourceRegistry(run_id="2020-01-01-000000")
+    this_run = SourceRegistry(run_id="2020-01-01-000001")
+    source_id = this_run.add("https://example.test/only-captured-elsewhere", title="Example")
+    _write_usable_source_file(config, other_run, source_id)
+    outcome = RunOutcome(
+        question="Does another run's capture leak in?",
+        answer=f"Should be unusable [{source_id}].",
+        registry=this_run,
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _UNUSABLE_HEADING in body
+    heading_pos = body.index(_UNUSABLE_HEADING)
+    bullet_pos = body.index(f"[{source_id}]", heading_pos)
+    assert bullet_pos > heading_pos

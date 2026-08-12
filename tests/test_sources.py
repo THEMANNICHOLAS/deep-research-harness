@@ -1,5 +1,7 @@
 """Behavioral tests for harness.sources."""
 
+from datetime import datetime
+
 import pytest
 
 from harness.sources import SourceRegistry, normalize_url
@@ -169,3 +171,21 @@ def test_urls_differing_only_by_password_stay_distinct_sources():
     assert normalize_url("http://:secret@example.com/x") == "http://:secret@example.com/x"
     assert registry.add("http://:a@example.com/x") != registry.add("http://:b@example.com/x")
     assert len(registry.all()) == 2
+
+
+# --- Phase 6: per-run `run_id`, so source captures never collide across runs -----------
+
+
+def test_run_id_defaults_to_a_timestamp_shaped_stamp():
+    """Not asserting two default registries differ — same-second construction would be
+    flaky (see the plan's Phase 6 test list). Only the shape is pinned here.
+    """
+    registry = SourceRegistry()
+
+    datetime.strptime(registry.run_id, "%Y-%m-%d-%H%M%S")  # must not raise
+
+
+def test_run_id_explicit_value_is_used_verbatim():
+    registry = SourceRegistry(run_id="2026-08-12-093000")
+
+    assert registry.run_id == "2026-08-12-093000"

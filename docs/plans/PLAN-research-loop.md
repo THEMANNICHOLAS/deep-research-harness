@@ -364,8 +364,9 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ### D10: The fetch tool captures source content to per-source workspace files
 - **Chosen:** `fetch_pages` writes each source's full extracted text (untruncated, unlike the
-  capped model-visible render) to `<workspace_dir>/sources/S<n>.md` with a URL and title
-  header, at fetch time. A non-`fetched` outcome writes a stub whose first line names the
+  capped model-visible render) to ~~`<workspace_dir>/sources/S<n>.md`~~
+  `<workspace_dir>/sources/<run_id>/S<n>.md` (see `## Reconciliations` 2026-08-12 — Phase 6)
+  with a URL and title header, at fetch time. A non-`fetched` outcome writes a stub whose first line names the
   failure. Verification (Phase 6) reads only these files.
 - **Rejected:** Extending `SourceRegistry` with content fields — content dies with the
   process (nothing left for a cut-short run), and it grows a substrate seam the sibling plan
@@ -413,7 +414,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 3: Tracer bullet — question in, report on disk
 - [x] Phase 4: Pre-research clarification
 - [x] Phase 5: Run ceiling and cut-short reporting
-- [ ] Phase 6: Claim verification and disclosure
+- [x] Phase 6: Claim verification and disclosure
 - [ ] Phase 7: Researcher and reader tier contracts
 - [ ] Final verification
 
@@ -541,7 +542,9 @@ workspace file that verification later reads offline.
   (D10).
 
 **Contracts:**
-- Source file path, frozen: `<workspace_dir>/sources/S<n>.md` — a URL and title header, then
+- Source file path, ~~frozen: `<workspace_dir>/sources/S<n>.md`~~ amended to
+  `<workspace_dir>/sources/<run_id>/S<n>.md` (see `## Reconciliations` 2026-08-12 —
+  Phase 6) — a URL and title header, then
   the full extracted text (untruncated; the model-visible render stays capped). A
   non-`fetched` outcome writes a stub whose first line names the outcome (e.g.
   `FETCH FAILED: blocked`). Phase 6 treats any stub as unusable.
@@ -852,7 +855,9 @@ remaining gap.
   reimplement marker matching or link rendering, and do NOT mint IDs here (substrate D4).
 - Call `build_chat_model(config, "head")` from Phase 1 — do NOT construct a model or add
   retry (the returned client already retries).
-- Read source content from Phase 2's frozen `sources/S<n>.md` path — do NOT refetch (D10).
+- Read source content from Phase 2's ~~frozen `sources/S<n>.md`~~ amended
+  `sources/<run_id>/S<n>.md` path (see `## Reconciliations` 2026-08-12 — Phase 6) — do NOT
+  refetch (D10).
 - Pattern to mirror: `harness/tools/fetch.py`'s independent per-item outcomes, where one
   item's failure never fails the batch.
 
@@ -878,17 +883,17 @@ remaining gap.
   the mitigation.
 
 **Tests (write first, confirm red):**
-- [ ] Each verdict in the frozen vocabulary is reachable and renders a visible marker in the
+- [x] Each verdict in the frozen vocabulary is reachable and renders a visible marker in the
       report: a claim its source supports, one its source does not, one with no citation, one
       citing an unregistered ID, and one citing a source whose file is a failure stub.
-- [ ] Each claim is checked against only its own cited source's captured file — a check never
+- [x] Each claim is checked against only its own cited source's captured file — a check never
       receives another source's text and never triggers a fetch.
-- [ ] Claims are checked one at a time — verification issues no concurrent model calls (D4).
-- [ ] One failing check does not fail the pass; the remaining claims are still checked and
+- [x] Claims are checked one at a time — verification issues no concurrent model calls (D4).
+- [x] One failing check does not fail the pass; the remaining claims are still checked and
       the failure is disclosed.
-- [ ] Disagreeing sources produce a conflicts section naming both positions and both IDs, and
+- [x] Disagreeing sources produce a conflicts section naming both positions and both IDs, and
       no verdict about which is right.
-- [ ] Every `[Sn]` marker surviving into the report resolves to a clickable link, and any that
+- [x] Every `[Sn]` marker surviving into the report resolves to a clickable link, and any that
       cannot is reported by `unresolved_ids` and disclosed.
 
 **Steps:**
@@ -904,7 +909,7 @@ remaining gap.
 - [ ] Manual live check: a real run produces a report in which at least one claim carries a
       non-`supported` marker or the report states that all claims were supported, and every
       citation in it is a working link.
-- [ ] `uv run ruff check .` and `uv run mypy .` clean for the new files.
+- [x] `uv run ruff check .` and `uv run mypy .` clean for the new files.
 
 ### Phase 7: Researcher and reader tier contracts
 
@@ -976,8 +981,9 @@ prompt artifacts, so a later round wires the pyramid without renegotiating the s
 - [ ] Manual end-to-end: `python -m harness "<an ambiguous question>"` asks at least one
       clarifying question, answers it, researches, and writes a report whose citations all
       resolve, whose unsupported claims are marked, and whose disclosure section is present.
-- [ ] Every source consulted in the manual end-to-end run has a `sources/S<n>.md` file in the
-      workspace — content or failure stub.
+- [ ] Every source consulted in the manual end-to-end run has a
+      ~~`sources/S<n>.md`~~ `sources/<run_id>/S<n>.md` file in the workspace — content or
+      failure stub.
 - [ ] `harness.toml` and `.env.example` between them name every setting the code reads, and no
       endpoint, model ID, or key appears as a literal in `harness/`.
 - [ ] The recorded single-agent token baseline from Phase 3 is written down where the next
@@ -1169,6 +1175,43 @@ contract-violating mid-run ask is bounded only by the time left on the clock, de
 no second timeout and no new setting. R7's other half — the ceiling still yields a report from
 whatever was gathered — is unaffected.
 
+2026-08-12 — Phase 6: D10's frozen source path `<workspace_dir>/sources/S<n>.md` collides
+across runs → amended to `<workspace_dir>/sources/<run_id>/S<n>.md`. `[Sn]` IDs are minted
+per-run (substrate D4), but `agent.workspace_dir` is one shared directory reused by every run,
+so a run that fetches fewer sources than its predecessor leaves the predecessor's `S<n>.md`
+readable under an ID it never fetched. Phase 5 flagged this as its Watch-next precisely
+because Phase 6 verification reads those files: a claim would be checked against a *different
+run's page* and returned `supported`, which is the exact class of silent overstatement R3
+exists to prevent. Phase 5 already solved the same collision for workspace notes with an
+mtime filter (`_MTIME_TOLERANCE_SECONDS` in `harness/report.py`); the developer chose
+structural separation over a second mtime filter at this gate, so collisions become
+impossible rather than detected after the fact, and each run's captured pages survive for
+debugging instead of being overwritten.
+
+Mechanism (developer-selected at this gate over two alternatives): `SourceRegistry` gains a
+`run_id` attribute defaulting to a construction-time `%Y-%m-%d-%H%M%S` stamp, and
+`_sources_dir` takes `(config, registry)`. The registry is already the per-run object and
+already reaches all three consumers — `fetch.py` receives it from `build_tools`, `report.py`
+carries it on `RunOutcome`, and `verify.py` will hold it — so no new parameter is threaded
+through `build_tools`/`build_agent` and substrate D8's signature is untouched. The default is
+a fresh stamp rather than a shared fallback so an omitted `run_id` still cannot collide;
+`__main__` passes the run's own `started_at` stamp. Note the sources dir and the report
+filename do NOT carry the same stamp — `run_id` is the run's START, while `write_report`
+stamps the filename at WRITE time — so on a long run they differ by the run's duration.
+Aligning them would mean changing Phase 3's frozen filename source, which is not worth fresh
+drift; pair a report with its sources dir by ordering, not by string equality. Rejected: a
+required `run_id` (most
+explicit, but ~40 mechanical test-site edits blow the phase's diff budget) and threading
+`run_id` through `build_tools` (disturbs substrate D8's frozen signature and sends run
+identity down two paths instead of one).
+
+Consequences: Phase 2's **Contracts** path and its already-passed acceptance criterion, D10's
+**Chosen** path, Phase 6's **Reuse** line, and the plan's `## Verification` bullet are struck
+and amended in place. No requirement text changes — R8's obligation is *that* content is
+captured and read from capture, not where it sits — so this does not escalate to
+REQUIREMENTS. Old flat `sources/S<n>.md` files from Phases 2-5 runs are orphaned, not
+migrated; they are disposable run artifacts.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
@@ -1271,6 +1314,29 @@ entered on ANY mid-run termination, not only on wall-clock expiry, and `__main__
 a terminal model failure into a plain stderr message plus a cut-short report rather than a
 traceback. Evidence that a useful partial report was possible: the todo plan and three captured
 `sources/S<n>.md` files were already on disk when it died.
+
+2026-08-12 — Phase 6: the per-claim check needs a model prompt, and the phase's **Files** list
+names only `harness/verify.py`, `harness/report.py` and the two test files — no prompt file.
+Not a contradiction (the plan simply never says where the prompt lives), so this is a
+Discovery, not Drift. → **acted on now**: a new `harness/prompts/verify.md` rendered through
+the existing `render()` loader, matching `orchestrator.md` and `subagent.md`. Chosen over a
+module-level template string in `verify.py` because it would otherwise be the only model
+prompt in the codebase outside `harness/prompts/`, and Phase 7 is about to freeze two more
+prompts as artifacts — the odd one out would read as an oversight to a cold session. The
+phase's Files list is therefore one file longer than written.
+
+2026-08-12 — Phase 6: the plan says verification "walks its claims" but never defines a claim.
+→ **decided at the 3C gate**: a claim is a SENTENCE, and one `ClaimCheck` is produced per
+(sentence × cited `[Sn]` marker), so a sentence citing two sources is checked twice,
+independently, once against each. Rejected: a whole paragraph/list item as the claim unit (no
+sentence splitter needed, but one bad clause marks five good sentences unsupported, which
+reads to a non-technical reader as "none of this is trustworthy" — the opposite of the
+calibration R3 wants), and a text span running back from each marker (most faithful to what a
+citation asserts, but spans go ragged in real prose and uncited text belongs to no span, so
+the `uncited` verdict would need a second extraction pass regardless). Consequence: conflict
+detection needs no extra model call and no extra vocabulary — a conflict is one sentence whose
+several cited sources return disagreeing verdicts, rendered with both positions and both IDs
+and no adjudication (D3).
 
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
@@ -1458,3 +1524,39 @@ phase). Append-only, empty at plan creation. -->
   verification reads `sources/S<n>.md`, and those files are NOT mtime-filtered the way
   workspace notes now are, so a stale `S1.md` from a previous run can still be read whenever
   IDs collide — decide there whether the same filter belongs on them.
+
+### 2026-08-12 — Phase 6: Claim verification and disclosure
+- Done: `harness/verify.py` (`Verdict`, `ClaimCheck`, `Conflict`, `VerificationResult`,
+  `VerifyError`, `extract_claims`, `verify_claims`) plus `harness/prompts/verify.md`, rendered
+  through the existing loader. `report.py` gained `RunOutcome.verification`, `_annotate`
+  (marker insertion then `registry.resolve()`, in that order), `_place_marker`,
+  `_conflicts_section` and `_gaps_section`. `__main__` runs the pass after the agent loop and
+  outside the wall clock, skipping it when the run died `cut_short="error"` and disclosing the
+  skip. Phase 5's Watch-next is settled by a Drift, not by an mtime filter: captures now live
+  at `sources/<run_id>/S<n>.md`. 211 tests green; all four gates clean. Live check NOT yet run
+  — it needs a real endpoint, so only the developer can.
+- Learned: (1) `extract_claims` joins a block's lines with a space, so a claim is NOT
+  guaranteed to be a verbatim substring of the answer — a hard-wrapped sentence or a
+  "Key findings:" lead-in above bullets both produce one that is not. `str.replace` then
+  no-oped and the verdict was computed and silently thrown away. Found by the 3F review, not
+  by any gate, because every test fed single-line answers. Now placed by a whitespace-tolerant
+  regex, and anything still unplaceable is disclosed in `## Gaps and disclosures` rather than
+  dropped. Generalise: when a helper's output is fed back into a `str.replace` against its own
+  input, test the shapes where the two can diverge. (2) Marker insertion MUST precede
+  `registry.resolve()` — resolving first rewrites `[S1]` into a link and no claim matches.
+  (3) Citation resolution is unconditional, not gated on the verification pass: a Phase 3 test
+  asserting a raw `[S1]` survives was outdated by R1 and was updated (with developer approval)
+  to assert the resolved form. A sibling test passed only because its registry was empty.
+  (4) An assertion over the WHOLE report body cannot say "no bare marker survives" — `##
+  Sources` legitimately prints `- [S1] <link>`; scope such assertions to `## Answer`.
+- Drift: one Reconciliation (2026-08-12 — Phase 6): D10's frozen `sources/S<n>.md` became
+  `sources/<run_id>/S<n>.md`, with `run_id` on `SourceRegistry` and `_sources_dir(config,
+  registry)`. Struck in four places. Plus two `## Discoveries` entries dated 2026-08-12 (the
+  prompt file's home; the definition of a claim), both acted on now.
+- Watch-next: **the live check is owed for BOTH Phase 5 and Phase 6** and neither is ticked —
+  Phase 5's wall-clock check (plus the still-unmeasured `InMemorySaver` growth inherited from
+  Phase 4) and Phase 6's cited-report check. For Phase 7: it is the last phase, needs no new
+  runtime code, and its `docs/architecture.md` acceptance criterion wants failure modes
+  actually observed in Phases 3-6 — this entry's "Learned" items and Phase 5's are the
+  material. Also note `docs/INDEX.md`'s Shared Resources must list `harness/verify.py`, which
+  now exists.

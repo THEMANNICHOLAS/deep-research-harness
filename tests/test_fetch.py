@@ -483,7 +483,7 @@ async def test_each_fetched_page_writes_its_source_file(install_crawler, make_co
     message = await fetch_pages.ainvoke(_tool_call(["https://article.test"], "call-source-1"))
 
     source_id = message.artifact[0].source_id
-    source_path = tmp_path / "sources" / f"{source_id}.md"
+    source_path = tmp_path / "sources" / registry.run_id / f"{source_id}.md"
     assert source_path.exists()
     text = source_path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -514,7 +514,7 @@ async def test_source_file_text_is_untruncated_even_when_the_render_is_capped(
     assert long_markdown not in message.content
 
     source_id = message.artifact[0].source_id
-    text = (tmp_path / "sources" / f"{source_id}.md").read_text(encoding="utf-8")
+    text = (tmp_path / "sources" / registry.run_id / f"{source_id}.md").read_text(encoding="utf-8")
     assert long_markdown in text
 
 
@@ -547,7 +547,9 @@ async def test_failed_fetch_writes_a_stub_naming_its_outcome(
 
     page = message.artifact[0]
     assert page.outcome == outcome
-    text = (tmp_path / "sources" / f"{page.source_id}.md").read_text(encoding="utf-8")
+    text = (tmp_path / "sources" / registry.run_id / f"{page.source_id}.md").read_text(
+        encoding="utf-8"
+    )
     lines = text.splitlines()
     assert lines[0] == f"FETCH FAILED: {outcome}"
     assert "https://fail.test" in text
@@ -590,8 +592,12 @@ async def test_a_mixed_batch_writes_content_for_successes_and_stubs_for_failures
     )
 
     ok_page, bad_page = message.artifact
-    ok_text = (tmp_path / "sources" / f"{ok_page.source_id}.md").read_text(encoding="utf-8")
-    bad_text = (tmp_path / "sources" / f"{bad_page.source_id}.md").read_text(encoding="utf-8")
+    ok_text = (tmp_path / "sources" / registry.run_id / f"{ok_page.source_id}.md").read_text(
+        encoding="utf-8"
+    )
+    bad_text = (tmp_path / "sources" / registry.run_id / f"{bad_page.source_id}.md").read_text(
+        encoding="utf-8"
+    )
 
     assert ok_text.splitlines()[0] == f"# {ok_page.source_id}: https://ok.test"
     assert "ok body" in ok_text
@@ -620,8 +626,8 @@ async def test_one_source_write_failure_does_not_poison_the_batch_or_go_silent(
     # Source IDs are minted in input order by a fresh registry, so the first URL is
     # S1 and the second S2 — predictable before the call, letting us target exactly
     # one write for failure.
-    failing_path = tmp_path / "sources" / "S1.md"
-    ok_path = tmp_path / "sources" / "S2.md"
+    failing_path = tmp_path / "sources" / registry.run_id / "S1.md"
+    ok_path = tmp_path / "sources" / registry.run_id / "S2.md"
     real_write_text = Path.write_text
 
     def raising_write_text(self: Path, *args: object, **kwargs: object) -> int:
@@ -676,7 +682,7 @@ async def test_refetching_the_same_url_overwrites_the_same_source_file(
     second_id = second_message.artifact[0].source_id
 
     assert first_id == second_id
-    sources_dir = tmp_path / "sources"
+    sources_dir = tmp_path / "sources" / registry.run_id
     assert list(sources_dir.glob(f"{first_id}*.md")) == [sources_dir / f"{first_id}.md"]
     text = (sources_dir / f"{first_id}.md").read_text(encoding="utf-8")
     assert "second" in text

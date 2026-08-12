@@ -40,6 +40,7 @@ from harness.config import ConfigError, load_config
 from harness.models import ModelError, preflight
 from harness.report import CutShortReason, RunOutcome, format_todos, write_report
 from harness.sources import SourceRegistry
+from harness.verify import VerificationResult, extract_claims, verify_claims
 
 _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -170,12 +171,15 @@ async def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    registry = SourceRegistry()
-    agent = build_agent(config, registry)
-
     # Stamped before the agent can write anything, so a cut-short report can tell THIS
     # run's workspace notes from a previous run's leftovers — see `report._notes_section`.
+    # The same stamp also names this run's `sources/<run_id>/` directory (`SourceRegistry`
+    # below), which is what keeps a previous run's captures out of this run's verification
+    # (see the plan's `## Reconciliations` 2026-08-12 — Phase 6).
     started_at = datetime.now()
+
+    registry = SourceRegistry(run_id=started_at.strftime("%Y-%m-%d-%H%M%S"))
+    agent = build_agent(config, registry)
 
     # A stable thread_id for the whole run — the checkpointer requires one, and the
     # interrupt/resume loop below must keep resuming the SAME thread.
@@ -274,15 +278,46 @@ async def main(argv: list[str] | None = None) -> int:
     messages: list[BaseMessage] = final_state["messages"] if final_state else []
     usage = _sum_usage(messages)
 
+    answer = _final_answer(messages)
+    verification = None
+    if cut_short == "error":
+        # A model-outage death means the head model is near-certainly still unreachable —
+        # running one verification call per claim, each carrying Phase 1's bounded
+        # backoff, would burn minutes on calls that are near-certain to fail before the
+        # report is even written. Skipping is disclosed, never silent (3F fix pass,
+        # Minor finding) — `## Gaps and disclosures` states it via `check_failures`.
+        verification = VerificationResult(
+            check_failures=[
+                "verification skipped: the run ended in an error, so claims were not checked"
+            ]
+        )
+    elif answer:
+        claims = extract_claims(answer)
+        # Computed once and reused below — `verify_claims` no longer recomputes it (3F fix
+        # pass, simplification). Worded as "claim(s)", not a call count: the actual number
+        # of model calls is per (claim x cited source), which this count does not claim
+        # to be.
+        print(f"verifying {len(claims)} claim(s) against their cited sources...", file=sys.stderr)
+        try:
+            verification = await verify_claims(answer, config, registry, claims=claims)
+        except Exception as exc:  # noqa: BLE001
+            # Best-effort + disclose: a pass that fails wholesale is reported IN the
+            # report, never silently dropped. Per-claim failures are handled inside the
+            # pass itself.
+            verification = VerificationResult(
+                check_failures=[f"verification pass failed: {type(exc).__name__}: {exc}"]
+            )
+
     outcome = RunOutcome(
         question=args.question,
-        answer=_final_answer(messages),
+        answer=answer,
         registry=registry,
         usage=usage,
         cut_short=cut_short,
         cut_short_detail=cut_short_detail,
         todos=last_todos or [],
         started_at=started_at,
+        verification=verification,
     )
     path = write_report(outcome, config)
     if cut_short == "error":

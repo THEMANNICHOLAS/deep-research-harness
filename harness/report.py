@@ -1,9 +1,12 @@
 """Assemble a finished run into a report file.
 
-Pure string work: no model, no network — the only I/O is writing the one report file and
-reading the captured `<workspace_dir>/sources/S<n>.md` files to judge which registered
-sources are usable evidence (3F fix pass, Major finding), so this module stays fully
-offline-testable (Phase 3 plan, `## Execution order` step 5).
+Pure string work: no model, no network — this module never calls a model itself. The
+verification pass's one model call per (claim x source) happens in `harness.verify`,
+before `write_report` is ever called; by the time a `RunOutcome` reaches this module its
+`verification` field is already-computed data. The only I/O here is writing the one
+report file and reading the captured `<workspace_dir>/sources/<run_id>/S<n>.md` files to
+judge which registered sources are usable evidence (3F fix pass, Major finding), so this
+module stays fully offline-testable (Phase 3 plan, `## Execution order` step 5).
 """
 
 import re
@@ -17,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from harness.config import HarnessConfig
 from harness.sources import Source, SourceRegistry
 from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
+from harness.verify import ClaimCheck, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
@@ -29,6 +33,8 @@ CutShortReason = Literal["round_cap", "wall_clock", "error"]
 
 _CUT_SHORT_HEADING = "## Run cut short"
 _NOTES_HEADING = "## Working notes"
+_CONFLICTS_HEADING = "## Conflicting sources"
+_GAPS_HEADING = "## Gaps and disclosures"
 _NO_NOTES_TEXT = "No working notes were written before the cutoff."
 _NO_ANSWER_TEXT = "The run produced no final answer."
 _NO_UNFINISHED_TODOS_TEXT = "No planned todos remained unfinished."
@@ -71,6 +77,10 @@ class RunOutcome(BaseModel):
     # When the run began, used to keep a PREVIOUS run's workspace notes out of this
     # report — see `_notes_section`. `None` means "unknown", which keeps every note.
     started_at: datetime | None = None
+    # `None` means the verification pass did not run, and renders exactly the
+    # pre-Phase-6 report — no markers, no "## Conflicting sources"/"## Gaps and
+    # disclosures" sections.
+    verification: VerificationResult | None = None
 
 
 def format_todos(todos: list[dict[str, Any]]) -> str:
@@ -110,17 +120,17 @@ def _usage_lines(usage: UsageMetadata) -> list[str]:
     ]
 
 
-def _is_usable(config: HarnessConfig, source: Source) -> bool:
+def _is_usable(config: HarnessConfig, registry: SourceRegistry, source: Source) -> bool:
     """A registered source is usable evidence iff its captured file exists and isn't a stub.
 
     `harness/tools/fetch.py` registers every attempted URL, including 404s, blocked pages,
     and empty ones — the registry alone cannot tell a real finding from a dead URL. The
-    captured `<workspace_dir>/sources/S<n>.md` file is Phase 2's frozen record of what
-    actually came back, so usability is judged from it, not from registry membership. A
-    missing file counts as NOT usable, per the Phase 2 handoff note: absence is treated
-    exactly like a stub.
+    captured `<workspace_dir>/sources/<run_id>/S<n>.md` file is Phase 2's frozen record of
+    what actually came back, so usability is judged from it, not from registry
+    membership. A missing file counts as NOT usable, per the Phase 2 handoff note:
+    absence is treated exactly like a stub.
     """
-    path = _sources_dir(config) / f"{source.id}.md"
+    path = _sources_dir(config, registry) / f"{source.id}.md"
     if not path.exists():
         return False
     try:
@@ -134,7 +144,7 @@ def _sources_section(config: HarnessConfig, registry: SourceRegistry) -> str:
     usable: list[Source] = []
     unusable: list[Source] = []
     for source in registry.all():
-        (usable if _is_usable(config, source) else unusable).append(source)
+        (usable if _is_usable(config, registry, source) else unusable).append(source)
 
     lines: list[str] = []
     if usable:
@@ -205,6 +215,124 @@ def _notes_section(config: HarnessConfig, started_at: datetime | None) -> str:
     return "\n\n".join(sections) if sections else _NO_NOTES_TEXT
 
 
+def _place_marker(text: str, claim: str, marker: str) -> str | None:
+    """Locate `claim` in `text` whitespace-tolerantly and insert `marker` right after it.
+
+    `extract_claims` joins a block's lines with a single space, so a hard-wrapped or
+    bulleted claim is NOT always a verbatim substring of the answer — a literal
+    `str.replace` then silently no-ops (3F fix pass, Major finding). Matching instead
+    against a regex built from the claim's whitespace-split tokens, joined by `\\s+`,
+    tolerates exactly that collapsing while still requiring the claim's words to appear
+    in order and adjacent. Returns `None` if the claim cannot be located at all, so the
+    caller can disclose it instead of dropping it.
+    """
+    tokens = claim.split()
+    if not tokens:
+        return None
+    pattern = re.compile(r"\s+".join(re.escape(token) for token in tokens))
+    match = pattern.search(text)
+    if match is None:
+        return None
+    # Known limitation, accepted: if the same sentence appears twice, `pattern.search`
+    # always finds the first occurrence — both markers would land there. Not worth
+    # building an index to fix.
+    return text[: match.end()] + marker + text[match.end() :]
+
+
+def _annotate(outcome: RunOutcome) -> tuple[str, list[ClaimCheck]]:
+    """Mark every non-`supported` claim in the answer, then resolve `[Sn]` markers.
+
+    Order is load-bearing: markers are inserted while the claim text can still be found
+    in the answer, and `registry.resolve()` runs LAST over the whole thing. Resolving
+    first would rewrite `[S1]` into a link and no claim would match.
+
+    Returns `(annotated_text, unplaced)` — `unplaced` holds every check whose claim could
+    not be located in the answer at all. A verdict that cannot be shown in place must
+    still be disclosed somewhere; the caller renders `unplaced` into
+    `## Gaps and disclosures` (3F fix pass, Major finding).
+    """
+    text = outcome.answer
+    unplaced: list[ClaimCheck] = []
+    if outcome.verification is not None:
+        for check in outcome.verification.checks:
+            if check.verdict == "supported":
+                continue
+            if check.source_id is None:
+                marker = "\n\n**[uncited]**"
+            else:
+                marker = f"\n\n**[{check.verdict} — {check.source_id}]**"
+            updated = _place_marker(text, check.claim, marker)
+            if updated is None:
+                unplaced.append(check)
+                continue
+            text = updated
+    return outcome.registry.resolve(text), unplaced
+
+
+def _conflicts_section(verification: VerificationResult) -> str:
+    """One block per claim where cited sources disagree. Adjudicates nothing (D3)."""
+    if not verification.conflicts:
+        return ""
+
+    blocks: list[str] = []
+    for conflict in verification.conflicts:
+        lines = [
+            conflict.claim,
+            "",
+            "The cited sources disagree on this claim. The harness does not decide "
+            "between them — both positions are given below so you can judge for "
+            "yourself.",
+        ]
+        lines.extend(
+            f"- [{position.source_id}] {position.detail}" for position in conflict.positions
+        )
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _gaps_section(
+    outcome: RunOutcome, verification: VerificationResult, unplaced: list[ClaimCheck]
+) -> str:
+    """Unresolved citation markers, per-check failures, unplaceable markers, and the
+    uncited-claim count.
+    """
+    lines: list[str] = []
+
+    # The RAW answer, not the annotated one: annotated markers never introduce or
+    # remove an `[Sn]` marker, but reading the raw text keeps this independent of that
+    # rendering step.
+    unresolved = outcome.registry.unresolved_ids(outcome.answer)
+    if unresolved:
+        lines.append("Unresolved citation markers (no matching source was registered):")
+        lines.extend(f"- {source_id}" for source_id in unresolved)
+
+    if verification.check_failures:
+        if lines:
+            lines.append("")
+        lines.append("Verification checks that failed to run:")
+        lines.extend(f"- {failure}" for failure in verification.check_failures)
+
+    if unplaced:
+        if lines:
+            lines.append("")
+        lines.append("Verification results whose marker could not be placed in the answer text:")
+        lines.extend(
+            f"- {check.verdict} — {check.source_id or 'no source cited'}: the marker "
+            "could not be positioned in the answer text."
+            for check in unplaced
+        )
+
+    uncited_count = sum(1 for check in verification.checks if check.verdict == "uncited")
+    if uncited_count:
+        if lines:
+            lines.append("")
+        lines.append(
+            f"{uncited_count} claim(s) in the answer carried no citation marker (uncited)."
+        )
+
+    return "\n".join(lines)
+
+
 def _render_body(
     outcome: RunOutcome, config: HarnessConfig, model_label: str, now: datetime
 ) -> str:
@@ -221,17 +349,27 @@ def _render_body(
     if outcome.cut_short:
         lines += [_CUT_SHORT_HEADING, "", _cut_short_section(outcome, config), ""]
 
+    annotated_answer, unplaced_checks = _annotate(outcome)
     lines += [
         "## Answer",
         "",
         # A cut-short run often has no prose answer at all. Say so, rather than rendering
         # an empty section that reads as "the answer is nothing" (3F Major).
-        outcome.answer or _NO_ANSWER_TEXT,
+        annotated_answer or _NO_ANSWER_TEXT,
         "",
     ]
 
     if outcome.cut_short:
         lines += [_NOTES_HEADING, "", _notes_section(config, outcome.started_at), ""]
+
+    if outcome.verification is not None:
+        conflicts_text = _conflicts_section(outcome.verification)
+        if conflicts_text:
+            lines += [_CONFLICTS_HEADING, "", conflicts_text, ""]
+
+        gaps_text = _gaps_section(outcome, outcome.verification, unplaced_checks)
+        if gaps_text:
+            lines += [_GAPS_HEADING, "", gaps_text, ""]
 
     lines += [
         "## Sources",

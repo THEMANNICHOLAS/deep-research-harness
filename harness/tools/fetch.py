@@ -39,9 +39,9 @@ _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form",
 FETCH_FAILED_PREFIX = "FETCH FAILED: "
 
 
-def _sources_dir(config: HarnessConfig) -> Path:
-    """The one place the frozen `<workspace_dir>/sources` layout is built."""
-    return config.agent.workspace_dir / "sources"
+def _sources_dir(config: HarnessConfig, registry: SourceRegistry) -> Path:
+    """The one place the `<workspace_dir>/sources/<run_id>` layout is built."""
+    return config.agent.workspace_dir / "sources" / registry.run_id
 
 
 def build_browser_config(settings: BrowserSettings) -> BrowserConfig:
@@ -282,7 +282,7 @@ async def _fetch(
             )
         )
 
-    sources_dir = _sources_dir(config)
+    sources_dir = _sources_dir(config, registry)
     for page in pages:
         _write_source_file(sources_dir, page)
 
@@ -293,11 +293,11 @@ async def _fetch(
 def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseTool:
     """Build the `fetch_pages` tool, closing over `config` and the shared `registry`.
 
-    Creates `<workspace_dir>/sources` up front, so an unwritable workspace fails at
-    startup — before any research is spent — rather than silently losing captures
-    mid-run.
+    Creates `<workspace_dir>/sources/<run_id>` up front, so an unwritable workspace
+    fails at startup — before any research is spent — rather than silently losing
+    captures mid-run.
     """
-    _sources_dir(config).mkdir(parents=True, exist_ok=True)
+    _sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
     class FetchPagesInput(BaseModel):
         """Model-facing input schema for the `fetch_pages` tool."""
