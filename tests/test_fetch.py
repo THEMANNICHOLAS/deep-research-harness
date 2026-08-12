@@ -235,6 +235,40 @@ async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_confi
     assert recorded.dispatcher.max_session_permit == 3
 
 
+async def test_dispatcher_is_memory_bounded_and_rate_limited(install_crawler, make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    results = [
+        _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"))
+    ]
+    fake_cls = install_crawler(results)
+
+    await fetch._fetch(["https://a.test"], config, registry)
+
+    dispatcher = fake_cls.calls[0].dispatcher
+    # 75%, not crawl4ai's 90% default: each permit is a real browser page.
+    assert dispatcher.memory_threshold_percent == 75.0
+    # Not a retry count — 0.9.2 re-fetches nothing on a 429/503; this caps how many times a
+    # domain's backoff delay doubles, and that sleep holds a concurrency permit.
+    assert dispatcher.rate_limiter is not None
+    assert dispatcher.rate_limiter.max_retries == 1
+
+
+async def test_crawl4ai_logging_is_silenced_on_both_configs(install_crawler, make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    results = [
+        _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"))
+    ]
+    fake_cls = install_crawler(results)
+
+    await fetch._fetch(["https://a.test"], config, registry)
+
+    # crawl4ai defaults `verbose` to True on both configs and prints into our process.
+    assert fake_cls.calls[0].config.verbose is False
+    assert fake_cls.constructed_with[0].verbose is False
+
+
 async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
@@ -383,9 +417,30 @@ async def test_content_type_header_on_the_result_drives_non_html_classification(
     assert pages[0].outcome == "non_html"
 
 
-async def test_result_whose_url_differs_from_the_input_is_still_paired(
+async def test_input_url_with_no_result_reports_a_single_error_outcome(
     install_crawler, make_config
 ):
+    config = make_config()
+    registry = SourceRegistry()
+    install_crawler([])
+
+    _, pages = await fetch._fetch(["https://a.test"], config, registry)
+
+    # This is the `None`-pairing branch (fetch.py:212-224), which was previously
+    # untested; it must survive the removal of the positional fallback.
+    assert len(pages) == 1
+    assert pages[0].url == "https://a.test"
+    assert pages[0].outcome == "error"
+    assert pages[0].markdown == ""
+    assert pages[0].error == "no result returned for this URL"
+
+
+async def test_result_matching_no_input_url_never_supplies_another_urls_body(
+    install_crawler, make_config
+):
+    # Supersedes the deleted test_result_whose_url_diff_from_input_paired, which asserted
+    # the opposite: that an unrelated result could be handed to an input URL positionally.
+    # A visible `error` is strictly safer than a plausible wrong citation.
     config = make_config()
     registry = SourceRegistry()
     results = [
@@ -398,8 +453,10 @@ async def test_result_whose_url_differs_from_the_input_is_still_paired(
     ]
     install_crawler(results)
 
-    _, pages = await fetch._fetch(["https://original.test/start"], config, registry)
+    content, pages = await fetch._fetch(["https://original.test/start"], config, registry)
 
-    assert len(pages) == 1
+    assert len(pages) == 1  # R6 — exactly one outcome per input URL
     assert pages[0].url == "https://original.test/start"
-    assert pages[0].markdown == "redirected content"
+    assert pages[0].outcome == "error"
+    assert pages[0].markdown == ""
+    assert "redirected content" not in content

@@ -80,6 +80,16 @@ to address.
   that session — converting the rest is a separate change, each pin chosen against what
   `uv.lock` already resolves, then re-locked and pushed through CI.
 
+- **Nothing retries a rate-limited page.** `RateLimiter(max_retries=...)` in
+  `harness/tools/fetch.py` does not re-fetch on a 429/503 — crawl4ai 0.9.2 calls
+  `update_delay` after the crawl has returned and only grows that domain's backoff delay
+  (`async_dispatcher.py:65-85`, verified 2026-08-11). So a source that rate-limits us is
+  reported `blocked` on a single attempt, and a transient 429 costs the whole page. This bites
+  research coverage against APIs and doc sites that throttle bursts. To address: a retry pass
+  in `_fetch` over the `blocked` outcomes, which is genuinely new machinery (attempt budget,
+  backoff, and a rule for how a retried page reports) — deliberately deferred in Phase 1 of
+  @docs/plans/PLAN-crawler-refinement.md, see its Reconciliation #1.
+
 - **An HTTP 404 that serves a real HTML body classifies as `fetched`.** Observed in the
   final end-to-end sanity check: a Wikipedia URL returning 404 came back
   `outcome=fetched, status_code=404` with the "page does not exist" body as its markdown,

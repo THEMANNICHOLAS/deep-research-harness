@@ -18,6 +18,7 @@ from crawl4ai import (  # type: ignore[import-untyped]
     DefaultMarkdownGenerator,
     MemoryAdaptiveDispatcher,
     PruningContentFilter,
+    RateLimiter,
 )
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
@@ -30,6 +31,19 @@ FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
 _BLOCKED_STATUSES = frozenset({403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
 
+# crawl4ai's own default is 90%, which on a box also hosting SearXNG and Chromium starts
+# shedding work far too late. Each concurrent crawl is a real browser page, so 75% leaves
+# headroom to finish the pages already in flight instead of pausing under real pressure.
+_MEMORY_THRESHOLD_PERCENT = 75.0
+
+# Despite the name, crawl4ai 0.9.2 re-fetches nothing on a 429/503: `update_delay` runs
+# after the crawl returns and this value caps how many times a domain's backoff delay may
+# double (`async_dispatcher.py:65-85`). That sleep is served while holding one of
+# `max_concurrency`'s permits, so 1 — the tightest cap — gives the slot back to the rest of
+# the batch soonest. It only bites when a batch holds 2+ URLs from one domain; either way a
+# rate-limited page still surfaces as `blocked`.
+_RATE_LIMIT_MAX_RETRIES = 1
+
 
 def build_browser_config(settings: BrowserSettings) -> BrowserConfig:
     """Map the harness's browser backend vocabulary onto crawl4ai's `browser_mode`.
@@ -38,8 +52,8 @@ def build_browser_config(settings: BrowserSettings) -> BrowserConfig:
     `browser_mode` is crawl4ai's. This function is the only place the two are mapped.
     """
     if settings.backend == "lightpanda":
-        return BrowserConfig(browser_mode="cdp", cdp_url=settings.cdp_url)
-    return BrowserConfig()
+        return BrowserConfig(browser_mode="cdp", cdp_url=settings.cdp_url, verbose=False)
+    return BrowserConfig(verbose=False)
 
 
 def classify(
@@ -109,35 +123,29 @@ def _title_of(result: object) -> str | None:
 
 
 def _pair(urls: list[str], results: list[object]) -> list[tuple[str, object | None]]:
-    """Pair each input URL with its crawl result, tolerating a redirect-renamed URL.
+    """Pair each input URL with the result crawl4ai keyed to that exact URL.
 
-    First pass: match each input URL against a dict keyed by `result.url` — the common
-    case. Second pass: any input URL left unmatched consumes the next still-unmatched
-    result in input order — this is what survives a redirect that leaves `result.url`
-    different from what was requested. An input URL with nothing left to match against
-    pairs with `None`.
+    crawl4ai keeps the requested URL on `result.url` and puts a redirect destination on
+    `redirected_url`, so an exact match is the only sound pairing. An input URL with no
+    matching result pairs with `None` and is reported as an `error` rather than consuming
+    an unclaimed result positionally — that fallback could attribute one page's body to
+    another page's `[Sn]` citation marker, which is silent and unfixable downstream.
+
+    One URL can legitimately yield two results: under critical memory pressure the
+    dispatcher returns a "Requeued" placeholder AND re-queues the crawl
+    (`async_dispatcher.py:289-293`), so the first of a URL's results is taken and that
+    page may report `error` despite the retry later succeeding. Pre-existing behaviour,
+    left alone deliberately — reordering to prefer a successful result would be new
+    machinery for a case only reachable above 95% memory.
     """
     by_url: dict[str | None, list[object]] = {}
     for result in results:
         by_url.setdefault(getattr(result, "url", None), []).append(result)
 
-    exact_matches: dict[int, object] = {}
-    claimed_ids: set[int] = set()
-    for index, url in enumerate(urls):
-        bucket = by_url.get(url)
-        if bucket:
-            match = bucket.pop(0)
-            exact_matches[index] = match
-            claimed_ids.add(id(match))
-
-    leftovers = iter(r for r in results if id(r) not in claimed_ids)
-
     pairs: list[tuple[str, object | None]] = []
-    for index, url in enumerate(urls):
-        if index in exact_matches:
-            pairs.append((url, exact_matches[index]))
-        else:
-            pairs.append((url, next(leftovers, None)))
+    for url in urls:
+        bucket = by_url.get(url)
+        pairs.append((url, bucket.pop(0) if bucket else None))
     return pairs
 
 
@@ -184,8 +192,13 @@ async def _fetch(
         markdown_generator=DefaultMarkdownGenerator(content_filter=PruningContentFilter()),
         cache_mode=CacheMode.BYPASS,
         stream=False,
+        verbose=False,
     )
-    dispatcher = MemoryAdaptiveDispatcher(max_session_permit=config.fetch.max_concurrency)
+    dispatcher = MemoryAdaptiveDispatcher(
+        max_session_permit=config.fetch.max_concurrency,
+        memory_threshold_percent=_MEMORY_THRESHOLD_PERCENT,
+        rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
+    )
 
     async with AsyncWebCrawler(config=build_browser_config(config.browser)) as crawler:
         raw_results = await crawler.arun_many(urls, config=run_config, dispatcher=dispatcher)
