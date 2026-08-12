@@ -23,9 +23,6 @@ model = "glm-5.2"
 provider = "cerebras"
 model = "gemma-4-31b"
 
-[browser]
-backend = "playwright"
-
 [fetch]
 page_timeout_ms = 20000
 max_concurrency = 8
@@ -52,9 +49,6 @@ model = "glm-5.2"
 [roles.subagent]
 provider = "cerebras"
 model = "gemma-4-31b"
-
-[browser]
-backend = "playwright"
 
 [search]
 base_url = "http://localhost:8080"
@@ -84,8 +78,6 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
     assert config.roles["head"].model == "glm-5.2"
     assert config.roles["subagent"].provider == "cerebras"
     assert config.roles["subagent"].model == "gemma-4-31b"
-
-    assert config.browser.backend == "playwright"
 
     assert config.fetch.page_timeout_ms == 20000
     assert config.fetch.max_concurrency == 8
@@ -134,30 +126,6 @@ def test_role_referencing_undeclared_provider_names_role_and_provider(tmp_path, 
     message = str(excinfo.value)
     assert "subagent" in message
     assert "nonexistent" in message
-
-
-def test_unknown_browser_backend_raises_config_error(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
-    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
-    toml_content = VALID_TOML.replace('backend = "playwright"', 'backend = "chromium-supreme"')
-    path = _write(tmp_path, toml_content)
-
-    with pytest.raises(ConfigError):
-        load_config(path)
-
-
-def test_lightpanda_backend_without_cdp_url_raises_config_error(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
-    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
-    toml_content = VALID_TOML.replace('backend = "playwright"', 'backend = "lightpanda"')
-    path = _write(tmp_path, toml_content)
-
-    with pytest.raises(ConfigError) as excinfo:
-        load_config(path)
-
-    message = str(excinfo.value)
-    assert "lightpanda" in message
-    assert "cdp_url" in message
 
 
 def test_malformed_toml_raises_config_error_not_tomldecodeerror(tmp_path):
@@ -264,7 +232,6 @@ def test_literal_api_key_in_the_file_is_rejected(tmp_path, monkeypatch):
                 '[roles.subagent]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n',
             ],
         ),
-        ("browser", ['[browser]\nbackend = "playwright"\n\n']),
     ],
 )
 def test_missing_top_level_table_raises_config_error_naming_it(
@@ -297,6 +264,31 @@ def test_shipped_harness_toml_loads_with_its_todo_placeholders(monkeypatch):
 
     assert config.providers["opencode"].base_url == "TODO"
     assert config.roles["head"].model == "TODO"
+
+
+def test_shipped_harness_toml_has_no_browser_surface(monkeypatch):
+    # Chromium is the only path; no config key selects a browser backend (R1).
+    monkeypatch.setenv("OPENCODE_API_KEY", "any")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "any")
+
+    config = load_config()
+
+    assert not hasattr(config, "browser")
+
+
+def test_browser_table_is_rejected_now_that_the_backend_is_gone(tmp_path, monkeypatch):
+    # Proves the key is genuinely GONE rather than merely unread — a config still
+    # carrying it now fails loudly instead of being silently ignored.
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    # Models a config file written before the backend was removed and never updated.
+    toml_content = VALID_TOML.replace("[fetch]", '[browser]\nbackend = "playwright"\n\n[fetch]')
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "browser" in str(excinfo.value)
 
 
 def test_missing_head_role_raises_config_error_naming_head(tmp_path, monkeypatch):

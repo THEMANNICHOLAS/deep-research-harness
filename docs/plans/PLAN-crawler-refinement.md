@@ -276,7 +276,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 
 - [x] Phase 1: Baseline — land existing work, retry policy, pairing
-- [ ] Phase 2: Remove Lightpanda
+- [x] Phase 2: Remove Lightpanda
 - [ ] Phase 3: Cap a call at five URLs
 - [ ] Phase 4: Boundary-aware truncation
 - [ ] Phase 5: Prune short boilerplate blocks
@@ -385,10 +385,14 @@ only path and no configuration key that selects a browser.
 - Truncation, pruning, and the retry constant.
 
 **Tests (write first, confirm red):**
-- [ ] The shipped `harness.toml` loads with no browser section present.
-- [ ] A config file that still contains a `[browser]` table is rejected — the strict models
+- [x] The shipped `harness.toml` loads with no browser section present.
+  (`test_shipped_harness_toml_has_no_browser_surface`; red on `assert not True`.)
+- [x] A config file that still contains a `[browser]` table is rejected — the strict models
   forbid extras, so this proves the key is genuinely gone rather than merely unused.
-- [ ] The `BrowserConfig` handed to crawl4ai for a fetch still has `verbose` false.
+  (`test_browser_table_is_rejected_now_that_the_backend_is_gone`; red on DID NOT RAISE.)
+- [x] The `BrowserConfig` handed to crawl4ai for a fetch still has `verbose` false. (Covered by
+  the existing `test_crawl4ai_logging_is_silenced_on_both_configs`, retargeted at the inline
+  config as the plan directs — green throughout, no new test written.)
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -397,10 +401,17 @@ only path and no configuration key that selects a browser.
 4. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `grep -ri lightpanda .` returns hits ONLY in `docs/plans/PLAN-harness-substrate.md`,
-  pre-existing `docs/decisions.md` entries, and this plan.
-- [ ] `docs/decisions.md` has one new trailing entry and no modified existing entry
-  (`git diff` shows additions only in that file).
+- [x] `grep -ri lightpanda .` returns hits ONLY in `docs/plans/PLAN-harness-substrate.md`,
+  pre-existing `docs/decisions.md` entries, and this plan. (Verified. Two hits the criterion's
+  wording did not anticipate, both correct: the NEW `docs/decisions.md` entry names Lightpanda
+  because R1 mandates recording the removal there, and `docs/plans/.impl/` scratch files are
+  gitignored and deleted at session end. Zero hits in `harness/`, `tests/`, `harness.toml`,
+  `CLAUDE.md`, `docs/INDEX.md`, `docs/guides/setup.md`, `docs/backlog.md`.)
+- [x] `docs/decisions.md` has one new trailing entry and no modified existing entry
+  (`git diff` shows additions only in that file). (`git diff --numstat` → `13 0`.)
+- [x] Beyond the plan's file list: `.env.example` also advertised the removed key and was
+  fixed — see the 2026-08-12 `## Discoveries` entry. The `grep` criterion could not catch it
+  because the line said "CDP", not "Lightpanda".
 
 ### Phase 3: Cap a call at five URLs
 **Risk:** flagged (!#3)
@@ -638,6 +649,14 @@ dropping `RateLimiter` entirely — it still supplies the inter-request politene
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+- **2026-08-12 — Phase 2: `.env.example` still advertises a browser backend key that no longer
+  exists.** Its header says non-secret endpoints "(SearXNG URL, browser backend/CDP URL, model
+  IDs) live in harness.toml", and `docs/guides/setup.md:30` tells the reader to copy that file —
+  so it is a live surface R1 covers, missed by the phase's file list and invisible to the
+  `grep -ri lightpanda` criterion because the line says "CDP", not "Lightpanda". → Surfaced by
+  the Phase 2 judgment review; suggested action: drop the phrase from the comment as part of
+  Phase 2 (one line, same requirement).
+
 - **2026-08-11 — Phase 1 — DEFERRED: the one-page fake-result setup repeats four times in
   `tests/test_fetch.py`.** `make_config()` + `SourceRegistry()` +
   `_FakeResult("https://a.test", markdown=_FakeMarkdown("a", "a"))` now appears at four call
@@ -670,4 +689,25 @@ phase). Append-only, empty at plan creation. -->
   concurrent research-loop session first and expect a conflict in `harness/config.py` /
   `tests/conftest.py` rather than a clean rebase. Also note `docs/plans/PLAN-crawler-refinement.html`
   is still untracked and deliberately uncommitted.
+
+### 2026-08-12 — Phase 2: Remove Lightpanda
+- Done: Deleted `BrowserSettings` + `HarnessConfig.browser`, the `[browser]` TOML table, and
+  `build_browser_config` (its call site now inlines `BrowserConfig(verbose=False)`); dropped the
+  dead tests and the `BrowserSettings` fixture wiring; stripped live references from `CLAUDE.md`,
+  `docs/INDEX.md`, `docs/guides/setup.md` (env var, `[browser]` bullet, Lightpanda Docker
+  section) and deleted `docs/backlog.md`'s Lightpanda entry; appended one `docs/decisions.md`
+  entry. 50 insertions / 119 deletions across 12 files. Suite 97 passed; all four gates green.
+- Learned: `.env.example` was a live surface the plan's file list missed and its
+  `grep -ri lightpanda` criterion structurally could not catch (the line said "CDP") — fixed in
+  this phase, logged under `## Discoveries`. Risk #2's blast radius was verified as zero on this
+  tree: nothing anywhere reads `config.browser`, and `harness/config.py` / `tests/conftest.py`
+  were both clean at phase start, so no live conflict occurred. The old decisions entry's
+  `@docs/backlog.md` pointer went dangling when that entry was deleted; the new entry now says
+  so explicitly, since the earlier one may not be edited.
+- Drift: none.
+- Watch-next: **Risk #2 is not fully discharged — coordination is still owed before this branch
+  merges.** The commits are local; another session writing against `HarnessConfig` will only
+  discover the deletion at merge. Phase 3 next: it adds `FetchSettings.max_urls_per_call` and
+  moves `FetchPagesInput` inside `build_fetch_tool`, which changes the tool's public schema
+  (risk #3) — the same session should be told when it lands.
 

@@ -54,8 +54,7 @@ not the ceiling).
   inline the whole ~559k-token lockfile into every session's context).
   Converting those floors to `==` is a docs/backlog.md item.
 - No database — reports are timestamped markdown files on disk.
-- Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium
-  (Lightpanda was tried and retired — see docs/decisions.md).
+- Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium.
 - Search: self-hosted SearXNG (JSON API).
 - Models: OpenCode API (GLM 5.2 default orchestrator, DeepSeek V4 Pro
   fallback); Cerebras API (Gemma 4 31B default worker, config-swappable).

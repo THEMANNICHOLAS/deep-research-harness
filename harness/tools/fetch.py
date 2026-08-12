@@ -23,7 +23,7 @@ from crawl4ai import (  # type: ignore[import-untyped]
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.config import BrowserSettings, HarnessConfig
+from harness.config import HarnessConfig
 from harness.sources import SourceRegistry, normalize_url
 
 FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
@@ -43,17 +43,6 @@ _MEMORY_THRESHOLD_PERCENT = 75.0
 # the batch soonest. It only bites when a batch holds 2+ URLs from one domain; either way a
 # rate-limited page still surfaces as `blocked`.
 _RATE_LIMIT_MAX_RETRIES = 1
-
-
-def build_browser_config(settings: BrowserSettings) -> BrowserConfig:
-    """Map the harness's browser backend vocabulary onto crawl4ai's `browser_mode`.
-
-    `settings.backend` is the harness's vocabulary (`"lightpanda"` / `"playwright"`);
-    `browser_mode` is crawl4ai's. This function is the only place the two are mapped.
-    """
-    if settings.backend == "lightpanda":
-        return BrowserConfig(browser_mode="cdp", cdp_url=settings.cdp_url, verbose=False)
-    return BrowserConfig(verbose=False)
 
 
 def classify(
@@ -200,7 +189,8 @@ async def _fetch(
         rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
     )
 
-    async with AsyncWebCrawler(config=build_browser_config(config.browser)) as crawler:
+    # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
+    async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as crawler:
         raw_results = await crawler.arun_many(urls, config=run_config, dispatcher=dispatcher)
         results = list(raw_results)
 

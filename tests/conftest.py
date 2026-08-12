@@ -3,7 +3,6 @@
 import pytest
 
 from harness.config import (
-    BrowserSettings,
     FetchSettings,
     HarnessConfig,
     ProviderConfig,
@@ -35,7 +34,6 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
                 "head": RoleConfig(provider="opencode", model="test-model"),
                 "subagent": RoleConfig(provider="opencode", model="test-model"),
             },
-            browser=BrowserSettings(backend="playwright", cdp_url=None),
             fetch=FetchSettings(
                 page_timeout_ms=page_timeout_ms,
                 max_concurrency=max_concurrency,

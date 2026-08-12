@@ -6,7 +6,6 @@ import pytest
 from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter  # type: ignore[import-untyped]
 from langchain_core.tools import BaseTool
 
-from harness.config import BrowserSettings
 from harness.sources import SourceRegistry
 from harness.tools import fetch
 
@@ -323,18 +322,6 @@ async def test_built_tool_exposes_the_pinned_contract_and_returns_content_and_ar
     assert [page.url for page in message.artifact] == ["https://tool.test"]
     assert message.artifact[0].markdown == "clean body"
     assert message.artifact[0].title == "Tool Page"
-
-
-def test_build_browser_config_maps_backend_to_browser_mode():
-    lightpanda = fetch.build_browser_config(
-        BrowserSettings(backend="lightpanda", cdp_url="ws://lightpanda.test:9222")
-    )
-    assert lightpanda.browser_mode == "cdp"
-    assert lightpanda.cdp_url == "ws://lightpanda.test:9222"
-
-    playwright = fetch.build_browser_config(BrowserSettings(backend="playwright"))
-    assert playwright.cdp_url is None
-    assert playwright.browser_mode == "dedicated"
 
 
 async def test_fit_markdown_is_preferred_over_raw_markdown(install_crawler, make_config):

@@ -10,17 +10,6 @@ to address.
 
 ## Entries
 
-- **Lightpanda cannot currently drive crawl4ai's `goto`.** No page lifecycle event
-  ever arrives over CDP, so `Page.goto` times out even though the CDP connection
-  attaches successfully (see @docs/decisions.md). This bites the browser backend
-  selection in `harness/tools/fetch.py` (Phase 3), which is why `browser.backend`
-  defaults to `playwright` there instead. To revisit: retest against a later
-  Lightpanda release, or drive navigation with a strategy that does not wait on a
-  lifecycle event crawl4ai currently blocks on. Separately, `--advertise-host` must be
-  set when starting Lightpanda — without it the server advertises
-  `webSocketDebuggerUrl: ws://0.0.0.0:9222/`, which no CDP client can dial; this is
-  independent of the lifecycle-event problem and needed regardless of which fix lands.
-
 - **PDFs never classify as `non_html`.** The `non_html` outcome in
   `harness/tools/fetch.py` assumes crawl4ai returns a successful crawl with empty markdown
   for a PDF. Over crawl4ai-managed Playwright it does neither: a PDF that triggers a
