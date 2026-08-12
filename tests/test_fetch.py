@@ -66,6 +66,20 @@ def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
     return _FakeCrawler
 
 
+def _rendered(markdown: str, cap: int) -> str:
+    """Render one fetched page's block through `_render`, for truncation assertions."""
+    page = fetch.FetchedPage(
+        source_id="S1",
+        url="https://a.test",
+        outcome="fetched",
+        status_code=200,
+        title=None,
+        markdown=markdown,
+        error=None,
+    )
+    return fetch._render(page, cap)
+
+
 @pytest.fixture
 def install_crawler(monkeypatch):
     """Patch fetch's AsyncWebCrawler with a fake serving canned results; returns the class."""
@@ -189,6 +203,61 @@ async def test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text(
     assert len(content) < len(long_markdown)
     assert str(cap) in content
     assert pages[0].markdown == long_markdown
+
+
+def test_text_at_or_under_the_cap_is_returned_unchanged():
+    cap = 100
+
+    at_cap = _rendered("A" * 100, cap)
+    under_cap = _rendered("A" * 40, cap)
+
+    assert "A" * 100 in at_cap
+    assert "truncated" not in at_cap
+    assert "A" * 40 in under_cap
+    assert "truncated" not in under_cap
+
+
+def test_over_cap_text_ends_at_the_latest_paragraph_break():
+    cap = 100
+    text = "A" * 40 + "\n\n" + "B" * 40 + "\n\n" + "C" * 100
+
+    rendered = _rendered(text, cap)
+
+    assert "C" not in rendered
+    assert ("A" * 40 + "\n\n" + "B" * 40) in rendered
+    assert str(cap) in rendered
+
+
+def test_a_heading_start_is_a_valid_truncation_boundary():
+    cap = 100
+    text = "A" * 70 + "\n# Later heading\n" + "B" * 100
+
+    rendered = _rendered(text, cap)
+
+    assert "# Later heading" not in rendered
+    assert "A" * 70 in rendered
+
+
+def test_text_with_no_boundary_before_the_cap_falls_back_to_a_hard_cut():
+    cap = 100
+    text = "A" * 500
+
+    rendered = _rendered(text, cap)
+
+    assert "A" * 100 in rendered
+    assert "A" * 101 not in rendered
+    assert "truncated" in rendered
+    assert str(cap) in rendered
+
+
+def test_a_boundary_too_early_to_be_worth_taking_falls_back_to_the_hard_cut():
+    cap = 100
+    text = "A" * 10 + "\n\n" + "B" * 200
+
+    rendered = _rendered(text, cap)
+
+    assert "B" * 50 in rendered
+    assert "truncated" in rendered
 
 
 async def test_content_has_a_heading_for_every_url_including_failures(install_crawler, make_config):

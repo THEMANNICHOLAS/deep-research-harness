@@ -278,7 +278,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Baseline — land existing work, retry policy, pairing
 - [x] Phase 2: Remove Lightpanda
 - [x] Phase 3: Cap a call at five URLs
-- [ ] Phase 4: Boundary-aware truncation
+- [x] Phase 4: Boundary-aware truncation
 - [ ] Phase 5: Prune short boilerplate blocks
 - [ ] Final verification
 
@@ -504,12 +504,21 @@ back to a hard cut when no usable boundary exists, and always discloses that it 
 - Reordering, summarising, or selecting content by relevance — cut only.
 
 **Tests (write first, confirm red):**
-- [ ] Text at or under the cap is returned unchanged, with no truncation notice.
-- [ ] Over-cap text ends at the latest heading or paragraph break at or before the cap.
-- [ ] Text with no boundary before the cap falls back to a hard cut and still discloses.
-- [ ] A boundary so early that it would discard most of the allowance is rejected in favour of
-  the hard cut — a structured page must never come back nearly empty.
-- [ ] The artifact keeps the full untruncated markdown while the rendered content is shorter.
+- [x] Text at or under the cap is returned unchanged, with no truncation notice. (Green before
+  implementation by design — a survival guard that the boundary logic never fires under the cap.)
+- [x] Over-cap text ends at the latest heading or paragraph break at or before the cap. (Red on
+  `assert 'C' not in ...`; a second test covers the heading boundary, red on
+  `assert '# Later heading' not in ...`.)
+- [x] Text with no boundary before the cap falls back to a hard cut and still discloses. (Green
+  before implementation — `rfind` returning `-1` falls under any floor, so this path needed no
+  special case.)
+- [x] A boundary so early that it would discard most of the allowance is rejected in favour of
+  the hard cut — a structured page must never come back nearly empty. (Green before
+  implementation; it is the regression guard for the floor — removing `_MIN_BOUNDARY_FRACTION`
+  turns it red.)
+- [x] The artifact keeps the full untruncated markdown while the rendered content is shorter.
+  (Already covered by `test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text`; not
+  duplicated, per the acceptance criterion that it keeps passing.)
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -518,9 +527,11 @@ back to a hard cut when no usable boundary exists, and always discloses that it 
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text` still passes, or is
+- [x] `test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text` still passes, or is
   deliberately updated with the reason recorded — it drives 500 characters at a cap of 50 and
-  is the existing contract for this behaviour.
+  is the existing contract for this behaviour. (Still passes unmodified: 500 `x`s carry no
+  boundary, so the hard-cut path runs and its `str(cap) in content` assertion is satisfied by
+  the new disclosure wording, which still names the cap.)
 
 ### Phase 5: Prune short boilerplate blocks
 **Risk:** flagged (!#5)
@@ -758,4 +769,26 @@ phase). Append-only, empty at plan creation. -->
   `_render`); its risk #4 warns the "boundary too early" floor is a guess until it meets real
   pages. Phase 5's acceptance and the plan's final verification both need the homelab box over
   SSH — they cannot be completed on this workstation.
+
+### 2026-08-12 — Phase 4: Boundary-aware truncation
+- Done: Replaced `_render`'s mid-word head-slice with a cut at the latest paragraph break or
+  heading start inside the cap (`max` over `rfind("\n\n")` and `_HEADING_LINE` match starts),
+  falling back to the hard cut when that boundary sits below `_MIN_BOUNDARY_FRACTION` (0.6) of
+  the allowance. A heading is cut *with* the break, since a heading with no body is noise, and
+  the disclosure now names the cap without claiming the cut landed on it. 5 new tests plus the
+  `_rendered` helper in `tests/test_fetch.py`; suite 109 passed (was 104); all four gates green.
+- Learned: `rfind` returning `-1` is below any floor, so the no-boundary case needs no special
+  case — the fallback is the same branch. The judgment review flagged one bounded false-positive:
+  `_HEADING_LINE` (`^#{1,6} `, MULTILINE) also matches a `# comment` line inside a fenced code
+  block, so a cut can be taken at a false heading. Not fixed and not a regression — the floor
+  caps the loss at 40% of the allowance, and the old head-slice already cut mid-fence.
+- Drift: none. Judgment review clean, no simplifications.
+- Watch-next: **Risk #2 AND #3 coordination is still owed before this branch merges** — the
+  concurrent research-loop session (worktree `structured-strolling-elephant`) has still not been
+  told that `HarnessConfig.browser` is gone and that `fetch_pages` now rejects more than 5 URLs.
+  Phase 5 next (`min_word_threshold` on `PruningContentFilter`): its wiring test is offline, but
+  its acceptance criterion — the live before/after page comparison — and the plan's final
+  verification both need the homelab box over SSH and cannot be done on this workstation. Risk
+  #4's floor is likewise still a guess until real pages meet it; the same live fetch is the
+  first chance to check whether a page comes back conspicuously shorter than the cap allows.
 

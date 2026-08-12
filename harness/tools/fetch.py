@@ -8,6 +8,7 @@ full, untruncated per-URL outcomes for anything downstream that needs them (e.g.
 resolution via `harness.sources.SourceRegistry`).
 """
 
+import re
 from typing import Literal
 
 from crawl4ai import (  # type: ignore[import-untyped]
@@ -43,6 +44,16 @@ _MEMORY_THRESHOLD_PERCENT = 75.0
 # the batch soonest. It only bites when a batch holds 2+ URLs from one domain; either way a
 # rate-limited page still surfaces as `blocked`.
 _RATE_LIMIT_MAX_RETRIES = 1
+
+# A markdown heading line, used to find a structural cut point. crawl4ai hands us flat
+# strings — `MarkdownGenerationResult` exposes no heading tree or block scores — so a
+# boundary has to be found in the text itself.
+_HEADING_LINE = re.compile(r"^#{1,6} ", re.MULTILINE)
+
+# A boundary that keeps less than this much of the allowance is not worth taking: a page
+# whose last heading sits near the top would come back nearly empty, which is worse than a
+# cut mid-sentence (plan risk #4). Judgment, not a measurement — revisit against real pages.
+_MIN_BOUNDARY_FRACTION = 0.6
 
 
 def classify(
@@ -151,7 +162,16 @@ def _render(page: FetchedPage, cap: int) -> str:
 
     text = page.markdown
     if len(text) > cap:
-        text = text[:cap] + f"\n\n_[truncated at {cap} characters]_"
+        window = text[:cap]
+        # Cut on the latest structural break inside the allowance: a paragraph break, or the
+        # start of a heading line — the heading itself goes with the cut, since a heading with
+        # no body under it is noise. Below the floor, take the whole allowance instead.
+        boundary = max([window.rfind("\n\n"), *(m.start() for m in _HEADING_LINE.finditer(window))])
+        cut = boundary if boundary >= int(cap * _MIN_BOUNDARY_FRACTION) else cap
+        text = (
+            window[:cut].rstrip()
+            + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
+        )
     lines.append(text)
 
     return "\n\n".join(lines)
