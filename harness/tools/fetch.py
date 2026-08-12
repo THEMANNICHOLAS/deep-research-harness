@@ -233,16 +233,23 @@ async def _fetch(
     return content, pages
 
 
-class FetchPagesInput(BaseModel):
-    """Model-facing input schema for the `fetch_pages` tool."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    urls: list[str] = Field(description="The URLs to fetch, in the order they should be reported.")
-
-
 def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseTool:
     """Build the `fetch_pages` tool, closing over `config` and the shared `registry`."""
+
+    max_urls = config.fetch.max_urls_per_call
+
+    class FetchPagesInput(BaseModel):
+        """Model-facing input schema for the `fetch_pages` tool."""
+
+        model_config = ConfigDict(extra="forbid")
+
+        urls: list[str] = Field(
+            max_length=max_urls,
+            description=(
+                "The URLs to fetch, in the order they should be reported. "
+                f"At most {max_urls} per call."
+            ),
+        )
 
     @tool("fetch_pages", args_schema=FetchPagesInput, response_format="content_and_artifact")
     async def fetch_pages(urls: list[str]) -> tuple[str, list[FetchedPage]]:
@@ -254,5 +261,28 @@ def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseToo
         (trailing slash, fragment, case) are fetched once and reported once.
         """
         return await _fetch(urls, config, registry)
+
+    # The limit is a config value, so it cannot be a literal in the docstring above without
+    # going stale the moment an operator changes it (D2: config is authoritative, the prose
+    # must not contradict it). Appending keeps exactly one copy of the number.
+    fetch_pages.description = (
+        f"{fetch_pages.description}\n\nAt most {max_urls} URLs may be requested per call; "
+        "a call carrying more is rejected without fetching anything."
+    )
+
+    # `exc` is typed `object` because langchain's hook may hand over either a pydantic v2 or a
+    # pydantic v1 `ValidationError`, and this only ever renders it as text.
+    def _explain_validation_error(exc: object) -> str:
+        """Turn a rejected call into a message the model can act on and retry."""
+        return (
+            f"fetch_pages rejected this call without fetching anything: {exc}. "
+            f"At most {max_urls} URLs may be requested per call."
+        )
+
+    # D2 and risk #3: an over-limit call must come back as a recoverable tool message rather
+    # than an exception escaping the call, so the caller can resend fewer URLs. A callable
+    # rather than a fixed string because this swallows EVERY validation failure for the tool —
+    # a wrong type would otherwise be reported as an over-limit call and stay unrecoverable.
+    fetch_pages.handle_validation_error = _explain_validation_error
 
     return fetch_pages

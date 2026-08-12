@@ -63,6 +63,9 @@ class FetchSettings(_StrictModel):
     page_timeout_ms: int = Field(default=15000, gt=0)
     max_concurrency: int = Field(default=5, gt=0)
     per_page_char_cap: int = Field(default=12000, gt=0)
+    # 5 is engineering judgment, not a measured optimum (D1): it bounds one call to ~15k
+    # tokens at the current per-page cap. Operators change it here, not in code.
+    max_urls_per_call: int = Field(default=5, gt=0)
 
 
 class SearchSettings(_StrictModel):

@@ -277,7 +277,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 - [x] Phase 1: Baseline — land existing work, retry policy, pairing
 - [x] Phase 2: Remove Lightpanda
-- [ ] Phase 3: Cap a call at five URLs
+- [x] Phase 3: Cap a call at five URLs
 - [ ] Phase 4: Boundary-aware truncation
 - [ ] Phase 5: Prune short boilerplate blocks
 - [ ] Final verification
@@ -446,12 +446,16 @@ the input schema, and adjustable without a code edit.
 - Anything that constrains how OFTEN the tool is called; that is the research-loop session's.
 
 **Tests (write first, confirm red):**
-- [ ] A call carrying more than the configured number of URLs is rejected before any fetch
-  is attempted.
-- [ ] A call at exactly the limit succeeds and fetches every URL.
-- [ ] The limit in the tool's schema follows the config value rather than a literal — build a
-  tool from a config with a different limit and assert the schema moved.
-- [ ] Both the tool description and the `urls` field description state the limit.
+- [x] A call carrying more than the configured number of URLs is rejected before any fetch
+  is attempted. (Red on `DID NOT RAISE ValidationError`; the assertion was then reshaped by the
+  judgment review to expect an error `ToolMessage` — see the 2026-08-12 `## Discoveries` entry.)
+- [x] A call at exactly the limit succeeds and fetches every URL. (Green before implementation
+  by design — a survival guard proving the cap does not break the at-limit case.)
+- [x] The limit in the tool's schema follows the config value rather than a literal — build a
+  tool from a config with a different limit and assert the schema moved. (Red on
+  `KeyError: 'maxItems'`.)
+- [x] Both the tool description and the `urls` field description state the limit. (Red on
+  `assert '5' in ...`.)
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -460,8 +464,16 @@ the input schema, and adjustable without a code edit.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] The number appears in the docstring and field description as text consistent with the
-  config default — config remains authoritative and the prose does not contradict it.
+- [x] The number appears in the docstring and field description as text consistent with the
+  config default — config remains authoritative and the prose does not contradict it. (Neither
+  prose surface hardcodes the number: the `urls` field description interpolates
+  `config.fetch.max_urls_per_call`, and because a literal docstring cannot interpolate a config
+  value, one interpolated sentence is appended to `fetch_pages.description` after the `@tool`
+  decorator. `test_both_prose_surfaces_state_the_url_limit` derives its expected number from
+  the config, so it fails if either surface ever goes stale.)
+- [x] Beyond the plan's Steps: `fetch_pages.handle_validation_error` was wired so the rejection
+  is a recoverable tool message, which D2's Consequences and risk #3 both assert but no step
+  required — see the 2026-08-12 `## Discoveries` entry.
 
 ### Phase 4: Boundary-aware truncation
 **Risk:** flagged (!#4)
@@ -649,6 +661,19 @@ dropping `RateLimiter` entirely — it still supplies the inter-request politene
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+- **2026-08-12 — Phase 3: nothing turned D2's promised "recoverable tool message" into one.**
+  A pydantic `max_length` violation raises `ValidationError` straight out of `ainvoke`, so the
+  mitigation D2's Consequences and risk #3 both rely on — the loop can retry — did not exist;
+  the first implementation's test comment called the conversion the future agent loop's job.
+  It is not: `BaseTool.handle_validation_error` is in the installed langchain-core and returns
+  an error-status `ToolMessage`. → Surfaced by the Phase 3 judgment review; FIXED in-phase with
+  a `_explain_validation_error` callable rather than a fixed string, because the hook swallows
+  every validation failure for the tool and a fixed over-limit string would misreport a
+  wrong-type call as a too-long list. Two tests cover it (over-limit reports the cap;
+  a malformed call reports itself). Also from the same review: the over-limit test gained an
+  assertion on the pydantic cap message so an unrelated validation failure cannot satisfy it,
+  and R7's "duplicates still count toward the limit" sub-bullet gained the test it lacked.
+
 - **2026-08-12 — Phase 2: `.env.example` still advertises a browser backend key that no longer
   exists.** Its header says non-secret endpoints "(SearXNG URL, browser backend/CDP URL, model
   IDs) live in harness.toml", and `docs/guides/setup.md:30` tells the reader to copy that file —
@@ -710,4 +735,27 @@ phase). Append-only, empty at plan creation. -->
   discover the deletion at merge. Phase 3 next: it adds `FetchSettings.max_urls_per_call` and
   moves `FetchPagesInput` inside `build_fetch_tool`, which changes the tool's public schema
   (risk #3) — the same session should be told when it lands.
+
+### 2026-08-12 — Phase 3: Cap a call at five URLs
+- Done: Added `FetchSettings.max_urls_per_call` (default 5, `gt=0`) and its `harness.toml` key;
+  moved `FetchPagesInput` inside `build_fetch_tool` so `max_length` — and therefore the schema's
+  `maxItems` — comes from config; stated the limit in the `urls` field description and in an
+  interpolated sentence appended to `fetch_pages.description`; wired
+  `handle_validation_error` so an over-limit call returns an error `ToolMessage` instead of
+  raising. 7 new tests in `tests/test_fetch.py`, plus the config load/default/reject cases.
+  Suite 104 passed (was 97); all four gates green.
+- Learned: a literal docstring cannot interpolate a config value, so the model-facing limit is
+  appended to `BaseTool.description` after the decorator — `search.py`'s pattern was mirrored
+  for the closure but not for its prose, which deliberately omits its number. `mypy` requires
+  the `handle_validation_error` callable to accept pydantic v1 OR v2 errors, hence its `object`
+  parameter. Risk #3 is now genuinely mitigated rather than merely asserted, but the mitigation
+  is per-tool: any future tool with a bounded schema needs the same hook.
+- Drift: none. The judgment review's Major was a gap against D2, not a contradiction of it —
+  fixed in-phase and logged under `## Discoveries`.
+- Watch-next: **Risk #2 AND #3 coordination is still owed before this branch merges** — the
+  concurrent research-loop session needs telling that `HarnessConfig.browser` is gone and that
+  `fetch_pages` now rejects more than 5 URLs. Phase 4 next (boundary-aware truncation in
+  `_render`); its risk #4 warns the "boundary too early" floor is a guess until it meets real
+  pages. Phase 5's acceptance and the plan's final verification both need the homelab box over
+  SSH — they cannot be completed on this workstation.
 

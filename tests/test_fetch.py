@@ -447,3 +447,146 @@ async def test_result_matching_no_input_url_never_supplies_another_urls_body(
     assert pages[0].outcome == "error"
     assert pages[0].markdown == ""
     assert "redirected content" not in content
+
+
+async def test_a_call_over_the_url_limit_is_rejected_before_any_fetch(install_crawler, make_config):
+    # R7 / D2 — the schema rejects the call before any fetch happens, and the rejection comes
+    # back as a recoverable tool message rather than an exception escaping the call (risk #3),
+    # so the caller can resend fewer URLs.
+    config = make_config()
+    limit = config.fetch.max_urls_per_call
+    registry = SourceRegistry()
+    fake_cls = install_crawler([])
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(
+        {
+            "name": "fetch_pages",
+            "args": {"urls": [f"https://over{n}.test" for n in range(1, limit + 2)]},
+            "id": "over-limit-1",
+            "type": "tool_call",
+        }
+    )
+
+    assert message.status == "error"
+    # The cap is what rejected the call, not some unrelated validation failure.
+    assert f"at most {limit} items" in message.content
+    assert f"At most {limit} URLs" in message.content
+    assert fake_cls.calls == []
+
+
+async def test_duplicate_urls_still_count_toward_the_limit(install_crawler, make_config):
+    # R7 sub-bullet: the limit counts URLs as submitted, not after deduplication. Six URLs of
+    # which two are equivalent spellings is rejected, not silently collapsed to four and
+    # accepted — the cap lives in the schema, which runs before `_fetch` dedups.
+    config = make_config(max_urls_per_call=5)
+    registry = SourceRegistry()
+    fake_cls = install_crawler([])
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(
+        {
+            "name": "fetch_pages",
+            "args": {
+                "urls": [
+                    "https://dup.test/a",
+                    "https://dup.test/b",
+                    "https://dup.test/c",
+                    "https://dup.test/d",
+                    "https://dup.test/a/",  # same page as /a once normalized
+                    "https://dup.test/b#frag",  # same page as /b once normalized
+                ]
+            },
+            "id": "over-limit-dupes",
+            "type": "tool_call",
+        }
+    )
+
+    assert message.status == "error"
+    assert fake_cls.calls == []
+
+
+async def test_a_malformed_call_is_reported_as_itself_not_as_an_over_limit_call(
+    install_crawler, make_config
+):
+    # The `handle_validation_error` hook swallows EVERY validation failure for this tool, so it
+    # must report the real cause — a fixed over-limit string would leave a wrong type looking
+    # like a too-long list and give the caller nothing to correct.
+    config = make_config()
+    registry = SourceRegistry()
+    fake_cls = install_crawler([])
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(
+        {
+            "name": "fetch_pages",
+            "args": {"urls": "https://not-a-list.test"},
+            "id": "malformed-1",
+            "type": "tool_call",
+        }
+    )
+
+    assert message.status == "error"
+    assert "valid list" in message.content
+    assert fake_cls.calls == []
+
+
+def test_both_prose_surfaces_state_the_url_limit(make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    expected = str(config.fetch.max_urls_per_call)
+
+    assert expected in fetch_pages.description
+    schema = fetch_pages.args_schema.model_json_schema()
+    assert expected in schema["properties"]["urls"]["description"]
+
+
+def test_the_schema_url_limit_follows_the_configured_value(make_config):
+    registry = SourceRegistry()
+    low_config = make_config(max_urls_per_call=2)
+    high_config = make_config(max_urls_per_call=7)
+
+    low_tool = fetch.build_fetch_tool(low_config, registry)
+    high_tool = fetch.build_fetch_tool(high_config, registry)
+
+    low_schema = low_tool.args_schema.model_json_schema()
+    high_schema = high_tool.args_schema.model_json_schema()
+
+    assert low_schema["properties"]["urls"]["maxItems"] == 2
+    assert high_schema["properties"]["urls"]["maxItems"] == 7
+
+
+async def test_a_call_at_exactly_the_limit_fetches_every_url(install_crawler, make_config):
+    # Survival guard: proves the cap does not break the at-limit case.
+    config = make_config(max_urls_per_call=2)
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://limit1.test",
+            markdown=_FakeMarkdown(raw_markdown="one", fit_markdown="one"),
+        ),
+        _FakeResult(
+            "https://limit2.test",
+            markdown=_FakeMarkdown(raw_markdown="two", fit_markdown="two"),
+        ),
+    ]
+    install_crawler(results)
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(
+        {
+            "name": "fetch_pages",
+            "args": {"urls": ["https://limit1.test", "https://limit2.test"]},
+            "id": "at-limit-1",
+            "type": "tool_call",
+        }
+    )
+
+    assert [page.url for page in message.artifact] == [
+        "https://limit1.test",
+        "https://limit2.test",
+    ]
+    assert "## [S1] https://limit1.test" in message.content
+    assert "## [S2] https://limit2.test" in message.content

@@ -26,6 +26,7 @@ model = "TODO"                       # TODO: Cerebras worker-model ID, e.g. gemm
 page_timeout_ms = 15000
 max_concurrency = 5
 per_page_char_cap = 12000
+max_urls_per_call = 5
 
 [search]
 base_url = "http://localhost:8080"   # local dev instance — see searxng/docker-compose.yml
