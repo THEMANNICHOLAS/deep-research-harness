@@ -44,8 +44,10 @@ for reports is non-technical, which is why the report must never overstate its e
 - **R7** — A run cannot spiral: a configured cap on research rounds plus a 30-minute
   wall-clock stop, either of which still yields a report from whatever was gathered. A run's
   token cost is recorded so a later pyramid can be priced against a real baseline.
-  - The wall clock keeps running while awaiting a clarification answer, so an unattended run
-    self-terminates rather than hanging indefinitely.
+  - ~~The wall clock keeps running while awaiting a clarification answer, so an unattended run
+    self-terminates rather than hanging indefinitely.~~ (see `## Reconciliations` 2026-08-10 —
+    Phase 5: the clock starts at the first research tool call, so a pre-research clarification
+    waits indefinitely by design.)
 - **R8** — Every consulted source is captured at fetch time: extracted content for a usable
   page, an explicit failure record (404, blocked, empty) for an unusable one. Claim
   verification reads only this captured content — never a refetch — and a claim citing a
@@ -292,9 +294,11 @@ Inherits every `## Intent` non-goal — not re-listed.
   inconsistent with a resumable thread. Asking at any point during a run — more powerful, but
   it creates interrupt contention once the pyramid exists and lets a run stall repeatedly.
 - **Consequences:** `__main__` is a resume loop, not a straight line: invoke, and while the
-  result carries an interrupt, print the question, read the answer, resume. The wall clock
+  result carries an interrupt, print the question, read the answer, resume. ~~The wall clock
   keeps running during that wait, which is what makes an unattended run self-terminate
-  instead of blocking forever. No approval-gate interrupts are enabled on any other tool.
+  instead of blocking forever.~~ (see `## Reconciliations` 2026-08-10 — Phase 5: the clock
+  does not start until research does, so the pre-research wait is unbounded.) No
+  approval-gate interrupts are enabled on any other tool.
 
 ### D6: Disk-backed backend, confined by `permissions`; custom backend if none ships
 - **Chosen:** A disk-backed backend with `permissions` restricting writes to a workspace
@@ -408,7 +412,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 2: Fetch amendments — URL cap and source capture
 - [x] Phase 3: Tracer bullet — question in, report on disk
 - [x] Phase 4: Pre-research clarification
-- [ ] Phase 5: Run ceiling and cut-short reporting
+- [x] Phase 5: Run ceiling and cut-short reporting
 - [ ] Phase 6: Claim verification and disclosure
 - [ ] Phase 7: Researcher and reader tier contracts
 - [ ] Final verification
@@ -763,9 +767,11 @@ the workspace notes when either fires.
 **Diff budget:** ~140-200 lines across 6 files.
 
 **Files:**
-- `harness/agent.py` — modify: apply the configured round cap.
+- ~~`harness/agent.py` — modify: apply the configured round cap.~~ (see
+  `## Reconciliations` 2026-08-10 — Phase 5: the cap is a `RunnableConfig` key, so it lands
+  in `harness/__main__.py`; `agent.py` is untouched this phase.)
 - `harness/__main__.py` — modify: enforce the wall clock across the whole run including
-  clarification waits.
+  clarification waits, and carry the round cap on the run config.
 - `harness/report.py` — modify: assemble a report from workspace notes when a run is cut
   short, and record that it was.
 - `tests/test_report.py` — modify; `tests/test_agent.py` — modify.
@@ -785,23 +791,30 @@ the workspace notes when either fires.
 
 **Out of scope:**
 - No token-budget ceiling and no rate/token accounting beyond the Phase 3 usage figure.
-- No pausing of the clock during a clarification wait — that is the decision that lets an
-  unattended run terminate (R7's recorded case).
+- ~~No pausing of the clock during a clarification wait — that is the decision that lets an
+  unattended run terminate (R7's recorded case).~~ (see `## Reconciliations` 2026-08-10 —
+  Phase 5: reversed by the developer at this gate. The clock does not start until the first
+  research tool call; a mid-run ask is bounded only by the time remaining on it.)
+- No separate idle timeout on a clarification wait, and no new `[agent]` setting of any kind.
 - No retry or resumption of a cut-short run.
 - No changes to the tools' own per-call concurrency or timeouts.
 
 **Tests (write first, confirm red):**
-- [ ] Reaching the round cap ends the run and produces a report disclosing that bound.
-- [ ] Exceeding the wall clock ends the run and produces a report disclosing that bound.
-- [ ] A cut-short report contains the findings present in the workspace notes at the time,
+- [x] Reaching the round cap ends the run and produces a report disclosing that bound.
+- [x] Exceeding the wall clock ends the run and produces a report disclosing that bound.
+- [x] A cut-short report contains the findings present in the workspace notes at the time,
       rather than being empty, and names the planned todos not yet done (D9).
-- [ ] The clock is not paused while an interrupt is pending, so an unanswered clarification
-      terminates the run at the bound.
-- [ ] A run finishing inside both bounds produces a report with no cut-short disclosure.
+- [x] ~~The clock is not paused while an interrupt is pending, so an unanswered clarification
+      terminates the run at the bound.~~ Amended (see `## Reconciliations` 2026-08-10 —
+      Phase 5), now two tests: a pre-research clarification does NOT start the clock, so an
+      unanswered one never terminates the run; and once research has started the clock is not
+      paused by an interrupt, so an unanswered mid-run clarification terminates at the bound.
+- [x] A run finishing inside both bounds produces a report with no cut-short disclosure.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
-2. Apply the round cap in `build_agent`.
+2. ~~Apply the round cap in `build_agent`.~~ Apply the round cap as `recursion_limit` on the
+   run config in `__main__` (see `## Reconciliations` 2026-08-10 — Phase 5).
 3. Enforce the wall clock around the whole `__main__` run, spanning the resume loop, and
    ensure the partial-report path runs on expiry rather than propagating a timeout (!#6).
 4. Extend `RunOutcome` and `write_report` for cut-short assembly from notes.
@@ -811,7 +824,7 @@ the workspace notes when either fires.
 **Acceptance criteria:**
 - [ ] Manual live check: with the wall clock temporarily set to a few seconds, a real run is
       cut short and still writes a report naming the bound it hit.
-- [ ] `uv run ruff check .` and `uv run mypy .` clean for the changed files.
+- [x] `uv run ruff check .` and `uv run mypy .` clean for the changed files.
 
 ### Phase 6: Claim verification and disclosure
 
@@ -1124,9 +1137,80 @@ series of questions, each blocking the run on human input. The backstop is Phase
 which by D5 keeps running through a clarification wait — so an unattended or over-asking run
 self-terminates rather than hanging. Revisit only if a real run actually over-asks.
 
+2026-08-10 — Phase 5: the round cap cannot be applied in `build_agent` (struck in **Files** and
+step 2). Verified against the installed packages before any code was written: `recursion_limit`
+is absent from `create_deep_agent`'s signature entirely, and is a `RunnableConfig` key consumed
+by `Pregel.astream` at invocation time. The only way to bind it inside `build_agent` is
+`graph.with_config(...)`, which is the recorded Phase 4 Dead End (the `RunnableBinding` it
+returns breaks `tests/test_agent.py`'s `graph.nodes[...]` helpers). → **Amendment:** the cap is
+set as `"recursion_limit"` on the `run_config` dict `__main__` already builds for `thread_id`,
+alongside the wall clock it also owns; `harness/agent.py` is not modified this phase, and the
+round-cap test lands in `tests/test_agent.py` driving the graph under that config rather than
+inspecting `build_agent`'s return. No requirement is affected — R7 names a "configured cap on
+research rounds", not where it is applied. `recursion_limit` counts LangGraph **supersteps**,
+not model-plus-tool rounds; the developer chose at this gate to preserve the config field's
+advertised meaning by mapping it as `max_rounds * 2 + 1` (one round = model call + tool
+execution, plus the final tool-free answer turn), so the default 20 rounds becomes 41
+supersteps. `AgentSettings.max_rounds` keeps its name and default.
+
+2026-08-10 — Phase 5: R7's sub-bullet, D5's Consequences and this phase's **Out of scope** all
+said the wall clock keeps running through a clarification wait, so an unattended run always
+self-terminates (all three struck). Put to the developer at this gate, they reversed it: an
+initial clarifying question may take as long as it takes. → **Amendment:** the wall clock starts
+at the **first `search_web` or `fetch_pages` tool call** — the observable form of R2's
+"pre-research window" — and from then on runs continuously, including through any later
+clarification wait. Consequences, accepted knowingly: (1) a run launched and then abandoned
+before the first question is answered waits indefinitely rather than self-terminating, which is
+the R7 case being given up — acceptable because the sole operator drives runs by hand over SSH
+and Ctrl-C works; (2) the Phase 4 reconciliation's recorded backstop for an unbounded number of
+clarifying questions no longer applies to pre-research asks, which is the whole window asking is
+supposed to happen in — so nothing bounds an over-asking lead except the operator; (3) a
+contract-violating mid-run ask is bounded only by the time left on the clock, deliberately, with
+no second timeout and no new setting. R7's other half — the ceiling still yields a report from
+whatever was gathered — is unaffected.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+
+2026-08-12 — Phase 5: the `max_rounds * 2 + 1` mapping chosen at the Phase 5 gate rests on a
+premise that measured FALSE. Its stated reasoning — one round = a model call plus a tool
+execution = 2 supersteps, plus the final answer turn — accounts only for the marginal cost.
+Measured against the installed deepagents by binary-searching `recursion_limit` against runs
+doing exactly 1, 2 and 3 tool rounds: 1 round needs a limit of 9, 2 needs 13, 3 needs 15. The
+marginal cost is indeed ~2 supersteps per round, but the compiled graph carries a fixed ~7-9
+superstep middleware overhead on top of it, so `max_rounds=20` → limit 41 buys roughly 16
+rounds, not 20. → **kept as-is, knowingly**: the error is conservative (the cap bites earlier
+than advertised, never later), R7 asks for a bound rather than an exact round count, and
+fitting the arithmetic to `2N + 9` would hard-code one deepagents version's node layout
+against a dependency whose patch cadence !#2 already flags as fast. Recorded instead in three
+places a reader will hit: the `run_config` comment, the `[agent]` bullet in
+docs/guides/setup.md, and `tests/test_agent.py::test_max_rounds_scales_the_recursion_limit`,
+which pins the measured boundary (cut short at `max_rounds=3`, completes at 4) so a
+deepagents upgrade that changes the overhead turns a test red rather than silently
+re-scaling the ceiling.
+
+2026-08-12 — Phase 5: `recursion_limit` is applied per INVOCATION, not per run — langgraph
+sets `stop = resumed_step + recursion_limit + 1` (`langgraph/pregel/_loop.py`), so every
+clarification resume grants a fresh allowance (3F judgment review, Minor). With the number of
+clarifying questions deliberately unbounded (Phase 4 Reconciliation) and pre-research asks now
+unclocked (Phase 5 Reconciliation), R7's "a run cannot spiral" holds per pass rather than per
+run. → **deferred**: the wall clock is the run-level bound once research starts, and every
+extra allowance costs a human answering a question at the terminal, so there is no unattended
+spiral. Revisit if a real run ever burns rounds across many resumes.
+
+2026-08-10 — Phase 5: `_read_answer`'s `asyncio.to_thread(input, prompt)` makes the wall clock
+unable to actually end a run. Probed before any code was written: with `asyncio.wait_for` around
+`asyncio.to_thread` on a blocking call, the timeout fires on schedule but `asyncio.run()` then
+blocks at interpreter shutdown joining the non-daemon executor worker — the probe returned at
+30s, not the 1s timeout. With a real `input()` that wait is unbounded, so the run would print its
+cut-short report and then hang at an already-dead `> ` prompt until someone typed. The same
+probe on a daemon thread feeding an `asyncio.Future` returned at 1.0s. This does not contradict
+Phase 4's recorded decision, whose stated reason was "so Phase 5's clock can still fire" — the
+daemon thread serves that intent and is the only shape where it holds. → **acted now**:
+`_read_answer` moves to a daemon thread; `harness/__main__.py` was already in this phase's Files
+list. Still required under the amended clock (see `## Reconciliations` 2026-08-10 — Phase 5),
+because the clock is armed during any mid-run ask.
 
 2026-08-10 — Phase 4: Phase 4's Files list omits `tests/test_agent.py`, but adding D5's
 `InMemorySaver` checkpointer to `build_agent` makes a `thread_id` mandatory on EVERY
@@ -1337,3 +1421,40 @@ phase). Append-only, empty at plan creation. -->
   timeout has to break out of a pass that may be blocked on human input, not just one blocked
   on the model. Also unchanged from Phase 3 and still owed: Phase 5 must widen the
   partial-report path to ANY mid-run termination.
+
+### 2026-08-12 — Phase 5: Run ceiling and cut-short reporting
+- Done: both ceilings wired, and every mid-run termination now yields a report. `__main__`
+  carries `recursion_limit = max_rounds * 2 + 1` on the run config (NOT `build_agent` — see
+  the Reconciliation), an `asyncio.timeout(None)` clock rescheduled to a real deadline at the
+  first `search_web`/`fetch_pages` call, and `TimeoutError`/`GraphRecursionError`/`Exception`
+  handling that writes a cut-short report and returns 0 for a bound, 1 for a failure with one
+  plain `error:` line on stderr. `_read_answer` moved to a daemon thread; `_final_answer`
+  picks the last `AIMessage` carrying prose. `report.py` gained `CutShortReason`, three
+  additive `RunOutcome` fields plus `started_at`, `_cut_short_section`, `_notes_section`, and
+  the public `format_todos` both modules now share. Phase 3's deferred "widen the
+  partial-report path to ANY mid-run termination" is discharged. 184 tests green; all four
+  gates clean. Live check NOT yet run — it needs a real terminal, so only the developer can.
+- Learned: (1) The mapping premise was wrong and is now measured — see the 2026-08-12
+  Discovery; marginal cost is ~2 supersteps per round, but the graph carries a fixed ~7-9
+  overhead. (2) `final_state` was being assigned AFTER the `async for`, which every cut-short
+  path exits by exception — so cut-short reports silently lost both the answer AND the token
+  usage. Found by mutation-testing a fix, not by the review or the gates; it is now assigned
+  inside the `values` branch. (3) `tests/test_search.py`'s client-faking helper patches the
+  process-global `httpx.AsyncClient`, and `openai`'s constructor rejects any `http_client`
+  that is not an instance of whatever that name is bound to at the time — including
+  `langchain_openai`'s `_AsyncHttpxClientWrapper`. Any test combining a faked search with a
+  scripted model MUST build the model first. (4) `asyncio.timeout(None)` + `reschedule()` is
+  the shape that works when the deadline is only known mid-stream; `asyncio.wait_for` cannot
+  express it.
+- Drift: two Reconciliations, both 2026-08-10 — Phase 5 (round cap moved out of `build_agent`;
+  R7's clock-spans-the-wait reversed by the developer). Plus two `## Discoveries` entries
+  dated 2026-08-12 (the measured mapping, kept knowingly; `recursion_limit` resetting per
+  invocation, deferred).
+- Watch-next: **run the live check before Phase 6** — set `wall_clock_seconds` to a few
+  seconds in `harness.toml`, run a real question, and confirm the report names the wall clock
+  and carries the notes written before the cut. Take an `InMemorySaver` memory reading during
+  that run: the Phase 4 Discovery deferred checkpoint growth to this phase and it is still
+  unmeasured — the one item Phase 5 inherited and did not settle. For Phase 6: claim
+  verification reads `sources/S<n>.md`, and those files are NOT mtime-filtered the way
+  workspace notes now are, so a stale `S1.md` from a previous run can still be read whenever
+  IDs collide — decide there whether the same filter belongs on them.

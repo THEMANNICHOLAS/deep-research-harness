@@ -56,6 +56,12 @@ are never stored here — each provider names an environment variable
   for `lightpanda`, the CDP URL.
 - `[fetch]` — per-page timeout, fetch concurrency, and the per-page character cap.
 - `[search]` — the SearXNG base URL and default result count.
+- `[agent]` — `max_rounds` (default 20) and `wall_clock_seconds` (default 1800), the
+  run's two ceilings. The wall clock starts at the first `search_web`/`fetch_pages`
+  call, not at launch, so an initial clarifying question can be answered at leisure;
+  hitting either bound still writes a report naming which one it was. `max_rounds` is
+  approximate — it maps onto LangGraph supersteps and buys somewhat fewer rounds than
+  its number suggests (see @docs/plans/PLAN-research-loop.md `## Discoveries`).
 
 ## Prerequisites
 

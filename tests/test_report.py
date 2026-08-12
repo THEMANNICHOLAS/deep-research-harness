@@ -6,16 +6,31 @@ frozen filename format are. This suite fixes those field names as part of writin
 tests first; `harness/report.py` must match them.
 """
 
+import os
 import re
+from datetime import datetime
 
 import pytest
 from pydantic import ValidationError
 
-from harness.report import _UNUSABLE_HEADING, RunOutcome, write_report
+from harness.config import AgentSettings
+from harness.report import (
+    _CUT_SHORT_HEADING,
+    _NO_ANSWER_TEXT,
+    _NO_NOTES_TEXT,
+    _NOTES_HEADING,
+    _UNUSABLE_HEADING,
+    RunOutcome,
+    write_report,
+)
 from harness.sources import SourceRegistry
 from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
 
 _FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-[a-z0-9-]+\.md$")
+
+# An mtime far enough back that no test run can straddle it — stands in for "written by a
+# previous run of the harness".
+_LONG_AGO = 1_000_000_000.0
 
 
 def _usage(reasoning: int = 0, input_tokens: int = 100, output_tokens: int = 50) -> dict:
@@ -190,8 +205,6 @@ def test_write_report_lists_usable_sources_and_marks_stubs_separately(make_confi
 
 
 def test_write_report_creates_reports_dir_if_missing(make_config, tmp_path):
-    from harness.config import AgentSettings
-
     agent = AgentSettings(
         workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports" / "nested"
     )
@@ -242,3 +255,248 @@ def test_run_outcome_rejects_unknown_fields():
             usage=_usage(),
             unexpected_field="nope",
         )
+
+
+# --- Phase 5: cut-short disclosure -----------------------------------------------------
+
+
+def _section(body: str, heading: str) -> str:
+    """Return the text between `heading` and the next top-level `## ` heading (or EOF).
+
+    Isolates a section by content, not a fixed line offset, so these tests stay correct
+    regardless of exactly where `## Run cut short` / `## Working notes` land relative to
+    the surrounding sections.
+    """
+    start = body.index(heading) + len(heading)
+    rest = body[start:]
+    end = rest.find("\n## ")
+    return rest if end == -1 else rest[:end]
+
+
+def test_write_report_discloses_the_round_cap_bound(make_config, tmp_path):
+    """A hardcoded default cap could never reveal a NON-default configured value."""
+    agent = AgentSettings(
+        max_rounds=17, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
+    )
+    config = make_config(agent=agent)
+    outcome = RunOutcome(
+        question="How far did the run get before the round cap hit?",
+        answer="Partial answer only.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="round_cap",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING in body
+    section = _section(body, _CUT_SHORT_HEADING)
+    assert "17" in section
+    # The untouched AgentSettings default (20) must never appear here — that would mean
+    # the configured value was ignored in favor of a hardcoded default.
+    assert "20" not in section
+
+
+def test_write_report_discloses_the_wall_clock_bound(make_config, tmp_path):
+    """Same shape as the round-cap test, for the other bound."""
+    agent = AgentSettings(
+        wall_clock_seconds=93,
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+    outcome = RunOutcome(
+        question="How long did the run get before the wall clock hit?",
+        answer="Partial answer only.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING in body
+    section = _section(body, _CUT_SHORT_HEADING)
+    assert "93" in section
+    assert "1800" not in section  # the untouched AgentSettings default
+
+
+def test_write_report_names_the_error_when_a_run_dies_mid_flight(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="What happened to the run?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="error",
+        cut_short_detail="APIConnectionError: getaddrinfo failed",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING in body
+    assert "APIConnectionError: getaddrinfo failed" in body
+
+
+def test_write_report_lists_only_planned_todos_not_completed(make_config):
+    config = make_config()
+    todos = [
+        {"content": "Search for pricing sources", "status": "pending"},
+        {"content": "Summarize the vendor comparison", "status": "completed"},
+        {"content": "Cross-check the delivery claim", "status": "in_progress"},
+    ]
+    outcome = RunOutcome(
+        question="Which vendor is cheapest?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="round_cap",
+        todos=todos,
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert "Search for pricing sources" in body
+    assert "Cross-check the delivery claim" in body
+    assert "Summarize the vendor comparison" not in body
+
+
+def test_write_report_includes_workspace_notes_when_cut_short(make_config):
+    config = make_config()
+    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
+    (config.agent.workspace_dir / "notes.md").write_text(
+        "Vendor Acme quoted $4.20/unit, confirmed by two listings.", encoding="utf-8"
+    )
+    # A captured source file, written directly to sources/ the way harness/tools/fetch.py
+    # does — never via the registry, so nothing else could surface its text.
+    _write_usable_source_file(config, "S1")
+    outcome = RunOutcome(
+        question="What pricing was found before the cutoff?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _NOTES_HEADING in body
+    assert "Vendor Acme quoted $4.20/unit" in body
+    # The notes section reads the workspace root only, never recursing into sources/ — if
+    # it did, this exact capture body would leak into the notes section.
+    assert "Some captured body text." not in body
+    # Guards against a stub that always claims "no notes" regardless of what is on disk.
+    assert _NO_NOTES_TEXT not in body
+
+
+def test_write_report_says_so_when_no_notes_were_written(make_config):
+    config = make_config()
+    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
+    outcome = RunOutcome(
+        question="Did anything get written before the cut?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="round_cap",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _NOTES_HEADING in body
+    assert _NO_NOTES_TEXT in body
+
+
+def test_write_report_excludes_notes_left_by_a_previous_run(make_config):
+    """`agent.workspace_dir` is one fixed directory nothing in `harness/` ever clears, so
+    an unfiltered glob would present a PREVIOUS run's notes as this run's findings — an
+    overstatement of evidence (R3) that the reader has no way to catch. Only files touched
+    at or after `started_at` belong to this run.
+    """
+    config = make_config()
+    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
+    stale = config.agent.workspace_dir / "old-run.md"
+    stale.write_text("Acme was cheapest, from last week's run.", encoding="utf-8")
+    os.utime(stale, (_LONG_AGO, _LONG_AGO))
+
+    started_at = datetime.now()
+    fresh = config.agent.workspace_dir / "this-run.md"
+    fresh.write_text("Beta quoted $9.10/unit today.", encoding="utf-8")
+
+    outcome = RunOutcome(
+        question="What did this run actually find?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+        started_at=started_at,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Beta quoted $9.10/unit today." in body
+    assert "Acme was cheapest, from last week's run." not in body
+
+
+def test_write_report_keeps_every_note_when_no_start_time_is_known(make_config):
+    """`started_at=None` means "unknown", which must keep notes rather than silently drop
+    them — losing this run's findings would be the worse failure of the two.
+    """
+    config = make_config()
+    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
+    old = config.agent.workspace_dir / "whenever.md"
+    old.write_text("A finding of unknown vintage.", encoding="utf-8")
+    os.utime(old, (_LONG_AGO, _LONG_AGO))
+
+    outcome = RunOutcome(
+        question="What is on disk?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="round_cap",
+        started_at=None,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "A finding of unknown vintage." in body
+
+
+def test_write_report_says_so_when_the_run_produced_no_answer(make_config):
+    """A cut-short run usually has no prose answer. An empty `## Answer` section reads as
+    "the answer is nothing"; the reader must be told the run never got that far.
+    """
+    config = make_config()
+    outcome = RunOutcome(
+        question="Did it answer?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert _NO_ANSWER_TEXT in _section(body, "## Answer")
+
+
+def test_write_report_has_no_cut_short_sections_when_the_run_finished(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="Did the run finish cleanly?",
+        answer="Yes.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short=None,
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING not in body
+    assert _NOTES_HEADING not in body
