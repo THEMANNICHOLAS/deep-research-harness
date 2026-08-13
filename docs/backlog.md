@@ -10,17 +10,6 @@ to address.
 
 ## Entries
 
-- **Lightpanda cannot currently drive crawl4ai's `goto`.** No page lifecycle event
-  ever arrives over CDP, so `Page.goto` times out even though the CDP connection
-  attaches successfully (see @docs/decisions.md). This bites the browser backend
-  selection in `harness/tools/fetch.py` (Phase 3), which is why `browser.backend`
-  defaults to `playwright` there instead. To revisit: retest against a later
-  Lightpanda release, or drive navigation with a strategy that does not wait on a
-  lifecycle event crawl4ai currently blocks on. Separately, `--advertise-host` must be
-  set when starting Lightpanda — without it the server advertises
-  `webSocketDebuggerUrl: ws://0.0.0.0:9222/`, which no CDP client can dial; this is
-  independent of the lifecycle-event problem and needed regardless of which fix lands.
-
 - **PDFs never classify as `non_html`.** The `non_html` outcome in
   `harness/tools/fetch.py` assumes crawl4ai returns a successful crawl with empty markdown
   for a PDF. Over crawl4ai-managed Playwright it does neither: a PDF that triggers a
@@ -35,13 +24,13 @@ to address.
   fixed mid-phase per that plan's risk #2, which forbids widening the classifier during
   Phase 3.
 
-- **Residual boilerplate survives the pruning filter.** `PruningContentFilter` strips
-  Wikipedia's sidebar, personal tools, navigation menu, privacy policy and license footer,
-  but a tail of category links and a "Search / N languages" fragment remains in the fetched
-  markdown. Costs tokens on every fetched page. The substrate plan's Preferences place
-  stripping quality outside the acceptance gate ("tuning quality is iterative"), so this is
-  tuning work: adjust `PruningContentFilter`'s threshold or extend `_EXCLUDED_TAGS` in
-  `harness/tools/fetch.py`, measured against real fetched pages rather than in the abstract.
+- **Residual boilerplate survives the pruning filter.** A tail of category links and a
+  "Search / N languages" fragment reaches the model on every fetched page. `min_word_threshold`
+  is ruled out as the fix on live measurement — it scores HTML blocks, so it cannot tell a
+  one-word heading from a nav stub; full evidence and the numbers are in Reconciliation #2 of
+  @docs/plans/PLAN-crawler-refinement.md. To address: a render-side line filter dropping bare
+  `* [Text](url)` bullets (the measured front-runner) or an extended `_EXCLUDED_TAGS`, either
+  one measured against real pages and mindful of genuine link-only "See also" lists.
 
 - **`harness.toml`'s `TODO` placeholders load as valid config.** The literal `"TODO"`
   strings shipped for the OpenCode `base_url` and both role model IDs pass `load_config()`
@@ -53,6 +42,42 @@ to address.
   `test_shipped_harness_toml_loads_with_its_todo_placeholders` in @tests/test_config.py.
   To address when the loop lands: validate `base_url` shape and non-`TODO` model IDs
   wherever roles are first consumed.
+
+- **The CI runner's configuration is not recorded anywhere.** CI depends on a self-hosted
+  GitHub Actions runner (`CI-Runner`, default tags `self-hosted`/`Linux`/`X64`) on a Proxmox
+  VM, but its systemd unit name, work directory, runner version, and OS version are not
+  written down, and `systemctl is-enabled` was never run — so nothing confirms the runner
+  comes back unattended after a reboot. This bites if the VM is lost or rebuilt: the runner
+  must be re-registered from GitHub's own documentation, and until it is, every pull request
+  queues forever with no verdict. Deliberately descoped by the developer on 2026-08-09 (see
+  the Phase 4 entry in @docs/plans/PLAN-ci-pipeline.md `## Reconciliations`), which drops
+  requirement R5. The project-side facts a rebuild needs — the uv pin and the setup-uv SHA —
+  are both already in @pyproject.toml and @.github/workflows/ci.yml. To address: capture the
+  unit name and `systemctl is-enabled` output, either over SSH or via a temporary read-only
+  step in the workflow, since the job runs on the VM itself.
+
+- **Most dependencies are `>=` floors, not exact pins.** `pyproject.toml` declares
+  `pydantic>=2.9`, `langchain-core>=0.3`, `httpx>=0.27`, and a `dev` group
+  (`ruff`, `mypy`, `pytest`, `pytest-asyncio`) with no constraints at all; only
+  `crawl4ai==0.9.2` is pinned. A `>=` floor blocks older releases but lets the resolved
+  version float, so the workstation, the CI runner, and a rebuilt VM can each land on
+  something different — `uv.lock` holds this steady in practice, but the declared intent
+  doesn't. This bites reproducibility (R5's rebuild story in
+  @docs/plans/PLAN-ci-pipeline.md) and makes an unplanned tool upgrade look like a code
+  regression. Developer instruction (2026-08-09): **all requirements in this project should
+  be pinned exactly (`==`), never `>=`.** Only `[tool.uv] required-version` was pinned in
+  that session — converting the rest is a separate change, each pin chosen against what
+  `uv.lock` already resolves, then re-locked and pushed through CI.
+
+- **Nothing retries a rate-limited page.** `RateLimiter(max_retries=...)` in
+  `harness/tools/fetch.py` does not re-fetch on a 429/503 — crawl4ai 0.9.2 calls
+  `update_delay` after the crawl has returned and only grows that domain's backoff delay
+  (`async_dispatcher.py:65-85`, verified 2026-08-11). So a source that rate-limits us is
+  reported `blocked` on a single attempt, and a transient 429 costs the whole page. This bites
+  research coverage against APIs and doc sites that throttle bursts. To address: a retry pass
+  in `_fetch` over the `blocked` outcomes, which is genuinely new machinery (attempt budget,
+  backoff, and a rule for how a retried page reports) — deliberately deferred in Phase 1 of
+  @docs/plans/PLAN-crawler-refinement.md, see its Reconciliation #1.
 
 - **An HTTP 404 that serves a real HTML body classifies as `fetched`.** Observed in the
   final end-to-end sanity check: a Wikipedia URL returning 404 came back

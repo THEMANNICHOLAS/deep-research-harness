@@ -115,7 +115,6 @@ def test_role_with_undeclared_provider_raises_model_error_naming_both(make_confi
             **config.roles,
             "head": RoleConfig(provider="ghost-provider", model="test-model"),
         },
-        browser=config.browser,
         fetch=config.fetch,
         search=config.search,
         agent=config.agent,
@@ -141,7 +140,6 @@ def test_absent_api_key_raises_model_error_naming_role_and_provider(make_config)
     broken = HarnessConfig.model_construct(
         providers={**config.providers, "opencode": broken_provider},
         roles=config.roles,
-        browser=config.browser,
         fetch=config.fetch,
         search=config.search,
         agent=config.agent,
@@ -161,7 +159,6 @@ def test_todo_model_raises_model_error_naming_role_and_provider(make_config):
     todo_config = HarnessConfig(
         providers=config.providers,
         roles={**config.roles, "head": RoleConfig(provider="opencode", model="TODO")},
-        browser=config.browser,
         fetch=config.fetch,
         search=config.search,
         agent=config.agent,
@@ -185,7 +182,6 @@ def test_todo_base_url_raises_model_error_naming_role_and_provider(make_config):
             "opencode": ProviderConfig(base_url="TODO", api_key_env="OPENCODE_API_KEY"),
         },
         roles=config.roles,
-        browser=config.browser,
         fetch=config.fetch,
         search=config.search,
         agent=config.agent,

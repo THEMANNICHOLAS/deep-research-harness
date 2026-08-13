@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, development]
+  push:
+    branches: [main, development]
+
+# One in-flight run per ref: a new push to a pull request cancels the run it
+# superseded (R7), while runs for different refs never cancel each other.
+# Pull requests only — cancelling on a branch push would leave a merged commit
+# with a verdict-less run whenever two merges land close together.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Sync dependencies
+        id: sync
+        run: uv sync --locked
+
+      # Every gate carries `!cancelled()` so one run reports EVERY failing gate rather
+      # than stopping at the first (D2, R6) — `!cancelled()` rather than `always()` so a
+      # superseded run still stops promptly for cancel-in-progress. The sync condition is
+      # not redundant: `!cancelled()` overrides the implicit `success()`, and `uv run`
+      # auto-syncs WITHOUT `--locked`, so without it a lock-drift failure would show four
+      # green gates that had silently re-resolved the environment.
+      - name: ruff check
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run ruff format --check .
+
+      - name: mypy
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run mypy .
+
+      # `--cov-fail-under=90` lives HERE and nowhere else (D4): keeping it out of
+      # pyproject's addopts means a local `uv run pytest` on a single file is not
+      # failed by a coverage check. The measured scope (`harness/` only) is defined
+      # once, in `[tool.coverage.run]`.
+      - name: pytest
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run pytest --cov --cov-report=term-missing --cov-fail-under=90

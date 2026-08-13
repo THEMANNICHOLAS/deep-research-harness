@@ -53,7 +53,7 @@ for reports is non-technical, which is why the report must never overstate its e
   verification reads only this captured content — never a refetch — and a claim citing a
   failed source is marked unverifiable, never supported.
 - **R9** — A single fetch call cannot pull more than a configured number of sources
-  (default 4); the bound is enforced by the tool's own input validation, not by prompt
+  (default ~~4~~ 5); the bound is enforced by the tool's own input validation, not by prompt
   guidance.
 - **R10** — Mid-run, the developer can see the agent's current research plan and which step
   is in progress, echoed at the terminal as it updates; the plan state survives history
@@ -380,7 +380,7 @@ Inherits every `## Intent` non-goal — not re-listed.
   are first-write-wins).
 
 ### D11: `fetch_pages` is bounded per call by config
-- **Chosen:** `FetchPagesInput` rejects more than `fetch.max_urls_per_call` URLs (default 4),
+- **Chosen:** `FetchPagesInput` rejects more than `fetch.max_urls_per_call` URLs (default ~~4~~ 5),
   bound into the schema at tool-build time the same way `search`'s `default_max_results`
   already is.
 - **Rejected:** Prompt-level guidance alone ("use at most N sources") — advisory and
@@ -404,7 +404,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R6 | Roles resolve to chat clients; fail-fast incl. `TODO` placeholders and an unreachable endpoint; bounded retry, no switchover | MUST | Phase 1 (config fail-fast + `preflight`), Phase 3 (`preflight` call site in `__main__`) |
 | R7 | Round cap + 30-minute wall clock; token cost recorded | MUST | Phase 5 (ceiling), Phase 3 (token baseline) |
 | R8 | Source content captured at fetch time; verification reads capture only | MUST | Phase 2 (capture), Phase 6 (consumption) |
-| R9 | Fetch call bounded to configured source count (default 4) | MUST | Phase 2 |
+| R9 | Fetch call bounded to configured source count (default ~~4~~ 5) | MUST | Phase 2 |
 | R10 | Research plan visible mid-run, echoed at terminal, survives compression | MUST | Phase 3 |
 
 ## Progress
@@ -527,7 +527,7 @@ workspace file that verification later reads offline.
 **Diff budget:** ~90-140 lines across 5 files.
 
 **Files:**
-- `harness/config.py` — modify: `max_urls_per_call` on `FetchSettings` (default 4).
+- `harness/config.py` — modify: `max_urls_per_call` on `FetchSettings` (default ~~4~~ 5).
 - `harness.toml` — modify: add the setting to `[fetch]`.
 - `harness/tools/fetch.py` — modify: enforce the cap in `FetchPagesInput`; write the source
   files.
@@ -561,7 +561,7 @@ workspace file that verification later reads offline.
 - [x] Each successfully fetched page writes `sources/S<n>.md` with its URL and title header
       and full extracted text, under the ID the registry assigned that URL.
 - [x] A failed or blocked fetch writes a stub naming its outcome instead of content.
-- [x] `max_urls_per_call` defaults to 4 and loads from `[fetch]` when overridden.
+- [x] `max_urls_per_call` defaults to ~~4~~ 5 and loads from `[fetch]` when overridden.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -1212,6 +1212,19 @@ captured and read from capture, not where it sits — so this does not escalate 
 REQUIREMENTS. Old flat `sources/S<n>.md` files from Phases 2-5 runs are orphaned, not
 migrated; they are disposable run artifacts.
 
+2026-08-13 — Phase 2, on merging `development` into this branch: `max_urls_per_call`'s default
+is ~~4~~ **5**. PLAN-crawler-refinement landed the same cap independently (its D1) while this
+branch was in flight, choosing 5 with a stated rationale — it bounds one call to ~15k tokens at
+the current `per_page_char_cap` — where this plan's 4 was an unargued placeholder. The merge
+takes the reasoned value and the shipped mechanism, which both branches had converged on
+(pydantic `max_length` on a `FetchPagesInput` nested inside `build_fetch_tool`); this branch's
+duplicate class and its three cap tests are dropped in favour of `development`'s, which also
+cover the recoverable-rejection path (`handle_validation_error`) that this branch's
+`pytest.raises(ValidationError)` tests contradict. R9's obligation is *that* the call is
+bounded by config, not the number, so no requirement changes and this does not escalate to
+REQUIREMENTS. Every "default 4" in `## Design Decisions` (D11), `## Requirements Coverage`
+(R9), Phase 2's **Files**/acceptance criteria and its handoff entry reads 5.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
@@ -1381,7 +1394,7 @@ phase). Append-only, empty at plan creation. -->
   the fastest way to find out, and a wrong path is a one-value fix in `harness.toml`.
 
 ### 2026-08-09 — Phase 2: Fetch amendments — URL cap and source capture
-- Done: `fetch.max_urls_per_call` (default 4) bounds one `fetch_pages` call through pydantic
+- Done: `fetch.max_urls_per_call` (default ~~4~~ 5) bounds one `fetch_pages` call through pydantic
   `max_length` on the input schema, which moved inside `build_fetch_tool` to close over config
   the way `build_search_tool` already does — so the bound is pre-network, not prompt guidance
   (R9/D11). Every consulted source is now captured to `<workspace_dir>/sources/S<n>.md` at

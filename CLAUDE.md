@@ -42,12 +42,21 @@ not the ceiling).
 
 ## Stack
 
-- Language: Python (>=3.11), managed with uv.
-- Dev tooling: ruff (lint + format), mypy (typecheck, targets 3.12 — see
-  docs/decisions.md), pytest.
+- Language: Python — `requires-python` floor is 3.11, but `.python-version`
+  pins 3.12 for uv and CI, matching mypy's target (see docs/decisions.md).
+- Package manager: uv, itself pinned to exactly 0.12.3 by `[tool.uv]
+  required-version` in @pyproject.toml — any other uv refuses to run every uv
+  command. CI installs its uv from that same key.
+- Runtime deps (declared in @pyproject.toml): pydantic, langchain-core,
+  crawl4ai (pinned `==0.9.2`), httpx. Dev deps: ruff, mypy, pytest,
+  pytest-asyncio, pytest-cov (pinned `==7.1.0`, pulls in coverage).
+- Everything not marked pinned above still carries a `>=` floor and so floats
+  on re-resolve; `uv.lock` holds the resolved set and is the source of truth for
+  what is actually installed (referenced by name, not `@` — an `@` prefix would
+  inline the whole ~559k-token lockfile into every session's context).
+  Converting those floors to `==` is a docs/backlog.md item.
 - No database — reports are timestamped markdown files on disk.
-- Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium
-  (Lightpanda was tried and retired — see docs/decisions.md).
+- Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium.
 - Search: self-hosted SearXNG (JSON API).
 - Models: OpenCode API serves both roles — `[roles.head]` = `deepseek-v4-flash`,
   `[roles.subagent]` = `gpt-5.6-luna`. Config-swappable; no other provider is
@@ -59,6 +68,10 @@ not the ceiling).
 
 - Commits: conventional commits — `type(scope): summary`.
 - PR bodies follow .github/pull_request_template.md.
+- Pin every dependency to an exact version (`==X.Y.Z`), never a `>=` floor — a
+  floor still lets the resolved version float on the next re-resolve. This
+  applies to tools and actions too: uv via `required-version`, GitHub Actions by
+  commit SHA with a trailing version comment.
 
 ## Code Reuse (CRITICAL)
 Before creating ANY new utility, helper, hook, or shared component:

@@ -1,14 +1,12 @@
-"""Load and validate the harness's TOML config surface.
+"""Load and validate `harness.toml`: providers, model roles, fetch/search limits.
 
-Providers, model roles, the browser backend, and fetch/search limits are declared in
-`harness.toml` at the repo root. Secrets are never stored in the file — each provider
-names an environment variable, resolved at load time.
+Secrets are never stored in the file — each provider names an environment variable,
+resolved at load time.
 """
 
 import os
 import tomllib
 from pathlib import Path
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -31,9 +29,8 @@ class ProviderConfig(_StrictModel):
     @model_validator(mode="before")
     @classmethod
     def _reject_literal_api_key(cls, data: object) -> object:
-        # Raw input only (revalidation of a built instance passes through): a literal
-        # key in the file would sit in version control while being silently ignored
-        # in favor of the env var — reject it outright.
+        # Raw input only; revalidation of a built instance passes through. A literal key
+        # would sit in version control while being silently ignored for the env var.
         if isinstance(data, dict) and data.get("api_key"):
             env_name = data.get("api_key_env", "api_key_env")
             raise ValueError(
@@ -58,24 +55,16 @@ class RoleConfig(_StrictModel):
     model: str
 
 
-class BrowserSettings(_StrictModel):
-    backend: Literal["lightpanda", "playwright"]
-    cdp_url: str | None = None
-
-    @model_validator(mode="after")
-    def _require_cdp_url_for_lightpanda(self) -> "BrowserSettings":
-        if self.backend == "lightpanda" and not self.cdp_url:
-            raise ValueError("browser.backend is 'lightpanda' but browser.cdp_url is not set")
-        return self
-
-
 class FetchSettings(_StrictModel):
-    # Bounded, not merely typed: these cross the config trust boundary into crawl4ai's
-    # dispatcher and the per-page truncation cap, where 0 or a negative is nonsense.
+    # Bounded, not merely typed: these cross into crawl4ai's dispatcher and the
+    # truncation cap, where 0 or a negative is nonsense.
     page_timeout_ms: int = Field(default=15000, gt=0)
     max_concurrency: int = Field(default=5, gt=0)
     per_page_char_cap: int = Field(default=12000, gt=0)
-    max_urls_per_call: int = Field(default=4, gt=0)
+    # 5 is engineering judgment, not a measured optimum (D1): it bounds one call to ~15k
+    # tokens at the current per-page cap. Operators change it here, not in code. It bounds
+    # one `fetch_pages` call, never the run (R9/D11).
+    max_urls_per_call: int = Field(default=5, gt=0)
 
 
 class SearchSettings(_StrictModel):
@@ -100,7 +89,6 @@ class AgentSettings(_StrictModel):
 class HarnessConfig(_StrictModel):
     providers: dict[str, ProviderConfig]
     roles: dict[str, RoleConfig]
-    browser: BrowserSettings
     fetch: FetchSettings = Field(default_factory=FetchSettings)
     search: SearchSettings
     agent: AgentSettings = Field(default_factory=AgentSettings)
@@ -141,8 +129,8 @@ def load_config(path: Path | None = None) -> HarnessConfig:
 def _describe(exc: ValidationError) -> str:
     """Render a ValidationError naming the offending field, not just the complaint.
 
-    Pydantic's `msg` alone reads "Field required" with no clue which field, which is
-    useless for R7's "fails at startup with a clear message". `loc` carries the path.
+    Pydantic's `msg` alone reads "Field required" with no clue which field — useless for
+    R7's "fails at startup with a clear message". `loc` carries the path.
     """
     parts: list[str] = []
     for error in exc.errors():

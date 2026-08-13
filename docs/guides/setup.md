@@ -2,14 +2,34 @@
 
 ## Install
 
-1. Install [uv](https://docs.astral.sh/uv/).
+1. Install [uv](https://docs.astral.sh/uv/) — **exactly `0.12.3`**. `pyproject.toml`'s
+   `[tool.uv] required-version = "==0.12.3"` is a hard constraint: any other uv refuses
+   to run *every* uv command, including step 2, with a version-mismatch error rather than
+   a dependency error. A fresh installer gives you a newer uv, so pin it explicitly:
+
+   ```
+   curl -LsSf https://astral.sh/uv/0.12.3/install.sh | sh
+   ```
+
+   On Windows PowerShell:
+
+   ```
+   powershell -c "irm https://astral.sh/uv/0.12.3/install.ps1 | iex"
+   ```
+
+   Confirm with `uv --version` before step 2.
+
+   Bumping uv is a deliberate edit to that one line in `pyproject.toml`, which CI, the
+   workstation, and a rebuilt runner VM all read — CI installs its uv from the same key
+   (see `.github/workflows/ci.yml` and `docs/plans/PLAN-ci-pipeline.md` `## Discoveries`).
 2. `uv sync` — creates `.venv` and installs runtime deps (pydantic, langchain-core,
    crawl4ai, httpx, deepagents, langchain-openai) and dev deps (ruff, mypy, pytest,
-   pytest-asyncio). `deepagents` and `langchain-openai` are both pinned exactly; the
-   former also pulls in langchain-anthropic, langchain-google-genai and langsmith.
-3. `uv run playwright install chromium` — the default browser backend
-   (`browser.backend = "playwright"` in `harness.toml`) needs a Chromium install; this
-   is not covered by `uv sync`.
+   pytest-asyncio, pytest-cov). Python 3.12 is used, pinned by `.python-version`;
+   `requires-python` floor is 3.11. `deepagents` and `langchain-openai` are both pinned
+   exactly; the former also pulls in langchain-anthropic, langchain-google-genai and
+   langsmith.
+3. `uv run playwright install chromium` — the fetch tool is crawl4ai-managed
+   Playwright/Chromium, and this is not covered by `uv sync`.
 4. Copy `.env.example` to `.env` and fill in:
    - `OPENCODE_API_KEY` — the OpenCode endpoint serving both model roles
    - `SEARXNG_SECRET` — cookie signing for the local SearXNG instance; generate
@@ -19,10 +39,9 @@
    whether or not a role uses it — so a declared provider with no key set fails
    `load_config()`. Only `[providers.opencode]` is declared today.
 
-   `SEARXNG_URL` and `LIGHTPANDA_CDP_URL` are no longer `.env` variables — they moved
-   into `harness.toml` (see below). If you have an existing `.env` with those keys,
-   move their values into `harness.toml`'s `[search]` and `[browser]` tables and
-   delete them from `.env`.
+   `SEARXNG_URL` is no longer an `.env` variable — it moved into `harness.toml` (see
+   below). If you have an existing `.env` with that key, move its value into
+   `harness.toml`'s `[search]` table and delete it from `.env`.
 5. `harness.toml` ships with real values — no `TODO` placeholders remain. If you
    change the endpoint or a model ID, note that a literal `TODO` still passes
    `load_config()` (it is a well-formed string), but is rejected at startup by
@@ -54,9 +73,9 @@ are never stored here — each provider names an environment variable
 - `[providers.<name>]` — a model provider's `base_url` and the env var holding its key.
 - `[roles.head]` / `[roles.subagent]` — which provider + model ID each role resolves
   to. Both keys are required.
-- `[browser]` — the fetch tool's browser backend (`playwright` or `lightpanda`) and,
-  for `lightpanda`, the CDP URL.
-- `[fetch]` — per-page timeout, fetch concurrency, and the per-page character cap.
+- `[fetch]` — per-page timeout, fetch concurrency, the per-page character cap, and the
+  maximum URLs one `fetch_pages` call may request (`max_urls_per_call`; a call carrying
+  more is rejected without fetching anything).
 - `[search]` — the SearXNG base URL and default result count.
 - `[agent]` — `max_rounds` (default 20) and `wall_clock_seconds` (default 1800), the
   run's two ceilings. The wall clock starts at the first `search_web`/`fetch_pages`
@@ -95,19 +114,6 @@ are never stored here — each provider names an environment variable
   take effect. Some engines (e.g. `wikidata`) may log a 403 init failure on
   start-up; that is one upstream engine refusing this instance, not a broken
   install — the others still return results.
-
-- **Lightpanda** — not currently used (`browser.backend` defaults to `playwright`;
-  see the `docs/decisions.md` entry on why). Left here for when the backlog item is
-  revisited:
-
-  ```
-  docker run -d --name lightpanda -p 9222:9222 lightpanda/browser \
-    /bin/lightpanda serve --host 0.0.0.0 --port 9222 --advertise-host 127.0.0.1
-  ```
-
-  On Git Bash for Windows, prefix with `MSYS_NO_PATHCONV=1` or the
-  `/bin/lightpanda` argument gets rewritten into a Windows path and the container
-  exits 127.
 
 ## Manual live check
 
