@@ -3,7 +3,6 @@
 import pytest
 
 from harness.config import (
-    BrowserSettings,
     FetchSettings,
     HarnessConfig,
     ProviderConfig,
@@ -21,6 +20,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
         page_timeout_ms: int = 15000,
         max_concurrency: int = 5,
         per_page_char_cap: int = 12000,
+        max_urls_per_call: int = 5,
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
     ) -> HarnessConfig:
@@ -35,11 +35,11 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
                 "head": RoleConfig(provider="opencode", model="test-model"),
                 "subagent": RoleConfig(provider="opencode", model="test-model"),
             },
-            browser=BrowserSettings(backend="playwright", cdp_url=None),
             fetch=FetchSettings(
                 page_timeout_ms=page_timeout_ms,
                 max_concurrency=max_concurrency,
                 per_page_char_cap=per_page_char_cap,
+                max_urls_per_call=max_urls_per_call,
             ),
             search=SearchSettings(base_url=base_url, default_max_results=default_max_results),
         )

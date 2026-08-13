@@ -8,6 +8,7 @@ full, untruncated per-URL outcomes for anything downstream that needs them (e.g.
 resolution via `harness.sources.SourceRegistry`).
 """
 
+import re
 from typing import Literal
 
 from crawl4ai import (  # type: ignore[import-untyped]
@@ -18,11 +19,12 @@ from crawl4ai import (  # type: ignore[import-untyped]
     DefaultMarkdownGenerator,
     MemoryAdaptiveDispatcher,
     PruningContentFilter,
+    RateLimiter,
 )
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.config import BrowserSettings, HarnessConfig
+from harness.config import HarnessConfig
 from harness.sources import SourceRegistry, normalize_url
 
 FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
@@ -30,16 +32,17 @@ FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
 _BLOCKED_STATUSES = frozenset({403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
 
+# 75%, not crawl4ai's default 90%: each concurrent crawl is a real browser page, and this
+# box also hosts SearXNG and Chromium.
+_MEMORY_THRESHOLD_PERCENT = 75.0
 
-def build_browser_config(settings: BrowserSettings) -> BrowserConfig:
-    """Map the harness's browser backend vocabulary onto crawl4ai's `browser_mode`.
+# Despite the name, crawl4ai 0.9.2 re-fetches nothing — this caps how many times a domain's
+# backoff delay may double. See @docs/plans/PLAN-crawler-refinement.md Reconciliation #1.
+_RATE_LIMIT_MAX_RETRIES = 1
 
-    `settings.backend` is the harness's vocabulary (`"lightpanda"` / `"playwright"`);
-    `browser_mode` is crawl4ai's. This function is the only place the two are mapped.
-    """
-    if settings.backend == "lightpanda":
-        return BrowserConfig(browser_mode="cdp", cdp_url=settings.cdp_url)
-    return BrowserConfig()
+# A markdown heading line. crawl4ai hands us flat strings with no heading tree, so a cut
+# boundary has to be found in the text itself.
+_HEADING_LINE = re.compile(r"^#{1,6} ", re.MULTILINE)
 
 
 def classify(
@@ -109,35 +112,21 @@ def _title_of(result: object) -> str | None:
 
 
 def _pair(urls: list[str], results: list[object]) -> list[tuple[str, object | None]]:
-    """Pair each input URL with its crawl result, tolerating a redirect-renamed URL.
+    """Pair each input URL with the result crawl4ai keyed to that exact URL.
 
-    First pass: match each input URL against a dict keyed by `result.url` — the common
-    case. Second pass: any input URL left unmatched consumes the next still-unmatched
-    result in input order — this is what survives a redirect that leaves `result.url`
-    different from what was requested. An input URL with nothing left to match against
-    pairs with `None`.
+    An input URL with no exact match pairs with `None` and reports `error` rather than
+    consuming an unclaimed result positionally, which could attribute one page's body to
+    another page's `[Sn]` marker. One URL can yield two results under memory pressure; the
+    first is taken. See @docs/plans/PLAN-crawler-refinement.md Phase 1.
     """
     by_url: dict[str | None, list[object]] = {}
     for result in results:
         by_url.setdefault(getattr(result, "url", None), []).append(result)
 
-    exact_matches: dict[int, object] = {}
-    claimed_ids: set[int] = set()
-    for index, url in enumerate(urls):
-        bucket = by_url.get(url)
-        if bucket:
-            match = bucket.pop(0)
-            exact_matches[index] = match
-            claimed_ids.add(id(match))
-
-    leftovers = iter(r for r in results if id(r) not in claimed_ids)
-
     pairs: list[tuple[str, object | None]] = []
-    for index, url in enumerate(urls):
-        if index in exact_matches:
-            pairs.append((url, exact_matches[index]))
-        else:
-            pairs.append((url, next(leftovers, None)))
+    for url in urls:
+        bucket = by_url.get(url)
+        pairs.append((url, bucket.pop(0) if bucket else None))
     return pairs
 
 
@@ -154,7 +143,16 @@ def _render(page: FetchedPage, cap: int) -> str:
 
     text = page.markdown
     if len(text) > cap:
-        text = text[:cap] + f"\n\n_[truncated at {cap} characters]_"
+        window = text[:cap]
+        # Cut on the latest paragraph break or heading start; the heading goes with the cut,
+        # since a heading with no body under it is noise. No boundary found — or one at 0,
+        # which would empty the block — takes the whole allowance instead.
+        boundary = max([window.rfind("\n\n"), *(m.start() for m in _HEADING_LINE.finditer(window))])
+        cut = boundary if boundary > 0 else cap
+        text = (
+            window[:cut].rstrip()
+            + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
+        )
     lines.append(text)
 
     return "\n\n".join(lines)
@@ -164,9 +162,8 @@ async def _fetch(
     urls: list[str], config: HarnessConfig, registry: SourceRegistry
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL, returning model-facing markdown and the full per-URL artifact."""
-    # The registry dedups by normalized URL, so crawl each canonical URL exactly once —
-    # otherwise two spellings of one page (trailing slash, fragment, case) would render
-    # duplicate [Sn] headings over independently-fetched, possibly different bodies.
+    # Crawl each canonical URL once: the registry dedups by normalized URL, so two spellings
+    # of one page would otherwise render duplicate [Sn] headings over different bodies.
     seen: set[str] = set()
     unique_urls: list[str] = []
     for url in urls:
@@ -184,10 +181,16 @@ async def _fetch(
         markdown_generator=DefaultMarkdownGenerator(content_filter=PruningContentFilter()),
         cache_mode=CacheMode.BYPASS,
         stream=False,
+        verbose=False,
     )
-    dispatcher = MemoryAdaptiveDispatcher(max_session_permit=config.fetch.max_concurrency)
+    dispatcher = MemoryAdaptiveDispatcher(
+        max_session_permit=config.fetch.max_concurrency,
+        memory_threshold_percent=_MEMORY_THRESHOLD_PERCENT,
+        rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
+    )
 
-    async with AsyncWebCrawler(config=build_browser_config(config.browser)) as crawler:
+    # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
+    async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as crawler:
         raw_results = await crawler.arun_many(urls, config=run_config, dispatcher=dispatcher)
         results = list(raw_results)
 
@@ -230,16 +233,23 @@ async def _fetch(
     return content, pages
 
 
-class FetchPagesInput(BaseModel):
-    """Model-facing input schema for the `fetch_pages` tool."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    urls: list[str] = Field(description="The URLs to fetch, in the order they should be reported.")
-
-
 def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseTool:
     """Build the `fetch_pages` tool, closing over `config` and the shared `registry`."""
+
+    max_urls = config.fetch.max_urls_per_call
+
+    class FetchPagesInput(BaseModel):
+        """Model-facing input schema for the `fetch_pages` tool."""
+
+        model_config = ConfigDict(extra="forbid")
+
+        urls: list[str] = Field(
+            max_length=max_urls,
+            description=(
+                "The URLs to fetch, in the order they should be reported. "
+                f"At most {max_urls} per call."
+            ),
+        )
 
     @tool("fetch_pages", args_schema=FetchPagesInput, response_format="content_and_artifact")
     async def fetch_pages(urls: list[str]) -> tuple[str, list[FetchedPage]]:
@@ -251,5 +261,24 @@ def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseToo
         (trailing slash, fragment, case) are fetched once and reported once.
         """
         return await _fetch(urls, config, registry)
+
+    # Appended rather than written into the docstring above: the limit is config, and a
+    # literal would go stale the moment an operator changed it (D2).
+    fetch_pages.description = (
+        f"{fetch_pages.description}\n\nAt most {max_urls} URLs may be requested per call; "
+        "a call carrying more is rejected without fetching anything."
+    )
+
+    # `exc` is `object`: langchain may hand over a pydantic v1 or v2 `ValidationError`.
+    def _explain_validation_error(exc: object) -> str:
+        """Turn a rejected call into a message the model can act on and retry."""
+        return (
+            f"fetch_pages rejected this call without fetching anything: {exc}. "
+            f"At most {max_urls} URLs may be requested per call."
+        )
+
+    # A callable, not a fixed string: this swallows EVERY validation failure for the tool, so
+    # a wrong type must not be misreported as an over-limit call (D2, risk #3).
+    fetch_pages.handle_validation_error = _explain_validation_error
 
     return fetch_pages

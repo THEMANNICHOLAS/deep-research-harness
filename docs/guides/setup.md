@@ -25,19 +25,17 @@
 2. `uv sync` — creates `.venv` and installs runtime deps (pydantic, langchain-core,
    crawl4ai, httpx) and dev deps (ruff, mypy, pytest, pytest-asyncio, pytest-cov).
    Python 3.12 is used, pinned by `.python-version`; `requires-python` floor is 3.11.
-3. `uv run playwright install chromium` — the default browser backend
-   (`browser.backend = "playwright"` in `harness.toml`) needs a Chromium install; this
-   is not covered by `uv sync`.
+3. `uv run playwright install chromium` — the fetch tool is crawl4ai-managed
+   Playwright/Chromium, and this is not covered by `uv sync`.
 4. Copy `.env.example` to `.env` and fill in:
    - `OPENCODE_API_KEY` — smart-model orchestration (GLM 5.2 / DeepSeek V4 Pro)
    - `CEREBRAS_API_KEY` — Gemma 4 31B worker triage (free tier)
    - `SEARXNG_SECRET` — cookie signing for the local SearXNG instance; generate
      with `openssl rand -hex 32`
 
-   `SEARXNG_URL` and `LIGHTPANDA_CDP_URL` are no longer `.env` variables — they moved
-   into `harness.toml` (see below). If you have an existing `.env` with those keys,
-   move their values into `harness.toml`'s `[search]` and `[browser]` tables and
-   delete them from `.env`.
+   `SEARXNG_URL` is no longer an `.env` variable — it moved into `harness.toml` (see
+   below). If you have an existing `.env` with that key, move its value into
+   `harness.toml`'s `[search]` table and delete it from `.env`.
 5. Replace `harness.toml`'s remaining `TODO` placeholders with real values: the
    OpenCode base URL and the head/subagent model IDs. (`[search] base_url` is
    already set to the local SearXNG below.) These are **not** validated — `TODO`
@@ -70,9 +68,9 @@ are never stored here — each provider names an environment variable
 - `[providers.<name>]` — a model provider's `base_url` and the env var holding its key.
 - `[roles.head]` / `[roles.subagent]` — which provider + model ID each role resolves
   to. Both keys are required.
-- `[browser]` — the fetch tool's browser backend (`playwright` or `lightpanda`) and,
-  for `lightpanda`, the CDP URL.
-- `[fetch]` — per-page timeout, fetch concurrency, and the per-page character cap.
+- `[fetch]` — per-page timeout, fetch concurrency, the per-page character cap, and the
+  maximum URLs one `fetch_pages` call may request (`max_urls_per_call`; a call carrying
+  more is rejected without fetching anything).
 - `[search]` — the SearXNG base URL and default result count.
 
 ## Prerequisites
@@ -102,19 +100,6 @@ are never stored here — each provider names an environment variable
   take effect. Some engines (e.g. `wikidata`) may log a 403 init failure on
   start-up; that is one upstream engine refusing this instance, not a broken
   install — the others still return results.
-
-- **Lightpanda** — not currently used (`browser.backend` defaults to `playwright`;
-  see the `docs/decisions.md` entry on why). Left here for when the backlog item is
-  revisited:
-
-  ```
-  docker run -d --name lightpanda -p 9222:9222 lightpanda/browser \
-    /bin/lightpanda serve --host 0.0.0.0 --port 9222 --advertise-host 127.0.0.1
-  ```
-
-  On Git Bash for Windows, prefix with `MSYS_NO_PATHCONV=1` or the
-  `/bin/lightpanda` argument gets rewritten into a Windows path and the container
-  exits 127.
 
 ## Manual live check
 

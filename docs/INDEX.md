@@ -9,8 +9,7 @@
 - **Integrations:** SearXNG (local Docker instance checked in at
   @searxng/docker-compose.yml, JSON API enabled — a stock container is HTML-only
   and will not work), crawl4ai over
-  crawl4ai-managed Playwright/Chromium (Lightpanda was tried and retired — see
-  docs/decisions.md), Cerebras API for worker-model triage (TODO — key),
+  crawl4ai-managed Playwright/Chromium, Cerebras API for worker-model triage (TODO — key),
   OpenCode API for orchestrator/synthesis models (TODO — key). API **keys** live
   in `.env`; **endpoints, model IDs and limits** live in `harness.toml` (see
   docs/guides/setup.md). Neither is ever hardcoded.

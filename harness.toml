@@ -22,15 +22,11 @@ model = "TODO"                       # TODO: OpenCode head-model ID, e.g. glm-5.
 provider = "cerebras"
 model = "TODO"                       # TODO: Cerebras worker-model ID, e.g. gemma-4-31b
 
-[browser]
-# Default is playwright, not lightpanda — see docs/decisions.md for the
-# crawl4ai<->Lightpanda smoke-check outcome that settled this.
-backend = "playwright"
-
 [fetch]
 page_timeout_ms = 15000
 max_concurrency = 5
 per_page_char_cap = 12000
+max_urls_per_call = 5
 
 [search]
 base_url = "http://localhost:8080"   # local dev instance — see searxng/docker-compose.yml

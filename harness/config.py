@@ -1,14 +1,13 @@
 """Load and validate the harness's TOML config surface.
 
-Providers, model roles, the browser backend, and fetch/search limits are declared in
-`harness.toml` at the repo root. Secrets are never stored in the file — each provider
-names an environment variable, resolved at load time.
+Providers, model roles, and fetch/search limits are declared in `harness.toml` at the
+repo root. Secrets are never stored in the file — each provider names an environment
+variable, resolved at load time.
 """
 
 import os
 import tomllib
 from pathlib import Path
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -58,23 +57,15 @@ class RoleConfig(_StrictModel):
     model: str
 
 
-class BrowserSettings(_StrictModel):
-    backend: Literal["lightpanda", "playwright"]
-    cdp_url: str | None = None
-
-    @model_validator(mode="after")
-    def _require_cdp_url_for_lightpanda(self) -> "BrowserSettings":
-        if self.backend == "lightpanda" and not self.cdp_url:
-            raise ValueError("browser.backend is 'lightpanda' but browser.cdp_url is not set")
-        return self
-
-
 class FetchSettings(_StrictModel):
     # Bounded, not merely typed: these cross the config trust boundary into crawl4ai's
     # dispatcher and the per-page truncation cap, where 0 or a negative is nonsense.
     page_timeout_ms: int = Field(default=15000, gt=0)
     max_concurrency: int = Field(default=5, gt=0)
     per_page_char_cap: int = Field(default=12000, gt=0)
+    # 5 is engineering judgment, not a measured optimum (D1): it bounds one call to ~15k
+    # tokens at the current per-page cap. Operators change it here, not in code.
+    max_urls_per_call: int = Field(default=5, gt=0)
 
 
 class SearchSettings(_StrictModel):
@@ -85,7 +76,6 @@ class SearchSettings(_StrictModel):
 class HarnessConfig(_StrictModel):
     providers: dict[str, ProviderConfig]
     roles: dict[str, RoleConfig]
-    browser: BrowserSettings
     fetch: FetchSettings = Field(default_factory=FetchSettings)
     search: SearchSettings
 

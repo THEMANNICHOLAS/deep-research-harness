@@ -10,17 +10,6 @@ to address.
 
 ## Entries
 
-- **Lightpanda cannot currently drive crawl4ai's `goto`.** No page lifecycle event
-  ever arrives over CDP, so `Page.goto` times out even though the CDP connection
-  attaches successfully (see @docs/decisions.md). This bites the browser backend
-  selection in `harness/tools/fetch.py` (Phase 3), which is why `browser.backend`
-  defaults to `playwright` there instead. To revisit: retest against a later
-  Lightpanda release, or drive navigation with a strategy that does not wait on a
-  lifecycle event crawl4ai currently blocks on. Separately, `--advertise-host` must be
-  set when starting Lightpanda — without it the server advertises
-  `webSocketDebuggerUrl: ws://0.0.0.0:9222/`, which no CDP client can dial; this is
-  independent of the lifecycle-event problem and needed regardless of which fix lands.
-
 - **PDFs never classify as `non_html`.** The `non_html` outcome in
   `harness/tools/fetch.py` assumes crawl4ai returns a successful crawl with empty markdown
   for a PDF. Over crawl4ai-managed Playwright it does neither: a PDF that triggers a
@@ -35,13 +24,13 @@ to address.
   fixed mid-phase per that plan's risk #2, which forbids widening the classifier during
   Phase 3.
 
-- **Residual boilerplate survives the pruning filter.** `PruningContentFilter` strips
-  Wikipedia's sidebar, personal tools, navigation menu, privacy policy and license footer,
-  but a tail of category links and a "Search / N languages" fragment remains in the fetched
-  markdown. Costs tokens on every fetched page. The substrate plan's Preferences place
-  stripping quality outside the acceptance gate ("tuning quality is iterative"), so this is
-  tuning work: adjust `PruningContentFilter`'s threshold or extend `_EXCLUDED_TAGS` in
-  `harness/tools/fetch.py`, measured against real fetched pages rather than in the abstract.
+- **Residual boilerplate survives the pruning filter.** A tail of category links and a
+  "Search / N languages" fragment reaches the model on every fetched page. `min_word_threshold`
+  is ruled out as the fix on live measurement — it scores HTML blocks, so it cannot tell a
+  one-word heading from a nav stub; full evidence and the numbers are in Reconciliation #2 of
+  @docs/plans/PLAN-crawler-refinement.md. To address: a render-side line filter dropping bare
+  `* [Text](url)` bullets (the measured front-runner) or an extended `_EXCLUDED_TAGS`, either
+  one measured against real pages and mindful of genuine link-only "See also" lists.
 
 - **`harness.toml`'s `TODO` placeholders load as valid config.** The literal `"TODO"`
   strings shipped for the OpenCode `base_url` and both role model IDs pass `load_config()`
@@ -79,6 +68,16 @@ to address.
   be pinned exactly (`==`), never `>=`.** Only `[tool.uv] required-version` was pinned in
   that session — converting the rest is a separate change, each pin chosen against what
   `uv.lock` already resolves, then re-locked and pushed through CI.
+
+- **Nothing retries a rate-limited page.** `RateLimiter(max_retries=...)` in
+  `harness/tools/fetch.py` does not re-fetch on a 429/503 — crawl4ai 0.9.2 calls
+  `update_delay` after the crawl has returned and only grows that domain's backoff delay
+  (`async_dispatcher.py:65-85`, verified 2026-08-11). So a source that rate-limits us is
+  reported `blocked` on a single attempt, and a transient 429 costs the whole page. This bites
+  research coverage against APIs and doc sites that throttle bursts. To address: a retry pass
+  in `_fetch` over the `blocked` outcomes, which is genuinely new machinery (attempt budget,
+  backoff, and a rule for how a retried page reports) — deliberately deferred in Phase 1 of
+  @docs/plans/PLAN-crawler-refinement.md, see its Reconciliation #1.
 
 - **An HTTP 404 that serves a real HTML body classifies as `fetched`.** Observed in the
   final end-to-end sanity check: a Wikipedia URL returning 404 came back
