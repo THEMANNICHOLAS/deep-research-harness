@@ -240,6 +240,11 @@ def _notes_section(config: HarnessConfig, started_at: datetime | None) -> str:
     return "\n\n".join(sections) if sections else _NO_NOTES_TEXT
 
 
+def _verdict_label(verdict: str) -> str:
+    """The reader-facing spelling of a verdict — reports are read by non-technical people."""
+    return verdict.replace("_", " ")
+
+
 def _place_marker(text: str, claim: str, marker: str) -> str | None:
     """Locate `claim` in `text` whitespace-tolerantly and insert `marker` right after it.
 
@@ -279,8 +284,17 @@ def _annotate(outcome: RunOutcome) -> tuple[str, list[ClaimCheck]]:
     text = outcome.answer
     unplaced: list[ClaimCheck] = []
     if outcome.verification is not None:
+        # A claim is marked only when NOT ONE of its cited sources supports it. A
+        # synthesized sentence cites several sources, each covering part of it, so marking
+        # per failing source painted well-evidenced prose as unsupported and read, to the
+        # non-technical reader this report is written for, as "trust none of this" (Phase 6
+        # live check). One supporting source is support; the per-source detail for the
+        # others stays available in `## Conflicting sources`.
+        supported_claims = {
+            check.claim for check in outcome.verification.checks if check.verdict == "supported"
+        }
         for check in outcome.verification.checks:
-            if check.verdict == "supported":
+            if check.verdict == "supported" or check.claim in supported_claims:
                 continue
             # A leading space, never a paragraph break: the marker has to stay on the line
             # of the sentence it judges. Broken onto its own line it reads as a label on
@@ -289,7 +303,7 @@ def _annotate(outcome: RunOutcome) -> tuple[str, list[ClaimCheck]]:
             if check.source_id is None:
                 marker = " **[uncited]**"
             else:
-                marker = f" **[{check.verdict} — {check.source_id}]**"
+                marker = f" **[{_verdict_label(check.verdict)} — {check.source_id}]**"
             updated = _place_marker(text, check.claim, marker)
             if updated is None:
                 unplaced.append(check)

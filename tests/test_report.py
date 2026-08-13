@@ -503,32 +503,41 @@ def test_write_report_has_no_cut_short_sections_when_the_run_finished(make_confi
 
 
 def test_write_report_marks_each_non_supported_verdict_and_leaves_supported_bare(make_config):
-    """Every verdict in the frozen vocabulary renders a visible marker except `supported`."""
-    from harness.verify import ClaimCheck, VerificationResult
+    """Every verdict in the frozen vocabulary renders a visible marker except `supported`.
+
+    Each claim below carries exactly one check, so no claim has a supporting source to
+    suppress its marker — that gating is tested separately. The `get_args` assertion keeps
+    this exhaustive: a verdict added later fails here until it is given a case.
+    """
+    from typing import get_args
+
+    from harness.verify import ClaimCheck, Verdict, VerificationResult
 
     config = make_config()
     supported = "The sky is blue."
     unsupported = "The moon is made of cheese."
+    not_addressed = "Jupiter has a great red spot."
     uncited = "Water boils at 100 degrees Celsius."
     unresolved = "Mercury is the closest planet to the sun."
     unverifiable = "Venus has a thick atmosphere."
-    answer = " ".join([supported, unsupported, uncited, unresolved, unverifiable])
-    verification = VerificationResult(
-        checks=[
-            ClaimCheck(claim=supported, source_id="S1", verdict="supported"),
-            ClaimCheck(
-                claim=unsupported, source_id="S1", verdict="unsupported", detail="disagrees"
-            ),
-            ClaimCheck(claim=uncited, source_id=None, verdict="uncited"),
-            ClaimCheck(claim=unresolved, source_id="S9", verdict="unresolved"),
-            ClaimCheck(
-                claim=unverifiable,
-                source_id="S2",
-                verdict="unverifiable",
-                detail="fetch failed",
-            ),
-        ]
-    )
+    answer = " ".join([supported, unsupported, not_addressed, uncited, unresolved, unverifiable])
+    checks = [
+        ClaimCheck(claim=supported, source_id="S1", verdict="supported"),
+        ClaimCheck(claim=unsupported, source_id="S1", verdict="unsupported", detail="disagrees"),
+        ClaimCheck(
+            claim=not_addressed, source_id="S3", verdict="not_addressed", detail="says nothing"
+        ),
+        ClaimCheck(claim=uncited, source_id=None, verdict="uncited"),
+        ClaimCheck(claim=unresolved, source_id="S9", verdict="unresolved"),
+        ClaimCheck(
+            claim=unverifiable,
+            source_id="S2",
+            verdict="unverifiable",
+            detail="fetch failed",
+        ),
+    ]
+    assert {check.verdict for check in checks} == set(get_args(Verdict))
+    verification = VerificationResult(checks=checks)
     outcome = RunOutcome(
         question="Marker rendering",
         answer=answer,
@@ -540,11 +549,12 @@ def test_write_report_marks_each_non_supported_verdict_and_leaves_supported_bare
     body = write_report(outcome, config).read_text(encoding="utf-8")
 
     assert "**[unsupported — S1]**" in body
+    assert "**[not addressed — S3]**" in body
     assert "**[uncited]**" in body
     assert "**[unresolved — S9]**" in body
     assert "**[unverifiable — S2]**" in body
-    # Exactly the four non-supported claims carry a marker — the supported one does not.
-    assert body.count("**[") == 4
+    # Exactly the five non-supported claims carry a marker — the supported one does not.
+    assert body.count("**[") == 5
 
 
 def test_write_report_resolves_registered_markers_and_discloses_unregistered_ones(
@@ -777,6 +787,67 @@ def test_marker_binds_to_the_sentence_it_judges_not_the_one_after_it(make_config
     # ...and does not open a line, which is what made it read as the next claim's label.
     assert "\n**[unsupported" not in answer_section
     assert "Lead time is six weeks" in answer_section
+
+
+def test_a_claim_one_cited_source_supports_carries_no_marker(make_config):
+    """Phase 6 live check: a synthesized sentence cites several sources, each covering
+    part of it, so the sentences that WERE properly evidenced collected a marker for every
+    source that merely didn't speak to them. A reader — non-technical, by design — reads a
+    page of unsupported markers as "none of this is trustworthy", the exact miscalibration
+    D3 rejected paragraph-level claims to avoid. One supporting source is support.
+    """
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    claim = "The vendor quoted $4.20 [S1][S2]."
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(claim=claim, source_id="S1", verdict="supported", detail="Confirms."),
+            ClaimCheck(claim=claim, source_id="S2", verdict="not_addressed", detail="Silent."),
+        ]
+    )
+    outcome = RunOutcome(
+        question="Partial coverage",
+        answer=claim,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    answer_section = body.split("## Answer", 1)[1].split("## ", 1)[0]
+    assert "**[" not in answer_section
+
+
+def test_a_claim_no_cited_source_supports_is_marked_per_failing_source(make_config):
+    """The other half of the same rule: when NOTHING supports the claim, every failing
+    source still shows in place, so the reader sees which source failed it and how.
+    """
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    claim = "The vendor quoted $4.20 [S1][S2]."
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(claim=claim, source_id="S1", verdict="unsupported", detail="Says $5.10."),
+            ClaimCheck(claim=claim, source_id="S2", verdict="not_addressed", detail="Silent."),
+        ]
+    )
+    outcome = RunOutcome(
+        question="No support at all",
+        answer=claim,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    answer_section = body.split("## Answer", 1)[1].split("## ", 1)[0]
+    assert "**[unsupported — S1]**" in answer_section
+    # Rendered for a non-technical reader, not as the raw literal `not_addressed`.
+    assert "**[not addressed — S2]**" in answer_section
 
 
 def test_write_report_discloses_a_verdict_whose_marker_could_not_be_placed(make_config):

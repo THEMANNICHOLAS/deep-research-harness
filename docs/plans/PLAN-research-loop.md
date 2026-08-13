@@ -1,6 +1,6 @@
 # PLAN: Research Loop — Single-Agent Orchestrator, Clarification, and Tier Contracts
 
-**Status:** In Progress
+**Status:** Complete
 **Created:** 2026-08-09
 **Amended:** 2026-08-09 — deepagents locked at 0.7.x; source capture (R8), fetch cap (R9),
 visible plan (R10); sequential verification; TODO-placeholder validation
@@ -416,7 +416,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 5: Run ceiling and cut-short reporting
 - [x] Phase 6: Claim verification and disclosure
 - [x] Phase 7: Researcher and reader tier contracts
-- [ ] Final verification
+- [x] Final verification
 
 ## Phases
 
@@ -974,13 +974,19 @@ prompt artifacts, so a later round wires the pyramid without renegotiating the s
 
 ## Verification
 
-- [x] `uv run pytest` — all tests pass from the repo root. (232 passed, 2026-08-12.)
+- [x] `uv run pytest` — all tests pass from the repo root. (270 passed, 2026-08-13, after
+      the `development` merge and the two live-check fixes.)
 - [x] `uv run ruff check .` — clean.
 - [x] `uv run ruff format --check .` — clean.
 - [x] `uv run mypy .` — clean.
-- [ ] Manual end-to-end: `python -m harness "<an ambiguous question>"` asks at least one
+- [x] Manual end-to-end: `python -m harness "<an ambiguous question>"` asks at least one
       clarifying question, answers it, researches, and writes a report whose citations all
       resolve, whose unsupported claims are marked, and whose disclosure section is present.
+      (Covered across two live runs, since one run cannot be both ambiguous and specific:
+      the clarifying-question half by Phase 4's live check on 2026-08-10, and the rest by
+      2026-08-13's 15-source run — every citation resolved to a link, markers placed,
+      `## Conflicting sources` and `## Gaps and disclosures` both rendered. That run is
+      also what exposed the two 2026-08-13 Discoveries, both fixed before this tick.)
 - [x] Every source consulted in the manual end-to-end run has a
       ~~`sources/S<n>.md`~~ `sources/<run_id>/S<n>.md` file in the workspace — content or
       failure stub. (2026-08-13, Phase 5's wall-clock run: five sources registered, five
@@ -1379,6 +1385,25 @@ whose judged sentence ended its line. → **acted now**: the marker is a single 
 binding it to the sentence it judges, with a test asserting adjacency rather than mere
 presence. Generalise: a test that asserts a marker is PRESENT says nothing about what it is
 attached to; when placement carries the meaning, assert the neighbours.
+
+2026-08-13 — Phase 6, found by the Phase 6 live check: the verdict vocabulary conflated
+"this source CONTRADICTS the claim" with "this source is SILENT on the claim", and both
+rendered as `unsupported`. Real answers cite several sources per synthesized sentence, each
+covering part of it, so on a 41-claim run nearly every sentence collected an `unsupported`
+marker per source that merely hadn't spoken to it — and, because a conflict was "two distinct
+sources with disagreeing verdicts", the report announced in the harness's own voice that "the
+cited sources disagree" over sources that never did. The detail lines gave it away: one
+position read "...supporting the claim" while its supposed opponent read "never mentions
+LangChain". This is D3's own failure mode arriving from the other direction — the plan
+rejected paragraph-level claims because one bad clause would mark five good sentences
+unsupported, and multi-source citation reproduced that at sentence level. → **acted now**:
+`not_addressed` joins the vocabulary as a third model-decidable verdict, `unsupported` now
+means contradiction only, a conflict requires one supporting AND one contradicting source
+(a silent source is still listed inside a real conflict but can never trigger one), and a
+claim is marked in the answer only when NOT ONE of its cited sources supports it. Verdicts
+render in reader-facing spelling (`not addressed`), since the audience is non-technical.
+Generalise: a vocabulary that cannot say "no comment" will say "no" instead, and every
+consumer downstream inherits the lie.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per

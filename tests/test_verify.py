@@ -8,12 +8,13 @@ fails them on content, not just on import.
 
 import asyncio
 import re
+from typing import get_args
 
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import PrivateAttr, SecretStr
 
 from harness.sources import SourceRegistry
-from harness.verify import Conflict, extract_claims, verify_claims
+from harness.verify import Conflict, Verdict, extract_claims, verify_claims
 from tests.conftest import (
     ScriptedChatModel,
     verify_reply,
@@ -35,12 +36,15 @@ async def test_every_verdict_in_the_frozen_vocabulary_is_reachable(
     supported_id = registry.add("https://example.test/tungsten-melting-point")
     unsupported_id = registry.add("https://example.test/oven-specs")
     failed_id = registry.add("https://example.test/dead-source")
+    silent_id = registry.add("https://example.test/kiln-catalogue")
     write_source_capture(config, registry, supported_id, "Tungsten melts at 3422 degrees Celsius.")
     write_source_capture(config, registry, unsupported_id, "The oven only reaches 1200 Celsius.")
     write_failed_capture(config, registry, failed_id, outcome="blocked")
+    write_source_capture(config, registry, silent_id, "Our kilns ship in three colours.")
 
     supported_claim = "Tungsten melts at 3422 degrees Celsius [S1]."
     unsupported_claim = "The oven can easily melt tungsten [S2]."
+    not_addressed_claim = "Tungsten is used in light bulb filaments [S4]."
     uncited_claim = "Tungsten is a very hard metal."
     unresolved_claim = "Tungsten was discovered in 1781 [S9]."
     unverifiable_claim = "Tungsten has the highest melting point of any metal [S3]."
@@ -48,6 +52,7 @@ async def test_every_verdict_in_the_frozen_vocabulary_is_reachable(
         [
             supported_claim,
             unsupported_claim,
+            not_addressed_claim,
             uncited_claim,
             unresolved_claim,
             unverifiable_claim,
@@ -58,6 +63,7 @@ async def test_every_verdict_in_the_frozen_vocabulary_is_reachable(
         [
             verify_reply("supported", "Matches the source exactly."),
             verify_reply("unsupported", "The oven falls short of tungsten's melting point."),
+            verify_reply("not_addressed", "The catalogue says nothing about filaments."),
         ]
     )
     monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
@@ -69,12 +75,16 @@ async def test_every_verdict_in_the_frozen_vocabulary_is_reachable(
     assert by_claim[supported_claim].source_id == "S1"
     assert by_claim[unsupported_claim].verdict == "unsupported"
     assert by_claim[unsupported_claim].source_id == "S2"
+    assert by_claim[not_addressed_claim].verdict == "not_addressed"
+    assert by_claim[not_addressed_claim].source_id == "S4"
     assert by_claim[uncited_claim].verdict == "uncited"
     assert by_claim[uncited_claim].source_id is None
     assert by_claim[unresolved_claim].verdict == "unresolved"
     assert by_claim[unresolved_claim].source_id == "S9"
     assert by_claim[unverifiable_claim].verdict == "unverifiable"
     assert by_claim[unverifiable_claim].source_id == "S3"
+    # Exhaustive by construction: a verdict added later fails here until it gets a case.
+    assert {check.verdict for check in result.checks} == set(get_args(Verdict))
 
 
 async def test_a_check_sees_only_its_own_sources_captured_text(
@@ -263,6 +273,76 @@ async def test_two_sources_on_one_sentence_both_supported_yields_no_conflict(
     assert {c.claim for c in result.checks} == {claim}
     assert {c.source_id for c in result.checks} == {id1, id2}
     assert all(c.verdict == "supported" for c in result.checks)
+
+
+async def test_a_silent_source_is_not_addressed_and_never_makes_a_conflict(
+    make_config, scripted_model, monkeypatch
+):
+    """Found by the Phase 6 live check. A synthesized sentence typically cites several
+    sources, each covering part of it. Reading "this source does not establish the claim"
+    as disagreement made the report state, in the harness's own voice, that sources
+    disagreed when one had simply said nothing on the point — the same false-confidence
+    failure D3 refuses, pointed the other way.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Source one confirms the $4.20 price.")
+    write_source_capture(config, registry, id2, "Source two discusses shipping lead times.")
+    claim = f"The vendor quoted $4.20 per unit [{id1}] [{id2}]."
+
+    model = scripted_model(
+        [
+            verify_reply("supported", "Confirms $4.20."),
+            verify_reply("not_addressed", "Says nothing about price."),
+        ]
+    )
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_claims(claim, config, registry)
+
+    by_source = {check.source_id: check for check in result.checks}
+    assert by_source[id1].verdict == "supported"
+    assert by_source[id2].verdict == "not_addressed"
+    # Silence is not disagreement.
+    assert result.conflicts == []
+
+
+async def test_a_contradiction_alongside_a_silent_source_still_conflicts(
+    make_config, scripted_model, monkeypatch
+):
+    """The other half: `not_addressed` must not SUPPRESS a real conflict either. One
+    source confirming, one contradicting and one silent is still a genuine disagreement,
+    and the silent source is listed so the reader sees the full picture.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    id3 = registry.add("https://example.test/three")
+    for source_id, text in (
+        (id1, "Source one says the price is $4.20."),
+        (id2, "Source two says the price is $5.10."),
+        (id3, "Source three is about lead times."),
+    ):
+        write_source_capture(config, registry, source_id, text)
+    claim = f"The vendor quoted $4.20 per unit [{id1}] [{id2}] [{id3}]."
+
+    model = scripted_model(
+        [
+            verify_reply("supported", "Confirms $4.20."),
+            verify_reply("unsupported", "Says $5.10 instead."),
+            verify_reply("not_addressed", "Says nothing about price."),
+        ]
+    )
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_claims(claim, config, registry)
+
+    assert len(result.conflicts) == 1
+    positions = result.conflicts[0].positions
+    assert {p.source_id for p in positions} == {id1, id2, id3}
 
 
 # --- 3F fix pass: direct unit tests for extract_claims (Minor finding 2) ----------------

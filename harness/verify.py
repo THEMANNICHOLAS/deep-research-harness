@@ -25,9 +25,15 @@ from harness.prompts import render
 from harness.sources import SourceRegistry, marker_ids
 from harness.tools.fetch import _sources_dir, is_failed_capture
 
-Verdict = Literal["supported", "unsupported", "uncited", "unresolved", "unverifiable"]
+Verdict = Literal[
+    "supported", "unsupported", "not_addressed", "uncited", "unresolved", "unverifiable"
+]
 
-_MODEL_VERDICTS = {"supported", "unsupported"}
+# `unsupported` means the source CONTRADICTS the claim; `not_addressed` means it is silent
+# on it. Collapsing the two (the Phase 6 live check found them collapsed) made every
+# synthesized sentence — which cites several sources, each covering part of it — look both
+# unsupported and disputed, because a source that said nothing was read as disagreeing.
+_MODEL_VERDICTS = {"supported", "unsupported", "not_addressed"}
 
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•–]|\d+[.)])\s+")
 _HEADING_RE = re.compile(r"^#{1,6}\s")
@@ -297,6 +303,10 @@ async def verify_claims(
         if len({c.source_id for c in positions}) < 2:
             continue
         verdicts_seen = {c.verdict for c in positions}
+        # A conflict needs one source that CONTRADICTS the claim, not merely one that
+        # fails to establish it (Phase 6 live check). A silent source is still listed in
+        # `positions` when a real conflict exists — the reader wants the whole picture —
+        # but it can never be what triggers the section.
         if "supported" in verdicts_seen and "unsupported" in verdicts_seen:
             conflicts.append(Conflict(claim=claim, positions=positions))
 
