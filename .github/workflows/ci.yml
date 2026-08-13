@@ -2,14 +2,14 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, development]
   push:
-    branches: [main]
+    branches: [main, development]
 
 # One in-flight run per ref: a new push to a pull request cancels the run it
 # superseded (R7), while runs for different refs never cancel each other.
-# Pull requests only — cancelling on `main` would leave a merged commit with a
-# verdict-less run whenever two merges land close together.
+# Pull requests only — cancelling on a branch push would leave a merged commit
+# with a verdict-less run whenever two merges land close together.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
