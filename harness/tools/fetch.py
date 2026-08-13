@@ -1,11 +1,8 @@
-"""Fetch many URLs concurrently through crawl4ai, with no single URL able to fail the batch.
+"""Fetch many URLs concurrently through crawl4ai; no single URL can fail the batch.
 
-Each URL is classified into a small outcome vocabulary (`FetchOutcome`) rather than
-raising, so a blocked or timed-out page shows up as data for the model to reason about
-instead of an exception that would sink the whole tool call. The model sees compact,
+Each URL is classified into `FetchOutcome` rather than raising. The model sees compact,
 `[Sn]`-headed, boilerplate-stripped markdown capped per page; the artifact carries the
-full, untruncated per-URL outcomes for anything downstream that needs them (e.g. citation
-resolution via `harness.sources.SourceRegistry`).
+full untruncated outcomes for downstream use (e.g. `harness.sources.SourceRegistry`).
 """
 
 import re
@@ -40,8 +37,8 @@ _MEMORY_THRESHOLD_PERCENT = 75.0
 # backoff delay may double. See @docs/plans/PLAN-crawler-refinement.md Reconciliation #1.
 _RATE_LIMIT_MAX_RETRIES = 1
 
-# A markdown heading line. crawl4ai hands us flat strings with no heading tree, so a cut
-# boundary has to be found in the text itself.
+# crawl4ai hands us flat strings with no heading tree, so a cut boundary has to be
+# found in the text itself.
 _HEADING_LINE = re.compile(r"^#{1,6} ", re.MULTILINE)
 
 
@@ -53,9 +50,8 @@ def classify(
 ) -> FetchOutcome:
     """Classify one crawl result into the frozen outcome vocabulary.
 
-    "Successful" is inferred from `error_message` being absent — this signature takes
-    no `success` flag, so a `None` error_message with empty markdown is treated as a
-    successful crawl of an empty (non-HTML) page, not an error.
+    Success is inferred from `error_message` being absent — there is no `success` flag,
+    so no error plus empty markdown means an empty (non-HTML) page, not an error.
     """
     if status_code in _BLOCKED_STATUSES:
         return "blocked"
@@ -85,7 +81,6 @@ class FetchedPage(BaseModel):
 
 
 def _content_type(result: object) -> str | None:
-    """Case-insensitive lookup of `content-type` in `result.response_headers`."""
     headers = getattr(result, "response_headers", None) or {}
     for key, value in headers.items():
         if key.lower() == "content-type":
@@ -106,18 +101,17 @@ def _markdown_of(result: object) -> str:
 
 
 def _title_of(result: object) -> str | None:
-    """Read the page title out of `result.metadata`, which crawl4ai keys as `"title"`."""
     metadata = getattr(result, "metadata", None) or {}
     return metadata.get("title")
 
 
 def _pair(urls: list[str], results: list[object]) -> list[tuple[str, object | None]]:
-    """Pair each input URL with the result crawl4ai keyed to that exact URL.
+    """Pair each URL with the result crawl4ai keyed to it exactly.
 
-    An input URL with no exact match pairs with `None` and reports `error` rather than
-    consuming an unclaimed result positionally, which could attribute one page's body to
-    another page's `[Sn]` marker. One URL can yield two results under memory pressure; the
-    first is taken. See @docs/plans/PLAN-crawler-refinement.md Phase 1.
+    Never positional: an unclaimed result could attribute one page's body to another's
+    `[Sn]`. No match pairs with `None` and reports `error`. One URL can yield two results
+    under memory pressure; the first is taken. See
+    @docs/plans/PLAN-crawler-refinement.md Phase 1.
     """
     by_url: dict[str | None, list[object]] = {}
     for result in results:
@@ -144,9 +138,8 @@ def _render(page: FetchedPage, cap: int) -> str:
     text = page.markdown
     if len(text) > cap:
         window = text[:cap]
-        # Cut on the latest paragraph break or heading start; the heading goes with the cut,
-        # since a heading with no body under it is noise. No boundary found — or one at 0,
-        # which would empty the block — takes the whole allowance instead.
+        # Cut at the latest paragraph break or heading start (a heading with no body is
+        # noise). No boundary, or one at 0 that would empty the block, takes the full cap.
         boundary = max([window.rfind("\n\n"), *(m.start() for m in _HEADING_LINE.finditer(window))])
         cut = boundary if boundary > 0 else cap
         text = (
@@ -162,8 +155,8 @@ async def _fetch(
     urls: list[str], config: HarnessConfig, registry: SourceRegistry
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL, returning model-facing markdown and the full per-URL artifact."""
-    # Crawl each canonical URL once: the registry dedups by normalized URL, so two spellings
-    # of one page would otherwise render duplicate [Sn] headings over different bodies.
+    # Crawl each canonical URL once: the registry dedups by normalized URL, so two
+    # spellings would otherwise render duplicate [Sn] headings over different bodies.
     seen: set[str] = set()
     unique_urls: list[str] = []
     for url in urls:

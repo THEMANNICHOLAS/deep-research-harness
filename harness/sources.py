@@ -1,10 +1,8 @@
 """Assign stable per-run source IDs and resolve `[Sn]` markers into markdown links.
 
-Citations in synthesized answers reference sources by a short `[Sn]` marker rather than
-a raw URL, so the model's output stays readable. This module is the purely mechanical
-half of that scheme: minting IDs, deduplicating equivalent URLs, and rewriting markers
-into clickable links. No model involvement, no fetching — see D6 for why retrieval is a
-separate, later concern.
+The mechanical half of the citation scheme: minting IDs, deduplicating equivalent URLs,
+and rewriting markers into links. No model involvement, no fetching — see D6 for why
+retrieval is a separate, later concern.
 """
 
 import re
@@ -20,21 +18,19 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 def normalize_url(url: str) -> str:
     """Return a canonical form of `url` so equivalent URLs share one identity.
 
-    Collapses differences that don't change what's fetched: scheme/host case, a
-    trailing slash on the path, an explicit default port, and any fragment. Preserves
-    everything else verbatim, including the query string — two URLs differing only by
-    query are different sources, not duplicates.
+    Collapses what doesn't change the fetch: scheme/host case, trailing slash, default
+    port, fragment. Everything else is verbatim, including the query — two URLs differing
+    only by query are different sources.
 
-    Total by design: a URL too malformed to parse is its own canonical form rather than
-    an exception. The fetch tool registers model-supplied URLs, and R2 forbids one bad
-    URL from failing the batch.
+    Total by design: an unparseable URL is its own canonical form, never an exception.
+    These URLs are model-supplied, and R2 forbids one bad URL failing the batch.
     """
     try:
         parts = urlsplit(url)
         port = parts.port
     except ValueError:
-        # `urlsplit` rejects an unterminated IPv6 literal; `.port` rejects a
-        # non-numeric or out-of-range port. Neither is worth guessing a repair for.
+        # `urlsplit` rejects an unterminated IPv6 literal, `.port` a bad port number.
+        # Neither is worth guessing a repair for.
         return url
 
     scheme = parts.scheme.lower()
@@ -79,10 +75,9 @@ class SourceRegistry:
         self._by_id: dict[str, Source] = {}
 
     def add(self, url: str, title: str | None = None) -> str:
-        """Register `url`, returning its ID. The same normalized URL is never added twice.
+        """Register `url` and return its ID; the same normalized URL is never added twice.
 
-        First write wins: if the URL is already registered, its existing title is kept
-        even if a different `title` is passed here.
+        First write wins — an already-registered URL keeps its existing title.
         """
         normalized = normalize_url(url)
         existing = self._by_url.get(normalized)
@@ -96,7 +91,6 @@ class SourceRegistry:
         return source_id
 
     def get(self, source_id: str) -> Source | None:
-        """Look up a source by ID, or `None` if it isn't registered."""
         return self._by_id.get(source_id)
 
     def all(self) -> list[Source]:
@@ -104,10 +98,7 @@ class SourceRegistry:
         return list(self._by_id.values())
 
     def link(self, source_id: str) -> str:
-        """Render `source_id` as a `[domain](url)` markdown link.
-
-        Raises `KeyError` if `source_id` isn't registered.
-        """
+        """Render `source_id` as a `[domain](url)` link; `KeyError` if unregistered."""
         source = self._by_id.get(source_id)
         if source is None:
             raise KeyError(f"unknown source id {source_id!r}")
@@ -115,16 +106,16 @@ class SourceRegistry:
         try:
             label = urlsplit(source.url).hostname or source.url
         except ValueError:
-            # `add` stores a URL `normalize_url` could not parse verbatim, so the
-            # same ValueError surfaces here; the raw URL is the only label there is.
+            # `add` stored a URL `normalize_url` could not parse, so it fails here too;
+            # the raw URL is the only label available.
             label = source.url
         return f"[{label}]({source.url})"
 
     def resolve(self, text: str) -> str:
         """Replace every known `[Sn]` marker in `text` with its markdown link.
 
-        Unknown markers are left untouched. Note `re.sub` does not re-scan its
-        replacements, so the brackets inside a rendered link are never re-matched.
+        Unknown markers are left untouched. `re.sub` does not re-scan replacements, so
+        brackets inside a rendered link are never re-matched.
         """
 
         def _replace(match: re.Match[str]) -> str:
