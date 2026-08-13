@@ -30,6 +30,13 @@ from harness.report import (
     _WALL_CLOCK_TEXT,
 )
 from harness.sources import SourceRegistry
+from tests.conftest import (
+    drain_stdout,
+    patch_model,
+    patch_run,
+    verify_reply,
+    write_source_capture,
+)
 
 
 def _tools_by_name(graph):
@@ -53,10 +60,6 @@ def _filesystem_backend(graph):
     raise AssertionError("could not recover the FilesystemMiddleware's backend from read_file")
 
 
-def _patch_model(monkeypatch, model):
-    monkeypatch.setattr("harness.agent.build_chat_model", lambda config, role: model)
-
-
 async def test_build_agent_drives_research_using_the_configured_model(
     make_config, monkeypatch, scripted_model
 ):
@@ -69,7 +72,7 @@ async def test_build_agent_drives_research_using_the_configured_model(
             )
         ]
     )
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
     result = await graph.ainvoke(
@@ -93,7 +96,7 @@ async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_
     """
     config = make_config()
     model = scripted_model([AIMessage(content="done")])
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
     await graph.ainvoke(
@@ -119,7 +122,7 @@ async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_
 async def test_build_agent_exposes_the_harness_tools(make_config, monkeypatch, scripted_model):
     config = make_config()
     model = scripted_model([AIMessage(content="done")])
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
 
@@ -131,7 +134,7 @@ async def test_build_agent_disables_the_general_purpose_subagent(
 ):
     config = make_config()
     model = scripted_model([AIMessage(content="done")])
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
 
@@ -144,7 +147,7 @@ async def test_build_agent_disables_the_general_purpose_subagent(
 async def test_build_agent_includes_todo_list_middleware(make_config, monkeypatch, scripted_model):
     config = make_config()
     model = scripted_model([AIMessage(content="done")])
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
 
@@ -156,7 +159,7 @@ async def test_execute_is_excluded_from_the_models_tool_schema(
 ):
     config = make_config()
     model = scripted_model([AIMessage(content="done")])
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
     await graph.ainvoke(
@@ -172,7 +175,7 @@ async def test_execute_is_excluded_from_the_models_tool_schema(
 def test_filesystem_backend_is_never_a_sandbox(make_config, monkeypatch, scripted_model):
     config = make_config()
     model = scripted_model([AIMessage(content="done")])
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
     backend = _filesystem_backend(graph)
@@ -199,7 +202,7 @@ async def test_writes_through_the_agent_land_under_the_workspace_dir(
             AIMessage(content="done"),
         ]
     )
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
     await graph.ainvoke(
@@ -229,7 +232,7 @@ async def test_writes_cannot_escape_the_workspace_dir(make_config, monkeypatch, 
             AIMessage(content="done"),
         ]
     )
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
     result = await graph.ainvoke(
@@ -305,7 +308,7 @@ async def test_compression_offloads_evicted_history_and_preserves_todos_state(
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
     model = scripted_model([plan_call, *tool_rounds, final])
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
     result = await graph.ainvoke(
@@ -358,9 +361,7 @@ async def test_todo_updates_surface_at_the_terminal(
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
     model = scripted_model([ping, plan_call, final])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
 
     await main_module.main(["What is the capital of France?"])
 
@@ -398,9 +399,7 @@ async def test_run_outcome_records_token_usage_summed_with_reasoning_split(
     )
     final = AIMessage(content="Final answer [S1].", usage_metadata=usage_b)
     model = scripted_model([ping, round_one, final])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
 
     captured = {}
     real_write_report = main_module.write_report
@@ -433,13 +432,11 @@ async def test_main_prints_the_report_path_as_the_final_line_of_stdout(
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
     model = scripted_model([ping, final])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
 
     await main_module.main(["a question with no tool calls"])
 
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    _, lines = drain_stdout(capsys)
     assert lines, "main() printed nothing"
     printed_path = lines[-1].strip()
     assert printed_path.endswith(".md")
@@ -509,6 +506,77 @@ def test_final_answer_is_empty_when_the_run_never_spoke():
     assert main_module._final_answer(messages) == ""
 
 
+def test_message_text_reads_block_style_content():
+    """`AIMessage.content` is `str | list`, and `str(content)` on the list shape is a repr.
+
+    A provider or model swap that returns content blocks would otherwise put
+    `[{'type': 'text', 'text': '...'}]` under `## Answer` for a non-technical reader
+    (PR #4 review, Minor). Non-text blocks (a `thinking` block, say) are dropped rather
+    than rendered.
+    """
+    message = AIMessage(
+        content=[
+            {"type": "thinking", "thinking": "internal scratch that must not be published"},
+            {"type": "text", "text": "Acme quoted $4.20/unit [S1]."},
+        ]
+    )
+
+    assert main_module._message_text(message) == "Acme quoted $4.20/unit [S1]."
+    assert main_module._final_answer([message]) == "Acme quoted $4.20/unit [S1]."
+
+
+def test_message_text_still_reads_the_plain_string_shape():
+    assert main_module._message_text(AIMessage(content="  Plain prose.  ")) == "Plain prose."
+
+
+async def test_read_answer_resolves_instead_of_hanging_when_stdin_is_closed(monkeypatch):
+    """A dead stdin must not strand the run on a future nothing will ever complete.
+
+    `input()` raising `EOFError` used to kill the worker thread BEFORE `_resolve` was
+    scheduled, so `await future` never returned (PR #4 review, Major). The wall clock is
+    still disarmed for a pre-research question, so nothing else would ever rescue it.
+    This test hangs forever against the old code rather than failing, which is why it
+    carries its own timeout.
+    """
+
+    def fake_input(prompt: str = "") -> str:
+        raise EOFError("EOF when reading a line")
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    answer = await asyncio.wait_for(main_module._read_answer(), timeout=5)
+
+    assert answer == ""
+
+
+async def test_read_answer_resolves_when_stdin_raises_oserror(monkeypatch):
+    """Same guard, for a detached-stdin `OSError` rather than a clean EOF."""
+
+    def fake_input(prompt: str = "") -> str:
+        raise OSError("Bad file descriptor")
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    assert await asyncio.wait_for(main_module._read_answer(), timeout=5) == ""
+
+
+async def test_the_clarification_prompt_never_reaches_stdout(monkeypatch, capsys):
+    """The report path is the final line of STDOUT — frozen, because R1 depends on it.
+
+    `input(prompt)` writes the prompt with no trailing newline, so the path printed at the
+    end of `main` landed on the same line as a pending `> ` (PR #4 review, Major). The
+    prompt belongs on stderr with the rest of the terminal chatter.
+    """
+    monkeypatch.setattr("builtins.input", lambda: "the metal")
+
+    answer = await main_module._read_answer("> ")
+
+    captured = capsys.readouterr()
+    assert answer == "the metal"
+    assert captured.out == "", f"the prompt reached stdout: {captured.out!r}"
+    assert "> " in captured.err
+
+
 async def test_read_answer_runs_on_a_daemon_thread(monkeypatch):
     """A non-daemon worker is joined at interpreter shutdown, so the process hangs after
     the wall clock has already fired and written its report. (Measured: a probe using
@@ -565,14 +633,11 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
         ],
     )
     model = scripted_model([ping, *([keep_going] * 20)])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["question that never settles"])
 
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if line.strip()]
+    out, lines = drain_stdout(capsys)
     assert exit_code == 0
     assert lines, "main() printed no report path"
     report_path = Path(lines[-1].strip())
@@ -626,14 +691,11 @@ async def test_max_rounds_scales_the_recursion_limit(
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
     model = scripted_model([ping, one_round, final])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["a question needing one round"])
 
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if line.strip()]
+    out, lines = drain_stdout(capsys)
     assert exit_code == 0
     body = Path(lines[-1].strip()).read_text(encoding="utf-8")
     assert (_CUT_SHORT_HEADING in body) is expect_cut_short
@@ -667,14 +729,11 @@ async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
         ],
     )
     model = scripted_model([ping, *([keep_going] * 20)])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
 
     await main_module.main(["question that never settles"])
 
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if line.strip()]
+    out, lines = drain_stdout(capsys)
     body = Path(lines[-1].strip()).read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING in body
     assert "Chase the pricing page" in body
@@ -712,9 +771,7 @@ async def test_main_cuts_the_run_short_when_the_wall_clock_expires(
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
     model = scripted_model([ping, search_call, final])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=3)
 
@@ -722,8 +779,7 @@ async def test_main_cuts_the_run_short_when_the_wall_clock_expires(
     exit_code = await main_module.main(["a question that starts researching"])
     elapsed = time.monotonic() - started
 
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if line.strip()]
+    out, lines = drain_stdout(capsys)
     assert exit_code == 0
     assert lines, "main() printed no report path"
     report_path = Path(lines[-1].strip())
@@ -763,9 +819,7 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
     model = scripted_model([ping, ask, final])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
 
     async def _slow_answer(prompt: str = "> ") -> str:
         await asyncio.sleep(2)
@@ -775,8 +829,7 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
 
     exit_code = await main_module.main(["Should we expand?"])
 
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if line.strip()]
+    out, lines = drain_stdout(capsys)
     assert exit_code == 0
     assert lines, "main() printed no report path"
     report_path = Path(lines[-1].strip())
@@ -820,9 +873,7 @@ async def test_a_mid_run_clarification_is_bounded_by_the_wall_clock(
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
     model = scripted_model([ping, search_call, ask, final])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=0.1)
 
@@ -836,8 +887,7 @@ async def test_a_mid_run_clarification_is_bounded_by_the_wall_clock(
     exit_code = await main_module.main(["Research widgets"])
     elapsed = time.monotonic() - started
 
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if line.strip()]
+    out, lines = drain_stdout(capsys)
     assert exit_code == 0
     assert lines, "main() printed no report path"
     report_path = Path(lines[-1].strip())
@@ -877,9 +927,7 @@ async def test_main_writes_a_cut_short_report_when_the_run_dies_mid_flight(
         usage_metadata={"input_tokens": 41, "output_tokens": 7, "total_tokens": 48},
     )
     model = scripted_model([ping, plan_call])  # no third response — the run dies here
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["question that never gets an answer"])
 
@@ -887,7 +935,7 @@ async def test_main_writes_a_cut_short_report_when_the_run_dies_mid_flight(
     assert exit_code == 1
     assert any(line.startswith("error:") for line in err.splitlines()), err
     assert "Traceback" not in err
-    lines = [line for line in out.splitlines() if line.strip()]
+    lines = [line for line in out.splitlines() if line.strip()]  # `out` already drained above
     assert lines, "no report path was printed even though the run died mid-flight"
     report_path = Path(lines[-1].strip())
     assert report_path.exists()
@@ -916,16 +964,120 @@ async def test_a_run_inside_both_bounds_reports_no_cut_short(
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
     model = scripted_model([ping, final])
-    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
-    _patch_model(monkeypatch, model)
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["a simple question"])
 
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if line.strip()]
+    out, lines = drain_stdout(capsys)
     assert exit_code == 0
     assert lines, "main() printed no report path"
     report_path = Path(lines[-1].strip())
     body = report_path.read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING not in body
+
+
+# --- PR #4 review: the Phase 5 x Phase 6 seam ------------------------------------------
+
+
+async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """A round-capped run whose partial answer cites a real, captured source.
+
+    This is the seam nothing covered (PR #4 review, Major). Every existing cut-short test
+    scripts an answer with no `[Sn]` marker, or no answer at all, so `verify_claims` only
+    ever took its trivial "no marker → no model call" path; the suite asserted cut-short
+    headings and bound text and *looked* like it covered the interaction. It could not
+    cover it, because `harness.verify` holds its own `build_chat_model` binding that no
+    test patched — reaching the model-call branch would have dialed the fake endpoint for
+    real. `patch_run` now patches that binding too, which is what makes this possible.
+
+    The verification model is scripted SEPARATELY from the run model: how many rounds the
+    cap allows is a langgraph implementation detail, so a shared script would make the
+    verify reply's index depend on it.
+    """
+    agent = AgentSettings(
+        max_rounds=2, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
+    )
+    config = make_config(agent=agent)
+
+    # `main` builds the registry itself, so a pre-populated one is injected in its place —
+    # standing in for the `fetch_pages` calls a real run would have made before the cap.
+    registry = SourceRegistry(run_id="2020-01-01-000000")
+    source_id = registry.add("https://example.test/pricing", title="Pricing")
+    write_source_capture(config, registry, source_id, "Acme lists $5.10 per unit.")
+    monkeypatch.setattr(main_module, "SourceRegistry", lambda run_id: registry)
+
+    ping = AIMessage(content="pong")
+    partial = AIMessage(
+        content=f"Acme quoted $4.20 per unit [{source_id}].",
+        tool_calls=[
+            {
+                "name": "write_todos",
+                "args": {"todos": [{"content": "Confirm the quote", "status": "pending"}]},
+                "id": "call_1",
+            }
+        ],
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    keep_going = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_todos",
+                "args": {"todos": [{"content": "Confirm the quote", "status": "pending"}]},
+                "id": "call_n",
+            }
+        ],
+    )
+    model = scripted_model([ping, partial, *([keep_going] * 20)])
+    patch_run(monkeypatch, config, model)
+
+    verify_model = scripted_model([verify_reply("unsupported", "The capture reads $5.10.")])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda cfg, role: verify_model)
+
+    await main_module.main(["what does Acme charge?"])
+
+    _, lines = drain_stdout(capsys)
+    body = Path(lines[-1].strip()).read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING in body, "this run was supposed to hit the round cap"
+    # The check actually ran on the cut-short path — not skipped, not defaulted.
+    assert verify_model._call_count == 1
+    assert f"**[unsupported — {source_id}]**" in body
+    # And R1's citation resolution still happened on the same partial answer.
+    assert "https://example.test/pricing" in body
+
+
+async def test_a_clarifying_question_can_arrive_without_a_question_argument(
+    make_config, monkeypatch, capsys
+):
+    """`args["question"] or description or str(args)` — only the first branch was exercised.
+
+    Nothing guarantees deepagents keeps putting the prompt under `args`, and the fallbacks
+    are all that stand between a schema change and an empty prompt at the terminal
+    (PR #4 review, nit). Driven through `_answer_questions` directly, since an action
+    request that omits `args["question"]` is a shape no real model can be scripted into.
+    """
+
+    async def _record(prompt: str = "> ") -> str:
+        return "answered"
+
+    monkeypatch.setattr(main_module, "_read_answer", _record)
+
+    interrupt = Interrupt(
+        value={
+            "action_requests": [
+                {"name": "ask_user", "args": {}, "description": "Metal or album?"},
+                {"name": "ask_user", "args": {"topic": "isotope"}},
+            ]
+        }
+    )
+
+    decisions = await main_module._answer_questions(interrupt)
+
+    out, _ = drain_stdout(capsys)
+    asked = [line for line in out.splitlines() if line.strip()]
+    assert asked[0] == "Metal or album?", "the description fallback never fired"
+    assert "isotope" in asked[1], "the str(args) last resort never fired"
+    assert [d["message"] for d in decisions] == ["answered", "answered"]

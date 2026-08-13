@@ -12,8 +12,10 @@ Calls are made ONE AT A TIME, in document order (D4) — see `verify_claims`.
 
 import json
 import re
+from pathlib import Path
 from typing import Literal
 
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,13 +23,14 @@ from harness.config import HarnessConfig
 from harness.models import build_chat_model
 from harness.prompts import render
 from harness.sources import SourceRegistry, marker_ids
-from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
+from harness.tools.fetch import _sources_dir, is_failed_capture
 
 Verdict = Literal["supported", "unsupported", "uncited", "unresolved", "unverifiable"]
 
 _MODEL_VERDICTS = {"supported", "unsupported"}
 
-_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•–]|\d+[.)])\s+")
+_HEADING_RE = re.compile(r"^#{1,6}\s")
 
 
 class ClaimCheck(BaseModel):
@@ -64,14 +67,67 @@ class VerifyError(Exception):
     """Raised for a verification-pass-level failure (this module's one `<Domain>Error`)."""
 
 
+def _block_units(lines: list[str]) -> list[str]:
+    """Split one block's non-blank lines into claim-sized units, line by line.
+
+    Decided PER LINE, never per block (PR #4 review, Blocker). The previous rule —
+    "every line in the block is a bullet, or the whole block is one unit" — merged a
+    heading or a `Key findings:` lead-in into the first bullet, and merged a whole
+    unpunctuated bullet list into ONE unit carrying several `[Sn]` markers. That unit
+    was then checked against each cited source in turn, so every source was asked to
+    support some other source's fact: `verify_claims` returned mixed verdicts, and
+    `report.py` rendered a "the cited sources disagree" section between sources that
+    never disagreed. A lead-in above a list is ordinary markdown and needs no blank line,
+    so it was the common case, not the exotic one.
+
+    Four line kinds:
+    - a markdown heading — dropped, and only the LINE is dropped. Dropping the whole
+      block (the previous behavior) silently discarded every claim under a `## Findings`
+      heading that carried no blank line beneath it — never checked, never disclosed.
+    - a list lead-in (`Key findings:` immediately above a list item) — dropped: it
+      introduces assertions rather than making one.
+    - a list item — starts a new unit, marker stripped.
+    - anything else — continues the open unit (a hard-wrapped line), or starts a prose
+      unit when none is open.
+    """
+    units: list[str] = []
+    open_unit = False
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+
+        if _HEADING_RE.match(line):
+            open_unit = False
+            continue
+
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if line.endswith(":") and _LIST_ITEM_RE.match(next_line):
+            open_unit = False
+            continue
+
+        if _LIST_ITEM_RE.match(raw_line):
+            units.append(_LIST_ITEM_RE.sub("", raw_line, count=1).strip())
+            open_unit = True
+        elif open_unit:
+            units[-1] = f"{units[-1]} {line}"
+        else:
+            units.append(line)
+            open_unit = True
+
+    return units
+
+
 def extract_claims(answer: str) -> list[str]:
     """Split `answer` into sentence-shaped claims, offline and deterministic.
 
-    A claim is a SENTENCE (plan `## Discoveries` 2026-08-12). A returned sentence is NOT
-    guaranteed to be a verbatim substring of `answer` — a block's lines are joined with a
-    single space, so a hard-wrapped or bulleted claim collapses whitespace that the
-    original answer did not have. `report.py` locates it back whitespace-tolerantly (3F
-    fix pass, Major finding), not by a literal substring match.
+    A claim is a SENTENCE (plan `## Discoveries` 2026-08-12) carrying, at most, the
+    citations of the one assertion it makes — see `_block_units` for how a block's lines
+    become units and why the split is per line.
+
+    A returned sentence is NOT guaranteed to be a verbatim substring of `answer` — a
+    wrapped line's continuation is joined with a single space, so a hard-wrapped claim
+    collapses whitespace that the original answer did not have. `report.py` locates it
+    back whitespace-tolerantly (3F fix pass, Major finding), not by a literal substring
+    match.
     """
     # 1. Strip fenced code blocks entirely — code is not a claim.
     without_code = re.sub(r"```.*?```", "", answer, flags=re.DOTALL)
@@ -81,25 +137,10 @@ def extract_claims(answer: str) -> list[str]:
         block = block.strip("\n")
         if not block.strip():
             continue
-        # 3. Drop blocks that are markdown headings.
-        if re.match(r"^#{1,6}\s", block.strip()):
-            continue
 
-        lines = block.split("\n")
-        is_list = all(_LIST_ITEM_RE.match(line) for line in lines if line.strip())
+        lines = [line for line in block.split("\n") if line.strip()]
 
-        units: list[str] = []
-        if is_list:
-            for line in lines:
-                if not line.strip():
-                    continue
-                units.append(_LIST_ITEM_RE.sub("", line, count=1))
-        else:
-            joined = " ".join(line.strip() for line in lines if line.strip())
-            if joined:
-                units.append(joined)
-
-        for unit in units:
+        for unit in _block_units(lines):
             for sentence in re.split(r"(?<=[.!?])\s+", unit):
                 sentence = sentence.strip()
                 if not sentence:
@@ -134,6 +175,66 @@ def _parse_reply(content: str) -> tuple[Verdict, str]:
     return verdict, detail
 
 
+async def _check_one(
+    claim: str,
+    source_id: str,
+    model: BaseChatModel,
+    registry: SourceRegistry,
+    sources_dir: Path,
+) -> tuple[ClaimCheck, str | None]:
+    """Check one claim against one source, reading only that source's captured file.
+
+    Returns `(check, failure)` — `failure` is a `check_failures` line when the check
+    could not be run at all, `None` otherwise. Extracted from `verify_claims`'s loop so
+    the result can be memoized per `(claim, source_id)`.
+    """
+    source = registry.get(source_id)
+    if source is None:
+        return ClaimCheck(claim=claim, source_id=source_id, verdict="unresolved"), None
+
+    path = sources_dir / f"{source_id}.md"
+    try:
+        source_text = path.read_text(encoding="utf-8")
+    except OSError:
+        return (
+            ClaimCheck(
+                claim=claim,
+                source_id=source_id,
+                verdict="unverifiable",
+                detail=f"no captured content exists for {source_id}",
+            ),
+            None,
+        )
+
+    if is_failed_capture(source_text):
+        return (
+            ClaimCheck(
+                claim=claim,
+                source_id=source_id,
+                verdict="unverifiable",
+                detail=source_text.split("\n", 1)[0],
+            ),
+            None,
+        )
+
+    try:
+        rendered = render("verify", claim=claim, source_id=source_id, source_text=source_text)
+        reply = await model.ainvoke([HumanMessage(content=rendered)])
+        verdict, detail = _parse_reply(str(reply.content))
+    except Exception as exc:  # noqa: BLE001 — one failed check must not fail the pass
+        return (
+            ClaimCheck(
+                claim=claim,
+                source_id=source_id,
+                verdict="unverifiable",
+                detail=f"{type(exc).__name__}: {exc}",
+            ),
+            f"{source_id}: {type(exc).__name__}: {exc}",
+        )
+
+    return ClaimCheck(claim=claim, source_id=source_id, verdict=verdict, detail=detail), None
+
+
 async def verify_claims(
     answer: str,
     config: HarnessConfig,
@@ -157,6 +258,14 @@ async def verify_claims(
 
     checks: list[ClaimCheck] = []
     check_failures: list[str] = []
+    # One check per (claim x source), even when the same sentence appears twice in the
+    # answer (PR #4 review, Major). Re-checking a repeated sentence spent a second model
+    # call on an already-settled pair, and — because the model is called with neither
+    # `temperature` nor `seed` — the two calls could legitimately disagree, which
+    # `by_claim` below then read as two SOURCES disagreeing. `_place_marker` only ever
+    # marks a claim's first occurrence anyway, so a second identical check had nowhere
+    # to render.
+    checked: dict[tuple[str, str], ClaimCheck] = {}
 
     for claim in claims if claims is not None else extract_claims(answer):
         ids = marker_ids(claim)
@@ -165,58 +274,14 @@ async def verify_claims(
             continue
 
         for source_id in ids:
-            source = registry.get(source_id)
-            if source is None:
-                checks.append(ClaimCheck(claim=claim, source_id=source_id, verdict="unresolved"))
+            if (claim, source_id) in checked:
                 continue
 
-            path = sources_dir / f"{source_id}.md"
-            try:
-                source_text = path.read_text(encoding="utf-8")
-            except OSError:
-                checks.append(
-                    ClaimCheck(
-                        claim=claim,
-                        source_id=source_id,
-                        verdict="unverifiable",
-                        detail=f"no captured content exists for {source_id}",
-                    )
-                )
-                continue
-
-            first_line = source_text.split("\n", 1)[0]
-            if first_line.startswith(FETCH_FAILED_PREFIX):
-                checks.append(
-                    ClaimCheck(
-                        claim=claim,
-                        source_id=source_id,
-                        verdict="unverifiable",
-                        detail=first_line,
-                    )
-                )
-                continue
-
-            try:
-                rendered = render(
-                    "verify", claim=claim, source_id=source_id, source_text=source_text
-                )
-                reply = await model.ainvoke([HumanMessage(content=rendered)])
-                verdict, detail = _parse_reply(str(reply.content))
-            except Exception as exc:  # noqa: BLE001 — one failed check must not fail the pass
-                checks.append(
-                    ClaimCheck(
-                        claim=claim,
-                        source_id=source_id,
-                        verdict="unverifiable",
-                        detail=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-                check_failures.append(f"{source_id}: {type(exc).__name__}: {exc}")
-                continue
-
-            checks.append(
-                ClaimCheck(claim=claim, source_id=source_id, verdict=verdict, detail=detail)
-            )
+            check, failure = await _check_one(claim, source_id, model, registry, sources_dir)
+            checked[(claim, source_id)] = check
+            checks.append(check)
+            if failure is not None:
+                check_failures.append(failure)
 
     conflicts: list[Conflict] = []
     by_claim: dict[str, list[ClaimCheck]] = {}
@@ -225,6 +290,12 @@ async def verify_claims(
 
     for claim, claim_checks in by_claim.items():
         positions = [c for c in claim_checks if c.verdict in _MODEL_VERDICTS]
+        # Two DISTINCT sources, not merely two disagreeing verdicts (PR #4 review,
+        # Major). `_conflicts_section` states "the cited sources disagree on this claim"
+        # in the harness's own voice; asserting that on one source's behalf, to a reader
+        # who cannot check, is the one thing D3 refused to do.
+        if len({c.source_id for c in positions}) < 2:
+            continue
         verdicts_seen = {c.verdict for c in positions}
         if "supported" in verdicts_seen and "unsupported" in verdicts_seen:
             conflicts.append(Conflict(claim=claim, positions=positions))

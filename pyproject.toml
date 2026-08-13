@@ -15,7 +15,12 @@ dependencies = [
     # minor release. Any bump is a deliberate act, not an incidental `uv sync`.
     # See the plan's risk #2.
     "deepagents==0.7.5",
-    "langchain-openai>=0.3",
+    # Pinned for the same reason as `deepagents`, and because the floor it shipped
+    # with (">=0.3") had already floated three majors to 1.4.2 in uv.lock. It wraps
+    # `ChatOpenAI`, which `harness/models.py` builds directly and `tests/conftest.py`'s
+    # `ScriptedChatModel` subclasses, so a silent bump moves the request body that
+    # `preflight` depends on. See PR #4 review.
+    "langchain-openai==1.4.2",
 ]
 
 [dependency-groups]

@@ -1,5 +1,6 @@
 """Shared test fixtures for the harness suite."""
 
+import json
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -22,6 +23,7 @@ from harness.config import (
     RoleConfig,
     SearchSettings,
 )
+from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
 
 
 class ScriptedChatModel(ChatOpenAI):
@@ -107,6 +109,100 @@ class ScriptedChatModel(ChatOpenAI):
         # `_generate` already records `messages` and is called synchronously below — no
         # separate recording needed here to cover the async path.
         return self._generate(messages, stop=stop, **kwargs)
+
+
+def patch_model(monkeypatch: pytest.MonkeyPatch, model: Any) -> None:
+    """Point EVERY module-local `build_chat_model` binding at `model`.
+
+    Three modules do `from harness.models import build_chat_model`, so each holds its own
+    binding that patching the others does not touch: `harness.agent` (the lead),
+    `harness.models` (the definition), and `harness.verify` (the per-claim check).
+
+    `harness.verify`'s was the one nothing patched (PR #4 review, Major). Because
+    `verify_claims` only reaches its model call when a claim's `[Sn]` resolves to a
+    registered source with a real capture on disk, every `main()`-driven test had to
+    avoid that state or dial `https://example.test/v1` for real — which is exactly why
+    the cut-short x verification seam had no coverage at all. One home for the list, so
+    a fourth importer cannot reopen the same hole silently.
+    """
+    for target in (
+        "harness.agent.build_chat_model",
+        "harness.models.build_chat_model",
+        "harness.verify.build_chat_model",
+    ):
+        monkeypatch.setattr(target, lambda cfg, role: model)
+
+
+def patch_run(
+    monkeypatch: pytest.MonkeyPatch,
+    config: HarnessConfig,
+    model: Any,
+    *,
+    skip_preflight: bool = False,
+) -> None:
+    """Patch everything a `main()` test reaches outside the compiled graph.
+
+    `skip_preflight` replaces `preflight` with a no-op. Left `False` by default because
+    most tests here deliberately let the REAL `preflight` run against the scripted model
+    and script a leading reply for it to consume — that keeps R6's call site exercised
+    rather than stubbed out of every test that drives `main`.
+    """
+    import harness.__main__ as main_module
+
+    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    if skip_preflight:
+
+        async def _noop_preflight(cfg: HarnessConfig, role: str) -> None:
+            return None
+
+        monkeypatch.setattr(main_module, "preflight", _noop_preflight)
+    patch_model(monkeypatch, model)
+
+
+def verify_reply(verdict: str, detail: str) -> AIMessage:
+    """A model reply in the JSON envelope `harness/verify.py`'s parser accepts.
+
+    Shared so a test driving `main()` end to end can script the verification pass with
+    the same envelope `tests/test_verify.py` uses, rather than hand-rolling a third copy.
+    """
+    return AIMessage(content=json.dumps({"verdict": verdict, "detail": detail}))
+
+
+def drain_stdout(capsys: pytest.CaptureFixture[str]) -> tuple[str, list[str]]:
+    """Return stdout and its non-empty lines. `readouterr` drains, so call this once."""
+    out = capsys.readouterr().out
+    return out, [line for line in out.splitlines() if line.strip()]
+
+
+def write_source_capture(
+    config: HarnessConfig,
+    registry: Any,
+    source_id: str,
+    body: str = "Some captured body text.",
+) -> None:
+    """Write a real, `fetched`-shaped capture under `registry`'s run directory.
+
+    The one home for the captured-file shape both `harness/report.py` (is this source
+    usable evidence?) and `harness/verify.py` (can it settle a claim?) read. Takes
+    `registry` so the file lands under `sources/<run_id>/`, never the flat `sources/`
+    layout Phases 2-5 used (plan `## Reconciliations` 2026-08-12 — Phase 6).
+    """
+    sources_dir = _sources_dir(config, registry)
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    (sources_dir / f"{source_id}.md").write_text(
+        f"# {source_id}: captured page\n\n- Outcome: fetched\n\n{body}", encoding="utf-8"
+    )
+
+
+def write_failed_capture(
+    config: HarnessConfig, registry: Any, source_id: str, outcome: str = "error"
+) -> None:
+    """Write a failure stub — the shape `harness/tools/fetch.py` writes for a bad fetch."""
+    sources_dir = _sources_dir(config, registry)
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    (sources_dir / f"{source_id}.md").write_text(
+        f"{FETCH_FAILED_PREFIX}{outcome}\n", encoding="utf-8"
+    )
 
 
 @pytest.fixture

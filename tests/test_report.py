@@ -16,15 +16,19 @@ from pydantic import ValidationError
 from harness.config import AgentSettings
 from harness.report import (
     _CUT_SHORT_HEADING,
+    _ERROR_TEXT,
     _NO_ANSWER_TEXT,
     _NO_NOTES_TEXT,
     _NOTES_HEADING,
+    _ROUND_CAP_TEXT,
     _UNUSABLE_HEADING,
+    _WALL_CLOCK_TEXT,
     RunOutcome,
     write_report,
 )
 from harness.sources import SourceRegistry
-from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
+from harness.verify import ClaimCheck, VerificationResult
+from tests.conftest import write_failed_capture, write_source_capture
 
 _FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-[a-z0-9-]+\.md$")
 
@@ -40,30 +44,6 @@ def _usage(reasoning: int = 0, input_tokens: int = 100, output_tokens: int = 50)
         "total_tokens": input_tokens + output_tokens,
         "output_token_details": {"reasoning": reasoning},
     }
-
-
-def _write_usable_source_file(config, registry, source_id: str) -> None:
-    """Write a real, `fetched`-shaped capture under `registry`'s run directory.
-
-    `report.py` reads this to judge usability. Takes `registry` (Phase 6 amendment —
-    see the plan's `## Reconciliations` 2026-08-12 — Phase 6) so the file lands under
-    `sources/<run_id>/`, never the flat `sources/` layout Phases 2-5 used.
-    """
-    sources_dir = _sources_dir(config, registry)
-    sources_dir.mkdir(parents=True, exist_ok=True)
-    (sources_dir / f"{source_id}.md").write_text(
-        f"# {source_id}: Example page\n\n- Outcome: fetched\n\nSome captured body text.",
-        encoding="utf-8",
-    )
-
-
-def _write_stub_source_file(config, registry, source_id: str, outcome: str = "error") -> None:
-    """Write a failure stub — the shape `harness/tools/fetch.py` writes for a bad fetch."""
-    sources_dir = _sources_dir(config, registry)
-    sources_dir.mkdir(parents=True, exist_ok=True)
-    (sources_dir / f"{source_id}.md").write_text(
-        f"{FETCH_FAILED_PREFIX}{outcome}\n", encoding="utf-8"
-    )
 
 
 def test_write_report_produces_a_frozen_filename_under_reports_dir(make_config):
@@ -132,7 +112,7 @@ def test_write_report_with_usable_sources_does_not_claim_it_has_none(make_config
     config = make_config()
     registry = SourceRegistry()
     source_id = registry.add("https://example.test/tungsten", title="Tungsten facts")
-    _write_usable_source_file(config, registry, source_id)
+    write_source_capture(config, registry, source_id)
     outcome = RunOutcome(
         question="What is the airspeed velocity of an unladen swallow?",
         answer="African or European? [S1]",
@@ -158,7 +138,7 @@ def test_write_report_treats_registered_stub_sources_as_not_usable(make_config):
     config = make_config()
     registry = SourceRegistry()
     dead_id = registry.add("https://example.test/dead-link", title=None)
-    _write_stub_source_file(config, registry, dead_id, outcome="blocked")
+    write_failed_capture(config, registry, dead_id, outcome="blocked")
     outcome = RunOutcome(
         question="What killed the link?",
         answer="Unable to determine — the only lead was unreachable.",
@@ -185,8 +165,8 @@ def test_write_report_lists_usable_sources_and_marks_stubs_separately(make_confi
     registry = SourceRegistry()
     good_id = registry.add("https://good.example.test/page", title="Good page")
     bad_id = registry.add("https://bad.example.test/page", title=None)
-    _write_usable_source_file(config, registry, good_id)
-    _write_stub_source_file(config, registry, bad_id, outcome="timeout")
+    write_source_capture(config, registry, good_id)
+    write_failed_capture(config, registry, bad_id, outcome="timeout")
     outcome = RunOutcome(
         question="Mixed source usability",
         answer="Partial answer [S1].",
@@ -232,7 +212,7 @@ def test_write_report_body_carries_answer_reasoning_split_and_sources(make_confi
     config = make_config()
     registry = SourceRegistry()
     source_id = registry.add("https://example.test/a", title="Example A")
-    _write_usable_source_file(config, registry, source_id)
+    write_source_capture(config, registry, source_id)
     outcome = RunOutcome(
         question="reasoning split check",
         answer="Answer text with a marker [S1].",
@@ -386,7 +366,7 @@ def test_write_report_includes_workspace_notes_when_cut_short(make_config):
     # harness/tools/fetch.py does — never via the registry, so nothing else could surface
     # its text.
     registry = SourceRegistry()
-    _write_usable_source_file(config, registry, "S1")
+    write_source_capture(config, registry, "S1")
     outcome = RunOutcome(
         question="What pricing was found before the cutoff?",
         answer="",
@@ -578,7 +558,7 @@ def test_write_report_resolves_registered_markers_and_discloses_unregistered_one
     config = make_config()
     registry = SourceRegistry()
     source_id = registry.add("https://example.test/known", title="Known page")
-    _write_usable_source_file(config, registry, source_id)
+    write_source_capture(config, registry, source_id)
     answer = "A known fact [S1]. An unresolvable fact [S9]."
     verification = VerificationResult(
         checks=[
@@ -681,7 +661,11 @@ def test_write_report_gaps_section_lists_check_failures_and_uncited_count(make_c
 
     gaps = _section(body, "## Gaps and disclosures")
     assert failure_line in gaps
-    assert "2" in gaps
+    # Scoped to the count LINE, not the whole section: a bare `"2" in gaps` passed on any
+    # stray "2" anywhere in the text — a regression rendering "1 claim(s)" would still
+    # have found a 2 in the failure line above it (PR #4 review, nit).
+    count_line = next(line for line in gaps.splitlines() if "claim(s)" in line)
+    assert count_line.startswith("2 claim(s)"), count_line
     assert "uncited" in gaps.lower()
 
 
@@ -863,7 +847,7 @@ def test_write_report_ignores_a_source_captured_under_a_different_run(make_confi
     other_run = SourceRegistry(run_id="2020-01-01-000000")
     this_run = SourceRegistry(run_id="2020-01-01-000001")
     source_id = this_run.add("https://example.test/only-captured-elsewhere", title="Example")
-    _write_usable_source_file(config, other_run, source_id)
+    write_source_capture(config, other_run, source_id)
     outcome = RunOutcome(
         question="Does another run's capture leak in?",
         answer=f"Should be unusable [{source_id}].",
@@ -878,3 +862,183 @@ def test_write_report_ignores_a_source_captured_under_a_different_run(make_confi
     heading_pos = body.index(_UNUSABLE_HEADING)
     bullet_pos = body.index(f"[{source_id}]", heading_pos)
     assert bullet_pos > heading_pos
+
+
+# --- PR #4 review -----------------------------------------------------------------------
+
+
+def test_working_notes_are_found_in_a_subdirectory(make_config):
+    """The agent is given no path convention, and nested writes are legal.
+
+    `harness/prompts/orchestrator.md` says only "Write findings into your workspace as you
+    go", and deepagents' `FilesystemBackend.write` creates parent directories rather than
+    rejecting `notes/pricing.md`. A top-level `*.md` glob therefore printed "no working
+    notes were written" over a workspace holding this run's findings — in the one report
+    where the reader has nothing else to fall back on.
+    """
+    config = make_config()
+    nested = config.agent.workspace_dir / "notes"
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / "pricing.md").write_text("Acme quoted $4.20/unit.", encoding="utf-8")
+
+    outcome = RunOutcome(
+        question="What pricing was found before the cutoff?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Acme quoted $4.20/unit." in body
+    assert _NO_NOTES_TEXT not in body
+    # Named by its path under the workspace, so two same-named notes stay distinguishable.
+    assert "notes/pricing.md" in body
+
+
+def test_working_notes_are_not_restricted_to_markdown(make_config):
+    """Nothing pins an extension either, so a `.txt` note is still this run's findings."""
+    config = make_config()
+    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
+    (config.agent.workspace_dir / "findings.txt").write_text(
+        "Lead time is six weeks.", encoding="utf-8"
+    )
+
+    outcome = RunOutcome(
+        question="What was found?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Lead time is six weeks." in body
+    assert _NO_NOTES_TEXT not in body
+
+
+def test_machine_written_bulk_still_never_reaches_the_notes_section(make_config):
+    """Recursion must not undo what the old top-level glob got right by accident.
+
+    `sources/` is captured page text and the other two are the summarizer's evicted
+    history — none of it is the agent's own notes, and all of it is large.
+    """
+    config = make_config()
+    workspace = config.agent.workspace_dir
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "notes.md").write_text("A real note.", encoding="utf-8")
+
+    registry = SourceRegistry()
+    write_source_capture(config, registry, "S1", "CAPTURED_PAGE_BODY")
+    for directory, filename, text in (
+        ("conversation_history", "thread.md", "EVICTED_HISTORY_BODY"),
+        ("large_tool_results", "result.md", "OFFLOADED_RESULT_BODY"),
+    ):
+        target = workspace / directory
+        target.mkdir(parents=True, exist_ok=True)
+        (target / filename).write_text(text, encoding="utf-8")
+
+    outcome = RunOutcome(
+        question="Does machine-written bulk leak into the notes?",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "A real note." in body
+    assert "CAPTURED_PAGE_BODY" not in body
+    assert "EVICTED_HISTORY_BODY" not in body
+    assert "OFFLOADED_RESULT_BODY" not in body
+
+
+def test_dead_branches_are_disclosed_on_a_run_that_finished_normally(make_config):
+    """R4 names dead branches unconditionally, not only for a cut-short run.
+
+    An agent that simply stops with steps still `pending` has abandoned those branches
+    just as surely as one the wall clock killed, and the reader was told nothing at all.
+    """
+    config = make_config()
+    todos = [
+        {"content": "Check the delivery claim against a second source", "status": "pending"},
+        {"content": "Summarize the vendor comparison", "status": "completed"},
+    ]
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim="Acme quoted $4.20.", source_id=None, verdict="uncited")]
+    )
+    outcome = RunOutcome(
+        question="Which vendor is cheapest?",
+        answer="Acme quoted $4.20.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short=None,
+        todos=todos,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING not in body, "this run was not cut short"
+    gaps = _section(body, "## Gaps and disclosures")
+    assert "Check the delivery claim against a second source" in gaps
+    assert "Summarize the vendor comparison" not in gaps
+
+
+def test_a_cut_short_run_does_not_list_its_dead_branches_twice(make_config):
+    """`## Run cut short` already lists them; the gaps section must not repeat them."""
+    config = make_config()
+    todos = [{"content": "Check the delivery claim", "status": "pending"}]
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim="Partial answer.", source_id=None, verdict="uncited")]
+    )
+    outcome = RunOutcome(
+        question="Which vendor is cheapest?",
+        answer="Partial answer.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+        todos=todos,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert body.count("Check the delivery claim") == 1
+
+
+def test_each_cut_short_reason_names_only_its_own_bound(make_config, tmp_path):
+    """The protection `report.py`'s `_ROUND_CAP_TEXT` comment promises a reviewer.
+
+    That comment claims the tests assert one phrase present AND another absent, so a
+    swapped `except` label in `__main__` cannot slip past. No test actually did that
+    (PR #4 review, Minor) — the existing bound tests assert on the configured NUMBER, and
+    a branch rendering "the wall clock (configured at 17 rounds per pass)" passed both.
+    """
+    agent = AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
+    config = make_config(agent=agent)
+    phrases = {
+        "round_cap": _ROUND_CAP_TEXT,
+        "wall_clock": _WALL_CLOCK_TEXT,
+        "error": _ERROR_TEXT,
+    }
+
+    for reason, expected in phrases.items():
+        outcome = RunOutcome(
+            question=f"Which bound ended the {reason} run?",
+            answer="Partial answer.",
+            registry=SourceRegistry(),
+            usage=_usage(),
+            cut_short=reason,
+            cut_short_detail="APIConnectionError: boom" if reason == "error" else None,
+        )
+        body = write_report(outcome, config).read_text(encoding="utf-8")
+        section = _section(body, _CUT_SHORT_HEADING)
+
+        assert expected in section, f"{reason} did not name its own bound"
+        for other_reason, other in phrases.items():
+            if other_reason != reason:
+                assert other not in section, f"{reason} also named {other_reason}'s bound"

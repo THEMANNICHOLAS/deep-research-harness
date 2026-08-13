@@ -12,12 +12,9 @@ import harness.__main__ as main_module
 from harness.agent import build_agent
 from harness.sources import SourceRegistry
 from harness.tools.ask_user import build_ask_user_tool
+from tests.conftest import drain_stdout, patch_model, patch_run
 
 _THREAD = {"configurable": {"thread_id": "test-thread"}}
-
-
-def _patch_model(monkeypatch, model):
-    monkeypatch.setattr("harness.agent.build_chat_model", lambda config, role: model)
 
 
 def _ask(question: str, call_id: str = "call_1") -> dict:
@@ -32,13 +29,7 @@ def _patch_main(monkeypatch, config, model, answers=None):
     test expects NO question: any call fails it. Returns the queue, so a test can assert
     every scripted answer was actually consumed.
     """
-    monkeypatch.setattr(main_module, "load_config", lambda: config)
-
-    async def _noop_preflight(cfg, role):
-        return None
-
-    monkeypatch.setattr(main_module, "preflight", _noop_preflight)
-    _patch_model(monkeypatch, model)
+    patch_run(monkeypatch, config, model, skip_preflight=True)
 
     queued = list(answers or [])
 
@@ -53,12 +44,6 @@ def _patch_main(monkeypatch, config, model, answers=None):
     return queued
 
 
-def _drain_stdout(capsys) -> tuple[str, list[str]]:
-    """Return stdout and its non-empty lines. `readouterr` drains, so call this once."""
-    out = capsys.readouterr().out
-    return out, [line for line in out.splitlines() if line.strip()]
-
-
 def _ask_user_results(request) -> list[ToolMessage]:
     """Every `ask_user` tool result in one recorded model request, in order."""
     return [m for m in request if isinstance(m, ToolMessage) and m.name == "ask_user"]
@@ -69,7 +54,7 @@ async def test_an_ask_user_call_interrupts_the_run_instead_of_completing(
 ):
     config = make_config()
     model = scripted_model([AIMessage(content="", tool_calls=[_ask("Metal or album?")])])
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     graph = build_agent(config, SourceRegistry())
     result = await graph.ainvoke(
@@ -104,7 +89,7 @@ async def test_the_question_reaches_stdout_and_the_answer_resumes_the_run(
 
     assert exit_code == 0
     assert queued == []
-    out, lines = _drain_stdout(capsys)
+    out, lines = drain_stdout(capsys)
     assert "Metal or album?" in out
     # The report path stays the last line of stdout (frozen — R1).
     assert lines[-1].strip().endswith(".md")
@@ -137,7 +122,7 @@ async def test_a_second_clarification_round_asks_again_and_resumes_again(
 
     assert exit_code == 0
     assert queued == [], "the second round never asked"
-    out, lines = _drain_stdout(capsys)
+    out, lines = drain_stdout(capsys)
     assert "Metal or album?" in out
     assert "Which isotope?" in out
     assert lines[-1].strip().endswith(".md")
@@ -182,7 +167,7 @@ async def test_two_questions_in_one_interrupt_get_one_answer_each(
 
     assert exit_code == 0
     assert queued == []
-    out, _ = _drain_stdout(capsys)
+    out, _ = drain_stdout(capsys)
     assert "Metal or album?" in out
     assert "Which isotope?" in out
 
@@ -235,7 +220,7 @@ async def test_a_run_that_never_asks_completes_without_interruption(
     exit_code = await main_module.main(["What is the capital of France?"])
 
     assert exit_code == 0
-    _, lines = _drain_stdout(capsys)
+    _, lines = drain_stdout(capsys)
     assert lines
     assert lines[-1].strip().endswith(".md")
 
@@ -259,7 +244,7 @@ async def test_a_proposed_fetch_pages_call_does_not_interrupt(
             AIMessage(content="Final answer."),
         ]
     )
-    _patch_model(monkeypatch, model)
+    patch_model(monkeypatch, model)
 
     async def _spy(urls, cfg, reg):
         return "", []

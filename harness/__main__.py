@@ -66,6 +66,30 @@ def _sum_usage(messages: list[BaseMessage]) -> UsageMetadata:
     return total if total is not None else _EMPTY_USAGE
 
 
+def _message_text(message: AIMessage) -> str:
+    """The prose in one `AIMessage`, whichever content shape the provider used.
+
+    `AIMessage.content` is `str | list[str | dict]`, and `str(content)` on the list shape
+    renders a raw Python repr — `[{'type': 'text', 'text': '...'}]` — which would land
+    verbatim under `## Answer` in front of a non-technical reader (PR #4 review, Minor).
+    The configured models return the string shape today, so this is a guard against a
+    provider or model swap, not a bug being observed.
+    """
+    content = message.content
+    if isinstance(content, str):
+        return content.strip()
+
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
 def _final_answer(messages: list[BaseMessage]) -> str:
     """The last `AIMessage` carrying real prose, or `""` if the run never produced one.
 
@@ -76,7 +100,7 @@ def _final_answer(messages: list[BaseMessage]) -> str:
     """
     for message in reversed(messages):
         if isinstance(message, AIMessage):
-            content = str(message.content).strip()
+            content = _message_text(message)
             if content:
                 return content
     return ""
@@ -93,12 +117,29 @@ async def _read_answer(prompt: str = "> ") -> str:
     timeout). With a real, still-blocked `input()` that join is unbounded, so the run would
     print its cut-short report and then hang at an already-dead `> ` prompt. The same probe
     on a daemon thread feeding a future returned at 1.0s, which is what this does.
+
+    The prompt goes to STDERR, not to stdout via `input`'s own argument (PR #4 review,
+    Major): `input(prompt)` writes it with no trailing newline, so the report path
+    printed at the end of `main` landed on the same stdout line as a still-pending `> `,
+    breaking this module's frozen "the path is the final line of stdout" contract on any
+    run that asked a question.
     """
     loop = asyncio.get_running_loop()
     future: asyncio.Future[str] = loop.create_future()
 
     def _worker() -> None:
-        answer = input(prompt)
+        try:
+            print(prompt, end="", file=sys.stderr, flush=True)
+            answer = input()
+        except (EOFError, OSError):
+            # stdin is closed or unreadable — piped from /dev/null, run under a service
+            # manager, or a session that went away. Resolve with nothing rather than
+            # letting the exception kill this thread before `_resolve` is scheduled,
+            # which left `await future` pending forever with no report and no
+            # disclosure (PR #4 review, Major). `_answer_questions` turns "" into
+            # `_NO_ANSWER_GIVEN`, so the model is told the question went unanswered and
+            # the run proceeds to a report like any other.
+            answer = ""
 
         def _resolve() -> None:
             # The wall clock may have already cancelled/timed out this future by the time
@@ -197,6 +238,15 @@ async def main(argv: list[str] | None = None) -> int:
         # the ~2 per round, so the cap buys somewhat FEWER rounds than its name suggests
         # (the default 20 → limit 41 → roughly 16). Bounding a run early is the job; a
         # tighter fit would hard-code one deepagents version's node layout.
+        #
+        # It is also a PER-PASS bound, not a per-run one, and this config is reused on
+        # every `Command(resume=...)` below: langgraph recomputes `stop = resumed_step +
+        # recursion_limit + 1` per `astream` invocation, so each clarification resume
+        # grants a fresh allowance (`## Discoveries` 2026-08-12 — Phase 5). Accepted, not
+        # fixed: the wall clock is the run-level bound once research starts, and every
+        # extra allowance costs a human answering a question at the terminal. What the
+        # PR #4 review changed is that the report and `docs/guides/setup.md` now SAY "per
+        # pass" instead of implying a run total the reader could not reconcile.
         "recursion_limit": config.agent.max_rounds * 2 + 1,
     }
     stream_input: Any = {"messages": [HumanMessage(content=args.question)]}

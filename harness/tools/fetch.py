@@ -39,6 +39,19 @@ _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form",
 FETCH_FAILED_PREFIX = "FETCH FAILED: "
 
 
+def is_failed_capture(source_text: str) -> bool:
+    """Whether a captured source file's text is a failure stub rather than real content.
+
+    The single home for READING the policy `FETCH_FAILED_PREFIX` writes, as opposed to
+    the prefix itself. `harness/report.py` (is this source usable evidence?) and
+    `harness/verify.py` (can this source settle a claim?) both ask the same question and
+    had each implemented "split the first line, test the prefix" separately (PR #4
+    review, Minor) — a change to the stub shape had to land in two places or leave the
+    two disagreeing about which sources count as evidence.
+    """
+    return source_text.split("\n", 1)[0].startswith(FETCH_FAILED_PREFIX)
+
+
 def _sources_dir(config: HarnessConfig, registry: SourceRegistry) -> Path:
     """The one place the `<workspace_dir>/sources/<run_id>` layout is built."""
     return config.agent.workspace_dir / "sources" / registry.run_id

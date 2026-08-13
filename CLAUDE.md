@@ -31,7 +31,9 @@ not the ceiling).
 ## Invariants
 
 - No shell tool in the tool registry — filesystem read/grep/glob is
-  read-only; writes are confined to a designated workspace + reports dir.
+  read-only; the agent's writes are confined to the workspace dir alone.
+  The reports dir is written by `harness/report.py`, not reachable from
+  the agent's backend at all.
 - Model routing (orchestrator, fallback, worker) is config/env-driven —
   never hardcode endpoints, model IDs, or keys.
 - Adding a new tool must require no changes to the agent loop itself.

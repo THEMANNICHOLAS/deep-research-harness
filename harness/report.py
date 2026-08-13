@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
 from harness.sources import Source, SourceRegistry
-from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
+from harness.tools.fetch import _sources_dir, is_failed_capture
 from harness.verify import ClaimCheck, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
@@ -38,6 +38,12 @@ _GAPS_HEADING = "## Gaps and disclosures"
 _NO_NOTES_TEXT = "No working notes were written before the cutoff."
 _NO_ANSWER_TEXT = "The run produced no final answer."
 _NO_UNFINISHED_TODOS_TEXT = "No planned todos remained unfinished."
+_DEAD_BRANCHES_HEADING = "Planned steps that were never completed (dead branches):"
+
+# Workspace subdirectories that hold machine-written bulk, not the agent's own notes:
+# `sources/` is Phase 2's captured page text (already summarized under `## Sources`), and
+# the other two are the summarizer's evicted history. See `_notes_section`.
+_NOTES_EXCLUDED_DIRS = frozenset({"sources", "conversation_history", "large_tool_results"})
 
 # Slack allowed when deciding whether a workspace note belongs to THIS run. Filesystem
 # mtime granularity is coarser than `datetime.now()` (2s on FAT32, and Windows can report
@@ -134,10 +140,10 @@ def _is_usable(config: HarnessConfig, registry: SourceRegistry, source: Source) 
     if not path.exists():
         return False
     try:
-        first_line = path.read_text(encoding="utf-8").split("\n", 1)[0]
+        source_text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    return not first_line.startswith(FETCH_FAILED_PREFIX)
+    return not is_failed_capture(source_text)
 
 
 def _sources_section(config: HarnessConfig, registry: SourceRegistry) -> str:
@@ -164,9 +170,14 @@ def _sources_section(config: HarnessConfig, registry: SourceRegistry) -> str:
 def _cut_short_section(outcome: RunOutcome, config: HarnessConfig) -> str:
     """One sentence naming the bound that ended the run, then the unfinished todos."""
     if outcome.cut_short == "round_cap":
+        # "per pass", not a flat run total: the cap is a LangGraph `recursion_limit`, and
+        # langgraph recomputes the budget from the resumed step on every `astream` call,
+        # so each clarification resume grants a fresh allowance (plan `## Discoveries`
+        # 2026-08-12 — Phase 5; PR #4 review, Major). Naming it as a run-level bound
+        # overstated a number the reader could not reconcile with a clarified run.
         bound_line = (
             f"The run was cut short by {_ROUND_CAP_TEXT} "
-            f"(configured at {config.agent.max_rounds} rounds)."
+            f"(configured at {config.agent.max_rounds} rounds per pass)."
         )
     elif outcome.cut_short == "wall_clock":
         bound_line = (
@@ -183,11 +194,21 @@ def _cut_short_section(outcome: RunOutcome, config: HarnessConfig) -> str:
 
 
 def _notes_section(config: HarnessConfig, started_at: datetime | None) -> str:
-    """Render this run's top-level `*.md` files under the workspace root, sorted by name.
+    """Render this run's workspace files, at any depth, sorted by relative path.
 
-    A top-level glob naturally excludes `sources/` — no recursion, so a captured page's
-    full text never leaks into this section. A missing workspace dir, or no matches,
-    yields the "no notes" line. Unreadable files are skipped, matching `_is_usable`'s
+    Recursive, and NOT restricted to `*.md` (PR #4 review, Major). The lead agent is told
+    only "Write findings into your workspace as you go" — `harness/prompts/orchestrator.md`
+    pins neither a directory nor an extension — and deepagents' `FilesystemBackend.write`
+    creates parent directories for a nested path like `notes/pricing.md` rather than
+    rejecting or flattening it. A top-level `*.md` glob therefore printed "no working
+    notes were written" while this run's findings sat on disk: an affirmatively false
+    disclosure on exactly the path D2 exists to protect, since it is a cut-short run that
+    has nothing else to show.
+
+    `_NOTES_EXCLUDED_DIRS` does explicitly what the old glob's lack of recursion did
+    accidentally — keeps captured page text (`sources/`) and the summarizer's evicted
+    history (`conversation_history/`, `large_tool_results/`) out of the report. Files
+    that are not UTF-8 text are skipped alongside unreadable ones, matching `_is_usable`'s
     existing `OSError` stance.
 
     Filtered by `started_at`, and that filter is load-bearing: `agent.workspace_dir` is one
@@ -203,14 +224,18 @@ def _notes_section(config: HarnessConfig, started_at: datetime | None) -> str:
 
     cutoff = started_at.timestamp() - _MTIME_TOLERANCE_SECONDS if started_at is not None else None
     sections: list[str] = []
-    for path in sorted(workspace_dir.glob("*.md"), key=lambda p: p.name):
+    candidates = [path for path in workspace_dir.rglob("*") if path.is_file()]
+    for path in sorted(candidates, key=lambda p: p.relative_to(workspace_dir).as_posix()):
+        relative = path.relative_to(workspace_dir)
+        if relative.parts[0] in _NOTES_EXCLUDED_DIRS:
+            continue
         try:
             if cutoff is not None and path.stat().st_mtime < cutoff:
                 continue
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
-        sections.append(f"### {path.name}\n\n{text}")
+        sections.append(f"### {relative.as_posix()}\n\n{text}")
 
     return "\n\n".join(sections) if sections else _NO_NOTES_TEXT
 
@@ -293,10 +318,22 @@ def _conflicts_section(verification: VerificationResult) -> str:
 def _gaps_section(
     outcome: RunOutcome, verification: VerificationResult, unplaced: list[ClaimCheck]
 ) -> str:
-    """Unresolved citation markers, per-check failures, unplaceable markers, and the
-    uncited-claim count.
+    """Unresolved citation markers, per-check failures, unplaceable markers, the
+    uncited-claim count, and — on a run that was NOT cut short — its dead branches.
+
+    R4 requires dead branches to be disclosed on every run, not only a cut-short one
+    (PR #4 review, Major). `_cut_short_section` already lists unfinished todos when a
+    bound ended the run, so this renders them only when it did not: an agent that simply
+    stops with steps still `pending` has abandoned those branches just as surely, and the
+    reader was previously told nothing at all.
     """
     lines: list[str] = []
+
+    if not outcome.cut_short:
+        unfinished = [todo for todo in outcome.todos if todo.get("status") != "completed"]
+        if unfinished:
+            lines.append(_DEAD_BRANCHES_HEADING)
+            lines.append(format_todos(unfinished))
 
     # The RAW answer, not the annotated one: annotated markers never introduce or
     # remove an `[Sn]` marker, but reading the raw text keeps this independent of that
@@ -383,8 +420,10 @@ def _render_body(
 def write_report(outcome: RunOutcome, config: HarnessConfig) -> Path:
     """Render `outcome` and write it to `<reports_dir>/YYYY-MM-DD-HHMMSS-<slug>.md`.
 
-    Does NOT call `registry.resolve()` — Phase 6 owns citation resolution. Sources are
-    listed; any `[Sn]` marker in the answer is left exactly as the model wrote it.
+    Citation resolution is UNCONDITIONAL: `_render_body` → `_annotate` calls
+    `registry.resolve()` on every run, whether or not `outcome.verification` is set, so
+    no bare `[Sn]` marker survives into `## Answer` (R1). What `verification` gates is the
+    claim MARKING that happens first, inside the same `_annotate` call.
     """
     config.agent.reports_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now()

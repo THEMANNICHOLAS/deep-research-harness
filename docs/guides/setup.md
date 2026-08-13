@@ -4,7 +4,9 @@
 
 1. Install [uv](https://docs.astral.sh/uv/).
 2. `uv sync` — creates `.venv` and installs runtime deps (pydantic, langchain-core,
-   crawl4ai, httpx) and dev deps (ruff, mypy, pytest, pytest-asyncio).
+   crawl4ai, httpx, deepagents, langchain-openai) and dev deps (ruff, mypy, pytest,
+   pytest-asyncio). `deepagents` and `langchain-openai` are both pinned exactly; the
+   former also pulls in langchain-anthropic, langchain-google-genai and langsmith.
 3. `uv run playwright install chromium` — the default browser backend
    (`browser.backend = "playwright"` in `harness.toml`) needs a Chromium install; this
    is not covered by `uv sync`.
@@ -62,6 +64,9 @@ are never stored here — each provider names an environment variable
   hitting either bound still writes a report naming which one it was. `max_rounds` is
   approximate — it maps onto LangGraph supersteps and buys somewhat fewer rounds than
   its number suggests (see @docs/plans/PLAN-research-loop.md `## Discoveries`).
+- `max_rounds` bounds one PASS, not the whole run: every clarification resume grants a
+  fresh allowance, so a run that asked two questions may use roughly three times the
+  number configured. The wall clock is the only run-level bound once research starts.
 
 ## Prerequisites
 
