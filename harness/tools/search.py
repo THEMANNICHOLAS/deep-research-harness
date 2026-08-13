@@ -1,8 +1,7 @@
 """Query the self-hosted SearXNG JSON API and return normalized results.
 
-Any failure to reach SearXNG, a non-200 response, or a malformed body is surfaced as a
-typed `SearchFailure` rather than an exception, so a dead search backend shows up as data
-for the model to reason about instead of an exception that would sink the whole tool call.
+An unreachable backend, a non-200, or a malformed body all surface as a typed
+`SearchFailure` rather than an exception.
 """
 
 from typing import Literal
@@ -37,11 +36,10 @@ class SearchFailure(BaseModel):
 def _parse_results(payload: dict, max_results: int) -> list[SearchResult] | SearchFailure:
     """Extract and normalize the `results` array, slicing to `max_results` after parsing.
 
-    Skips any entry that is not a dict, has no truthy `url`, or carries a wrong-typed
-    field — one engine emitting a non-string value must degrade to a skipped entry, not
-    an exception out of the tool call. `raw.get(key) or ""` maps both `None` and missing
-    keys to `""`, matching the frozen `str` fields (`engine` is declared `str | None`
-    upstream in SearXNG).
+    Skips any entry that is not a dict, lacks a truthy `url`, or is wrong-typed — one
+    engine emitting a non-string must degrade to a skipped entry, not an exception.
+    `raw.get(key) or ""` maps both `None` and missing keys to `""`, matching the frozen
+    `str` fields (SearXNG declares `engine` as `str | None`).
     """
     raw_results = payload.get("results")
     if not isinstance(raw_results, list):
