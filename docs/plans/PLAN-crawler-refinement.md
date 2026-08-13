@@ -1,6 +1,6 @@
 # PLAN: Crawler Refinement
 
-**Status:** In Progress
+**Status:** Complete
 **Created:** 2026-08-10
 **Type:** Single plan
 
@@ -30,9 +30,13 @@ source reached its conclusion.
   - When no boundary exists before the cap, it cuts at the cap and still discloses — a page
     with no structure must never come back empty or uncut.
   - The full untruncated markdown stays on the artifact, unchanged.
-- **R3** — Short boilerplate blocks (nav residue, category-link stubs, the "Search / N
+- ~~**R3** — Short boilerplate blocks (nav residue, category-link stubs, the "Search / N
   languages" fragment) stop reaching the model, confirmed against a real fetched page rather
-  than a fixture.
+  than a fixture.~~ **Amended 2026-08-12** — the real fetched page it demanded is what killed
+  it: `min_word_threshold` cannot separate that boilerplate from headings and inline links.
+  See Reconciliation #2. The surviving outcome is that the mechanism is ruled out **on
+  measured evidence** and the residue is a recorded @docs/backlog.md item, per this plan's own
+  Preference that boilerplate removal is tuning, not a correctness gate.
 - ~~**R4** — Fetching pages across many tool calls does not relaunch the browser each time; the
   startup cost is paid once per run rather than once per call.~~ **Dropped 2026-08-10** — see
   D3. The crawler stays constructed and closed per call.
@@ -268,7 +272,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 |----|---------|------------|
 | R1 | Lightpanda removed | Phase 2 (`grep -ri lightpanda` hits only historical records) |
 | R2 | Boundary-aware truncation | Phase 4 (cut lands on a heading/paragraph break; hard-cut fallback) |
-| R3 | Short-block boilerplate removed | Phase 5 (threshold reaches the filter; live before/after check) |
+| R3 | ~~Short-block boilerplate removed~~ Mechanism ruled out on live evidence | Phase 5 (no code change; Reconciliation #2 + backlog entry) |
 | R5 | ~~Rate-limited source retries once~~ Rate-limit backoff bounded, still `blocked` | Phase 1 (`max_retries=1` caps per-domain backoff growth — see Reconciliation #1) |
 | R6 | One outcome per URL, no misattribution | Phase 1 (unmatched URL reports `error`, never borrows a body) |
 | R7 | At most 5 URLs per call | Phase 3 (over-limit call rejected before any fetch) |
@@ -279,8 +283,8 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 2: Remove Lightpanda
 - [x] Phase 3: Cap a call at five URLs
 - [x] Phase 4: Boundary-aware truncation
-- [ ] Phase 5: Prune short boilerplate blocks
-- [ ] Final verification
+- [x] Phase 5: Prune short boilerplate blocks (amended — mechanism ruled out, Reconciliation #2)
+- [x] Final verification
 
 ## Phases
 
@@ -535,23 +539,26 @@ back to a hard cut when no usable boundary exists, and always discloses that it 
 
 ### Phase 5: Prune short boilerplate blocks
 **Risk:** flagged (!#5)
-**Test-first:** required
-**Goal:** Stop short boilerplate blocks reaching the model, with the threshold chosen against a
-real fetched page rather than in the abstract.
-**Requirements:** R3
+**Test-first:** ~~required~~ N/A as amended — the phase ships no code, so there is no
+behaviour to drive red (Reconciliation #2).
+**Goal:** ~~Stop short boilerplate blocks reaching the model, with the threshold chosen against a
+real fetched page rather than in the abstract.~~ **Amended 2026-08-12 (Reconciliation #2):**
+choosing the threshold against a real page ruled the threshold out. The phase's surviving work
+is to record that finding and leave the filter unset.
+**Requirements:** R3 (amended)
 **Files:**
-- `harness/tools/fetch.py` — pass `min_word_threshold` to `PruningContentFilter` at line 195,
-  with a named constant carrying its rationale.
-- `tests/test_fetch.py` — wiring assertion.
+- ~~`harness/tools/fetch.py` — pass `min_word_threshold` to `PruningContentFilter` at line 195,
+  with a named constant carrying its rationale.~~ No code change — see Reconciliation #2.
+- ~~`tests/test_fetch.py` — wiring assertion.~~ Nothing to assert; there is no wiring.
 - `docs/backlog.md` — update or close the residual-boilerplate entry with what actually
   survived.
-**Diff budget:** ~25-45 lines across 3 files
+**Diff budget:** ~~25-45 lines across 3 files~~ → docs only
 
-**Reuse:**
-- Extend the existing `DefaultMarkdownGenerator(content_filter=PruningContentFilter())` call —
-  do NOT introduce a second filter or a custom filter subclass.
-- Pattern to mirror: `_MEMORY_THRESHOLD_PERCENT` in `harness/tools/fetch.py:34-37` — a module
-  constant whose comment states why the number is not the library default.
+**Reuse:** *(cancelled by Reconciliation #2 — nothing is extended, the call is left as it is)*
+- ~~Extend the existing `DefaultMarkdownGenerator(content_filter=PruningContentFilter())` call —
+  do NOT introduce a second filter or a custom filter subclass.~~
+- ~~Pattern to mirror: `_MEMORY_THRESHOLD_PERCENT` in `harness/tools/fetch.py:34-37` — a module
+  constant whose comment states why the number is not the library default.~~
 
 **Out of scope:**
 - `PruningContentFilter`'s `threshold`, which stays at the library default `0.48`. Raising it
@@ -562,31 +569,58 @@ real fetched page rather than in the abstract.
   not set it "for completeness" — it would read as a working control.
 
 **Tests (write first, confirm red):**
-- [ ] The configured `min_word_threshold` reaches the `PruningContentFilter` handed to the
-  markdown generator.
+- ~~[ ] The configured `min_word_threshold` reaches the `PruningContentFilter` handed to the
+  markdown generator.~~ Dropped — there is no wiring to assert (Reconciliation #2). A test
+  pinning an unset default would assert the absence of a decision, not a behaviour.
 
 **Steps:**
-1. Write the test above; run it; confirm it FAILS (red).
-2. Add the constant and wire it through.
-3. Run the test; confirm it PASSES (green).
+1. ~~Write the test above; run it; confirm it FAILS (red).~~
+2. ~~Add the constant and wire it through.~~
+3. ~~Run the test; confirm it PASSES (green).~~
+   **Amended 2026-08-12:** the live comparison the acceptance criterion demanded was run
+   FIRST, to choose the threshold as the Preferences require, and it ruled the mechanism out.
+   The phase's work became recording that in `docs/backlog.md` and Reconciliation #2.
 
 **Acceptance criteria:**
-- [ ] A real page is fetched before and after the change and the two outputs compared: the
+- [x] A real page is fetched before and after the change and the two outputs compared: the
   "Search / N languages" fragment and category-link stubs are gone, AND no substantive short
   line disappeared — specifically check a one-sentence finding, a table row, and a line of
-  code. This is a live network check and cannot be satisfied by a fixture.
-- [ ] `docs/backlog.md`'s residual-boilerplate entry records what survived, or is removed if
-  nothing did.
+  code. This is a live network check and cannot be satisfied by a fixture. (Run on
+  `en.wikipedia.org/wiki/Retrieval-augmented_generation` from the workstation — which does have
+  Chromium and egress, contrary to the earlier assumption that this needed the homelab box.
+  **The criterion failed at every effective threshold**, which is the finding: `1` is a
+  byte-identical no-op; `2` leaves "23 languages" and costs 54% of headings; `3` clears the
+  target set at the price of 85% of headings and 63% of inline links, including link text
+  inside prose. Numbers in Reconciliation #2. Satisfied as a *check performed*, not as an
+  outcome achieved — the amendment is the outcome. **Two of the criterion's three probes were
+  evidenced on this page — the one-sentence finding and the table row. The third, a line of
+  code, could not be: the RAG article contains no code at all (0 fenced blocks, 0 backticks),
+  so that probe is unmeasured rather than passed.** It does not change the verdict — the
+  mechanism was already ruled out by the heading and inline-link losses — but a page carrying
+  code should be used if this is ever revisited.)
+- [x] `docs/backlog.md`'s residual-boilerplate entry records what survived, or is removed if
+  nothing did. (Updated with the measured evidence and the two remaining candidate
+  mechanisms.)
 
 ## Verification
 
-- [ ] `uv run pytest` — full suite green, and still launching zero browsers.
-- [ ] `uv run ruff check .`
-- [ ] `uv run ruff format --check .`
-- [ ] `uv run mypy .`
-- [ ] `grep -ri lightpanda .` returns only the historical records named in Phase 2.
-- [ ] A live end-to-end fetch of several real URLs, confirming the truncation notice appears
+- [x] `uv run pytest` — full suite green, and still launching zero browsers. (109 passed.)
+- [x] `uv run ruff check .`
+- [x] `uv run ruff format --check .`
+- [x] `uv run mypy .`
+- [x] `grep -ri lightpanda .` returns only the historical records named in Phase 2.
+  (`docs/decisions.md`, `docs/plans/PLAN-harness-substrate.md`, this plan, plus the untracked
+  `.html` render and gitignored caches — a stale `tests/__pycache__/*.pyc` from before Phase 2
+  also matches and is not source.)
+- [x] A live end-to-end fetch of several real URLs, confirming the truncation notice appears
   on a long page, a short page is untouched, and each page carries its own `[Sn]` marker.
+  (Run from the workstation, not the homelab — see Reconciliation #2's closing note.
+  `en.wikipedia.org/wiki/Retrieval-augmented_generation` (34,100 chars), `example.com` (166),
+  `httpbin.org/html` (3,598): all three `fetched`/200, one outcome each, distinct `[S1]`/`[S2]`/
+  `[S3]` markers, 15,713 chars rendered in total. Against the real 33k Wikipedia markdown at the
+  12,000 cap, Phase 4 kept 11,608 chars — 96.7% of the allowance — ending on a complete sentence
+  with the notice present, so **risk #4's watch item is answered on a real page: the floor never
+  fired and nothing came back conspicuously short.**)
 
 ## Notes
 
@@ -666,6 +700,51 @@ tested).
 latency win, against the Intent non-goal of adding no new fetch capability. **Rejected:**
 dropping `RateLimiter` entirely — it still supplies the inter-request politeness delay and the
 429 backoff; only its retry semantics were misdescribed.
+
+### #2 — 2026-08-12 — Phase 5: `min_word_threshold` cannot separate boilerplate from structure
+
+**Contradiction.** R3, Phase 5's goal, and risk #5 all assume a small `min_word_threshold`
+(3-5) removes nav residue while costing at most a few short-but-meaningful lines. Measured live
+on `en.wikipedia.org/wiki/Retrieval-augmented_generation` (one crawl, the same `cleaned_html`
+re-rendered per threshold), the cost is structural, not marginal:
+
+| threshold | "Search" | "23 languages" | headings | inline links | table rows | link text in prose |
+|---|---|---|---|---|---|---|
+| unset | present | present | 13 | 161 | 33 | present |
+| 1 | no-op — byte-identical to unset | — | 13 | 161 | 33 | present |
+| 2 | gone | **present** | 6 | 109 | 29 | **gone** |
+| 3 | gone | gone | **2** | **60** | 26 | **gone** |
+
+`PruningContentFilter` scores HTML blocks, so a one-word `<h2>Process</h2>` and a
+`* [Slop](...)` nav stub are the same thing to it; at 3 the page loses 85% of its headings and
+63% of its inline links, and prose degrades from "Libraries such as [spaCy] or [NLTK] can also
+help" to "Libraries such as or can also help". Phase 5's own acceptance criterion — no
+substantive short line disappears, "specifically a one-sentence finding, a table row, and a
+line of code" — therefore fails at every value that does anything. It also undercuts Phase 4,
+landed one commit earlier: pruning headings removes the boundaries its truncation cuts on.
+
+**Amendment.** `PruningContentFilter` stays unset; Phase 5 ships no code change. The residue is
+recorded in @docs/backlog.md with the measured numbers and the mechanism ruled out, which the
+plan's own Preference explicitly permits ("Boilerplate removal is tuning, not a correctness
+gate — a residue that survives is a backlog item, not a failed phase"). R3 is struck and
+amended in `## Intent`. Approved by the developer 2026-08-12 over the two alternatives below.
+
+**Rejected:** `min_word_threshold=2` — meets neither R3 (the "N languages" fragment survives)
+nor the acceptance criterion, while still costing half the headings and all inline link text.
+**Rejected (deferred to backlog, not refuted):** a render-side line filter dropping bare
+`* [Text](url)` bullets, measured on the same page at -84 lines / -30% chars with all 13
+headings and all 161 inline links kept. It is the most promising remaining option, but it is
+new machinery this plan did not scope, and it would strip a genuine link-only "See also" list.
+
+**Limits of this evidence.** One page, one site. The acceptance criterion's third probe — a
+line of code — is unmeasured, because the RAG article contains none (0 fenced blocks, 0
+backticks); the one-sentence finding and the table row were both observed to die. A page
+carrying code should be used if the question is reopened.
+
+**Note on where this ran.** Two prior sessions recorded that Phase 5's acceptance needed the
+homelab box over SSH. That was never in the plan text and is wrong: the workstation has
+crawl4ai, Playwright Chromium and network egress, and ran the real `_fetch` path end to end.
+The homelab constraint in `## Intent` is about the cost of a failure during a research run.
 
 ## Discoveries
 
@@ -791,4 +870,26 @@ phase). Append-only, empty at plan creation. -->
   verification both need the homelab box over SSH and cannot be done on this workstation. Risk
   #4's floor is likewise still a guess until real pages meet it; the same live fetch is the
   first chance to check whether a page comes back conspicuously shorter than the cap allows.
+
+### 2026-08-12 — Phase 5: Prune short boilerplate blocks (amended)
+- Done: No code change. The phase's live comparison was run FIRST — to choose the threshold
+  against a real page as the Preferences require — and it ruled the mechanism out; see
+  Reconciliation #2 for the measured table. `PruningContentFilter` stays unset, @docs/backlog.md
+  records the evidence and the two surviving candidate mechanisms, R3 is struck and amended.
+  Final verification also completed: four gates green (109 passed), `grep -ri lightpanda` clean,
+  and a live three-URL end-to-end fetch.
+- Learned: **the workstation can run the live fetch** — crawl4ai, Playwright Chromium and
+  network egress are all present here, and the real `_fetch` path ran end to end. The "needs the
+  homelab box over SSH" belief came from two prior handoffs, not from the plan, and cost this
+  work a phase-and-a-half of unnecessary deferral. Substantively: `min_word_threshold` prunes
+  HTML blocks, so it cannot tell a one-word `<h2>` from a nav stub — at 3 it costs 85% of a
+  page's headings and 63% of its inline links, including link text inside prose. Risk #4 is
+  answered on a real page: 96.7% of the cap retained, cut on a sentence end, floor never fired.
+- Drift: Reconciliation #2 (R3's mechanism). Approved by the developer, who chose the
+  backlog-the-residue option over a threshold of 2 or a new render-side line filter.
+- Watch-next: **The only thing still owed is the risk #2/#3 coordination** — the concurrent
+  research-loop session (worktree `structured-strolling-elephant`) has still not been told that
+  `HarnessConfig.browser` is gone and that `fetch_pages` now rejects more than 5 URLs. Do that
+  before this branch merges. The plan is otherwise complete; `/pr-review` is the next step, and
+  the render-side link-stub filter is waiting in @docs/backlog.md if boilerplate is revisited.
 

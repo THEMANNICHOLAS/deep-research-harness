@@ -27,10 +27,20 @@ to address.
 - **Residual boilerplate survives the pruning filter.** `PruningContentFilter` strips
   Wikipedia's sidebar, personal tools, navigation menu, privacy policy and license footer,
   but a tail of category links and a "Search / N languages" fragment remains in the fetched
-  markdown. Costs tokens on every fetched page. The substrate plan's Preferences place
-  stripping quality outside the acceptance gate ("tuning quality is iterative"), so this is
-  tuning work: adjust `PruningContentFilter`'s threshold or extend `_EXCLUDED_TAGS` in
-  `harness/tools/fetch.py`, measured against real fetched pages rather than in the abstract.
+  markdown. Costs tokens on every fetched page. **`min_word_threshold` is ruled out as the
+  fix** — measured live, not inferred: on the RAG article, `1` is a byte-identical no-op, `2`
+  removes "Search" but not "23 languages" while costing 54% of headings and a third of the
+  page's inline links, and `3` clears the target set only at the price of 85% of headings and
+  63% of inline links — including links embedded in prose, whose anchor text vanishes with them
+  ("Libraries such as [spaCy] or [NLTK] can also help" becomes "Libraries such as or can also
+  help"). The filter scores HTML blocks, so a one-word `<h2>` and a nav stub are
+  indistinguishable to it, and pruning headings would also strip the boundaries Phase 4's
+  truncation cuts on. Full evidence in Reconciliation #2 of
+  @docs/plans/PLAN-crawler-refinement.md. To address: a render-side line filter that drops
+  bare `* [Text](url)` bullets (measured at -84 lines / -30% chars on that page with all 13
+  headings and all 161 inline links kept), or extend `_EXCLUDED_TAGS` — both measured against
+  real fetched pages rather than in the abstract, and both must keep a genuine link-only
+  "See also" list in mind.
 
 - **`harness.toml`'s `TODO` placeholders load as valid config.** The literal `"TODO"`
   strings shipped for the OpenCode `base_url` and both role model IDs pass `load_config()`
