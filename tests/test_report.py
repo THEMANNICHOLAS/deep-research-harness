@@ -746,6 +746,39 @@ def test_write_report_places_marker_for_a_hard_wrapped_claim(make_config):
     assert "**[unsupported — S1]**" in body
 
 
+def test_marker_binds_to_the_sentence_it_judges_not_the_one_after_it(make_config):
+    """Found by the Phase 5 live check, which every prior test missed by feeding answers
+    whose judged sentence was the last thing on its line. A marker separated from its claim
+    by a paragraph break reads as a label on whatever follows it, so a reader attributes the
+    verdict to the wrong sentence — the one failure a citation report cannot afford.
+    """
+    from harness.verify import ClaimCheck, VerificationResult, extract_claims
+
+    config = make_config()
+    answer = "The vendor quoted $4.20 [S1]. Lead time is six weeks [S2]."
+    claims = extract_claims(answer)
+    target = next(claim for claim in claims if "vendor quoted" in claim)
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim=target, source_id="S1", verdict="unsupported", detail="mismatch")]
+    )
+    outcome = RunOutcome(
+        question="Two sentences, one paragraph",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    answer_section = body.split("## Answer", 1)[1].split("## ", 1)[0]
+    # The marker trails its own sentence on the same line...
+    assert "$4.20 [S1]. **[unsupported — S1]**" in answer_section
+    # ...and does not open a line, which is what made it read as the next claim's label.
+    assert "\n**[unsupported" not in answer_section
+    assert "Lead time is six weeks" in answer_section
+
+
 def test_write_report_discloses_a_verdict_whose_marker_could_not_be_placed(make_config):
     """A claim that genuinely does not appear in the answer at all (e.g. a stale check
     against an edited answer) must be disclosed in `## Gaps and disclosures`, never

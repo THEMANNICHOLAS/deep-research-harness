@@ -981,9 +981,12 @@ prompt artifacts, so a later round wires the pyramid without renegotiating the s
 - [ ] Manual end-to-end: `python -m harness "<an ambiguous question>"` asks at least one
       clarifying question, answers it, researches, and writes a report whose citations all
       resolve, whose unsupported claims are marked, and whose disclosure section is present.
-- [ ] Every source consulted in the manual end-to-end run has a
+- [x] Every source consulted in the manual end-to-end run has a
       ~~`sources/S<n>.md`~~ `sources/<run_id>/S<n>.md` file in the workspace — content or
-      failure stub.
+      failure stub. (2026-08-13, Phase 5's wall-clock run: five sources registered, five
+      capture files, one per `[Sn]`. The run dir is stamped at run START and the report
+      filename at WRITE time, so the two timestamps differ — pair them by ordering, per the
+      2026-08-12 Reconciliation.)
 - [x] `harness.toml` and `.env.example` between them name every setting the code reads, and no
       endpoint, model ID, or key appears as a literal in `harness/`. (2026-08-13: the fourteen
       `config.<table>.<key>` reads across `harness/` all resolve to keys present in
@@ -1367,6 +1370,16 @@ detection needs no extra model call and no extra vocabulary — a conflict is on
 several cited sources return disagreeing verdicts, rendered with both positions and both IDs
 and no adjudication (D3).
 
+2026-08-13 — Phase 6, found by Phase 5's live check: `_annotate` inserted its verdict marker
+as `"\n\n**[verdict — Sn]**"`, breaking it onto its own line directly above the NEXT sentence
+whenever a paragraph held more than one. Markdown then renders the marker as a label on the
+text that follows it, so a reader attributes the verdict to the wrong claim — the one failure
+a citation report cannot afford, and invisible to every prior test because each fed an answer
+whose judged sentence ended its line. → **acted now**: the marker is a single leading space,
+binding it to the sentence it judges, with a test asserting adjacency rather than mere
+presence. Generalise: a test that asserts a marker is PRESENT says nothing about what it is
+attached to; when placement carries the meaning, assert the neighbours.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
@@ -1545,11 +1558,24 @@ phase). Append-only, empty at plan creation. -->
   R7's clock-spans-the-wait reversed by the developer). Plus two `## Discoveries` entries
   dated 2026-08-12 (the measured mapping, kept knowingly; `recursion_limit` resetting per
   invocation, deferred).
-- Watch-next: **run the live check before Phase 6** — set `wall_clock_seconds` to a few
-  seconds in `harness.toml`, run a real question, and confirm the report names the wall clock
-  and carries the notes written before the cut. Take an `InMemorySaver` memory reading during
-  that run: the Phase 4 Discovery deferred checkpoint growth to this phase and it is still
-  unmeasured — the one item Phase 5 inherited and did not settle. For Phase 6: claim
+- Live check (run 2026-08-13, after the `development` merge): **PASSED.** At
+  `wall_clock_seconds = 20`, `python -m harness "what changed in the EU AI Act in 2026?"`
+  wrote a report whose `## Run cut short` reads "The run was cut short by the wall clock
+  (configured at 20 seconds)" with the todo plan preserved, and all five consulted sources had
+  a `sources/<run_id>/S<n>.md` capture — five being the merged `max_urls_per_call`, so D11's
+  cap is confirmed live at its new value. Three findings. (1) The FIRST attempt died on a
+  missing Playwright Chromium and still produced a well-formed report naming the error, the
+  todo plan and the skipped verification — so Phase 3's deferred "any mid-run termination
+  yields a report" is now confirmed live on the ERROR branch as well as the clock branch.
+  A browser LAUNCH failure is not a per-URL failure: `_fetch`'s "no single URL fails the
+  batch" guarantee begins after the crawler is up, so a broken browser always costs a whole
+  run. (2) The "carries the notes written before the cut" half of this criterion is still
+  VACUOUS — at 20 seconds the agent wrote no notes, so the report correctly said so; a
+  populated `## Working notes` is owed from any longer run. (3) The marker-placement defect
+  this run exposed is fixed — see the 2026-08-13 Discovery.
+- Watch-next: the `InMemorySaver` memory reading is STILL unmeasured — deferred at Phase 4,
+  inherited by Phase 5, and not taken during the live check above. It is the one item this
+  phase never settled. For Phase 6: claim
   verification reads `sources/S<n>.md`, and those files are NOT mtime-filtered the way
   workspace notes now are, so a stale `S1.md` from a previous run can still be read whenever
   IDs collide — decide there whether the same filter belongs on them.

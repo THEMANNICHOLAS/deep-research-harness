@@ -282,10 +282,14 @@ def _annotate(outcome: RunOutcome) -> tuple[str, list[ClaimCheck]]:
         for check in outcome.verification.checks:
             if check.verdict == "supported":
                 continue
+            # A leading space, never a paragraph break: the marker has to stay on the line
+            # of the sentence it judges. Broken onto its own line it reads as a label on
+            # whatever text follows, which attributes the verdict to the wrong claim
+            # whenever a paragraph holds more than one sentence (Phase 5 live check).
             if check.source_id is None:
-                marker = "\n\n**[uncited]**"
+                marker = " **[uncited]**"
             else:
-                marker = f"\n\n**[{check.verdict} — {check.source_id}]**"
+                marker = f" **[{check.verdict} — {check.source_id}]**"
             updated = _place_marker(text, check.claim, marker)
             if updated is None:
                 unplaced.append(check)

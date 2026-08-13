@@ -33,7 +33,7 @@ default_max_results = 10
 # Frozen surface for the agent loop (Phase 3) and its workspace/report capture
 # (Phase 2) — see docs/plans/PLAN-research-loop.md.
 max_rounds = 20
-wall_clock_seconds = 1800
+wall_clock_seconds = 20
 workspace_dir = "workspace"
 reports_dir = "reports"
 max_retries = 2
