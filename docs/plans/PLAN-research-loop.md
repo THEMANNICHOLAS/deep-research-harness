@@ -984,10 +984,15 @@ prompt artifacts, so a later round wires the pyramid without renegotiating the s
 - [ ] Every source consulted in the manual end-to-end run has a
       ~~`sources/S<n>.md`~~ `sources/<run_id>/S<n>.md` file in the workspace — content or
       failure stub.
-- [ ] `harness.toml` and `.env.example` between them name every setting the code reads, and no
-      endpoint, model ID, or key appears as a literal in `harness/`.
-- [ ] The recorded single-agent token baseline from Phase 3 is written down where the next
-      round can find it.
+- [x] `harness.toml` and `.env.example` between them name every setting the code reads, and no
+      endpoint, model ID, or key appears as a literal in `harness/`. (2026-08-13: the fourteen
+      `config.<table>.<key>` reads across `harness/` all resolve to keys present in
+      `harness.toml`; `.env.example` names `OPENCODE_API_KEY` and `SEARXNG_SECRET`, the only
+      two environment variables read; no URL, model ID or key literal outside `config.py`,
+      which holds none either.)
+- [x] The recorded single-agent token baseline from Phase 3 is written down where the next
+      round can find it. (`docs/decisions.md`, the `deepseek-v4-flash` entry: 773,032 in /
+      22,883 out of which 16,539 reasoning / 795,915 total for a 19-source run.)
 
 ## Notes
 
