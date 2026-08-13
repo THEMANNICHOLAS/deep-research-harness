@@ -415,7 +415,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 4: Pre-research clarification
 - [x] Phase 5: Run ceiling and cut-short reporting
 - [x] Phase 6: Claim verification and disclosure
-- [ ] Phase 7: Researcher and reader tier contracts
+- [x] Phase 7: Researcher and reader tier contracts
 - [ ] Final verification
 
 ## Phases
@@ -954,10 +954,10 @@ prompt artifacts, so a later round wires the pyramid without renegotiating the s
 - Do not modify `harness/agent.py`; adding tiers is the next round's work.
 
 **Tests (write first, confirm red):**
-- [ ] Both contracts render with all declared variables supplied and leave no `$` placeholder.
-- [ ] A missing variable raises `PromptError` naming both the prompt and the variable.
-- [ ] `required_variables` reports exactly the placeholders each file declares.
-- [ ] Neither contract references `ask_user`.
+- [x] Both contracts render with all declared variables supplied and leave no `$` placeholder.
+- [x] A missing variable raises `PromptError` naming both the prompt and the variable.
+- [x] `required_variables` reports exactly the placeholders each file declares.
+- [x] Neither contract references `ask_user`.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -967,17 +967,17 @@ prompt artifacts, so a later round wires the pyramid without renegotiating the s
    `docs/INDEX.md`.
 
 **Acceptance criteria:**
-- [ ] `docs/architecture.md` has no `To be documented` placeholder left in `## Failure Modes`,
+- [x] `docs/architecture.md` has no `To be documented` placeholder left in `## Failure Modes`,
       and its content names failure modes actually observed in Phases 3-6.
-- [ ] `docs/INDEX.md` Shared Resources lists `harness/models.py`, `harness/agent.py`,
+- [x] `docs/INDEX.md` Shared Resources lists `harness/models.py`, `harness/agent.py`,
       `harness/verify.py`, and `harness/report.py`.
 
 ## Verification
 
-- [ ] `uv run pytest` — all tests pass from the repo root.
-- [ ] `uv run ruff check .` — clean.
-- [ ] `uv run ruff format --check .` — clean.
-- [ ] `uv run mypy .` — clean.
+- [x] `uv run pytest` — all tests pass from the repo root. (232 passed, 2026-08-12.)
+- [x] `uv run ruff check .` — clean.
+- [x] `uv run ruff format --check .` — clean.
+- [x] `uv run mypy .` — clean.
 - [ ] Manual end-to-end: `python -m harness "<an ambiguous question>"` asks at least one
       clarifying question, answers it, researches, and writes a report whose citations all
       resolve, whose unsupported claims are marked, and whose disclosure section is present.
@@ -1241,6 +1241,17 @@ unclocked (Phase 5 Reconciliation), R7's "a run cannot spiral" holds per pass ra
 run. → **deferred**: the wall clock is the run-level bound once research starts, and every
 extra allowance costs a human answering a question at the terminal, so there is no unattended
 spiral. Revisit if a real run ever burns rounds across many resumes.
+
+2026-08-12 — Phase 7: the phase's four named tests cover placeholders, rendering and the
+`ask_user` exclusion, but nothing guards the contract FIELD names that R5 calls frozen and
+that the next round builds subagent definitions against — a later edit could drop "conflicts"
+from either contract with every test still green. → **acted now**: added
+`tests/test_prompts.py::test_tier_contracts_name_their_frozen_fields`, parametrized over both
+contracts and all seven fields. Anchored to the bolded bullet (`**Tools**`), not the bare word,
+because the 3F review showed the first version could not fail — "tools" also matches the
+`# Tools` heading, "boundaries" matches `# Standing boundaries`, and so on, so a renamed field
+still passed. Generalise: a presence assertion over prose needs an anchor the prose does not
+supply incidentally.
 
 2026-08-10 — Phase 5: `_read_answer`'s `asyncio.to_thread(input, prompt)` makes the wall clock
 unable to actually end a run. Probed before any code was written: with `asyncio.wait_for` around
@@ -1560,3 +1571,37 @@ phase). Append-only, empty at plan creation. -->
   actually observed in Phases 3-6 — this entry's "Learned" items and Phase 5's are the
   material. Also note `docs/INDEX.md`'s Shared Resources must list `harness/verify.py`, which
   now exists.
+
+### 2026-08-12 — Phase 7: Researcher and reader tier contracts
+- Done: `harness/prompts/subagent.md` rewritten as the researcher contract and
+  `harness/prompts/reader.md` written as the reader contract — both mechanism-neutral prose
+  through the existing `render()`, both declaring exactly `{current_date, max_urls_per_call}`,
+  both naming the four task fields (`**Objective**`, `**Output format**`, `**Tools**`,
+  `**Boundaries**`) and the three return fields (`**Findings**`, `**Source IDs**`,
+  `**Conflicts**`), neither mentioning `ask_user`. `tests/test_prompts.py` gained a
+  `TIER_CONTRACTS` list, a `_render_shipped` helper, and five parametrized tests (34 in that
+  file). `docs/architecture.md` gained `## Agent Topology` and nine observed `## Failure
+  Modes`, and its stale `## Overview`/`## Dependencies` were corrected; `docs/INDEX.md` gained
+  five Shared Resources rows and a current Status line. No runtime code changed. 232 tests
+  green; all four gates clean.
+- Learned: (1) `$task` is gone from the researcher contract (developer-approved). A tier
+  receives its task through the delegation call at run time, so substituting task text into
+  the system prompt would freeze a second delivery path beside deepagents' native one — risk
+  !#3's exact shape. This also shrinks !#4 exposure: the artifacts assume no subagent-dict
+  field names at all. (2) A presence assertion over prose needs an anchor the prose does not
+  supply incidentally — see the 2026-08-12 Phase 7 Discovery. (3) The contracts forbid
+  searching (reader) and asking the developer (both) in prose only, but `build_tools` always
+  returns `search_web` and `ask_user` and a deepagents subagent inherits the parent's tools
+  unless given its own — so the next round must pass each tier a filtered tool list or it gets
+  a searching reader that can interrupt the developer while every test stays green. Recorded
+  in `docs/architecture.md` `## Agent Topology`.
+- Drift: none. One `## Discoveries` entry dated 2026-08-12 — Phase 7 (the frozen-field test),
+  acted on now.
+- Watch-next: **three live checks are owed and the plan is NOT finished without them** — Phase
+  5's wall-clock check plus the still-unmeasured `InMemorySaver` growth (inherited from Phase
+  4, deferred twice), Phase 6's cited-report check, and the four manual items in `##
+  Verification`, all developer-run. Plan `**Status:**` deliberately stays `In Progress` and
+  `- [ ] Final verification` stays unticked until they pass. After that: `/pr-review` for the
+  whole-feature review. Then the next round wires the researcher tier against this phase's
+  contract and prices it against Phase 3's baseline (773,032 in / 22,883 out for a 19-source
+  run — input dominates ~34x).

@@ -2,21 +2,45 @@
 
 ## Overview
 
-To be documented as code is written. Direction so far: an orchestrator–worker
-agent loop — a smart model (GLM 5.2, DeepSeek V4 Pro as config-swappable
-fallback) plans and synthesizes, while a cheap fast model does parallel
-triage/extraction under a rate/token budget scheduler. The worker role is
-itself config-swappable (e.g. to an OpenCode-served model) if the initial
-choice proves rate-limit-constrained in practice.
+One command — `python -m harness "<question>"` (@harness/__main__.py) — takes a
+research question and writes one timestamped, cited markdown report. A single
+`deepagents` lead agent (@harness/agent.py) drives the substrate's tools over the
+head role, streaming its todo plan to the terminal; Python then verifies the
+draft's claims (@harness/verify.py) and assembles the report (@harness/report.py).
+Model roles are config-declared, never literal: `[roles.head]` plans, synthesizes
+and checks claims, `[roles.subagent]` is the cheap worker held for the later
+delegation tiers.
+
+## Agent Topology
+
+Today there is exactly one agent. The researcher and reader tiers exist only as
+frozen prompt contracts — @harness/prompts/subagent.md (researcher) and
+@harness/prompts/reader.md (reader) — and nothing delegates to them; wiring them
+is the next round's work. Each contract freezes the four fields a task must carry
+(objective, output format, tools, boundaries) and the three a tier must return
+(findings, source IDs, conflicts), so the tiers can be built without renegotiating
+the seam. Neither tier may ask the developer anything: clarification is the lead's
+alone, or a tier-3 reader would interrupt mid-fan-out. Both tiers must therefore be
+built with a filtered tool list rather than the lead's — @harness/tools/__init__.py
+always returns `search_web` and `ask_user`, and a deepagents subagent inherits the
+parent's tools unless given its own, which would silently produce a reader that can
+search and a tier that can interrupt the developer. The reader always receives
+the facet it is supporting, never a bare URL — a reader handed a URL without
+knowing why it mattered is the documented telephone-game failure. Delegation costs
+3-10x the tokens of a single agent and compounds per level, which is why the tiers
+wait for a measured baseline (the Phase 3 figure in docs/plans/PLAN-research-loop.md).
 
 ## Directory Structure
 
 `harness/` holds the source: @harness/config.py (TOML config models),
-@harness/sources.py (per-run source registry), @harness/prompts.py (prompt
-loader) with its `.md` files in @harness/prompts/, and @harness/tools/ (the
-tool registry and one module per tool). Tests live in `tests/`, mirroring
-the source modules. `harness.toml` sits at the repo root. Reports will be
-timestamped markdown files on disk (not yet built).
+@harness/models.py (role → chat client, with preflight and bounded retry),
+@harness/agent.py (the deepagents lead), @harness/sources.py (per-run source
+registry), @harness/verify.py (per-claim check), @harness/report.py (report
+assembly), @harness/__main__.py (the CLI and its resume loop),
+@harness/prompts.py (prompt loader) with its `.md` files in @harness/prompts/,
+and @harness/tools/ (the tool registry and one module per tool). Tests live in
+`tests/`, mirroring the source modules. `harness.toml` sits at the repo root.
+Reports are timestamped markdown files under the configured reports directory.
 
 ## Principles & Invariants
 
@@ -37,10 +61,59 @@ by env var and never inlined.
 
 ## Dependencies
 
-Runtime: `pydantic`, `langchain-core`, `crawl4ai` (pinned 0.9.2), `httpx`.
-Dev: `pytest`, `pytest-asyncio`, `ruff`, `mypy`. Deliberately not depended
-on: `deepagents`, `langchain`, `langgraph`, `pydantic-settings`.
+Runtime: `pydantic`, `langchain-core`, `crawl4ai` (pinned 0.9.2), `httpx`,
+`deepagents` (pinned exact on the 0.7.x line) and `langchain-openai` for the
+OpenAI-compatible OpenCode endpoint. Dev: `pytest`, `pytest-asyncio`, `ruff`,
+`mypy`. `deepagents` drags in `langchain-anthropic`, `langchain-google-genai`
+and `langsmith`, none of which this project calls — accepted knowingly, do not
+try to strip them. Deliberately not depended on: `pydantic-settings`.
 
 ## Failure Modes
 
-To be documented as code is written.
+Observed while building the research loop (Phases 3-6 of
+docs/plans/PLAN-research-loop.md). Each is a mode the system can fail in, not a
+bug that was fixed and forgotten — the fix is named so it stays visible.
+
+- **The wrong summarizer passes every test.** langchain's plain
+  `SummarizationMiddleware` and `deepagents.middleware.summarization`'s share a
+  `.name`, so either one replaces the default. Only the deepagents wrapper offloads
+  evicted history to the backend instead of deleting it and leaves the message list
+  intact for the token sum. Installing the wrong one is silent.
+- **Compression can erase attribution.** If the summarizer's `keep` policy drops
+  which `[Sn]` supported which finding, the lead synthesizes from unattributed
+  assertions and the claim check has nothing left to check against — and the report
+  looks fine. Compression immediately before synthesis is also the regime where
+  false-conclusion adoption is worst.
+- **The `execute` shell tool cannot be removed from the graph.** Every deepagents
+  backend binds it. The no-shell invariant is enforced by hiding it from the model's
+  schema via `excluded_tools` on a registered `HarnessProfile` (@harness/agent.py) —
+  a process-global registry keyed `provider:model-name`. Same registration disables
+  the injected `general-purpose` subagent.
+- **Any mid-run termination abandons the graph.** A transient DNS failure, the wall
+  clock, or the recursion limit all exit the stream by exception, so the report can
+  only be assembled from what is already on disk — which is why notes and captured
+  sources are disk-backed and why the lead is told to write findings as it goes. The
+  run state must be captured *inside* the stream loop; assigning it after the loop
+  loses both the answer and the token usage on exactly the paths that need them.
+- **Interrupts surface in both streams, as a tuple.** An `ask_user` interrupt appears
+  in `updates` as `{"__interrupt__": (Interrupt(...),)}` and in `values` as the state
+  dict plus that key, so code that calls `.get` on every update value raises
+  `AttributeError` on the first one. Detection must also be scoped to the current
+  pass, or a carried-over state re-asks the same question forever.
+- **A verified claim can be silently discarded.** `extract_claims` joins a block's
+  lines with a space, so a claim is not guaranteed to be a verbatim substring of the
+  answer; a `str.replace` then no-ops and the verdict is computed and thrown away.
+  Markers are placed by a whitespace-tolerant regex, anything unplaceable is
+  disclosed, and marker insertion must run *before* `registry.resolve()` — resolving
+  first rewrites `[S1]` into a link and no claim matches.
+- **A 404 body classifies as `fetched`.** The substrate's fetch classification is
+  known-imperfect (see docs/backlog.md) and is left that way deliberately. The
+  mitigation is the per-claim check reading captured source files: an error page
+  cannot support the claim attached to it, so the claim comes back unsupported.
+- **The head model 403s without a region opt-in.** `deepseek-v4-flash` requires it on
+  the OpenCode workspace dashboard; the endpoint is otherwise reachable and the
+  failure looks like a credential problem.
+- **Faked search and a scripted model conflict in tests.** `tests/test_search.py`'s
+  client fake patches the process-global `httpx.AsyncClient`, and `openai`'s
+  constructor rejects any `http_client` that is not an instance of whatever that name
+  is bound to at the time. Any test combining both must build the model first.
