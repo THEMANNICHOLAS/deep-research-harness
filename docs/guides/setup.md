@@ -68,7 +68,9 @@ are never stored here — each provider names an environment variable
 - `[providers.<name>]` — a model provider's `base_url` and the env var holding its key.
 - `[roles.head]` / `[roles.subagent]` — which provider + model ID each role resolves
   to. Both keys are required.
-- `[fetch]` — per-page timeout, fetch concurrency, and the per-page character cap.
+- `[fetch]` — per-page timeout, fetch concurrency, the per-page character cap, and the
+  maximum URLs one `fetch_pages` call may request (`max_urls_per_call`; a call carrying
+  more is rejected without fetching anything).
 - `[search]` — the SearXNG base URL and default result count.
 
 ## Prerequisites

@@ -250,13 +250,27 @@ def test_text_with_no_boundary_before_the_cap_falls_back_to_a_hard_cut():
     assert str(cap) in rendered
 
 
-def test_a_boundary_too_early_to_be_worth_taking_falls_back_to_the_hard_cut():
+def test_an_early_boundary_is_taken_even_though_it_discards_most_of_the_allowance():
+    # Supersedes test_a_boundary_too_early_to_be_worth_taking_falls_back_to_the_hard_cut:
+    # the `_MIN_BOUNDARY_FRACTION` floor was removed, so the latest boundary always wins.
     cap = 100
     text = "A" * 10 + "\n\n" + "B" * 200
 
     rendered = _rendered(text, cap)
 
-    assert "B" * 50 in rendered
+    assert "A" * 10 in rendered
+    assert "B" not in rendered
+    assert "truncated" in rendered
+
+
+def test_a_heading_at_the_very_start_does_not_empty_the_block():
+    cap = 100
+    text = "# Title\n" + "A" * 200
+
+    rendered = _rendered(text, cap)
+
+    assert "# Title" in rendered
+    assert "A" * 92 in rendered
     assert "truncated" in rendered
 
 
@@ -489,6 +503,30 @@ async def test_input_url_with_no_result_reports_a_single_error_outcome(
     assert pages[0].outcome == "error"
     assert pages[0].markdown == ""
     assert pages[0].error == "no result returned for this URL"
+
+
+async def test_the_first_of_two_results_for_one_url_is_the_one_reported(
+    install_crawler, make_config
+):
+    # Pins `_pair`'s documented `bucket.pop(0)`: under memory pressure the dispatcher can
+    # return a "Requeued" placeholder AND re-queue the crawl, and the first result wins.
+    config = make_config()
+    registry = SourceRegistry()
+    results = [
+        _FakeResult("https://a.test", error_message="Requeued", status_code=None),
+        _FakeResult(
+            "https://a.test",
+            markdown=_FakeMarkdown(raw_markdown="retry body", fit_markdown="retry body"),
+        ),
+    ]
+    install_crawler(results)
+
+    content, pages = await fetch._fetch(["https://a.test"], config, registry)
+
+    assert len(pages) == 1
+    assert pages[0].outcome == "error"
+    assert pages[0].error == "Requeued"
+    assert "retry body" not in content
 
 
 async def test_result_matching_no_input_url_never_supplies_another_urls_body(

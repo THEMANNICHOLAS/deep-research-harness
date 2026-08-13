@@ -271,7 +271,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | ID | Outcome | Covered by |
 |----|---------|------------|
 | R1 | Lightpanda removed | Phase 2 (`grep -ri lightpanda` hits only historical records) |
-| R2 | Boundary-aware truncation | Phase 4 (cut lands on a heading/paragraph break; hard-cut fallback) |
+| R2 | Boundary-aware truncation | Phase 4 (cut lands on a heading/paragraph break; hard cut only when none exists — the minimum-yield floor was removed, see Reconciliation #3) |
 | R3 | ~~Short-block boilerplate removed~~ Mechanism ruled out on live evidence | Phase 5 (no code change; Reconciliation #2 + backlog entry) |
 | R5 | ~~Rate-limited source retries once~~ Rate-limit backoff bounded, still `blocked` | Phase 1 (`max_retries=1` caps per-domain backoff growth — see Reconciliation #1) |
 | R6 | One outcome per URL, no misattribution | Phase 1 (unmatched URL reports `error`, never borrows a body) |
@@ -516,10 +516,10 @@ back to a hard cut when no usable boundary exists, and always discloses that it 
 - [x] Text with no boundary before the cap falls back to a hard cut and still discloses. (Green
   before implementation — `rfind` returning `-1` falls under any floor, so this path needed no
   special case.)
-- [x] A boundary so early that it would discard most of the allowance is rejected in favour of
-  the hard cut — a structured page must never come back nearly empty. (Green before
-  implementation; it is the regression guard for the floor — removing `_MIN_BOUNDARY_FRACTION`
-  turns it red.)
+- [x] ~~A boundary so early that it would discard most of the allowance is rejected in favour of
+  the hard cut — a structured page must never come back nearly empty.~~ Struck: the floor was
+  removed in review (Reconciliation #3). The early boundary is now taken, and the replacement
+  test pins that; a separate test covers a heading at offset 0.
 - [x] The artifact keeps the full untruncated markdown while the rendered content is shorter.
   (Already covered by `test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text`; not
   duplicated, per the acceptance criterion that it keeps passing.)
@@ -745,6 +745,28 @@ carrying code should be used if the question is reopened.
 homelab box over SSH. That was never in the plan text and is wrong: the workstation has
 crawl4ai, Playwright Chromium and network egress, and ran the real `_fetch` path end to end.
 The homelab constraint in `## Intent` is about the cost of a failure during a research run.
+
+### #3 — 2026-08-12 — Phase 4: the "boundary too early" floor is removed
+
+**Contradiction.** Phase 4's test list and Steps require a `_MIN_BOUNDARY_FRACTION` floor: a
+boundary keeping less than 60% of the allowance is rejected in favour of the hard cut, so "a
+structured page must never come back nearly empty". Risk #4 flagged the fraction as a guess
+until it met real pages. It never did — the one live run (33k-char RAG article at the 12,000
+cap) kept 96.7% of the allowance, so the floor never fired in practice, and no page has yet
+been observed that would trigger it.
+
+**Amendment.** The floor and its constant are deleted in PR #3 review (developer decision,
+2026-08-12): the latest paragraph break or heading start inside the allowance is now always
+taken. Phase 4's fourth test bullet is struck and its regression guard replaced by
+`test_an_early_boundary_is_taken_even_though_it_discards_most_of_the_allowance`, which pins
+the opposite behaviour. Risk #4's failure mode is therefore accepted, not mitigated: a page
+whose only boundary sits near the top now returns that much and discloses the truncation.
+
+**Consequence for the no-boundary case.** The floor was doing double duty — Phase 4's handoff
+log recorded that `rfind` returning `-1` "falls under any floor, so this path needed no
+special case". With the floor gone the guard is explicit (`boundary > 0`), which also covers a
+heading at offset 0 that would otherwise render an empty block;
+`test_a_heading_at_the_very_start_does_not_empty_the_block` pins it.
 
 ## Discoveries
 
