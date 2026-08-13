@@ -31,13 +31,15 @@ from harness.sources import SourceRegistry
 from harness.tools import build_tools
 from harness.tools.ask_user import ASK_USER_TOOL_NAME
 
-# The summarizer's own policy constants (not config-driven — see D7). `trigger` matches
-# the profile-driven fallback that would apply anyway if unset (settled finding 6):
-# 170,000 tokens is deliberately generous for a reasoning model that spends heavily on
-# output. `keep` is set explicitly, per D7, rather than left to fall back to deepagents'
-# smaller profile default of 6 messages — a larger kept tail gives recent `[Sn]`-bearing
-# findings more room to survive into synthesis.
-_SUMMARIZATION_TRIGGER: tuple[Literal["tokens"], int] = ("tokens", 170_000)
+# The summarizer's own policy constants (not config-driven — see D7). `trigger` is set
+# above the profile-driven fallback that would apply if unset (settled finding 6, which
+# matched it at 170,000): 200,000 tokens is deliberately generous for a reasoning model
+# that spends heavily on output, and defers compression — and the attribution loss D7
+# guards against — as long as the head role's context window allows. `keep` is set
+# explicitly, per D7, rather than left to fall back to deepagents' smaller profile
+# default of 6 messages — a larger kept tail gives recent `[Sn]`-bearing findings more
+# room to survive into synthesis.
+_SUMMARIZATION_TRIGGER: tuple[Literal["tokens"], int] = ("tokens", 200_000)
 _SUMMARIZATION_KEEP: tuple[Literal["messages"], int] = ("messages", 20)
 
 # `allowed_decisions` is `["respond"]` only — the developer answers on behalf of the tool
