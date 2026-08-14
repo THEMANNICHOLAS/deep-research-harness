@@ -5,7 +5,17 @@ Issues found during the `/implement` run of `docs/plans/PLAN-report-output.md`
 
 ---
 
-## 1. [Major] Fenced code blocks are dropped from the report's `## Answer`
+## 1. [Major — FIXED, PR #7 review] Fenced code blocks are dropped from the report's `## Answer`
+
+**Resolved** by the fix the entry itself proposed: `Paragraph` gained `is_code`,
+`split_paragraphs` emits each fence as its own code paragraph (citation-free and
+bullet-free, so verification still makes zero calls for it and index alignment holds),
+and `_paragraph_block` returns that text verbatim. The Phase 1 test asserting fences are
+removed was replaced by one asserting they survive as `is_code` paragraphs. Original
+write-up kept below.
+
+---
+
 
 **What:** `_answer_section` renders only `outcome.paragraphs`, and `split_paragraphs`
 strips fenced blocks before any `Paragraph` is built (`harness/paragraphs.py`, the
@@ -89,6 +99,11 @@ line, and it turns a list of URLs into an actual disclosure.
   beside `_FENCE_RE` would match the file's own convention. The
   `indent_match ... else ""` guard is unreachable (`[ \t]*` always matches) and exists
   only to satisfy mypy.
+- `harness/verify.py` — `sources_conflict = bool(...)` accepts any truthy value, so a
+  quoted `"false"` from the model would read as True, unlike `detail` and
+  `unsupported_items` which are both type-checked. Raised by the PR #7 review as
+  PLAUSIBLE; left because the prompt asks for an unquoted boolean and no live reply has
+  ever been captured. Confirm or drop it on the first live run (item 7).
 - `harness/verify.py` — the `registered` list could be built as
   `[(sid, src) for sid in paragraph.source_ids if (src := registry.get(sid)) is not None]`,
   dropping a second `registry.get` call and an `assert source is not None`.

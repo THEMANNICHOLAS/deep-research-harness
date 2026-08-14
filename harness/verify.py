@@ -31,8 +31,9 @@ Verdict = Literal[
 # The last two are assigned deterministically by this module and are NEVER returned by the
 # model — `no_sources_cited` when a paragraph cites nothing registered, `not_verified` when
 # a check could not be run at all (no usable source, a malformed reply, an unknown verdict,
-# or a raised exception).
-_MODEL_VERDICTS = {"supported", "partially_supported", "not_supported"}
+# or a raised exception). Public because `report.py` gates its bullet rollup on the same
+# distinction, and this is the one place that line is drawn.
+MODEL_VERDICTS = {"supported", "partially_supported", "not_supported"}
 
 
 class ParagraphVerdict(BaseModel):
@@ -66,21 +67,17 @@ def _parse_reply(content: str) -> tuple[Verdict, str, bool, list[int]]:
     Raises `VerifyError` (or lets a `json.JSONDecodeError` propagate) on anything malformed
     — the caller treats both as a per-paragraph failure, never a pass-ending one.
     """
-    text = content.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[len("json") :]
-        text = text.strip()
-    if not text.startswith("{"):
-        # Prose around the JSON: take the substring from the first `{` to the last `}`.
-        start = text.index("{")
-        end = text.rindex("}")
-        text = text[start : end + 1]
+    # Take the substring from the first `{` to the last `}`, which absorbs every wrapper
+    # risk #1 predicted at once: a markdown fence, prose before the object, and prose after
+    # it. Unconditional on purpose — gating this on a leading `{` let a reply that OPENED
+    # with the object and then trailed prose reach `json.loads` whole, where "Extra data"
+    # turned a genuine verdict into `not_verified`. A reply with no `{` raises `ValueError`,
+    # which the caller already treats as a per-paragraph failure.
+    text = content[content.index("{") : content.rindex("}") + 1]
     data = json.loads(text)
     verdict = data["verdict"]
     detail = data["detail"]
-    if verdict not in _MODEL_VERDICTS:
+    if verdict not in MODEL_VERDICTS:
         raise VerifyError(f"model returned an unknown verdict: {verdict!r}")
     if not isinstance(detail, str):
         raise VerifyError("model's 'detail' field is not a string")

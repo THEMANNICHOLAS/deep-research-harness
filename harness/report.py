@@ -18,10 +18,10 @@ from langchain_core.messages import UsageMetadata
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
-from harness.paragraphs import Paragraph, strip_markers
+from harness.paragraphs import LIST_ITEM_RE, Paragraph, strip_markers
 from harness.sources import Source, SourceRegistry
 from harness.tools.fetch import _sources_dir, is_failed_capture
-from harness.verify import ParagraphVerdict, VerificationResult
+from harness.verify import MODEL_VERDICTS, ParagraphVerdict, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
@@ -256,31 +256,24 @@ def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> 
     bullet line whose zero-based index is in `verdict.unsupported_items` (D4: an index
     outside `range(len(paragraph.items))` is ignored rather than raising).
 
-    Rendered bullet lines are matched back to `paragraph.items` positionally: each
-    stripped line that ENDS WITH that item's own marker-stripped text is, in order, that
-    item's rendered line — `split_paragraphs` only ever strips a bullet's leading syntax
-    off the front of its raw line, so the item text always survives as a verbatim suffix.
+    A bullet is identified by `LIST_ITEM_RE` — the same test `split_paragraphs` uses to
+    build `items` — so the Nth list line IS `items[N]`. Matching on rendered text instead
+    let a lead-in line ending in the first bullet's wording consume that bullet's slot,
+    putting the `*` on prose and leaving the failing bullet unmarked.
     """
     unsupported = set(verdict.unsupported_items) if verdict is not None else set()
     valid = {i for i in unsupported if 0 <= i < len(paragraph.items)}
-    expected = [strip_markers(item) for item in paragraph.items]
 
     lines: list[str] = []
     item_index = 0
     for raw_line in paragraph.text.split("\n"):
         rendered = strip_markers(raw_line)
-        if not rendered:
-            continue
-        # Skip past any item whose text is empty once markers are stripped (a bullet that
-        # is nothing but a citation, `- [S1]`). Without this the index sticks on it and
-        # every later bullet in the list silently loses its `*`.
-        while item_index < len(expected) and not expected[item_index]:
-            item_index += 1
-        if item_index < len(expected) and rendered.endswith(expected[item_index]):
+        if LIST_ITEM_RE.match(raw_line):
             if item_index in valid:
                 rendered = f"{rendered} *"
             item_index += 1
-        lines.append(rendered)
+        if rendered:
+            lines.append(rendered)
     return lines
 
 
@@ -290,7 +283,13 @@ def _paragraph_block(
     """Render one paragraph: marker-stripped prose, then `Sources:`/`Verdict:` when the
     paragraph cites at least one REGISTERED source — gated on citation alone, never on
     the verdict value, so a `supported` paragraph gets a line exactly like any other.
+
+    A fenced block is emitted verbatim: stripping markers or re-wrapping it would corrupt
+    the code, and it cites nothing, so it carries no `Sources:`/`Verdict:` pair anyway.
     """
+    if paragraph.is_code:
+        return paragraph.text
+
     lines = _paragraph_prose(paragraph, verdict)
     registered = [sid for sid in paragraph.source_ids if registry.get(sid) is not None]
     if not registered:
@@ -304,7 +303,9 @@ def _paragraph_block(
     else:
         label = _verdict_label(verdict.verdict)
         detail = verdict.detail
-        if paragraph.items:
+        # Only a verdict the MODEL returned can carry a bullet rollup. `not_verified` means
+        # no check ran, so "n/m bullets verified" would assert a count nothing measured.
+        if paragraph.items and verdict.verdict in MODEL_VERDICTS:
             total = len(paragraph.items)
             unsupported_count = len({i for i in verdict.unsupported_items if 0 <= i < total})
             detail = f"{total - unsupported_count}/{total} bullets verified. {detail}"

@@ -14,6 +14,7 @@ written for that must have a test that fails if the tolerance is removed.
 import asyncio
 from typing import get_args
 
+import pytest
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import PrivateAttr, SecretStr
 
@@ -448,6 +449,42 @@ async def test_a_reply_wrapped_in_prose_is_still_parsed(make_config, scripted_mo
     result = await verify_paragraphs([paragraph], config, registry)
 
     assert result.verdicts[0].verdict == "supported"
+    assert result.verdicts[0].detail == "The capture quotes $4.20."
+    assert result.check_failures == []
+
+
+_OBJECT = '{"verdict": "supported", "detail": "The capture quotes $4.20."}'
+
+
+@pytest.mark.parametrize(
+    ("content", "shape"),
+    [
+        (f"{_OBJECT} Hope that helps!", "trailing prose only"),
+        (f"```json\n{_OBJECT}\n```", "markdown fence"),
+    ],
+)
+async def test_a_reply_wrapped_on_either_side_is_still_parsed(
+    make_config, scripted_model, monkeypatch, content, shape
+):
+    """Risk #1, both remaining wrapper shapes. Trailing-prose-only is the one that used to
+    fail: the repair was gated on the reply NOT starting with `{`, so an object followed by
+    a sign-off went to `json.loads` whole and raised "Extra data", turning a genuine
+    `supported` verdict into `not verified` for a correctly-cited paragraph.
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "The vendor quoted $4.20.")
+    paragraph = _paragraph(f"The vendor quoted $4.20 [{source_id}].", [source_id])
+
+    model = scripted_model([AIMessage(content=content)])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert result.verdicts[0].verdict == "supported", shape
     assert result.verdicts[0].detail == "The capture quotes $4.20."
     assert result.check_failures == []
 

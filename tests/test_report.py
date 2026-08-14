@@ -865,6 +865,122 @@ def test_write_report_a_list_paragraphs_lead_in_and_bullets_render_cleanly_with_
     ) in answer_section
 
 
+def test_a_lead_in_repeating_the_first_bullet_does_not_steal_its_unsupported_mark(make_config):
+    """The `*` is placed by list-item POSITION, not by matching rendered text. A lead-in
+    line ending in the first bullet's own wording used to consume that bullet's slot, so
+    the mark landed on prose and the failing bullet rendered clean — pointing the reader
+    at the wrong line, which is the one job the mark has.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/vendor")
+    write_source_capture(config, registry, source_id, "Body text.")
+    answer = (
+        "Summary: the vendor quoted $4.20.\n"
+        f"- the vendor quoted $4.20 [{source_id}].\n"
+        "- Lead time is six weeks."
+    )
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="Lead-in colliding with its first bullet",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=VerificationResult(
+            verdicts=[
+                ParagraphVerdict(
+                    verdict="partially_supported",
+                    detail="The quote does not match the source.",
+                    unsupported_items=[0],
+                    source_ids=[source_id],
+                )
+            ]
+        ),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    lines = [line.strip() for line in _section(body, "## Answer").splitlines()]
+
+    assert "Summary: the vendor quoted $4.20." in lines, "the lead-in must not be marked"
+    assert "- the vendor quoted $4.20. *" in lines, "the failing bullet must carry the mark"
+    assert "- Lead time is six weeks." in lines
+
+
+def test_a_list_that_was_never_verified_carries_no_bullets_verified_rollup(make_config):
+    """`not_verified` means no check ran, so an `n/m bullets verified` rollup would assert
+    a count nothing measured — telling a non-technical reader every bullet checked out at
+    the exact moment none of them did.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/vendor")
+    write_source_capture(config, registry, source_id, "Body text.")
+    answer = f"- The vendor quoted $4.20 [{source_id}].\n- Lead time is six weeks."
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="A list whose check failed",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=VerificationResult(
+            verdicts=[
+                ParagraphVerdict(
+                    verdict="not_verified",
+                    detail="JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+                    source_ids=[source_id],
+                )
+            ]
+        ),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert "bullets verified" not in answer_section
+    assert (
+        "Verdict: not verified - JSONDecodeError: Expecting value: line 1 column 1 (char 0)"
+        in answer_section
+    )
+
+
+def test_a_fenced_code_block_reaches_the_answer_verbatim(make_config):
+    """R2 removes MARKERS from prose, not CONTENT. A fence is excluded from the
+    verification unit, but dropping it from the report deleted a command sample or config
+    snippet with no disclosure anywhere — a silent thinning the invariant forbids.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/docs")
+    write_source_capture(config, registry, source_id, "Body text.")
+    answer = f"Run the migration first [{source_id}].\n\n```bash\nuv run alembic upgrade head\n```"
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="How do I migrate?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=VerificationResult(
+            verdicts=[
+                ParagraphVerdict(
+                    verdict="supported", detail="The page says so.", source_ids=[source_id]
+                ),
+                ParagraphVerdict(verdict="no_sources_cited", detail="Nothing to check."),
+            ]
+        ),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert "```bash\nuv run alembic upgrade head\n```" in answer_section
+    # The fence cites nothing, so it carries no pair of its own — the prose above keeps its.
+    assert answer_section.count("Sources: ") == 1
+    assert answer_section.count("Verdict: ") == 1
+
+
 def test_write_report_a_hard_wrapped_paragraph_renders_as_one_clean_prose_block(make_config):
     """A sentence hard-wrapped across two lines is still ONE `Paragraph` (blank-line
     delimited, not sentence-delimited), so its Sources:/Verdict: pair renders once,

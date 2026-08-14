@@ -5,19 +5,36 @@ import pytest
 from harness.paragraphs import Paragraph, split_paragraphs, strip_markers
 
 
-def test_fenced_code_block_is_removed_and_never_becomes_a_paragraph():
+def test_fenced_code_block_is_its_own_code_paragraph_keeping_its_content():
+    """A fence is excluded from the VERIFICATION unit without being dropped from the
+    answer: it becomes an `is_code` paragraph carrying no citations and no bullets, so it
+    takes the zero-call `no_sources_cited` path while its text survives for rendering.
+    """
     answer = (
         "Intro paragraph one.\n\n```python\ndef f():\n    return 1\n```\n\nClosing paragraph two."
     )
 
     paragraphs = split_paragraphs(answer)
 
-    assert len(paragraphs) == 2
-    assert paragraphs[0].text == "Intro paragraph one."
-    assert paragraphs[1].text == "Closing paragraph two."
-    for paragraph in paragraphs:
-        assert "def f()" not in paragraph.text
-        assert "return 1" not in paragraph.text
+    assert [p.text for p in paragraphs] == [
+        "Intro paragraph one.",
+        "```python\ndef f():\n    return 1\n```",
+        "Closing paragraph two.",
+    ]
+    assert [p.is_code for p in paragraphs] == [False, True, False]
+    code = paragraphs[1]
+    assert code.source_ids == [] and code.items == []
+
+
+def test_a_marker_inside_a_fence_is_not_treated_as_a_citation():
+    """A `[S1]` in a code sample is syntax, not a citation — it must not pull a source
+    onto a `Sources:` line or trigger a verification call.
+    """
+    paragraphs = split_paragraphs("```\nlookup(table[S1])\n```")
+
+    assert len(paragraphs) == 1
+    assert paragraphs[0].is_code is True
+    assert paragraphs[0].source_ids == []
 
 
 def test_source_ids_deduplicated_in_first_appearance_order():
