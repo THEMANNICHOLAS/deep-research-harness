@@ -7,6 +7,7 @@ rewriting markers into links. No model involvement, no fetching (D6).
 import re
 import secrets
 from datetime import datetime
+from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict
@@ -14,6 +15,12 @@ from pydantic import BaseModel, ConfigDict
 MARKER_RE = re.compile(r"\[S(\d+)\]")
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# R5's recording seam: "unread" until a tool actually captures the page, "digested" when the
+# reader's fetch_pages call succeeded, "fallback" when fetch_raw's raw-capture recovery path
+# succeeded. Written by the tool closures (fetch.py/fallback.py), never inside the shared
+# `_fetch` helper both call, since the mode is a property of which tool was invoked.
+ReadMode = Literal["unread", "digested", "fallback"]
 
 
 def marker_ids(text: str) -> list[str]:
@@ -81,6 +88,7 @@ class Source(BaseModel):
     id: str
     url: str
     title: str | None = None
+    read_mode: ReadMode = "unread"
 
 
 class SourceRegistry:
@@ -117,6 +125,14 @@ class SourceRegistry:
 
     def get(self, source_id: str) -> Source | None:
         return self._by_id.get(source_id)
+
+    def mark_read(self, source_id: str, mode: ReadMode) -> None:
+        """Record how `source_id` was captured. Last write wins if called more than once.
+
+        `source_id` is expected to already be registered — an unknown id raises `KeyError`,
+        which is fine because every caller is an internal tool closure that just minted it.
+        """
+        self._by_id[source_id].read_mode = mode
 
     def all(self) -> list[Source]:
         """Return every registered source, in insertion order."""

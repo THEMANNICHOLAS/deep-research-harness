@@ -343,7 +343,13 @@ def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseToo
         their outcome rather than raising, so one bad URL never fails the batch. Equivalent
         spellings of the same page (trailing slash, fragment, case) are fetched once.
         """
-        return await _fetch(urls, config, registry)
+        content, pages = await _fetch(urls, config, registry)
+        # Only a real capture counts as "digested" (R5) — a failed fetch stays "unread" so the
+        # report doesn't claim the reader read something that was never actually captured.
+        for page in pages:
+            if page.outcome == "fetched":
+                registry.mark_read(page.source_id, "digested")
+        return content, pages
 
     # Appended rather than written into the docstring: the limit is config, and a literal would
     # go stale the moment an operator changed it (D2).

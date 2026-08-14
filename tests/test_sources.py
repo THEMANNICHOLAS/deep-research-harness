@@ -197,3 +197,38 @@ def test_run_id_explicit_value_is_used_verbatim():
     registry = SourceRegistry(run_id="2026-08-12-093000")
 
     assert registry.run_id == "2026-08-12-093000"
+
+
+# --- Phase 2: per-source read mode (digested / fallback / unread), R5's recording seam ---
+
+
+def test_a_freshly_added_source_defaults_to_unread():
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.com/a")
+
+    source = registry.get(source_id)
+    assert source is not None
+    assert source.read_mode == "unread"
+
+
+def test_mark_read_sets_digested_and_fallback_modes_independently():
+    registry = SourceRegistry()
+    digested_id = registry.add("https://example.com/a")
+    fallback_id = registry.add("https://example.com/b")
+
+    registry.mark_read(digested_id, "digested")
+    registry.mark_read(fallback_id, "fallback")
+
+    assert registry.get(digested_id).read_mode == "digested"
+    assert registry.get(fallback_id).read_mode == "fallback"
+
+
+def test_re_marking_a_source_overwrites_its_read_mode():
+    # Last write wins: whichever tool marked a source most recently is authoritative.
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.com/a")
+
+    registry.mark_read(source_id, "digested")
+    registry.mark_read(source_id, "fallback")
+
+    assert registry.get(source_id).read_mode == "fallback"

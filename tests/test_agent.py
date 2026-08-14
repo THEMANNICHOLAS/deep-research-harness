@@ -31,6 +31,7 @@ from harness.report import (
 )
 from harness.sources import SourceRegistry
 from tests.conftest import (
+    ScriptedChatModel,
     drain_stdout,
     install_search_transport,
     patch_model,
@@ -243,6 +244,104 @@ async def test_reader_model_profile_excludes_execute(make_config, patch_models_b
 
     assert profile is not None
     assert "execute" in profile.excluded_tools
+
+
+# --- Phase 2: failure path — task-tool retry/error middleware, fetch_raw fallback (D2) --
+
+
+class _RaisingChatModel(ScriptedChatModel):
+    """Raises on every call, recording each invocation — drives the task-tool retry path."""
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        self._received_messages.append(list(messages))
+        self._call_count += 1
+        raise RuntimeError("boom")
+
+
+def _task_call(description: str, call_id: str = "call_task") -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": description, "subagent_type": "reader"},
+                "id": call_id,
+            }
+        ],
+    )
+
+
+async def test_a_reader_crash_becomes_an_error_task_message_after_one_retry(
+    make_config, patch_models_by_role, scripted_model
+):
+    """D2: the task tool is wrapped by ToolRetryMiddleware(max_retries=1) inner and
+    ToolErrorMiddleware outer, so a reader crash surfaces as an error ToolMessage — never a
+    raised exception out of `ainvoke` — after exactly one retry (two reader model calls total).
+    """
+    from pydantic import SecretStr
+
+    head_model = scripted_model(
+        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    )
+    reader_model = _RaisingChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+
+    graph = build_agent(make_config(), SourceRegistry())
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0].status == "error"
+    assert str(task_messages[0].content).startswith("READER FAILED")
+    assert reader_model._call_count == 2  # initial attempt + exactly one retry
+
+
+async def test_a_reader_ending_with_no_final_text_returns_an_empty_task_message(
+    make_config, patch_models_by_role, scripted_model
+):
+    """deepagents' documented empty-ToolMessage behavior: a subagent ending on an AIMessage with
+    no text produces a task ToolMessage with empty content. THIS emptiness is the documented
+    failure signal Phase 3's prompt teaches the lead to treat as a failed digest.
+    """
+    head_model = scripted_model(
+        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    )
+    reader_model = scripted_model([AIMessage(content="")])
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+
+    graph = build_agent(make_config(), SourceRegistry())
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0].content == ""
+
+
+async def test_fetch_raw_is_offered_to_the_lead_but_not_the_reader(
+    noop_agent, make_config, scripted_model
+):
+    _, graph = noop_agent
+    assert "fetch_raw" in _tools_by_name(graph)
+
+    from harness.agent import _reader_spec
+    from harness.tools import build_tools
+
+    config = make_config()
+    reader_tools = build_tools(config, SourceRegistry()).reader
+    spec = _reader_spec(config, scripted_model([AIMessage(content="done")]), reader_tools)
+    assert "fetch_raw" not in [t.name for t in spec["tools"]]
 
 
 async def test_build_agent_includes_todo_list_middleware(noop_agent):

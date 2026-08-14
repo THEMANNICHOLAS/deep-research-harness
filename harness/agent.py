@@ -21,7 +21,13 @@ from deepagents._models import get_model_identifier, get_model_provider
 from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware.summarization import SummarizationMiddleware
-from langchain.agents.middleware import AgentMiddleware, InterruptOnConfig, TodoListMiddleware
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    InterruptOnConfig,
+    TodoListMiddleware,
+    ToolErrorMiddleware,
+    ToolRetryMiddleware,
+)
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
@@ -48,6 +54,13 @@ _SUMMARIZATION_KEEP: tuple[Literal["messages"], int] = ("messages", 20)
 _INTERRUPT_ON: dict[str, bool | InterruptOnConfig] = {
     ASK_USER_TOOL_NAME: InterruptOnConfig(allowed_decisions=["respond"])
 }
+
+
+# D2: a reader crash must not kill the run. Phase 3's prompt keys off the "READER FAILED"
+# prefix, so it must stay exact.
+def _reader_failure_message(exc: Exception, request: Any) -> str:
+    """Render a reader (`task`) crash as content for an error `ToolMessage`."""
+    return f"READER FAILED ({type(exc).__name__}): {exc}"
 
 
 def _register_no_shell_profile(model: BaseChatModel) -> None:
@@ -158,10 +171,27 @@ def _middleware(model: Any, backend: BackendProtocol) -> list[AgentMiddleware[An
     offloads evicted messages to `backend` before dropping them from context — langchain's
     issues a destructive `RemoveMessage(REMOVE_ALL_MESSAGES)` with no recovery path for a
     dropped `[Sn]`-to-finding association, which D7/R3/R7 depend on.
+
+    The last two entries (D2) scope to the `task` tool only: `ToolErrorMiddleware` defined
+    first (outermost) catches whatever exception exhausts `ToolRetryMiddleware` (inner,
+    `on_failure="error"` so the exhausted exception reaches the outer catch rather than being
+    swallowed into a "continue" message here) and converts it to a `status="error"`
+    ToolMessage. `max_retries=1`: retrying `task` re-runs the whole reader subagent, so the
+    budget already doubles at one retry. `initial_delay=0.0, jitter=False`: this retry exists
+    for reader crashes, not transient network waits, so it should be deterministic and
+    test-fast rather than backed off.
     """
     return [
         TodoListMiddleware(),
         SummarizationMiddleware(
             model=model, backend=backend, trigger=_SUMMARIZATION_TRIGGER, keep=_SUMMARIZATION_KEEP
+        ),
+        ToolErrorMiddleware(on_error=_reader_failure_message, tools=["task"]),
+        ToolRetryMiddleware(
+            max_retries=1,
+            tools=["task"],
+            on_failure="error",
+            initial_delay=0.0,
+            jitter=False,
         ),
     ]

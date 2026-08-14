@@ -205,7 +205,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Wire the reader subagent (tracer bullet)
-- [ ] Phase 2: Failure path — retry, catch, fallback tool
+- [x] Phase 2: Failure path — retry, catch, fallback tool
 - [ ] Phase 3: Disclosure and prompt wiring
 - [ ] Phase 4: End-to-end regression + docs
 - [ ] Final verification
@@ -311,12 +311,12 @@ error-classified ToolMessage, and can recover the page via the marked raw-fallba
   the middleware beyond the `task` tool.
 
 **Tests (write first, confirm red):**
-- [ ] A task-tool exception (including `GraphRecursionError`) becomes an error ToolMessage
+- [x] A task-tool exception (including `GraphRecursionError`) becomes an error ToolMessage
   after one retry; the run continues.
-- [ ] `fetch_raw` returns marker-wrapped content, still writes `sources/Sn.md`, still mints
+- [x] `fetch_raw` returns marker-wrapped content, still writes `sources/Sn.md`, still mints
   `[Sn]` via the shared registry, and records fallback mode.
-- [ ] Read-mode field: default/unread, digested, fallback transitions each observable.
-- [ ] Empty-digest edge: an empty task ToolMessage is distinguishable (documented shape)
+- [x] Read-mode field: default/unread, digested, fallback transitions each observable.
+- [x] Empty-digest edge: an empty task ToolMessage is distinguishable (documented shape)
   so the lead prompt can treat it as failure.
 
 **Steps:**
@@ -325,7 +325,7 @@ error-classified ToolMessage, and can recover the page via the marked raw-fallba
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full suite green; no retry layer added around model clients (inspection against
+- [x] Full suite green; no retry layer added around model clients (inspection against
   models.py guidance).
 
 ### Phase 3: Disclosure and prompt wiring
@@ -494,6 +494,22 @@ Append-only, empty at plan creation. -->
 - Watch-next: Phase 2's middleware must scope retry/error to the `task` tool only;
   langchain's ToolRetryMiddleware/ToolErrorMiddleware config needs checking for
   per-tool scoping before hand-rolling anything.
+
+### 2026-08-14 — Phase 2: Failure path — retry, catch, fallback tool
+- Done: task-scoped ToolErrorMiddleware (outer) + ToolRetryMiddleware(max_retries=1,
+  on_failure="error", initial_delay=0, jitter=False) (inner); `fetch_raw` fallback tool
+  (harness/tools/fallback.py) reusing fetch.py's `_fetch`/`_render`/`_sources_dir`;
+  `Source.read_mode` + `SourceRegistry.mark_read`; 344 tests + gates green; flagged
+  review clean.
+- Learned: error ToolMessage content starts `READER FAILED (` — Phase 3's prompt should
+  reference that exact prefix. Empty digest = empty ToolMessage content (tested shape).
+  `<undigested>` bodies are unescaped — rendering must read `read_mode` from the
+  registry (D4), never parse markers.
+- Drift: none (one sanctioned addition: build_fallback_tool mkdirs the sources dir,
+  mirroring build_fetch_tool).
+- Watch-next: Phase 3 prompt work — delegation protocol references `READER FAILED`
+  prefix, empty-digest-as-failure, and max_urls_per_call batching; report reads
+  read_mode buckets from the registry.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so

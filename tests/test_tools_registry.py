@@ -23,8 +23,9 @@ def test_build_tools_returns_the_frozen_tool_set(make_config, monkeypatch):
 
     # Ordered, not a set: `harness/tools/__init__.py`'s builder list is part of the contract.
     # `fetch_pages` moved off the lead onto the reader (Phase 1) — the lead delegates through
-    # `task` instead of fetching directly.
-    assert [tool.name for tool in tool_sets.lead] == ["search_web", "ask_user"]
+    # `task` instead of fetching directly. `fetch_raw` (Phase 2) is the lead's fallback path
+    # when digestion fails, appended after the pre-existing two.
+    assert [tool.name for tool in tool_sets.lead] == ["search_web", "ask_user", "fetch_raw"]
     assert [tool.name for tool in tool_sets.reader] == ["fetch_pages"]
 
     # The fetch instance is built exactly once and routed to the reader, never duplicated.
@@ -51,6 +52,9 @@ def test_every_tool_exposes_description_and_json_schema(make_config):
     assert "query" in search_props
     assert "max_results" in search_props
     assert "question" in by_name["ask_user"].args_schema.model_json_schema()["properties"]
+    fetch_raw_props = by_name["fetch_raw"].args_schema.model_json_schema()["properties"]
+    assert "urls" in fetch_raw_props
+    assert "reason" in fetch_raw_props
 
 
 async def test_build_tools_wires_the_callers_registry_into_the_fetch_tool(make_config, monkeypatch):
