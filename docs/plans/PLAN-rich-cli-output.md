@@ -163,7 +163,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Event seam + plain renderer
-- [ ] Phase 2: Rich live display
+- [x] Phase 2: Rich live display
 - [ ] Phase 3: ask_user question panel
 - [ ] Phase 4: End-of-run summary
 - [ ] Final verification
@@ -445,3 +445,20 @@ never add a section below it. -->
 - Drift: none
 - Watch-next: Phase 2 adds `rich==15.0.0` + `RichRenderer(console=...)`; the manual Windows
   Terminal run is the real gate for risk #2 (Live + asyncio + Windows).
+
+### 2026-08-14 — Phase 2: Rich live display
+- Done: `RichRenderer` (one lazy `Live`, `refresh_per_second=4`, `transient=True`, spinner
+  header + dim 8-line activity tail, collapse via `console.print` after clearing the region);
+  `build_renderer` TTY switch final; `rich==15.0.0` pinned in pyproject. Review fixes: pre-stage
+  activities no longer cleared by `StageStarted` (initial todo plan now renders on TTY) +
+  `Live.start(refresh=True)` so the first frame paints; tail-cap test asserts the rendered
+  frame delta, not the private list.
+- Learned: printing through an active `Live` repaints the current renderable after the printed
+  line — the region must be cleared to empty BEFORE printing the collapse line, or stale
+  activity text lands as the buffer's final content. `Live.start()` does not paint (refresh
+  defaults False); with `auto_refresh=False` nothing renders until an update.
+- Drift: none
+- Watch-next: Phase 2's manual acceptance (live terminal run: spinner/collapse; piped run: no
+  ANSI) is still PENDING — fold it into the final-verification manual e2e. Phase 3 implements
+  real `suspend()` (stop/restart the Live) + `Question` panel; `close()` while suspended must
+  stay legal (risk #3).

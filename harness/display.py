@@ -9,6 +9,11 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from rich.console import Console, Group
+from rich.live import Live
+from rich.spinner import Spinner
+from rich.text import Text
+
 Stage = Literal["clarifying", "researching", "verifying", "writing"]
 
 
@@ -95,6 +100,72 @@ class StageTracker:
         self._current = None
 
 
+class RichRenderer:
+    """Live-updating stage header + activity feed (R1), collapsing to a timeline line (R2).
+
+    One `Live` region for the whole run, low refresh rate, every print routed through the
+    same `Console` — the risk #2 mitigations from the parent plan.
+    """
+
+    _ACTIVITY_TAIL = 8
+
+    def __init__(self, console: Console | None = None, *, auto_refresh: bool = True) -> None:
+        self._console = console or Console()
+        self._auto_refresh = auto_refresh
+        self._live: Live | None = None
+        self._stage: Stage | None = None
+        self._activities: list[str] = []
+
+    def _build_renderable(self) -> Group:
+        header = Spinner("dots", text=f"[bold]{self._stage}[/bold]")
+        activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
+        return Group(header, *activity_lines)
+
+    def emit(self, event: DisplayEvent) -> None:
+        if isinstance(event, StageStarted):
+            self._stage = event.stage
+            # Deliberately NOT clearing `_activities`: events emitted before the first stage
+            # (the agent's initial todo plan) buffer here and render with the first frame.
+            # `StageCompleted` clears, and the tracker always pairs Completed -> Started.
+            renderable = self._build_renderable()
+            if self._live is None:
+                self._live = Live(
+                    renderable,
+                    console=self._console,
+                    refresh_per_second=4,
+                    transient=True,
+                    auto_refresh=self._auto_refresh,
+                )
+                # refresh=True paints the first frame immediately — without it the header
+                # (and any pre-stage activity buffer) waits for the next update to render.
+                self._live.start(refresh=True)
+            else:
+                self._live.update(renderable, refresh=True)
+        elif isinstance(event, StageCompleted):
+            self._stage = None
+            self._activities = []
+            if self._live is not None:
+                self._live.update("", refresh=True)
+            self._console.print(
+                f"[green]✓[/green] {event.stage} [dim]({event.elapsed_seconds:.1f}s)[/dim]"
+            )
+        else:  # Activity
+            self._activities = (self._activities + [event.text])[-self._ACTIVITY_TAIL :]
+            if self._live is not None:
+                self._live.update(self._build_renderable(), refresh=True)
+
+    def suspend(self) -> AbstractContextManager[None]:
+        return nullcontext()
+
+    def close(self) -> None:
+        if self._live is not None:
+            self._live.update("", refresh=True)
+            self._live.stop()
+            self._live = None
+
+
 def build_renderer() -> Renderer:
-    """Pick the renderer implementation (Phase 1: always `PlainRenderer`)."""
+    """Pick the renderer implementation: TTY -> `RichRenderer`, non-TTY -> `PlainRenderer` (R5)."""
+    if sys.stdout.isatty():
+        return RichRenderer()
     return PlainRenderer()

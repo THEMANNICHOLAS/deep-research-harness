@@ -1,23 +1,39 @@
-"""Behavioral tests for harness.display: events, PlainRenderer, and StageTracker."""
+"""Behavioral tests for harness.display: events, renderers, and StageTracker."""
 
+import re
 from contextlib import AbstractContextManager
+from io import StringIO
 from typing import Any
 
 import httpx
 import pytest
 from langchain_core.messages import AIMessage
+from rich.console import Console
 
 import harness.__main__ as main_module
 from harness.display import (
     Activity,
     DisplayEvent,
     PlainRenderer,
+    RichRenderer,
     StageCompleted,
     StageStarted,
     StageTracker,
     build_renderer,
 )
 from tests.conftest import drain_stdout, install_search_transport, patch_run
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _rich_renderer() -> tuple[RichRenderer, StringIO]:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=True, width=80)
+    return RichRenderer(console=console, auto_refresh=False), buffer
 
 
 @pytest.mark.parametrize(
@@ -202,3 +218,103 @@ async def test_a_research_call_and_todo_produce_activity_lines(
     assert '  search_web: "the answer"' in out
     assert "  [pending] Search for the answer" in out
     assert lines[-1].strip().endswith(".md")
+
+
+# --- RichRenderer tests -------------------------------------------------------------------
+
+
+def test_rich_renderer_stage_lifecycle_collapses_to_one_line():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(Activity('search_web: "first query"'))
+    renderer.emit(Activity('search_web: "second query"'))
+    renderer.emit(StageCompleted("researching", 2.0))
+    renderer.close()
+
+    text = _strip_ansi(buffer.getvalue())
+    assert "researching" in text
+    assert 'search_web: "first query"' in text
+    assert 'search_web: "second query"' in text
+    lines = [line for line in text.splitlines() if line.strip()]
+    collapsed = [line for line in lines if re.search(r"researching \(2\.0s\)", line)]
+    assert len(collapsed) == 1
+    assert re.search(r"✓\s*researching \(2\.0s\)", collapsed[0])
+    assert lines[-1] == collapsed[0]
+
+
+def test_rich_renderer_activity_tail_shows_only_last_eight():
+    # Earlier frames' text stays physically present in the raw recorded buffer (the Live
+    # region overwrites in place via ANSI cursor control), so the assertable frame is the
+    # buffer delta written by the LAST update alone.
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    for i in range(9):
+        renderer.emit(Activity(f"activity {i}"))
+    before = len(buffer.getvalue())
+    renderer.emit(Activity("activity 9"))
+    last_frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "activity 0" not in last_frame
+    assert "activity 1" not in last_frame
+    for i in range(2, 10):
+        assert f"activity {i}" in last_frame
+
+
+def test_rich_renderer_renders_pre_stage_activities_with_the_first_frame():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(Activity("[pending] Search for the answer"))
+    renderer.emit(StageStarted("researching"))
+    renderer.close()
+
+    text = _strip_ansi(buffer.getvalue())
+    assert "[pending] Search for the answer" in text
+
+
+def test_rich_renderer_two_stages_produce_two_collapsed_lines_in_order():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(StageCompleted("researching", 1.0))
+    renderer.emit(StageStarted("verifying"))
+    renderer.emit(StageCompleted("verifying", 3.5))
+    renderer.close()
+
+    text = _strip_ansi(buffer.getvalue())
+    lines = [line for line in text.splitlines() if line.strip()]
+    collapsed = [line for line in lines if "✓" in line]
+    assert len(collapsed) == 2
+    assert re.search(r"researching \(1\.0s\)", collapsed[0])
+    assert re.search(r"verifying \(3\.5s\)", collapsed[1])
+
+
+def test_build_renderer_picks_rich_on_a_tty(monkeypatch):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    assert isinstance(build_renderer(), RichRenderer)
+
+
+def test_build_renderer_picks_plain_off_a_tty(monkeypatch):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+
+    assert isinstance(build_renderer(), PlainRenderer)
+
+
+def test_rich_renderer_close_twice_does_not_raise():
+    renderer, _ = _rich_renderer()
+    renderer.emit(StageStarted("researching"))
+
+    renderer.close()
+    renderer.close()  # must not raise
+
+
+def test_rich_renderer_suspend_is_a_context_manager():
+    renderer, _ = _rich_renderer()
+
+    with renderer.suspend():
+        pass
+
+    renderer.close()
