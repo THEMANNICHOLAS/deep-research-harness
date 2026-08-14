@@ -238,9 +238,14 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
     """Return a factory building a valid HarnessConfig from pydantic models (no TOML).
 
     Defaults `agent.workspace_dir`/`reports_dir` to subdirectories of pytest's `tmp_path`
-    rather than `AgentSettings()`'s repo-root-relative defaults, so a full test run never
-    leaves `workspace/`/`reports/` behind in the repo. A caller-supplied `agent=` wins
-    untouched.
+    rather than `AgentSettings()`'s own defaults. Those defaults are now HOME-relative
+    (`~/deep-research/...`), so this override stops a test run from writing into the
+    developer's real output directory — a stronger reason than the repo-litter one it
+    replaced. A caller-supplied `agent=` wins untouched.
+
+    `head_model`/`subagent_model` default to the same string; pass distinct values when a
+    test must prove the two roles are read from different places rather than one being
+    rendered twice.
     """
 
     def _make(
@@ -252,6 +257,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
         agent: AgentSettings | None = None,
+        head_model: str = "test-model",
+        subagent_model: str = "test-model",
     ) -> HarnessConfig:
         monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
         if agent is None:
@@ -265,8 +272,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
                 )
             },
             roles={
-                "head": RoleConfig(provider="opencode", model="test-model"),
-                "subagent": RoleConfig(provider="opencode", model="test-model"),
+                "head": RoleConfig(provider="opencode", model=head_model),
+                "subagent": RoleConfig(provider="opencode", model=subagent_model),
             },
             fetch=FetchSettings(
                 page_timeout_ms=page_timeout_ms,

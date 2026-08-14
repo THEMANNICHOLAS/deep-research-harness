@@ -385,15 +385,16 @@ def _gaps_section(outcome: RunOutcome, verification: VerificationResult) -> str:
     return "\n".join(lines)
 
 
-def _render_body(
-    outcome: RunOutcome, config: HarnessConfig, model_label: str, now: datetime
-) -> str:
+def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> str:
     lines = [
         f"# {outcome.question}",
         "",
         "## Run metadata",
         f"- Timestamp: {now.isoformat()}",
-        f"- Model: {model_label}",
+        # Reports what is CONFIGURED for each role, not whether it was ever invoked — the
+        # subagent tier is configured but not yet wired (R6).
+        f"- Lead Model: {config.roles['head'].model}",
+        f"- Subagent Model: {config.roles['subagent'].model}",
         *_usage_lines(outcome.usage),
         "",
     ]
@@ -445,6 +446,5 @@ def write_report(outcome: RunOutcome, config: HarnessConfig) -> Path:
     config.agent.reports_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
     path = config.agent.reports_dir / _filename(outcome.question, now)
-    model_label = config.roles["head"].model
-    path.write_text(_render_body(outcome, config, model_label, now), encoding="utf-8")
+    path.write_text(_render_body(outcome, config, now), encoding="utf-8")
     return path

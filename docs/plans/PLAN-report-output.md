@@ -1,6 +1,7 @@
 # PLAN: Report Output and Default Location
 
-**Status:** In Progress
+**Status:** Complete — all four phases landed; the live end-to-end run in
+`## Verification` is the one outstanding item (needs API keys + SearXNG)
 **Created:** 2026-08-13
 **Type:** Single plan
 
@@ -205,8 +206,8 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Paragraph unit
 - [x] Phase 2+3: Pooled paragraph verification and report rendering (merged — see
   `## Reconciliations` 2026-08-13)
-- [ ] Phase 4: Default paths and run metadata
-- [ ] Final verification
+- [x] Phase 4: Default paths and run metadata
+- [x] Final verification (except the live end-to-end run — see `## Discoveries`)
 
 ## Phases
 
@@ -469,17 +470,20 @@ directory, and run metadata names both configured models.
 4. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `docs/guides/setup.md` no longer documents `workspace`/`reports` as the paths.
-- [ ] A run started with no `[agent]` path keys writes its report under
-  `Path.home()/"deep-research"/"reports"`.
+- [x] `docs/guides/setup.md` no longer documents `workspace`/`reports` as the paths.
+- [x] A run started with no `[agent]` path keys writes its report under
+  `Path.home()/"deep-research"/"reports"` (asserted at the config layer against
+  `Path.home()`; the live run itself is still outstanding — see `## Discoveries`).
 
 ## Verification
-- [ ] `uv run pytest`
-- [ ] `uv run ruff check .`
-- [ ] `uv run ruff format --check .`
-- [ ] `uv run mypy .`
-- [ ] CI's 90% coverage floor still met (`.github/workflows/ci.yml`).
-- [ ] End-to-end: `python -m harness "<question>"` writes a report under
+- [x] `uv run pytest` — 277 passed
+- [x] `uv run ruff check .`
+- [x] `uv run ruff format --check .`
+- [x] `uv run mypy .`
+- [x] CI's 90% coverage floor still met (`.github/workflows/ci.yml`) — 97% total.
+- [ ] NOT DONE — needs API keys and a reachable SearXNG, neither available in the
+  session that implemented this. End-to-end: `python -m harness "<question>"` writes a
+  report under
   `~/deep-research/reports/` whose answer has no inline markers, whose citing
   paragraphs each carry `Sources:` and `Verdict:` lines, and whose captured sources
   are under `~/deep-research/workspace/sources/<run_id>/`.
@@ -580,6 +584,16 @@ ported, none dropped.
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+### 2026-08-13 — Phase 4: the R6 test could not fail, and a stale fixture reason
+The flagged-phase review returned `concern`, both findings fixed in place. The only R6
+test used `make_config()`, whose head and subagent roles were both hardcoded to
+`"test-model"` — an implementation rendering the HEAD model on both lines would have
+passed it. `make_config` now takes `head_model`/`subagent_model` overrides and a second
+test asserts distinct values per role, so rendering one role twice fails. Separately,
+`make_config`'s docstring justified its `tmp_path` override as keeping `workspace/` and
+`reports/` out of the repo; with home-relative defaults it now guards the developer's real
+`~/deep-research` instead, and the docstring says so.
+
 ### 2026-08-13 — Phase 2+3: judgment review findings routed to `LATER-Problems.md`
 The flagged-phase review returned `concern`. Two Minor defects were fixed in place: an
 `IndexError` rendering `## Conflicting sources` for a paragraph that is nothing but a
@@ -663,3 +677,20 @@ phase). Append-only, empty at plan creation. -->
   `_gaps_section` lost its `unplaced` parameter and its uncited count.
 - Watch-next: `LATER-Problems.md` item 1 — fenced code blocks are dropped from `## Answer`.
   It is the one open Major and it needs a Phase 1 contract change to fix.
+
+### 2026-08-13 — Phase 4: Default paths and run metadata
+- Done: both `AgentSettings` path defaults are now `default_factory` values under
+  `Path.home()/"deep-research"`, the two pinned keys are gone from `harness.toml` (D5 —
+  removing them is what actually moves this deployment's output), `## Run metadata` names
+  Lead Model and Subagent Model separately, and `docs/guides/setup.md` documents the new
+  defaults. 277 passed, 97% coverage, ruff/format/mypy clean.
+- Learned: `_render_body` no longer takes `model_label` — it reads both roles from
+  `config` directly, because a parameter carrying one role while the other came from
+  config was the worse seam. `config.roles["subagent"]` cannot KeyError: a
+  `model_validator(mode="after")` hard-requires both role keys on every construction, not
+  only via `load_config`.
+- Drift: none in this phase.
+- Watch-next: the live end-to-end run in `## Verification` is the ONE unchecked item —
+  it needs API keys and a reachable SearXNG. First live run also settles risk #1's real
+  question (does the model actually honor the pooled JSON contract), so watch
+  `check_failures` and any `Verdict: not verified` lines in that first report.

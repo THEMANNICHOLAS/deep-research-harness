@@ -75,6 +75,45 @@ def test_write_report_produces_a_frozen_filename_under_reports_dir(make_config):
     assert "tungsten" in path.name
 
 
+def test_write_report_run_metadata_names_both_configured_models(make_config):
+    """Even when head and subagent are configured to the same model, both roles still get
+    their own named line (R6) — this asserts on the two distinctly-labeled lines, not just
+    that the model string appears somewhere in the body.
+    """
+    config = make_config()
+    outcome = RunOutcome(
+        question="What is the boiling point of water?",
+        answer="100 C at sea level.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "- Lead Model: test-model" in body
+    assert "- Subagent Model: test-model" in body
+
+
+def test_write_report_run_metadata_reads_each_role_from_its_own_config_entry(make_config):
+    """The falsifiable half of R6: with head and subagent configured to DIFFERENT models,
+    each line must carry its own role's model. Rendering the head model on both lines
+    passes the same-model test above and fails this one.
+    """
+    config = make_config(head_model="lead-model-x", subagent_model="worker-model-y")
+    outcome = RunOutcome(
+        question="What is the boiling point of water?",
+        answer="100 C at sea level.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "- Lead Model: lead-model-x" in body
+    assert "- Subagent Model: worker-model-y" in body
+    assert "- Subagent Model: lead-model-x" not in body
+
+
 def test_write_report_returns_a_path_whose_body_is_the_answer_actually_written(make_config):
     """`[S1]` is unregistered here, so it is stripped from the prose like any other marker
     (D4) rather than left bare — the prose itself must still survive verbatim otherwise.
