@@ -106,15 +106,15 @@ def test_shipped_prompts_render_with_their_declared_variables(name):
 
     rendered = _render_shipped(name)
 
-    # No unsubstituted placeholder survives rendering. Checked via get_identifiers rather
-    # than `"$" not in rendered`, because a `$$` escape legitimately renders to a literal `$`.
+    # No unsubstituted placeholder survives. Checked via `get_identifiers` rather than
+    # `"$" not in rendered`, because a `$$` escape legitimately renders a literal `$`.
     assert Template(rendered).get_identifiers() == []
 
 
 @pytest.mark.parametrize("name", TIER_CONTRACTS)
 def test_tier_contracts_declare_exactly_their_placeholders(name):
-    # Frozen: a tier receives its task through the delegation call at run time, never by
-    # template substitution, so neither contract declares a task or facet placeholder.
+    # A tier receives its task through the delegation call at run time, never by substitution, so
+    # neither contract declares a task or facet placeholder.
     assert required_variables(name) == {"current_date", "max_urls_per_call"}
 
 
@@ -132,8 +132,7 @@ def test_tier_contract_missing_variable_raises_prompt_error_naming_both(name):
 
 @pytest.mark.parametrize("name", TIER_CONTRACTS)
 def test_tier_contracts_do_not_reference_ask_user(name):
-    # D1: a tier that can interrupt the developer would stall the run mid-fan-out, so no
-    # tier contract may name the clarification tool.
+    # D1: a tier that can interrupt the developer would stall the run mid-fan-out.
     assert "ask_user" not in _render_shipped(name)
 
 
@@ -143,8 +142,7 @@ def test_tier_contracts_do_not_reference_ask_user(name):
     ["Objective", "Output format", "Tools", "Boundaries", "Findings", "Source IDs", "Conflicts"],
 )
 def test_tier_contracts_name_their_frozen_fields(name, field):
-    # R5: the next round builds subagent definitions against exactly these field names —
-    # four a task must carry, three a tier must return. Anchored to the bolded field bullet,
-    # not a bare word: "tools" alone would also match the `# Tools` heading, so a renamed
-    # field would slip through the assertion this test exists to make.
+    # R5: the next round builds subagent definitions against exactly these names — four a task
+    # must carry, three a tier must return. Anchored to the bolded bullet, since a bare "tools"
+    # would also match the `# Tools` heading and let a renamed field slip through.
     assert f"**{field}**" in _render_shipped(name)

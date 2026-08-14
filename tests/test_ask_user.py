@@ -1,9 +1,7 @@
 """Behavioral tests for the `ask_user` clarification tool and its interrupt/resume protocol.
 
-Every test that drives a real graph does so via `build_agent` — nothing about deepagents
-itself is mocked, only the model (`harness.agent.build_chat_model`, patched per the module
-that imports it, never a network call), and, for the `__main__` tests, config loading,
-`preflight`, and `_read_answer`.
+Every test driving a real graph does so via `build_agent`: nothing about deepagents is mocked,
+only the model and — for the `__main__` tests — config loading, `preflight` and `_read_answer`.
 """
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -25,9 +23,8 @@ def _ask(question: str, call_id: str = "call_1") -> dict:
 def _patch_main(monkeypatch, config, model, answers=None):
     """Patch everything `main()` reaches outside the graph, and script the answers.
 
-    `answers` is consumed in order by the patched `_read_answer`. Passing `None` means the
-    test expects NO question: any call fails it. Returns the queue, so a test can assert
-    every scripted answer was actually consumed.
+    `answers` is consumed in order by the patched `_read_answer`; `None` means the test expects NO
+    question, so any call fails it. Returns the queue, so a test can assert every answer was used.
     """
     patch_run(monkeypatch, config, model, skip_preflight=True)
 
@@ -66,8 +63,7 @@ async def test_an_ask_user_call_interrupts_the_run_instead_of_completing(
     assert action_request["name"] == "ask_user"
     assert action_request["args"]["question"] == "Metal or album?"
 
-    # The run stopped at the interrupt: the script holds one reply, so a run that carried
-    # on would have asked the model a second time and overrun the script.
+    # The script holds one reply, so a run that carried on would have overrun it.
     assert model._call_count == 1
 
 
@@ -91,7 +87,7 @@ async def test_the_question_reaches_stdout_and_the_answer_resumes_the_run(
     assert queued == []
     out, lines = drain_stdout(capsys)
     assert "Metal or album?" in out
-    # The report path stays the last line of stdout (frozen — R1).
+    # The report path stays the last line of stdout (R1).
     assert lines[-1].strip().endswith(".md")
 
     results = _ask_user_results(model._received_messages[1])
@@ -101,10 +97,9 @@ async def test_the_question_reaches_stdout_and_the_answer_resumes_the_run(
 async def test_a_second_clarification_round_asks_again_and_resumes_again(
     make_config, monkeypatch, scripted_model, capsys
 ):
-    """The resume path is a LOOP, not a single `if` (3F Minor).
-
-    Two sequential `ask_user` rounds: a one-shot resume would leave the second question
-    unasked and unanswered, so both the stdout assertion and the second tool result fail.
+    """The resume path is a LOOP, not a single `if`: with two sequential `ask_user` rounds, a
+    one-shot resume leaves the second question unasked, failing both the stdout assertion and the
+    second tool result.
     """
     model = scripted_model(
         [
@@ -129,8 +124,7 @@ async def test_a_second_clarification_round_asks_again_and_resumes_again(
 
     # Three model calls: ask, ask again, answer. A one-round resume loop stops at two.
     assert model._call_count == 3
-    # Both answers arrived, each as its own round's tool result: the third model call sees
-    # the first answer and the second, in order.
+    # Both answers arrived as their own round's tool result, in order.
     assert [m.content for m in _ask_user_results(model._received_messages[2])] == [
         "The metal.",
         "Mercury-202.",
@@ -140,11 +134,9 @@ async def test_a_second_clarification_round_asks_again_and_resumes_again(
 async def test_two_questions_in_one_interrupt_get_one_answer_each(
     make_config, monkeypatch, scripted_model, capsys
 ):
-    """One decision per action request, correctly paired.
-
-    Two `ask_user` calls in a single `AIMessage` arrive as ONE interrupt carrying two action
-    requests. Returning a short or mis-ordered decisions list raises `ValueError` inside the
-    middleware, and executing the tool as well as responding would duplicate the results.
+    """One decision per action request, correctly paired: two `ask_user` calls in a single
+    `AIMessage` arrive as ONE interrupt with two action requests, and a short or mis-ordered
+    decisions list raises `ValueError` inside the middleware.
     """
     model = scripted_model(
         [
@@ -177,16 +169,15 @@ async def test_two_questions_in_one_interrupt_get_one_answer_each(
         "call_1": "The metal.",
         "call_2": "Mercury-202.",
     }
-    # That the tool body never ran is proven by the equality above, not by a separate
-    # scan: `respond` skips execution, and the body now raises rather than returning a
-    # stand-in string, so any execution would have failed the run outright.
+    # The equality above also proves the tool body never ran: `respond` skips execution, and the
+    # body raises rather than returning a stand-in, so any execution would have failed the run.
     assert len(results) == 2
 
 
 async def test_an_empty_answer_is_disclosed_rather_than_sent_as_silence(
     make_config, monkeypatch, scripted_model
 ):
-    """A bare Enter must not reach the model as an empty tool result (3F Minor)."""
+    """A bare Enter must not reach the model as an empty tool result."""
     model = scripted_model(
         [
             AIMessage(content="", tool_calls=[_ask("Metal or album?")]),

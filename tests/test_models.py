@@ -50,8 +50,8 @@ class _RecordingHandler:
 def _patch_chat_openai_with_transport(
     monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]
 ) -> None:
-    """Monkeypatch harness.models.ChatOpenAI to inject a mock transport, keeping the real
-    OpenAI-SDK retry path under test rather than reimplementing it."""
+    """Inject a mock transport into `harness.models.ChatOpenAI`, keeping the real OpenAI-SDK retry
+    path under test rather than reimplementing it."""
     real_chat_openai = models.ChatOpenAI
 
     def _factory(**kwargs: Any) -> ChatOpenAI:
@@ -62,12 +62,7 @@ def _patch_chat_openai_with_transport(
 
 
 class _RecordingResponder:
-    """Records every request and delegates the response (or raised exception) to `respond`.
-
-    Third use of the "record requests, hand back a canned outcome" shape after
-    `_RecordingHandler` and the inline handler in `test_non_transient_failure_is_not_retried`
-    — factored out per CLAUDE.md's Code Reuse rule.
-    """
+    """Records every request and delegates the response (or raised exception) to `respond`."""
 
     def __init__(self, respond: Callable[[httpx.Request], httpx.Response]) -> None:
         self._respond = respond
@@ -133,10 +128,9 @@ def test_absent_api_key_raises_model_error_naming_role_and_provider(make_config)
     broken_provider = ProviderConfig.model_construct(
         base_url="https://example.test/v1", api_key_env="OPENCODE_API_KEY", api_key=""
     )
-    # HarnessConfig(...) (unlike .model_construct) re-runs each nested ProviderConfig's
-    # after-validator, which would re-resolve api_key from the (set) environment variable
-    # and defeat the point of this test — so the whole config is built via model_construct,
-    # matching test 3's technique.
+    # `HarnessConfig(...)` re-runs each nested `ProviderConfig`'s after-validator, which would
+    # re-resolve `api_key` from the (set) environment variable, so the whole config is built with
+    # `model_construct` instead.
     broken = HarnessConfig.model_construct(
         providers={**config.providers, "opencode": broken_provider},
         roles=config.roles,
@@ -352,9 +346,5 @@ async def test_preflight_request_is_capped_to_one_token(make_config, monkeypatch
     assert body["max_completion_tokens"] == 1
 
 
-# Removed: `test_preflight_does_not_leak_library_exceptions` re-ran the same three
-# scenarios as the unreachable/credentials/unknown-model tests above with only
-# `pytest.raises(ModelError)`. Those three already prove the property — a leaked
-# `httpx.ConnectError` or `openai` error would fail their `raises(ModelError)` too — so
-# the parametrized copy bought three more mock transports to maintain and no coverage
-# (PR #4 review, Nit).
+# No separate "does not leak library exceptions" test: the three tests above already prove it, in
+# that a leaked `httpx.ConnectError` or `openai` error would fail their `raises(ModelError)`.

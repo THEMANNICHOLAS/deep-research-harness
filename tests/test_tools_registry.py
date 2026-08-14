@@ -11,8 +11,7 @@ def test_build_tools_returns_the_frozen_tool_set(make_config):
 
     tools = build_tools(config, SourceRegistry())
 
-    # Ordered, not a set: the explicit builder list in harness/tools/__init__.py is
-    # part of the documented contract.
+    # Ordered, not a set: `harness/tools/__init__.py`'s builder list is part of the contract.
     assert [tool.name for tool in tools] == ["fetch_pages", "search_web", "ask_user"]
 
 

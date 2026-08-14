@@ -146,10 +146,8 @@ def test_missing_toml_file_raises_config_error_not_oserror(tmp_path):
 
 
 def test_missing_section_error_names_the_offending_field(tmp_path, monkeypatch):
-    """R7: a missing setting must be identifiable from the message alone.
-
-    Pydantic's bare `msg` is "Field required" with no field name; the loc path is what
-    makes it actionable.
+    """R7: a missing setting must be identifiable from the message alone, and pydantic's bare `msg`
+    is "Field required" with no field name — the `loc` path is what makes it actionable.
     """
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
@@ -261,15 +259,12 @@ def test_missing_top_level_table_raises_config_error_naming_it(
 
 
 def test_shipped_harness_toml_loads_with_no_todo_placeholders_left(monkeypatch):
-    """The gap this test used to keep visible is now closed. Literal "TODO" values are
-    well-formed strings that `load_config` still accepts, so nothing but this test stops
-    one from being reintroduced into the checked-in config; `build_chat_model` rejects a
-    `TODO` it is handed at runtime (see tests/test_models.py), and this guards the file
-    itself.
+    """Literal "TODO" values are well-formed strings `load_config` accepts, so nothing but this
+    test stops one from being reintroduced into the checked-in config; `build_chat_model` rejects a
+    `TODO` handed to it at runtime, and this guards the file itself.
 
-    Checks shape, not the specific endpoint/model in use: pinning those exact deployment
-    facts would fail this suite on a legitimate endpoint or model swap, working against the
-    config-swappable invariant (CLAUDE.md -> Invariants).
+    Checks shape, not the endpoint/model in use: pinning those deployment facts would fail on a
+    legitimate swap, against the config-swappable invariant.
     """
     monkeypatch.setenv("OPENCODE_API_KEY", "any")
 
@@ -294,11 +289,10 @@ def test_shipped_harness_toml_has_no_browser_surface(monkeypatch):
 
 
 def test_browser_table_is_rejected_now_that_the_backend_is_gone(tmp_path, monkeypatch):
-    # Proves the key is genuinely GONE rather than merely unread — a config still
-    # carrying it now fails loudly instead of being silently ignored.
+    # The key is genuinely GONE rather than merely unread: a config still carrying it fails loudly.
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
-    # Models a config file written before the backend was removed and never updated.
+    # A config file written before the backend was removed and never updated.
     toml_content = VALID_TOML.replace("[fetch]", '[browser]\nbackend = "playwright"\n\n[fetch]')
     path = _write(tmp_path, toml_content)
 

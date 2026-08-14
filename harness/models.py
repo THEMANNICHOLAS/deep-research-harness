@@ -64,23 +64,17 @@ def build_chat_model(config: HarnessConfig, role: str) -> BaseChatModel:
 async def preflight(config: HarnessConfig, role: str) -> None:
     """Verify `role` resolves to a chat client that can actually reach the endpoint.
 
-    This is R6's "before any research starts" reachability check
-    (`docs/plans/PLAN-research-loop.md`, `## Intent`): `build_chat_model` catches
-    config-shape problems, but a wrong or dead `base_url` only surfaces as a raw
-    `openai`/`httpx` exception mid-run unless something makes exactly one real call first.
-    Phase 3's `__main__` is the call site — it must call this for every configured role
-    before starting the research loop.
+    R6's "before any research starts" check: `build_chat_model` catches config-shape problems,
+    but a wrong or dead `base_url` only surfaces as a raw `openai`/`httpx` exception mid-run
+    unless something makes one real call first. `__main__` calls this before the research loop.
 
-    Builds its client via `build_chat_model` (no duplicated construction or validation,
-    no extra retry layer — the returned client already retries per `config.agent.max_retries`)
-    and makes one chat call capped at a single completion token, so the check costs a
-    fraction of a cent. Returns `None` on success.
+    Builds its client via `build_chat_model` — no duplicated validation, no extra retry layer —
+    and makes one chat call capped at a single completion token. Returns `None` on success.
 
-    Raises `ModelError` — naming the role, provider, `base_url`, and model — on failure,
-    classifying the underlying `openai` exception so the operator knows what to fix:
-    endpoint unreachable/DNS/connection refused, credentials rejected, or model unknown/
-    rejected by the endpoint. The underlying error's own text is appended. No `openai` or
-    `httpx` exception is allowed to escape.
+    Raises `ModelError` naming the role, provider, `base_url` and model, classifying the
+    underlying `openai` exception so the operator knows what to fix (endpoint unreachable,
+    credentials rejected, model unknown) with the original text appended. No `openai` or `httpx`
+    exception escapes.
     """
     client = build_chat_model(config, role)
     role_config = config.roles[role]

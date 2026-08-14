@@ -1,8 +1,7 @@
 """Assign stable per-run source IDs and resolve `[Sn]` markers into markdown links.
 
-The mechanical half of the citation scheme: minting IDs, deduplicating equivalent URLs,
-and rewriting markers into links. No model involvement, no fetching — see D6 for why
-retrieval is a separate, later concern.
+The mechanical half of the citation scheme: minting IDs, deduplicating equivalent URLs, and
+rewriting markers into links. No model involvement, no fetching (D6).
 """
 
 import re
@@ -20,10 +19,9 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 def marker_ids(text: str) -> list[str]:
     """Every `Sn` ID referenced by `text`, deduplicated, in first-appearance order.
 
-    Pure regex scan, no registry lookup — shared by `SourceRegistry.unresolved_ids`
-    (filtered to unknown IDs) and `harness.verify` (which needs every marker a claim
-    carries, known or not), so the dedupe-in-first-appearance-order loop lives in exactly
-    one place (3F fix pass, Minor finding).
+    Pure regex scan, no registry lookup, shared by `SourceRegistry.unresolved_ids` (filtered to
+    unknown IDs) and `harness.verify` (every marker, known or not), so the ordering loop lives
+    in one place.
     """
     seen: list[str] = []
     for match in MARKER_RE.finditer(text):
@@ -36,12 +34,12 @@ def marker_ids(text: str) -> list[str]:
 def normalize_url(url: str) -> str:
     """Return a canonical form of `url` so equivalent URLs share one identity.
 
-    Collapses what doesn't change the fetch: scheme/host case, trailing slash, default
-    port, fragment. Everything else is verbatim, including the query — two URLs differing
-    only by query are different sources.
+    Collapses what does not change the fetch: scheme/host case, trailing slash, default port,
+    fragment. Everything else is verbatim, including the query — two URLs differing only by
+    query are different sources.
 
-    Total by design: an unparseable URL is its own canonical form, never an exception.
-    These URLs are model-supplied, and R2 forbids one bad URL failing the batch.
+    Total by design: an unparseable URL is its own canonical form, never an exception, because
+    these URLs are model-supplied and R2 forbids one bad URL failing the batch.
     """
     try:
         parts = urlsplit(url)
@@ -89,15 +87,12 @@ class SourceRegistry:
     """Mints per-run `S1..Sn` IDs for URLs and resolves `[Sn]` markers into links."""
 
     def __init__(self, run_id: str | None = None) -> None:
-        # Names this run's whole workspace subdirectory, built by
-        # `harness.config.run_workspace_dir` — notes, captures and evicted history all
-        # hang off it. `[Sn]` IDs are per-run, but `agent.workspace_dir` is one shared
-        # directory reused by every run, so without this a shorter run would read a
-        # previous run's `S1.md` (plan `## Reconciliations` 2026-08-12 — Phase 6, and
-        # 2026-08-13 for the widening to the whole workspace). The timestamp alone is only
-        # second-resolution, so two runs launched in the same second shared a directory
-        # and overwrote each other's captures mid-run (PR #4 review); the random suffix
-        # makes the default collision-free while keeping the stamp sortable by start.
+        # Names this run's whole workspace subdirectory (`harness.config.run_workspace_dir`) —
+        # notes, captures and evicted history all hang off it. `[Sn]` IDs are per-run but
+        # `agent.workspace_dir` is shared, so without this a shorter run would read a previous
+        # run's `S1.md`. The timestamp alone is second-resolution, so two runs launched in the
+        # same second shared a directory and overwrote each other's captures mid-run; the
+        # random suffix makes the default collision-free while keeping the stamp sortable.
         self.run_id = run_id or (
             f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}-{secrets.token_hex(4)}"
         )

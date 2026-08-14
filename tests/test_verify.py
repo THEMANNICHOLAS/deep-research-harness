@@ -1,14 +1,11 @@
 """Behavioral tests for harness.verify — pooled, one-call-per-paragraph verification.
 
-Written against the new pooled contract (Phase 2+3 plan, PART A): one model call per
-`Paragraph` regardless of how many sources it cites, deterministic verdicts assigned
-without a model call, and `sources_conflict`/`unsupported_items` carried straight through
-from the model's reply.
+The pooled contract: one model call per `Paragraph` however many sources it cites, deterministic
+verdicts assigned without a call, and `sources_conflict`/`unsupported_items` carried straight
+through from the reply.
 
-The `_parse_reply` tolerance tests at the end of this file exist for plan risk #1: the
-orchestrator model is not guaranteed to return bare, complete JSON, so every tolerance
-written for that must have a test that fails if the tolerance is removed.
-
+The `_parse_reply` tolerance tests at the end exist because the model is not guaranteed to return
+bare, complete JSON — every tolerance must have a test that fails if the tolerance is removed.
 """
 
 import asyncio
@@ -72,9 +69,8 @@ async def test_one_call_per_paragraph_and_prompt_contains_every_pooled_source(
 class _ConcurrencyTrackingModel(ScriptedChatModel):
     """Tracks in-flight `_agenerate` calls to prove the verification loop is sequential.
 
-    The `asyncio.sleep(0)` is load-bearing (D4): without a real await point, a concurrent
-    `asyncio.gather` would still show a peak of 1, since nothing would ever yield control
-    between increment and decrement.
+    The `asyncio.sleep(0)` is load-bearing (D4): with no real await point, even a concurrent
+    `asyncio.gather` would show a peak of 1, since nothing yields between increment and decrement.
     """
 
     _in_flight: int = PrivateAttr(default=0)
@@ -171,7 +167,7 @@ async def test_a_paragraph_left_with_no_usable_source_returns_not_verified_namin
     missing_id = registry.add("https://example.test/missing")
     failed_id = registry.add("https://example.test/failed")
     write_failed_capture(config, registry, failed_id, outcome="error")
-    # `missing_id` is registered but never captured — no file exists under sources_dir.
+    # `missing_id` is registered but never captured: no file exists under `sources_dir`.
     paragraph = _paragraph(
         f"The pump failed under load [{missing_id}] [{failed_id}].", [missing_id, failed_id]
     )
@@ -184,8 +180,8 @@ async def test_a_paragraph_left_with_no_usable_source_returns_not_verified_namin
     assert model._call_count == 0
     verdict = result.verdicts[0]
     assert verdict.verdict == "not_verified"
-    # "readable", not just "exists": the catch covers a `UnicodeDecodeError` from a capture
-    # whose write died mid-character, not only a missing file (PR #4 review).
+    # "readable", not just "exists": the catch covers a `UnicodeDecodeError` from a capture whose
+    # write died mid-character, not only a missing file.
     assert "no readable captured content exists" in verdict.detail
     assert "FETCH FAILED: error" in verdict.detail
     assert verdict.source_ids == []
@@ -194,9 +190,9 @@ async def test_a_paragraph_left_with_no_usable_source_returns_not_verified_namin
 async def test_a_capture_that_is_not_valid_utf8_is_skipped_not_raised(
     make_config, scripted_model, monkeypatch
 ):
-    """PR #4's fix, carried onto the pooled read. A `write_text` dying mid-flush leaves a
-    byte prefix that can end mid-character; `UnicodeDecodeError` is a `ValueError`, not an
-    `OSError`, so catching `OSError` alone let it escape the whole verification pass.
+    """A `write_text` dying mid-flush leaves a byte prefix that can end mid-character, and
+    `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so catching `OSError` alone let it
+    escape the whole verification pass.
     """
     config = make_config()
     registry = SourceRegistry()
@@ -270,9 +266,8 @@ async def test_a_malformed_reply_unknown_verdict_and_raised_exception_all_contin
 async def test_a_failed_check_keeps_its_diagnostic_out_of_the_readers_verdict_detail(
     make_config, scripted_model, monkeypatch
 ):
-    """R4 wants verdict wording a production technician can act on, so the exception text
-    goes to `check_failures` — which `## Gaps and disclosures` prints — and never to the
-    paragraph's own `Verdict:` detail (PR #7 review).
+    """R4 wants verdict wording a technician can act on, so the exception text goes to
+    `check_failures` — which `## Gaps and disclosures` prints — never to the `Verdict:` detail.
     """
     from langchain_core.messages import AIMessage
 
@@ -477,8 +472,8 @@ async def test_the_input_paragraphs_list_is_exactly_what_gets_checked(
 
 
 async def test_a_reply_wrapped_in_prose_is_still_parsed(make_config, scripted_model, monkeypatch):
-    """Risk #1: the model may narrate around its JSON. The object between the first `{`
-    and the last `}` is still the answer, and none of the prose leaks into `detail`.
+    """The model may narrate around its JSON: the object between the first `{` and the last `}` is
+    still the answer, and none of the prose leaks into `detail`.
     """
     from langchain_core.messages import AIMessage
 
@@ -522,10 +517,9 @@ _OBJECT = '{"verdict": "supported", "detail": "The capture quotes $4.20."}'
 async def test_a_reply_wrapped_on_either_side_is_still_parsed(
     make_config, scripted_model, monkeypatch, content, shape
 ):
-    """Risk #1, both remaining wrapper shapes. Trailing-prose-only is the one that used to
-    fail: the repair was gated on the reply NOT starting with `{`, so an object followed by
-    a sign-off went to `json.loads` whole and raised "Extra data", turning a genuine
-    `supported` verdict into `not verified` for a correctly-cited paragraph.
+    """Both remaining wrapper shapes. Trailing-prose-only is the one that failed: the repair was
+    gated on the reply NOT starting with `{`, so an object followed by a sign-off reached
+    `json.loads` whole and raised "Extra data", turning a genuine verdict into `not verified`.
     """
     from langchain_core.messages import AIMessage
 
@@ -548,8 +542,8 @@ async def test_a_reply_wrapped_on_either_side_is_still_parsed(
 async def test_a_reply_omitting_unsupported_items_defaults_to_empty(
     make_config, scripted_model, monkeypatch
 ):
-    """Risk #1: the model may omit `unsupported_items` and `sources_conflict` entirely.
-    A missing list is empty and a missing flag is False — not a parse failure.
+    """The model may omit `unsupported_items` and `sources_conflict` entirely: a missing list is
+    empty and a missing flag is False, not a parse failure.
     """
     from langchain_core.messages import AIMessage
 
@@ -577,9 +571,9 @@ async def test_a_reply_omitting_unsupported_items_defaults_to_empty(
 async def test_non_integer_bullet_indices_are_dropped_not_carried_through(
     make_config, scripted_model, monkeypatch
 ):
-    """Risk #1: `unsupported_items` may arrive with strings or nulls mixed in. Only real
-    ints survive, so the render path never indexes a list with a string. `True` is an int
-    to Python and is dropped too — a boolean is not a bullet index.
+    """`unsupported_items` may arrive with strings or nulls mixed in. Only real ints survive, so
+    the render path never indexes a list with a string; `True` is an int to Python and is dropped
+    too, since a boolean is not a bullet index.
     """
     from langchain_core.messages import AIMessage
 
@@ -613,10 +607,9 @@ async def test_non_integer_bullet_indices_are_dropped_not_carried_through(
 async def test_a_quoted_conflict_flag_reads_as_no_conflict(
     make_config, scripted_model, monkeypatch
 ):
-    """Risk #1: the prompt asks for an unquoted boolean, but `bool("false")` is True — a
-    quoted one used to file the paragraph under `## Conflicting sources` against its own
-    reply (PR #7 review). Only a real boolean sets the flag, the same stance the non-int
-    bullet indices above take.
+    """The prompt asks for an unquoted boolean, but `bool("false")` is True — a quoted one filed
+    the paragraph under `## Conflicting sources` against its own reply. Only a real boolean sets
+    the flag, the same stance the non-int bullet indices above take.
     """
     from langchain_core.messages import AIMessage
 
