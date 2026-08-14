@@ -1,6 +1,6 @@
 # PLAN: Report Output and Default Location
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-13
 **Type:** Single plan
 
@@ -202,7 +202,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R6 | Lead + Subagent model in metadata | Phase 4 |
 
 ## Progress
-- [ ] Phase 1: Paragraph unit
+- [x] Phase 1: Paragraph unit
 - [ ] Phase 2: Pooled paragraph verification
 - [ ] Phase 3: Report rendering
 - [ ] Phase 4: Default paths and run metadata
@@ -263,8 +263,8 @@ bullets, shared by every consumer.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `uv run mypy .` passes with the new module.
-- [ ] `harness/paragraphs.py` imports nothing from `report.py` or `verify.py`.
+- [x] `uv run mypy .` passes with the new module.
+- [x] `harness/paragraphs.py` imports nothing from `report.py` or `verify.py`.
 
 ### Phase 2: Pooled paragraph verification
 
@@ -519,6 +519,28 @@ correction. Empty at plan creation. -->
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+### 2026-08-13 — Phase 1: uncompiled regexes in `strip_markers` (deferred)
+The per-line loop in `harness/paragraphs.py` uses three inline `re.match`/`re.sub`
+patterns, the module's only uncompiled ones; hoisting them beside `_FENCE_RE` would match
+the file's own convention. The `indent_match ... else ""` guard is also unreachable
+(`[ \t]*` always matches) and exists only for mypy. Cosmetic, no behavior change —
+deferred rather than churn a green phase.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
+
+### 2026-08-13 — Phase 1: Paragraph unit
+- Done: added `harness/paragraphs.py` (`Paragraph`, `split_paragraphs`, `strip_markers`)
+  and `tests/test_paragraphs.py` (11 tests). Nothing else changed. Full suite 281 passed;
+  ruff, format, and mypy clean.
+- Learned: the session opened on a worktree branched from `main`, where none of the files
+  this plan modifies exist — they live only on `origin/research-loop`. The branch was
+  rebased onto `origin/research-loop` (developer's call) before any code was written, and
+  the Codebase Map then matched line-for-line. A later session must stay on that base.
+  `_LIST_ITEM_RE` is now duplicated between `paragraphs.py` and `verify.py:38`; Phase 2
+  deletes the consumers of the verify.py copy.
+- Drift: none — the plan text was correct; the worktree base was wrong.
+- Watch-next: Phase 2 is flagged (!#1). Confirm the pooled reply contract tolerates prose
+  around the JSON, a missing `unsupported_items`, and 1-based bullet indices — and check
+  it against a live run, not only scripted replies.
