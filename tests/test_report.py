@@ -33,8 +33,9 @@ from harness.report import (
     write_report,
 )
 from harness.sources import SourceRegistry
+from harness.tools.fetch import _sources_dir
 from harness.verify import ParagraphVerdict, VerificationResult
-from tests.conftest import write_failed_capture, write_source_capture
+from tests.conftest import write_failed_capture, write_source_capture, write_workspace_note
 
 _FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-[a-z0-9-]+\.md$")
 
@@ -208,6 +209,38 @@ def test_write_report_treats_registered_stub_sources_as_not_usable(make_config):
     heading_pos = body.index(_UNUSABLE_HEADING)
     dead_bullet_pos = body.index(f"[{dead_id}]")
     assert no_sources_pos < heading_pos < dead_bullet_pos
+
+
+def test_write_report_survives_a_capture_file_that_is_not_valid_utf8(make_config):
+    """A truncated capture must cost one source, never the whole report (PR #4, Major).
+
+    `write_text` dying mid-flush (ENOSPC, EIO) leaves a byte prefix that can end
+    mid-character. `UnicodeDecodeError` is a `ValueError`, so it used to escape
+    `_is_usable` and `write_report` — which `__main__` does not guard — throwing away a
+    run that had already spent its wall clock, its tokens and its verification pass.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    good_id = registry.add("https://example.test/good", title=None)
+    torn_id = registry.add("https://example.test/torn", title=None)
+    write_source_capture(config, registry, good_id)
+    torn_path = _sources_dir(config, registry) / f"{torn_id}.md"
+    # A valid UTF-8 prefix cut mid-character, exactly as an aborted flush would leave it.
+    torn_path.write_bytes(b"# S2: torn page\n\n- Outcome: fetched\n\ncaf\xc3")
+    outcome = RunOutcome(
+        question="What survived?",
+        answer="The good source did [S1].",
+        registry=registry,
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert "example.test/good" in body
+    # Unreadable is treated exactly like a stub: disclosed as not usable, never as evidence.
+    unusable_pos = body.index(_UNUSABLE_HEADING)
+    assert unusable_pos < body.index(f"[{torn_id}]")
 
 
 def test_write_report_lists_usable_sources_and_marks_stubs_separately(make_config):
@@ -411,14 +444,13 @@ def test_write_report_lists_only_planned_todos_not_completed(make_config):
 
 def test_write_report_includes_workspace_notes_when_cut_short(make_config):
     config = make_config()
-    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
-    (config.agent.workspace_dir / "notes.md").write_text(
-        "Vendor Acme quoted $4.20/unit, confirmed by two listings.", encoding="utf-8"
+    registry = SourceRegistry()
+    write_workspace_note(
+        config, registry, "notes.md", "Vendor Acme quoted $4.20/unit, confirmed by two listings."
     )
-    # A captured source file, written directly to sources/<run_id>/ the way
+    # A captured source file, written directly to the run's sources/ the way
     # harness/tools/fetch.py does — never via the registry, so nothing else could surface
     # its text.
-    registry = SourceRegistry()
     write_source_capture(config, registry, "S1")
     outcome = RunOutcome(
         question="What pricing was found before the cutoff?",
@@ -459,25 +491,25 @@ def test_write_report_says_so_when_no_notes_were_written(make_config):
 
 
 def test_write_report_excludes_notes_left_by_a_previous_run(make_config):
-    """`agent.workspace_dir` is one fixed directory nothing in `harness/` ever clears, so
-    an unfiltered glob would present a PREVIOUS run's notes as this run's findings — an
-    overstatement of evidence (R3) that the reader has no way to catch. Only files touched
-    at or after `started_at` belong to this run.
+    """Presenting a PREVIOUS run's notes as this run's findings overstates the evidence
+    (R3) in a way the reader cannot catch. Per-run workspaces are the first defence; this
+    pins the second, which still matters because `SourceRegistry(run_id=...)` lets a run
+    id be reused deliberately. Only files touched at or after `started_at` belong here.
     """
     config = make_config()
-    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
-    stale = config.agent.workspace_dir / "old-run.md"
-    stale.write_text("Acme was cheapest, from last week's run.", encoding="utf-8")
+    registry = SourceRegistry()
+    stale = write_workspace_note(
+        config, registry, "old-run.md", "Acme was cheapest, from last week's run."
+    )
     os.utime(stale, (_LONG_AGO, _LONG_AGO))
 
     started_at = datetime.now()
-    fresh = config.agent.workspace_dir / "this-run.md"
-    fresh.write_text("Beta quoted $9.10/unit today.", encoding="utf-8")
+    write_workspace_note(config, registry, "this-run.md", "Beta quoted $9.10/unit today.")
 
     outcome = RunOutcome(
         question="What did this run actually find?",
         answer="",
-        registry=SourceRegistry(),
+        registry=registry,
         usage=_usage(),
         cut_short="wall_clock",
         started_at=started_at,
@@ -494,15 +526,14 @@ def test_write_report_keeps_every_note_when_no_start_time_is_known(make_config):
     them — losing this run's findings would be the worse failure of the two.
     """
     config = make_config()
-    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
-    old = config.agent.workspace_dir / "whenever.md"
-    old.write_text("A finding of unknown vintage.", encoding="utf-8")
+    registry = SourceRegistry()
+    old = write_workspace_note(config, registry, "whenever.md", "A finding of unknown vintage.")
     os.utime(old, (_LONG_AGO, _LONG_AGO))
 
     outcome = RunOutcome(
         question="What is on disk?",
         answer="",
-        registry=SourceRegistry(),
+        registry=registry,
         usage=_usage(),
         cut_short="round_cap",
         started_at=None,
@@ -1332,14 +1363,13 @@ def test_working_notes_are_found_in_a_subdirectory(make_config):
     where the reader has nothing else to fall back on.
     """
     config = make_config()
-    nested = config.agent.workspace_dir / "notes"
-    nested.mkdir(parents=True, exist_ok=True)
-    (nested / "pricing.md").write_text("Acme quoted $4.20/unit.", encoding="utf-8")
+    registry = SourceRegistry()
+    write_workspace_note(config, registry, "notes/pricing.md", "Acme quoted $4.20/unit.")
 
     outcome = RunOutcome(
         question="What pricing was found before the cutoff?",
         answer="",
-        registry=SourceRegistry(),
+        registry=registry,
         usage=_usage(),
         cut_short="wall_clock",
     )
@@ -1352,18 +1382,45 @@ def test_working_notes_are_found_in_a_subdirectory(make_config):
     assert "notes/pricing.md" in body
 
 
+def test_a_concurrent_runs_notes_never_reach_this_report(make_config):
+    """`started_at` cannot separate two runs in flight at once — the other run's files are
+    NEWER than this run's start, so the mtime filter keeps them. Per-run workspace
+    subdirectories are what actually holds them apart (PR #4 review).
+
+    `started_at=None` deliberately disables the mtime filter, so a pass here proves the
+    directory boundary did the work and not the timestamp.
+    """
+    config = make_config()
+    this_run = SourceRegistry()
+    other_run = SourceRegistry()
+    write_workspace_note(config, this_run, "mine.md", "Beta quoted $9.10/unit.")
+    write_workspace_note(config, other_run, "theirs.md", "AN UNRELATED QUESTION'S FINDING.")
+
+    outcome = RunOutcome(
+        question="What did this run find?",
+        answer="",
+        registry=this_run,
+        usage=_usage(),
+        cut_short="wall_clock",
+        started_at=None,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Beta quoted $9.10/unit." in body
+    assert "AN UNRELATED QUESTION'S FINDING." not in body
+
+
 def test_working_notes_are_not_restricted_to_markdown(make_config):
     """Nothing pins an extension either, so a `.txt` note is still this run's findings."""
     config = make_config()
-    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
-    (config.agent.workspace_dir / "findings.txt").write_text(
-        "Lead time is six weeks.", encoding="utf-8"
-    )
+    registry = SourceRegistry()
+    write_workspace_note(config, registry, "findings.txt", "Lead time is six weeks.")
 
     outcome = RunOutcome(
         question="What was found?",
         answer="",
-        registry=SourceRegistry(),
+        registry=registry,
         usage=_usage(),
         cut_short="wall_clock",
     )
@@ -1381,19 +1438,11 @@ def test_machine_written_bulk_still_never_reaches_the_notes_section(make_config)
     history — none of it is the agent's own notes, and all of it is large.
     """
     config = make_config()
-    workspace = config.agent.workspace_dir
-    workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / "notes.md").write_text("A real note.", encoding="utf-8")
-
     registry = SourceRegistry()
+    write_workspace_note(config, registry, "notes.md", "A real note.")
     write_source_capture(config, registry, "S1", "CAPTURED_PAGE_BODY")
-    for directory, filename, text in (
-        ("conversation_history", "thread.md", "EVICTED_HISTORY_BODY"),
-        ("large_tool_results", "result.md", "OFFLOADED_RESULT_BODY"),
-    ):
-        target = workspace / directory
-        target.mkdir(parents=True, exist_ok=True)
-        (target / filename).write_text(text, encoding="utf-8")
+    write_workspace_note(config, registry, "conversation_history/thread.md", "EVICTED_HISTORY_BODY")
+    write_workspace_note(config, registry, "large_tool_results/result.md", "OFFLOADED_RESULT_BODY")
 
     outcome = RunOutcome(
         question="Does machine-written bulk leak into the notes?",

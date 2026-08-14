@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from harness.config import (
     ProviderConfig,
     RoleConfig,
     SearchSettings,
+    run_workspace_dir,
 )
 from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
 
@@ -207,6 +209,23 @@ def write_source_capture(
     (sources_dir / f"{source_id}.md").write_text(
         f"# {source_id}: captured page\n\n- Outcome: fetched\n\n{body}", encoding="utf-8"
     )
+
+
+def write_workspace_note(
+    config: HarnessConfig, registry: Any, relative_path: str, text: str
+) -> Path:
+    """Write an agent working note into `registry`'s run workspace; return its path.
+
+    The one home for "where a run's notes live", as `write_source_capture` is for
+    captures. Every run owns a subdirectory (`harness.config.run_workspace_dir`), so a
+    note written to the shared workspace root belongs to no run and no report will see
+    it — which is exactly what keeps two concurrent runs from reading each other's
+    findings (PR #4 review).
+    """
+    path = run_workspace_dir(config, registry.run_id) / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def write_failed_capture(

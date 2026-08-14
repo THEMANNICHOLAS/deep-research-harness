@@ -132,10 +132,14 @@ async def verify_paragraphs(
             source = registry.get(sid)
             assert source is not None  # guaranteed by `registered`'s filter above
             path = sources_dir / f"{sid}.md"
+            # `UnicodeDecodeError` (a `ValueError`, not an `OSError`) alongside the
+            # missing-file case: a capture whose write died mid-flush can end
+            # mid-character, and an unreadable source is a paragraph we cannot settle,
+            # not a pass we should abandon (PR #4 review, carried onto the pooled read).
             try:
                 text = path.read_text(encoding="utf-8")
-            except OSError:
-                skipped.append(f"{sid}: no captured content exists")
+            except (OSError, UnicodeDecodeError):
+                skipped.append(f"{sid}: no readable captured content exists")
                 continue
             if is_failed_capture(text):
                 skipped.append(f"{sid}: {text.split(chr(10), 1)[0]}")

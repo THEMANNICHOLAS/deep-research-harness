@@ -20,6 +20,7 @@ from pydantic import PrivateAttr, SecretStr
 
 from harness.paragraphs import Paragraph
 from harness.sources import SourceRegistry
+from harness.tools.fetch import _sources_dir
 from harness.verify import Verdict, verify_paragraphs
 from tests.conftest import (
     ScriptedChatModel,
@@ -183,9 +184,36 @@ async def test_a_paragraph_left_with_no_usable_source_returns_not_verified_namin
     assert model._call_count == 0
     verdict = result.verdicts[0]
     assert verdict.verdict == "not_verified"
-    assert "no captured content exists" in verdict.detail
+    # "readable", not just "exists": the catch covers a `UnicodeDecodeError` from a capture
+    # whose write died mid-character, not only a missing file (PR #4 review).
+    assert "no readable captured content exists" in verdict.detail
     assert "FETCH FAILED: error" in verdict.detail
     assert verdict.source_ids == []
+
+
+async def test_a_capture_that_is_not_valid_utf8_is_skipped_not_raised(
+    make_config, scripted_model, monkeypatch
+):
+    """PR #4's fix, carried onto the pooled read. A `write_text` dying mid-flush leaves a
+    byte prefix that can end mid-character; `UnicodeDecodeError` is a `ValueError`, not an
+    `OSError`, so catching `OSError` alone let it escape the whole verification pass.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/truncated")
+    write_source_capture(config, registry, source_id, "placeholder")
+    # A lone continuation byte — valid on disk, undecodable as UTF-8.
+    (_sources_dir(config, registry) / f"{source_id}.md").write_bytes(b"Tungsten melts at \xff\xfe")
+
+    paragraph = _paragraph(f"Tungsten melts at 3422 C [{source_id}].", [source_id])
+    model = scripted_model([])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert model._call_count == 0
+    assert result.verdicts[0].verdict == "not_verified"
+    assert "no readable captured content exists" in result.verdicts[0].detail
 
 
 # --- item 4: malformed reply / unknown verdict / raised exception all continue the loop -

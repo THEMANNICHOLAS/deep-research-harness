@@ -4,9 +4,12 @@
 `harness/agent.py` registers it in `interrupt_on` with `allowed_decisions=["respond"]`, so
 `HumanInTheLoopMiddleware` intercepts the call, prints/collects the developer's answer, and
 synthesizes the tool's `ToolMessage` result itself before the function body ever runs. The
-function below exists only to give the model a name, description, and schema to call — its
-body is dead code on that path. If the `interrupt_on` entry for this tool were ever removed,
-the string it returns is the honest in-band answer: no developer input was captured.
+function below exists only to give the model a name, description, and schema to call.
+
+Its body therefore raises rather than returning a stand-in answer. Reaching it means the
+`interrupt_on` registration is gone, and a run that silently answered its own clarifying
+question would research the wrong thing and never say so — the failure must be loud
+(PR #4 review: the stand-in string was unreachable and untestable dead code).
 """
 
 from langchain_core.tools import BaseTool, tool
@@ -42,7 +45,9 @@ def build_ask_user_tool(config: HarnessConfig) -> BaseTool:
         would change what you research. Once you have started searching, do not call this
         tool — make your best judgment call instead.
         """
-        content = "No answer was captured: the developer was never asked."
-        return content, question
+        raise RuntimeError(
+            f"{ASK_USER_TOOL_NAME} was executed instead of interrupting the run — "
+            "harness/agent.py's interrupt_on registration is missing."
+        )
 
     return ask_user

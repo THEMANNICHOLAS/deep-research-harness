@@ -1,5 +1,6 @@
 """Behavioral tests for harness.sources."""
 
+import re
 from datetime import datetime
 
 import pytest
@@ -176,13 +177,20 @@ def test_urls_differing_only_by_password_stay_distinct_sources():
 # --- Phase 6: per-run `run_id`, so source captures never collide across runs -----------
 
 
-def test_run_id_defaults_to_a_timestamp_shaped_stamp():
-    """Not asserting two default registries differ — same-second construction would be
-    flaky (see the plan's Phase 6 test list). Only the shape is pinned here.
-    """
+def test_run_id_defaults_to_a_sortable_stamp_carrying_a_collision_suffix():
     registry = SourceRegistry()
 
-    datetime.strptime(registry.run_id, "%Y-%m-%d-%H%M%S")  # must not raise
+    stamp, _, suffix = registry.run_id.rpartition("-")
+    datetime.strptime(stamp, "%Y-%m-%d-%H%M%S")  # must not raise
+    assert re.fullmatch(r"[0-9a-f]{8}", suffix)
+
+
+def test_two_default_registries_never_share_a_run_id():
+    """Two runs launched in the same second used to share one captured-sources directory
+    and overwrite each other's `S<n>.md` files mid-run (PR #4 review). The suffix is
+    random rather than time-derived, so this assertion is deterministic, not flaky.
+    """
+    assert SourceRegistry().run_id != SourceRegistry().run_id
 
 
 def test_run_id_explicit_value_is_used_verbatim():

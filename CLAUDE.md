@@ -36,7 +36,10 @@ not the ceiling).
   the agent's backend at all.
 - Model routing (orchestrator, fallback, worker) is config/env-driven —
   never hardcode endpoints, model IDs, or keys.
-- Adding a new tool must require no changes to the agent loop itself.
+- Adding a new tool must require no changes to the agent loop itself. The one
+  standing exception is a tool that must STOP the loop to work — `ask_user`
+  is registered in `harness/agent.py`'s `interrupt_on`, because an interrupt
+  is a property of the loop, not of the tool. Everything else stays additive.
 - Best-effort + disclose: degraded coverage (rate limits, fetch failures)
   is answered and disclosed, never silently thinned or hidden.
 

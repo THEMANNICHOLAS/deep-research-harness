@@ -4,7 +4,7 @@ Pure string work: no model, no network — this module never calls a model itsel
 verification pass's one pooled model call per paragraph happens in `harness.verify`,
 before `write_report` is ever called; by the time a `RunOutcome` reaches this module its
 `verification` field is already-computed data. The only I/O here is writing the one
-report file and reading the captured `<workspace_dir>/sources/<run_id>/S<n>.md` files to
+report file and reading the captured `<workspace_dir>/<run_id>/sources/S<n>.md` files to
 judge which registered sources are usable evidence (3F fix pass, Major finding), so this
 module stays fully offline-testable (Phase 3 plan, `## Execution order` step 5).
 """
@@ -17,7 +17,7 @@ from typing import Any, Literal
 from langchain_core.messages import UsageMetadata
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.config import HarnessConfig
+from harness.config import HarnessConfig, run_workspace_dir
 from harness.paragraphs import LIST_ITEM_RE, Paragraph, strip_markers
 from harness.sources import Source, SourceRegistry
 from harness.tools.fetch import _sources_dir, is_failed_capture
@@ -137,17 +137,21 @@ def _is_usable(config: HarnessConfig, registry: SourceRegistry, source: Source) 
 
     `harness/tools/fetch.py` registers every attempted URL, including 404s, blocked pages,
     and empty ones — the registry alone cannot tell a real finding from a dead URL. The
-    captured `<workspace_dir>/sources/<run_id>/S<n>.md` file is Phase 2's frozen record of
+    captured `<workspace_dir>/<run_id>/sources/S<n>.md` file is Phase 2's frozen record of
     what actually came back, so usability is judged from it, not from registry
     membership. A missing file counts as NOT usable, per the Phase 2 handoff note:
-    absence is treated exactly like a stub.
+    absence is treated exactly like a stub — and so does an unreadable or non-UTF-8 one.
+    A `write_text` that dies mid-flush (ENOSPC, EIO) leaves a byte prefix that can end
+    mid-character, and `UnicodeDecodeError` is a `ValueError`, so catching `OSError`
+    alone let it escape all the way out of `write_report`, losing the whole report of an
+    otherwise finished run (PR #4 review, Major).
     """
     path = _sources_dir(config, registry) / f"{source.id}.md"
     if not path.exists():
         return False
     try:
         source_text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
     return not is_failed_capture(source_text)
 
@@ -199,7 +203,9 @@ def _cut_short_section(outcome: RunOutcome, config: HarnessConfig) -> str:
     return f"{bound_line}\n\n{todo_lines}"
 
 
-def _notes_section(config: HarnessConfig, started_at: datetime | None) -> str:
+def _notes_section(
+    config: HarnessConfig, registry: SourceRegistry, started_at: datetime | None
+) -> str:
     """Render this run's workspace files, at any depth, sorted by relative path.
 
     Recursive, and NOT restricted to `*.md` (PR #4 review, Major). The lead agent is told
@@ -214,17 +220,17 @@ def _notes_section(config: HarnessConfig, started_at: datetime | None) -> str:
     `_NOTES_EXCLUDED_DIRS` does explicitly what the old glob's lack of recursion did
     accidentally — keeps captured page text (`sources/`) and the summarizer's evicted
     history (`conversation_history/`, `large_tool_results/`) out of the report. Files
-    that are not UTF-8 text are skipped alongside unreadable ones, matching `_is_usable`'s
-    existing `OSError` stance.
+    that are not UTF-8 text are skipped alongside unreadable ones, matching `_is_usable`.
 
-    Filtered by `started_at`, and that filter is load-bearing: `agent.workspace_dir` is one
-    fixed directory that nothing in `harness/` ever clears, so an unfiltered glob would
-    present a PREVIOUS run's notes as this run's findings — the exact overstatement R3
-    forbids, in the one report where the reader is least able to catch it (3F Major).
+    Scans THIS run's workspace subdirectory alone (`run_workspace_dir`), which is what
+    keeps another run's notes out — including a run still in flight, whose files the
+    `started_at` filter below cannot exclude because they are newer than this run's start
+    (PR #4 review). That filter is now the second line rather than the only one: it still
+    catches an explicitly reused `run_id`, which `SourceRegistry(run_id=...)` permits.
     `None` means "no run start known" (a directly-constructed `RunOutcome` in a test) and
     keeps every file.
     """
-    workspace_dir = config.agent.workspace_dir
+    workspace_dir = run_workspace_dir(config, registry.run_id)
     if not workspace_dir.exists():
         return _NO_NOTES_TEXT
 
@@ -414,7 +420,12 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
     ]
 
     if outcome.cut_short:
-        lines += [_NOTES_HEADING, "", _notes_section(config, outcome.started_at), ""]
+        lines += [
+            _NOTES_HEADING,
+            "",
+            _notes_section(config, outcome.registry, outcome.started_at),
+            "",
+        ]
 
     if outcome.verification is not None:
         conflicts_text = _conflicts_section(outcome, outcome.verification)

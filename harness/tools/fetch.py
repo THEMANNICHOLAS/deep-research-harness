@@ -23,7 +23,7 @@ from crawl4ai import (  # type: ignore[import-untyped]
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.config import HarnessConfig
+from harness.config import HarnessConfig, run_workspace_dir
 from harness.sources import SourceRegistry, normalize_url
 
 FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
@@ -56,8 +56,8 @@ def is_failed_capture(source_text: str) -> bool:
 
 
 def _sources_dir(config: HarnessConfig, registry: SourceRegistry) -> Path:
-    """The one place the `<workspace_dir>/sources/<run_id>` layout is built."""
-    return config.agent.workspace_dir / "sources" / registry.run_id
+    """The one place the `<workspace_dir>/<run_id>/sources` layout is built."""
+    return run_workspace_dir(config, registry.run_id) / "sources"
 
 
 # Despite the name, crawl4ai 0.9.2 re-fetches nothing — this caps how many times a domain's
@@ -151,18 +151,36 @@ def _pair(urls: list[str], results: list[object]) -> list[tuple[str, object | No
     return pairs
 
 
+def _holds_successful_capture(path: Path) -> bool:
+    """Whether `path` already holds real captured content rather than a failure stub.
+
+    A missing or unreadable file answers False — the caller only asks in order to decide
+    whether overwriting would LOSE evidence, and neither case has any to lose.
+    """
+    try:
+        return not is_failed_capture(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def _write_source_file(sources_dir: Path, page: FetchedPage) -> None:
     """Write `page`'s full-text capture to `<sources_dir>/<source_id>.md`.
 
     A `fetched` page gets its full untruncated markdown; any other outcome gets a stub
     whose first line names the outcome (`FETCH FAILED: <outcome>`) so Phase 6 can treat
-    it as unusable without parsing further. Overwrites freely — a refetched URL reuses
-    its registry ID and rewrites its file rather than duplicating it (D10).
+    it as unusable without parsing further. A refetched URL reuses its registry ID and
+    rewrites its file rather than duplicating it (D10) — but only ever upward: a later
+    failure never overwrites content an earlier fetch captured. The registry hands the
+    same `[Sn]` to both attempts, so downgrading the file would make Phase 6 report a
+    claim cited from the good capture as unverifiable (PR #4 review, Major).
 
     A write failure here degrades to a skipped file, never an exception into the model —
     Phase 6 treats a missing source file exactly as it treats a stub.
     """
     path = sources_dir / f"{page.source_id}.md"
+    if page.outcome != "fetched" and _holds_successful_capture(path):
+        return
+
     if page.outcome == "fetched":
         heading = page.title or page.url
         text = (
@@ -303,7 +321,7 @@ async def _fetch(
 def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseTool:
     """Build the `fetch_pages` tool, closing over `config` and the shared `registry`.
 
-    Creates `<workspace_dir>/sources/<run_id>` up front, so an unwritable workspace
+    Creates `<workspace_dir>/<run_id>/sources` up front, so an unwritable workspace
     fails at startup — before any research is spent — rather than silently losing
     captures mid-run.
     """

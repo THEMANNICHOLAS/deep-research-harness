@@ -247,7 +247,9 @@ first run). `[agent] workspace_dir` / `reports_dir` in `harness.toml` are option
 that still win when present. Open that file: it should answer the question as clean prose —
 each citing paragraph is followed by a `Sources:` line of links and a `Verdict:` line, with
 no inline `[Sn]` markers — and list its sources. Every source consulted also leaves a file
-under `~/deep-research/workspace/sources/`.
+under `~/deep-research/workspace/<run_id>/sources/`. Each run owns a `<run_id>` subdirectory
+of the workspace — its notes, its captures, and its evicted history — so two runs started at
+once never read each other's findings.
 
 **Running from a git worktree:** `.env` is gitignored, so it does not exist inside a worktree.
 Point uv at the main checkout's copy — `uv run --env-file ../../../.env python -m harness

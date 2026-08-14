@@ -35,7 +35,7 @@
 | docs/plans/ | Implementation plans from `/devlead` |
 | docs/architecture.md | System architecture, principles, invariants |
 | docs/backlog.md | Deferred work and predicted issues |
-| LATER-Problems.md | Defects found during an `/implement` run and deliberately not fixed in it, with why (repo root) |
+| LATER-PROBLEMS.md | Known defects accepted into a merge rather than fixed, with why and what fixing takes (repo root) |
 | docs/decisions.md | Decision log |
 | docs/guides/setup.md | Install, env vars, prerequisites |
 

@@ -30,6 +30,13 @@ knowing why it mattered is the documented telephone-game failure. Delegation cos
 3-10x the tokens of a single agent and compounds per level, which is why the tiers
 wait for a measured baseline (the Phase 3 figure in docs/plans/PLAN-research-loop.md).
 
+Every run owns a `<workspace_dir>/<run_id>/` subdirectory — the agent's
+`FilesystemBackend` is rooted there, and its notes, captured sources and evicted
+history all live under it (@harness/config.py `run_workspace_dir` builds the path).
+Runs are therefore isolated by construction rather than by filtering: two started at
+once cannot read each other's notes, which a timestamp filter cannot prevent because
+a concurrent run's files are newer than this run's start.
+
 ## Directory Structure
 
 `harness/` holds the source: @harness/config.py (TOML config models),

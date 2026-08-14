@@ -1,8 +1,37 @@
-# LATER-Problems
+# Later Problems
+
+Known defects accepted into a merge rather than fixed at the gate. Each entry names
+what is wrong, what it costs while it stands, and what fixing it takes. Unlike
+docs/backlog.md — which holds deferred *work* — everything here is a real defect
+already shipping.
+
+---
+
+## [RESOLVED by PLAN-report-output] Claims on a line above a list skip verification entirely
+
+**Was:** `harness/verify.py` — `_block_units`, the list lead-in branch. A
+colon-terminated line above a list was discarded instead of becoming a claim, so an
+unchecked sentence rendered byte-identical to a verified one and nothing disclosed it.
+Found by the PR #4 review (CONFIRMED, Blocker, 3/3 quorum) and accepted into that merge.
+
+**Why it is gone:** `_block_units` and the whole per-line claim-unit concept were deleted
+by `docs/plans/PLAN-report-output.md`. `split_paragraphs` splits on blank lines only, so a
+lead-in stays inside its own `Paragraph.text` and its `[Sn]` is collected into
+`source_ids` — the line reaches verification as part of the block it introduces. Verified
+against the entry's own example: `Three factors drove the decline [S1]:` over two bullets
+yields one paragraph carrying `S1` and both items.
+
+**Watch:** the structural fix the entry recommended — reconciling every `[Sn]`-bearing
+line against exactly one checked unit — was never built. Paragraph boundaries make the
+old shape unreachable rather than detected, so a future change to `split_paragraphs`
+could reopen the class without a test noticing.
+
+---
+
+# Deferred from the PLAN-report-output implement run
 
 Issues found during the `/implement` run of `docs/plans/PLAN-report-output.md`
 (2026-08-13) that were deliberately NOT fixed in that run, with why. Ordered by severity.
-
 ---
 
 ## 1. [Major — FIXED, PR #7 review] Fenced code blocks are dropped from the report's `## Answer`

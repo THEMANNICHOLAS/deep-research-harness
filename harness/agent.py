@@ -24,7 +24,7 @@ from langchain.agents.middleware import AgentMiddleware, InterruptOnConfig, Todo
 from langchain_core.runnables import Runnable
 from langgraph.checkpoint.memory import InMemorySaver
 
-from harness.config import HarnessConfig
+from harness.config import HarnessConfig, run_workspace_dir
 from harness.models import build_chat_model
 from harness.prompts import render
 from harness.sources import SourceRegistry
@@ -80,8 +80,11 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
         ),
     )
 
-    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
-    backend = FilesystemBackend(root_dir=config.agent.workspace_dir)
+    # Rooted at THIS run's subdirectory, not the shared workspace: the agent can only
+    # reach its own notes, and two concurrent runs cannot read each other's.
+    workspace = run_workspace_dir(config, registry.run_id)
+    workspace.mkdir(parents=True, exist_ok=True)
+    backend = FilesystemBackend(root_dir=workspace)
 
     tools = build_tools(config, registry)
 
