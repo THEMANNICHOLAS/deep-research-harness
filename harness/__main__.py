@@ -36,7 +36,7 @@ from harness.config import ConfigError, load_config
 from harness.display import Activity, Question, Renderer, RunFinished, StageTracker, build_renderer
 from harness.models import ModelError, preflight
 from harness.paragraphs import split_paragraphs
-from harness.report import CutShortReason, RunOutcome, _is_usable, write_report
+from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
 from harness.sources import SourceRegistry
 from harness.verify import VerificationResult, verify_paragraphs
 
@@ -365,23 +365,27 @@ async def main(argv: list[str] | None = None) -> int:
         verification=verification,
     )
     tracker.advance("writing")
-    path = write_report(outcome, config)
-    if cut_short == "error":
-        # To stderr and before the path, so the path stays the LAST line of stdout.
-        print(f"error: {cut_short_detail}", file=sys.stderr)
-    tracker.finish()
-    sources = registry.all()
-    usable = sum(1 for source in sources if _is_usable(config, registry, source))
-    renderer.emit(
-        RunFinished(
-            stage_timings=tracker.timings(),
-            usable_sources=usable,
-            unusable_sources=len(sources) - usable,
-            cut_short=cut_short,
-            verification_failures=len(verification.check_failures) if verification else 0,
+    # `finally`, because the live region owns terminal state: `Live.start` hides the cursor and
+    # rich registers no atexit restore, so a `write_report` OSError (unwritable or full reports
+    # dir) escaping here would leave the developer's shell with no cursor after the traceback.
+    try:
+        path = write_report(outcome, config)
+        if cut_short == "error":
+            # To stderr and before the path, so the path stays the LAST line of stdout.
+            print(f"error: {cut_short_detail}", file=sys.stderr)
+        tracker.finish()
+        usable, unusable = partition_sources(config, registry)
+        renderer.emit(
+            RunFinished(
+                stage_timings=tracker.timings(),
+                usable_sources=len(usable),
+                unusable_sources=len(unusable),
+                cut_short=cut_short,
+                verification_failures=len(verification.check_failures) if verification else 0,
+            )
         )
-    )
-    renderer.close()
+    finally:
+        renderer.close()
     print(path)
     return 1 if cut_short == "error" else 0
 

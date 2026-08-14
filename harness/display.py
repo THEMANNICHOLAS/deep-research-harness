@@ -153,6 +153,10 @@ class RichRenderer:
 
     _ACTIVITY_TAIL = 8
 
+    # The header shown while activity is arriving but no stage has started yet — the agent's
+    # first model turn and its initial todo plan, which precede the first `search_web` call.
+    _PRE_STAGE_LABEL = "starting"
+
     def __init__(self, console: Console | None = None, *, auto_refresh: bool = True) -> None:
         self._console = console or Console()
         self._auto_refresh = auto_refresh
@@ -162,7 +166,7 @@ class RichRenderer:
         self._closed = False
 
     def _build_renderable(self) -> Group:
-        header = Spinner("dots", text=f"[bold]{self._stage}[/bold]")
+        header = Spinner("dots", text=f"[bold]{self._stage or self._PRE_STAGE_LABEL}[/bold]")
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
         return Group(header, *activity_lines)
 
@@ -194,10 +198,14 @@ class RichRenderer:
             if self._live is not None:
                 self._live.update("", refresh=True)
             self._console.print(
-                f"[green]✓[/green] {event.stage} [dim]({event.elapsed_seconds:.1f}s)[/dim]"
+                f"[green]ok[/green] {event.stage} [dim]({event.elapsed_seconds:.1f}s)[/dim]"
             )
         elif isinstance(event, Question):
-            self._console.print(Panel(event.text, border_style="cyan"))
+            # `Text(...)`, not the raw string: `Panel` renders console markup, and the question
+            # is model-authored. A bracketed path (`[/var/log]`) would raise `MarkupError` and
+            # end the run instead of asking, and a `[a]`-style option label would be parsed as
+            # an unknown style and silently dropped from the question the developer answers.
+            self._console.print(Panel(Text(event.text), border_style="cyan"))
         elif isinstance(event, RunFinished):
             lines = _summary_lines(event)
             self._console.print(lines[0], style="bold")
@@ -205,7 +213,13 @@ class RichRenderer:
                 self._console.print(line, style="dim")
         else:  # Activity
             self._activities = (self._activities + [event.text])[-self._ACTIVITY_TAIL :]
-            if self._live is not None:
+            # Starts the region if no stage has begun yet: the first stage is `clarifying` or
+            # `researching`, both of which trail the agent's first model turn, so waiting for
+            # `StageStarted` left the terminal blank through it and buffered the todo plan
+            # instead of showing it as it happened (R1).
+            if self._live is None:
+                self._start_live()
+            else:
                 self._live.update(self._build_renderable(), refresh=True)
 
     def suspend(self) -> AbstractContextManager[None]:

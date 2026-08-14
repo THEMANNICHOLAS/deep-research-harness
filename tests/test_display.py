@@ -24,7 +24,15 @@ from harness.display import (
     StageTracker,
     build_renderer,
 )
-from tests.conftest import drain_stdout, install_search_transport, patch_run
+from harness.sources import SourceRegistry
+from tests.conftest import (
+    drain_stdout,
+    install_search_transport,
+    patch_run,
+    verify_reply,
+    write_failed_capture,
+    write_source_capture,
+)
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
@@ -82,6 +90,7 @@ class _RecordingRenderer:
 
     def __init__(self) -> None:
         self.events: list[DisplayEvent] = []
+        self.closes = 0
 
     def emit(self, event: DisplayEvent) -> None:
         self.events.append(event)
@@ -90,7 +99,7 @@ class _RecordingRenderer:
         raise NotImplementedError
 
     def close(self) -> None:
-        pass
+        self.closes += 1
 
 
 def _fake_clock(times: list[float]):
@@ -243,7 +252,7 @@ def test_rich_renderer_stage_lifecycle_collapses_to_one_line():
     lines = [line for line in text.splitlines() if line.strip()]
     collapsed = [line for line in lines if re.search(r"researching \(2\.0s\)", line)]
     assert len(collapsed) == 1
-    assert re.search(r"✓\s*researching \(2\.0s\)", collapsed[0])
+    assert re.search(r"ok\s+researching \(2\.0s\)", collapsed[0])
     assert lines[-1] == collapsed[0]
 
 
@@ -278,6 +287,31 @@ def test_rich_renderer_renders_pre_stage_activities_with_the_first_frame():
     assert "[pending] Search for the answer" in text
 
 
+def test_rich_renderer_paints_activity_before_any_stage_starts():
+    """The first stage trails the agent's first model turn, so waiting for `StageStarted`
+    left the terminal blank through it and buffered the todo plan out of sight (R1)."""
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(Activity("[pending] Search for the answer"))
+    painted_before_any_stage = _strip_ansi(buffer.getvalue())
+    renderer.close()
+
+    assert "[pending] Search for the answer" in painted_before_any_stage
+
+
+def test_rich_renderer_stage_line_is_ascii_only():
+    """CLAUDE.md forbids non-ASCII in output strings; a checkmark here broke ASCII readers."""
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(StageCompleted("researching", 2.0))
+    renderer.close()
+
+    lines = _strip_ansi(buffer.getvalue()).splitlines()
+    collapsed = next(line for line in lines if "researching (2.0s)" in line)
+    assert collapsed.isascii()
+
+
 def test_rich_renderer_two_stages_produce_two_collapsed_lines_in_order():
     renderer, buffer = _rich_renderer()
 
@@ -289,7 +323,7 @@ def test_rich_renderer_two_stages_produce_two_collapsed_lines_in_order():
 
     text = _strip_ansi(buffer.getvalue())
     lines = [line for line in text.splitlines() if line.strip()]
-    collapsed = [line for line in lines if "✓" in line]
+    collapsed = [line for line in lines if line.startswith("ok ")]
     assert len(collapsed) == 2
     assert re.search(r"researching \(1\.0s\)", collapsed[0])
     assert re.search(r"verifying \(3\.5s\)", collapsed[1])
@@ -340,6 +374,22 @@ def test_rich_renderer_question_renders_as_a_bordered_panel():
     # each side that is not itself the question text (do not assert box characters).
     assert question_index > 0
     assert question_index < len(lines) - 1
+
+
+def test_rich_renderer_question_is_not_parsed_as_console_markup():
+    """The question is model-authored, and `Panel` renders console markup.
+
+    `[/var/log]` raised `MarkupError` and ended the run instead of asking it; `[a]` parsed as
+    an unknown style and vanished from the question the developer was answering.
+    """
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(Question("Which log, [/var/log] or [a] the app's own?"))
+    renderer.close()
+
+    text = _strip_ansi(buffer.getvalue())
+    assert "[/var/log]" in text
+    assert "[a]" in text
 
 
 def test_rich_renderer_suspend_stops_the_live_region_and_resume_repaints_after_marker():
@@ -457,6 +507,66 @@ async def test_a_full_run_prints_a_summary_above_the_report_path(
     assert "summary:" in out
     assert any(line.strip().startswith("sources:") for line in lines)
     assert lines[-1].strip().endswith(".md")
+
+
+async def test_the_summary_counts_real_usable_and_unusable_sources(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    """Drives the counting itself, which a `sources:`-prefix assertion cannot: both counts
+    come from `report.partition_sources`, so the summary cannot drift from the report body.
+    """
+    config = make_config()
+    # `main` builds the registry itself, so a pre-populated one is injected in its place,
+    # standing in for the `fetch_pages` calls a real run would have made — one page that came
+    # back, one that did not.
+    registry = SourceRegistry(run_id="2020-01-01-000000")
+    fetched = registry.add("https://example.test/pricing", title="Pricing")
+    blocked = registry.add("https://example.test/blocked", title="Blocked")
+    write_source_capture(config, registry, fetched, "Acme lists $5.10 per unit.")
+    write_failed_capture(config, registry, blocked)
+    monkeypatch.setattr(main_module, "SourceRegistry", lambda run_id: registry)
+
+    ping = AIMessage(content="pong")
+    final = AIMessage(
+        content=f"Acme lists $5.10 per unit [{fetched}].",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    model = scripted_model([ping, final, verify_reply(True, "The page states $5.10.")])
+    patch_run(monkeypatch, config, model)
+
+    await main_module.main(["what does acme charge"])
+
+    _, lines = drain_stdout(capsys)
+    assert "  sources: 1 usable, 1 unusable" in lines
+
+
+async def test_a_failing_report_write_still_closes_the_display(
+    make_config, monkeypatch, scripted_model
+):
+    """`Live.start` hides the cursor and rich registers no atexit restore, so a `write_report`
+    error escaping `main` left the developer's shell cursorless behind the traceback.
+    """
+    config = make_config()
+    renderer = _RecordingRenderer()
+    monkeypatch.setattr(main_module, "build_renderer", lambda: renderer)
+
+    def _unwritable(outcome: Any, cfg: Any) -> Any:
+        raise OSError("reports dir is not writable")
+
+    monkeypatch.setattr(main_module, "write_report", _unwritable)
+
+    ping = AIMessage(content="pong")
+    final = AIMessage(
+        content="Final answer.",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    model = scripted_model([ping, final])
+    patch_run(monkeypatch, config, model)
+
+    with pytest.raises(OSError, match="reports dir is not writable"):
+        await main_module.main(["a question whose report cannot be written"])
+
+    assert renderer.closes == 1
 
 
 async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
