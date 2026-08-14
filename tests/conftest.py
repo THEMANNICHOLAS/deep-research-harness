@@ -30,17 +30,14 @@ from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
 class ScriptedChatModel(ChatOpenAI):
     """A `ChatOpenAI` subclass that plays back a scripted list of `AIMessage` replies.
 
-    Subclasses `ChatOpenAI` — rather than `GenericFakeChatModel` — because `harness.agent`
-    derives its deepagents `HarnessProfile` registry key from `get_model_provider`/
-    `get_model_identifier` (Phase 3 plan, settled finding 4), which read `model_name` and
-    `_get_ls_params()`. `GenericFakeChatModel` supplies neither, so it would silently fail
-    profile resolution in a way that has nothing to do with the code under test.
-    `_generate`/`_agenerate` are overridden so no network call is ever made; every other
-    `ChatOpenAI` behavior — `bind_tools`'s schema conversion, `ls_provider="openai"` — is
-    real, matching exactly what `build_agent` sees in production. Every call's `messages`
-    argument is recorded on `_received_messages`, oldest call first, so a test can assert
-    on what actually reached the model (e.g. that the rendered system prompt arrived, or
-    that a later call's messages are the post-compression, truncated set).
+    Subclasses `ChatOpenAI` rather than `GenericFakeChatModel` because `harness.agent` derives
+    its deepagents profile key from `get_model_provider`/`get_model_identifier`, which read
+    `model_name` and `_get_ls_params()`; `GenericFakeChatModel` supplies neither and would fail
+    profile resolution for reasons unrelated to the code under test.
+
+    Only `_generate`/`_agenerate` are overridden, so no network call happens while every other
+    `ChatOpenAI` behavior stays real. Each call's `messages` are recorded on `_received_messages`,
+    oldest first, so a test can assert on what actually reached the model.
     """
 
     _script: list[AIMessage] = PrivateAttr(default_factory=list)
@@ -66,8 +63,8 @@ class ScriptedChatModel(ChatOpenAI):
     ) -> Runnable[LanguageModelInput, AIMessage]:
         """Record the tool names offered on each bind, then delegate to the real schema logic.
 
-        This is what lets a test assert on the schema the model was actually offered
-        (e.g. that `execute` never appears in it) without inspecting deepagents internals.
+        Lets a test assert on the schema the model was offered (e.g. that `execute` never
+        appears) without inspecting deepagents internals.
         """
         names: list[str] = []
         for entry in tools:
@@ -107,24 +104,18 @@ class ScriptedChatModel(ChatOpenAI):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        # `_generate` already records `messages` and is called synchronously below — no
-        # separate recording needed here to cover the async path.
+        # `_generate` records `messages` itself, so the async path needs no second recording.
         return self._generate(messages, stop=stop, **kwargs)
 
 
 def patch_model(monkeypatch: pytest.MonkeyPatch, model: Any) -> None:
     """Point EVERY module-local `build_chat_model` binding at `model`.
 
-    Three modules do `from harness.models import build_chat_model`, so each holds its own
-    binding that patching the others does not touch: `harness.agent` (the lead),
-    `harness.models` (the definition), and `harness.verify` (the per-claim check).
-
-    `harness.verify`'s was the one nothing patched (PR #4 review, Major). Because
-    `verify_claims` only reaches its model call when a claim's `[Sn]` resolves to a
-    registered source with a real capture on disk, every `main()`-driven test had to
-    avoid that state or dial `https://example.test/v1` for real — which is exactly why
-    the cut-short x verification seam had no coverage at all. One home for the list, so
-    a fourth importer cannot reopen the same hole silently.
+    Three modules do `from harness.models import build_chat_model`, so each holds its own binding
+    that patching the others does not touch: `harness.agent`, `harness.models`, and
+    `harness.verify`. Missing one leaves a `main()`-driven test either avoiding the state that
+    reaches it or dialing `https://example.test/v1` for real. One home for the list, so a fourth
+    importer cannot reopen that hole silently.
     """
     for target in (
         "harness.agent.build_chat_model",
@@ -143,10 +134,9 @@ def patch_run(
 ) -> None:
     """Patch everything a `main()` test reaches outside the compiled graph.
 
-    `skip_preflight` replaces `preflight` with a no-op. Left `False` by default because
-    most tests here deliberately let the REAL `preflight` run against the scripted model
-    and script a leading reply for it to consume — that keeps R6's call site exercised
-    rather than stubbed out of every test that drives `main`.
+    `skip_preflight` replaces `preflight` with a no-op. `False` by default, so most tests let the
+    REAL `preflight` run against the scripted model and script a leading reply for it — that
+    keeps R6's call site exercised rather than stubbed out everywhere.
     """
     import harness.__main__ as main_module
 
@@ -167,11 +157,10 @@ def verify_reply(
     sources_conflict: bool = False,
     unsupported_items: list[int] | None = None,
 ) -> AIMessage:
-    """A model reply in the pooled-paragraph JSON envelope `harness/verify.py`'s parser
-    accepts.
+    """A model reply in the pooled-paragraph JSON envelope `harness/verify.py` parses.
 
-    Shared so a test driving `main()` end to end can script the verification pass with
-    the same envelope `tests/test_verify.py` uses, rather than hand-rolling a third copy.
+    Shared so an end-to-end `main()` test scripts the verification pass with the same envelope
+    `tests/test_verify.py` uses, rather than hand-rolling a third copy.
     """
     return AIMessage(
         content=json.dumps(
@@ -199,10 +188,9 @@ def write_source_capture(
 ) -> None:
     """Write a real, `fetched`-shaped capture under `registry`'s run directory.
 
-    The one home for the captured-file shape both `harness/report.py` (is this source
-    usable evidence?) and `harness/verify.py` (can it settle a claim?) read. Takes
-    `registry` so the file lands under `sources/<run_id>/`, never the flat `sources/`
-    layout Phases 2-5 used (plan `## Reconciliations` 2026-08-12 — Phase 6).
+    The one home for the captured-file shape that `harness/report.py` (is this usable evidence?)
+    and `harness/verify.py` (can it settle a claim?) both read. Takes `registry` so the file
+    lands under this run's directory rather than a flat `sources/`.
     """
     sources_dir = _sources_dir(config, registry)
     sources_dir.mkdir(parents=True, exist_ok=True)
@@ -216,11 +204,9 @@ def write_workspace_note(
 ) -> Path:
     """Write an agent working note into `registry`'s run workspace; return its path.
 
-    The one home for "where a run's notes live", as `write_source_capture` is for
-    captures. Every run owns a subdirectory (`harness.config.run_workspace_dir`), so a
-    note written to the shared workspace root belongs to no run and no report will see
-    it — which is exactly what keeps two concurrent runs from reading each other's
-    findings (PR #4 review).
+    The one home for "where a run's notes live", as `write_source_capture` is for captures. Every
+    run owns a subdirectory, so a note written to the shared workspace root belongs to no run and
+    no report sees it — which is what keeps two concurrent runs apart.
     """
     path = run_workspace_dir(config, registry.run_id) / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,15 +242,12 @@ def scripted_model():
 def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
     """Return a factory building a valid HarnessConfig from pydantic models (no TOML).
 
-    Defaults `agent.workspace_dir`/`reports_dir` to subdirectories of pytest's `tmp_path`
-    rather than `AgentSettings()`'s own defaults. Those defaults are now HOME-relative
-    (`~/deep-research/...`), so this override stops a test run from writing into the
-    developer's real output directory — a stronger reason than the repo-litter one it
-    replaced. A caller-supplied `agent=` wins untouched.
+    Defaults `agent.workspace_dir`/`reports_dir` under pytest's `tmp_path`, because
+    `AgentSettings()`'s own defaults are HOME-relative and would write into the developer's real
+    output directory. A caller-supplied `agent=` wins untouched.
 
-    `head_model`/`subagent_model` default to the same string; pass distinct values when a
-    test must prove the two roles are read from different places rather than one being
-    rendered twice.
+    `head_model`/`subagent_model` default to the same string; pass distinct values when a test
+    must prove the two roles are read from different places.
     """
 
     def _make(

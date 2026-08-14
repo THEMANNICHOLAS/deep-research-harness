@@ -186,9 +186,9 @@ def test_run_id_defaults_to_a_sortable_stamp_carrying_a_collision_suffix():
 
 
 def test_two_default_registries_never_share_a_run_id():
-    """Two runs launched in the same second used to share one captured-sources directory
-    and overwrite each other's `S<n>.md` files mid-run (PR #4 review). The suffix is
-    random rather than time-derived, so this assertion is deterministic, not flaky.
+    """Two runs launched in the same second shared one captured-sources directory and overwrote
+    each other's `S<n>.md` files mid-run. The suffix is random rather than time-derived, so this
+    assertion is deterministic, not flaky.
     """
     assert SourceRegistry().run_id != SourceRegistry().run_id
 

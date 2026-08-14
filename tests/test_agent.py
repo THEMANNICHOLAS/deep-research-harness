@@ -1,10 +1,8 @@
 """Behavioral tests for harness.agent (and the __main__ entrypoint that drives it).
 
-Every test here builds a real deepagents-compiled graph via `build_agent` — nothing about
-deepagents itself is mocked, only the model (`harness.agent.build_chat_model`, patched per
-the module that imports it, never a network call) and, for the `__main__` tests, config
-loading. Tool calls stay confined to filesystem/todo tools; nothing here drives
-`fetch_pages`/`search_web`, which would touch a real browser or a real SearXNG instance.
+Every test builds a real deepagents-compiled graph via `build_agent`: nothing about deepagents is
+mocked, only the model and, for the `__main__` tests, config loading. Tool calls stay confined to
+filesystem/todo tools — driving `fetch_pages`/`search_web` would touch a real browser or SearXNG.
 """
 
 import asyncio
@@ -43,10 +41,8 @@ from tests.conftest import (
 def noop_agent(make_config, monkeypatch, scripted_model):
     """A real compiled graph over a model scripted to answer once, plus that model.
 
-    Six tests below need nothing but "a graph built over a model that does nothing", and
-    each was pasting the same four setup lines (PR #4 review, Nit — CLAUDE.md: repeated
-    setup becomes a fixture). The model comes back with it because two of them assert on
-    what actually reached it, which `patch_model` otherwise puts out of reach.
+    Six tests below need nothing but a graph over a model that does nothing. The model comes back
+    with it because two of them assert on what reached it, which `patch_model` otherwise hides.
     """
     model = scripted_model([AIMessage(content="done")])
     patch_model(monkeypatch, model)
@@ -60,10 +56,9 @@ def _tools_by_name(graph):
 def _filesystem_backend(graph):
     """Recover the `FilesystemBackend` a compiled graph was built with.
 
-    deepagents does not expose middleware instances on the compiled graph. Every
-    filesystem tool's function closes over the owning `FilesystemMiddleware` (see the
-    Phase 3 plan's settled finding 3, `filesystem.py:1713`), so `read_file`'s closure is
-    the stable, documented way in to recover it for the `SandboxBackendProtocol` check.
+    deepagents does not expose middleware instances on the compiled graph, but every filesystem
+    tool's function closes over the owning `FilesystemMiddleware`, so `read_file`'s closure is the
+    way in for the `SandboxBackendProtocol` check.
     """
     read_tool = _tools_by_name(graph)["read_file"]
     for cell in read_tool.func.__closure__ or ():
@@ -94,19 +89,16 @@ async def test_build_agent_drives_research_using_the_configured_model(
         config={"configurable": {"thread_id": "test-thread"}},
     )
 
-    # Behavioral, not structural: if build_agent ignored build_chat_model's return value
-    # (or hardcoded a different model), this scripted content would never appear.
+    # Behavioral, not structural: had `build_agent` ignored `build_chat_model`'s return value,
+    # this scripted content would never appear.
     assert result["messages"][-1].content == "final answer from the configured fake"
 
 
 async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_model(
     noop_agent,
 ):
-    """Regression guard for risk !#3 (a stale JSON tool-call instruction in the prompt).
-
-    Nothing in the rest of the suite asserted anything about what actually reaches the
-    model — `ScriptedChatModel._received_messages` (3F fix pass, Minor finding) records
-    the real request, so this checks it directly instead of trusting the wiring.
+    """Guards against a stale prompt reaching the model: `_received_messages` records the real
+    request, so this checks it directly instead of trusting the wiring.
     """
     model, graph = noop_agent
 
@@ -120,8 +112,8 @@ async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_
 
     system_messages = [m for m in first_request if isinstance(m, SystemMessage)]
     assert system_messages, "no system message reached the model"
-    # Distinctive text from harness/prompts/orchestrator.md, not from any fallback or
-    # default LangChain/deepagents prompt — fails if build_agent stops rendering it.
+    # Distinctive text from `harness/prompts/orchestrator.md`, not from any default
+    # LangChain/deepagents prompt, so this fails if `build_agent` stops rendering it.
     assert "lead researcher in a cited-sources research harness" in str(system_messages[0].content)
 
     human_messages = [m for m in first_request if isinstance(m, HumanMessage)]
@@ -139,9 +131,8 @@ async def test_build_agent_exposes_the_harness_tools(noop_agent):
 async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):
     _, graph = noop_agent
 
-    # Asserted on the outcome (the tool disappearing), never on the derived profile-key
-    # string, so this fails loudly if deepagents changes its key derivation instead of
-    # silently passing on a profile that no longer matched anything.
+    # Asserted on the outcome (the tool disappearing), never on the derived profile key, so a
+    # change in deepagents' key derivation fails loudly instead of passing on a dead profile.
     assert "task" not in _tools_by_name(graph)
 
 
@@ -199,8 +190,8 @@ async def test_writes_through_the_agent_land_under_the_workspace_dir(
         config={"configurable": {"thread_id": "test-thread"}},
     )
 
-    # Under THIS run's subdirectory, not the shared workspace root — that is what keeps a
-    # concurrent run from reading these notes as its own.
+    # Under THIS run's subdirectory, not the shared root: that is what keeps a concurrent run
+    # from reading these notes as its own.
     written = run_workspace_dir(config, registry.run_id) / "notes.md"
     assert written.exists()
     assert written.read_text(encoding="utf-8") == "hello"
@@ -233,8 +224,7 @@ async def test_writes_cannot_escape_the_workspace_dir(make_config, monkeypatch, 
         config={"configurable": {"thread_id": "test-thread"}},
     )
 
-    # One level up from the run's own root is the shared workspace, where a sibling run's
-    # notes live — the boundary the backend must hold.
+    # One level up is the shared workspace, where a sibling run's notes live.
     escaped = run_workspace_dir(config, registry.run_id).parent / "escape.md"
     assert not escaped.exists()
     tool_messages = [m for m in result["messages"] if isinstance(m, ToolMessage)]
@@ -246,30 +236,20 @@ async def test_compression_offloads_evicted_history_and_preserves_todos_state(
 ):
     """Cross the summarizer's trigger with real volume, then check real evidence.
 
-    Two things verified empirically against the installed `deepagents`/`langchain` before
-    writing this (Blocker 2 of the 3F fix pass):
+    Two properties of the installed middleware shape this test:
 
-    - `keep=("messages", 20)` vetoes summarization independently of `trigger` —
-      `_find_safe_cutoff` returns 0 (no-op) whenever `len(messages) <= keep`. 14 tool
-      rounds (28 messages) plus the plan round (2) plus the human message (1) is
-      comfortably over 20, so this padding also crosses the message-count floor, not
-      only the token trigger.
-    - The deepagents `SummarizationMiddleware` (Blocker 1's fix) implements
-      `wrap_model_call`/`awrap_model_call`, NOT the legacy `before_model`. It does NOT
-      shrink the graph's own `state["messages"]` — it offloads the evicted messages to
-      `backend` and rewrites only the NEXT model *request* to `[summary, *preserved]`.
-      So the post-run message list is never shorter than what was scripted, and no
-      summary message is ever added to `state["messages"]`; the state-shrinkage/summary-
-      in-state assertions the old version of this test made cannot succeed under this
-      middleware and were not testing anything real.
+    - `keep=("messages", 20)` vetoes summarization independently of `trigger`, since
+      `_find_safe_cutoff` is a no-op whenever `len(messages) <= keep`. 14 tool rounds plus the
+      plan round plus the human message clears 20, so the padding crosses both floors.
+    - The middleware wraps the model call rather than mutating state: it offloads evicted
+      messages to `backend` and rewrites only the NEXT model *request*. The post-run message
+      list is therefore never shorter than what was scripted, and no summary message appears in
+      `state["messages"]` — assertions about either would prove nothing.
 
-    The real, checkable evidence is therefore: (1) a later model *request* carries the
-    middleware's own summarization `HumanMessage` (`additional_kwargs["lc_source"] ==
-    "summarization"`) — produced by the middleware, not by anything the scripted model
-    said, so this cannot pass by accident; and (2) the `[S1]` marker attached to an early
-    finding, which that request no longer carries, is still recoverable from the
-    backend's offload file under `<workspace_dir>/conversation_history/` — the strongest
-    form of the D7 attribution-survival assertion per the fix plan.
+    So the checkable evidence is (1) a later model request carrying the middleware's own
+    summarization `HumanMessage`, which the scripted model cannot have produced, and (2) the
+    `[S1]` marker from an early finding still recoverable from the offload file under
+    `conversation_history/` — D7's attribution survival.
     """
     config = make_config()
     padding = "x" * 60_000
@@ -332,8 +312,7 @@ async def test_compression_offloads_evicted_history_and_preserves_todos_state(
     offloaded_text = "\n".join(f.read_text(encoding="utf-8") for f in offloaded_files)
     assert "[S1]" in offloaded_text
 
-    # Finding 7: todos live in graph state, not the message list, so they cannot be
-    # dropped by message compression — assert that rather than merely hoping it holds.
+    # Todos live in graph state, not the message list, so compression cannot drop them.
     assert result["todos"] == [{"content": "Investigate the topic", "status": "pending"}]
 
 
@@ -409,9 +388,8 @@ async def test_run_outcome_records_token_usage_summed_with_reasoning_split(
     await main_module.main(["question"])
 
     usage = captured["outcome"].usage
-    # Summed across BOTH AIMessages in the final state, not just the last one — a stub
-    # that read only the final message's usage_metadata would report 40/20/60 here, not
-    # the true 60/30/90.
+    # Summed across BOTH AIMessages: reading only the final message's `usage_metadata` would
+    # report 40/20/60 rather than the true 60/30/90.
     assert usage["input_tokens"] == 60
     assert usage["output_tokens"] == 30
     assert usage["total_tokens"] == 90
@@ -446,16 +424,13 @@ async def test_main_prints_the_report_path_as_the_final_line_of_stdout(
 def _install_slow_search(monkeypatch, delay_seconds: float) -> None:
     """Route `harness.tools.search`'s `httpx.AsyncClient` through a transport that sleeps.
 
-    Same faking technique as `tests/test_search.py`'s `_install` — monkeypatch the class
-    the module imports — not a new one; reproduced here (rather than imported) because
-    that helper is private to its own test module.
+    Same technique as `tests/test_search.py`'s `_install`, reproduced rather than imported
+    because that helper is private to its own module.
 
-    CALL THIS AFTER `scripted_model(...)`, never before. `harness.tools.search` does a
-    plain `import httpx`, so this replaces the process-global `httpx.AsyncClient`, and
-    `openai`'s client constructor rejects anything that is not an instance of whatever
-    `httpx.AsyncClient` is bound to at that moment — including
-    `langchain_openai`'s `_AsyncHttpxClientWrapper`, which subclasses the ORIGINAL class
-    captured at import time. Building the model first means that check has already run.
+    CALL THIS AFTER `scripted_model(...)`, never before: this replaces the process-global
+    `httpx.AsyncClient`, and `openai`'s constructor rejects anything that is not an instance of
+    whatever that name is bound to at build time — including `langchain_openai`'s wrapper, which
+    subclasses the ORIGINAL class. Building the model first means that check has already run.
     """
     real = httpx.AsyncClient
 
@@ -470,10 +445,9 @@ def _install_slow_search(monkeypatch, delay_seconds: float) -> None:
 
 
 def test_final_answer_skips_trailing_tool_output():
-    """On every cut-short path the message list usually ends in tool traffic, not prose.
-    Taking `messages[-1].content` verbatim would publish deepagents' internal tool output
-    as the run's ANSWER to a non-technical reader (3F Major), so the last AIMessage that
-    actually said something is what counts.
+    """On a cut-short path the message list usually ends in tool traffic, so
+    `messages[-1].content` would publish internal tool output as the run's ANSWER. The last
+    `AIMessage` that actually said something is what counts.
     """
     messages = [
         AIMessage(content="Acme is cheapest at $4.20/unit [S1]."),
@@ -488,8 +462,8 @@ def test_final_answer_skips_trailing_tool_output():
 
 
 def test_final_answer_is_empty_when_the_run_never_spoke():
-    """A run cut short before any prose has no answer at all — `report.py` renders the
-    empty case explicitly rather than showing an empty section.
+    """A run cut short before any prose has no answer at all, and `report.py` renders that case
+    explicitly rather than showing an empty section.
     """
     messages = [
         AIMessage(
@@ -503,12 +477,9 @@ def test_final_answer_is_empty_when_the_run_never_spoke():
 
 
 def test_message_text_reads_block_style_content():
-    """`AIMessage.content` is `str | list`, and `str(content)` on the list shape is a repr.
-
-    A provider or model swap that returns content blocks would otherwise put
-    `[{'type': 'text', 'text': '...'}]` under `## Answer` for a non-technical reader
-    (PR #4 review, Minor). Non-text blocks (a `thinking` block, say) are dropped rather
-    than rendered.
+    """`AIMessage.content` is `str | list`, and `str(content)` on the list shape is a repr, so a
+    provider returning content blocks would put `[{'type': 'text', ...}]` under `## Answer`.
+    Non-text blocks (a `thinking` block, say) are dropped rather than rendered.
     """
     message = AIMessage(
         content=[
@@ -526,13 +497,11 @@ def test_message_text_still_reads_the_plain_string_shape():
 
 
 async def test_read_answer_resolves_instead_of_hanging_when_stdin_is_closed(monkeypatch):
-    """A dead stdin must not strand the run on a future nothing will ever complete.
+    """A dead stdin must not strand the run on a future nothing will complete.
 
-    `input()` raising `EOFError` used to kill the worker thread BEFORE `_resolve` was
-    scheduled, so `await future` never returned (PR #4 review, Major). The wall clock is
-    still disarmed for a pre-research question, so nothing else would ever rescue it.
-    This test hangs forever against the old code rather than failing, which is why it
-    carries its own timeout.
+    `input()` raising `EOFError` killed the worker thread BEFORE `_resolve` was scheduled, so
+    `await future` never returned, and the wall clock is disarmed for a pre-research question.
+    Against the old code this hangs rather than failing, hence its own timeout.
     """
 
     def fake_input(prompt: str = "") -> str:
@@ -557,10 +526,8 @@ async def test_read_answer_resolves_when_stdin_raises_oserror(monkeypatch):
 
 
 async def test_the_clarification_prompt_never_reaches_stdout(monkeypatch, capsys):
-    """The report path is the final line of STDOUT — frozen, because R1 depends on it.
-
-    `input(prompt)` writes the prompt with no trailing newline, so the path printed at the
-    end of `main` landed on the same line as a pending `> ` (PR #4 review, Major). The
+    """The report path is the final line of STDOUT, frozen because R1 depends on it. `input(prompt)`
+    writes with no trailing newline, so the path landed on the same line as a pending `> `; the
     prompt belongs on stderr with the rest of the terminal chatter.
     """
     monkeypatch.setattr("builtins.input", lambda: "the metal")
@@ -574,10 +541,9 @@ async def test_the_clarification_prompt_never_reaches_stdout(monkeypatch, capsys
 
 
 async def test_read_answer_runs_on_a_daemon_thread(monkeypatch):
-    """A non-daemon worker is joined at interpreter shutdown, so the process hangs after
-    the wall clock has already fired and written its report. (Measured: a probe using
-    `asyncio.to_thread` under a 1s timeout returned at 30s; the daemon-thread version
-    returned at 1.0s.) This is the only cheap in-process assertion of that property.
+    """A non-daemon worker is joined at interpreter shutdown, so the process hangs after the wall
+    clock has already fired and written its report. This is the cheapest in-process assertion of
+    that property.
     """
     recorded: dict[str, bool] = {}
 
@@ -593,8 +559,8 @@ async def test_read_answer_runs_on_a_daemon_thread(monkeypatch):
 
 
 async def test_read_answer_returns_what_was_typed(monkeypatch):
-    """Regression: swapping `input()` for a thread-based read must not mangle the answer,
-    and the normalization `_answer_questions` applies (Phase 4) must still see it whole.
+    """The thread-based read must not mangle the answer, and `_answer_questions`' normalization
+    must still see it whole.
     """
     monkeypatch.setattr("builtins.input", lambda prompt="": "  Yes, region EU-West  ")
     interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which region?"}}]})
@@ -607,11 +573,10 @@ async def test_read_answer_returns_what_was_typed(monkeypatch):
 async def test_main_cuts_the_run_short_at_the_round_cap(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """`max_rounds=1` with a model that never stops proposing tool calls forces
-    `recursion_limit` to end the run instead of the graph terminating on its own — proving
-    the cap, not an exhausted script, is what ends it. `ScriptedChatModel` raises
-    `IndexError` once its script runs out (see tests/conftest.py), so far more responses
-    are scripted than the cap could ever consume.
+    """`max_rounds=1` with a model that never stops proposing tool calls forces `recursion_limit`
+    to end the run rather than the graph terminating on its own. `ScriptedChatModel` raises
+    `IndexError` when its script runs out, so far more responses are scripted than the cap can
+    consume — proving the cap, not an exhausted script, is what ended it.
     """
     agent = AgentSettings(
         max_rounds=1, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
@@ -638,14 +603,12 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
     assert lines, "main() printed no report path"
     report_path = Path(lines[-1].strip())
     assert report_path.exists()
-    # Proves the cap ended the run rather than the 20-item script running out: a run that
-    # actually consumed the whole script would have driven far more model calls.
+    # A run that consumed the whole 20-item script would have driven far more model calls.
     assert len(model._received_messages) < 5
     body = report_path.read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING in body
-    # Names the ROUND CAP specifically, not just "something cut this short": without this,
-    # swapping the `GraphRecursionError` and `TimeoutError` labels in __main__'s except
-    # clauses would keep every cut-short test green.
+    # Names the ROUND CAP specifically: without this, swapping the `GraphRecursionError` and
+    # `TimeoutError` labels in `__main__`'s except clauses would keep every cut-short test green.
     assert _ROUND_CAP_TEXT in body
     assert _WALL_CLOCK_TEXT not in body
 
@@ -654,16 +617,13 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
 async def test_max_rounds_scales_the_recursion_limit(
     make_config, monkeypatch, scripted_model, tmp_path, capsys, max_rounds, expect_cut_short
 ):
-    """Pins the `max_rounds * 2 + 1` mapping at its measured boundary, which the round-cap
-    test above cannot — that one passes under ANY mapping small enough to trip.
+    """Pins the `max_rounds * 2 + 1` mapping at its measured boundary, which the round-cap test
+    above cannot — that one passes under ANY mapping small enough to trip.
 
-    A run doing exactly one tool round is cut short at `max_rounds=3` (limit 7) and
-    completes at `max_rounds=4` (limit 9). Measured against the installed deepagents, not
-    derived: the graph carries a fixed ~7-9 superstep middleware overhead on top of the
-    ~2 supersteps a round actually costs, so the mapping's arithmetic is looser than its
-    name (see `## Discoveries` 2026-08-11 — Phase 5). Passing `max_rounds` straight
-    through as `recursion_limit` would cut BOTH of these short, so this pair is what
-    distinguishes the two mappings.
+    A run doing exactly one tool round is cut short at `max_rounds=3` (limit 7) and completes at
+    `max_rounds=4` (limit 9). Measured, not derived: the graph adds a fixed ~7-9 superstep
+    middleware overhead on top of the ~2 a round costs. Passing `max_rounds` straight through as
+    `recursion_limit` would cut BOTH short, so this pair is what separates the two mappings.
     """
     agent = AgentSettings(
         max_rounds=max_rounds,
@@ -702,13 +662,12 @@ async def test_max_rounds_scales_the_recursion_limit(
 async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """`todos=last_todos or []` is the only route from the streamed todo state into the
-    report (D9's "name the planned steps not yet done"). Without this, passing `[]` there
-    would stay green — `test_report.py` only proves the RENDER, never the wiring.
+    """`todos=last_todos or []` is the only route from the streamed todo state into the report
+    (D9). Passing `[]` there would stay green otherwise, since `test_report.py` proves the RENDER
+    and never the wiring.
     """
-    # max_rounds=2 (limit 5), measured: far enough for the write_todos round to land in
-    # the stream, still short of the ~9 a full run needs — so the report is cut short AND
-    # has todos to name. At max_rounds=1 the run dies before any todo update is emitted.
+    # max_rounds=2 (limit 5), measured: far enough for the write_todos round to reach the stream,
+    # short of the ~9 a full run needs, so the report is cut short AND has todos to name.
     agent = AgentSettings(
         max_rounds=2, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
     )
@@ -733,9 +692,8 @@ async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
     body = Path(lines[-1].strip()).read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING in body
     assert "Chase the pricing page" in body
-    # The last message on a cut-short run is the write_todos ToolMessage. Taking
-    # `messages[-1].content` verbatim would publish deepagents' "Updated todo list to
-    # [...]" as the run's ANSWER to a non-technical reader (3F Major).
+    # The last message here is the write_todos ToolMessage, so `messages[-1].content` would
+    # publish "Updated todo list to [...]" as the run's ANSWER.
     assert _NO_ANSWER_TEXT in body
     assert "Updated todo list" not in body
 
@@ -743,12 +701,10 @@ async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
 async def test_main_cuts_the_run_short_when_the_wall_clock_expires(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """A `final` response is scripted AFTER the slow search — reachable only if nothing
-    cuts the run short — so an unimplemented clock would let this run complete normally
-    (no exception, no cut-short disclosure) rather than coincidentally raising once the
-    3-item script exhausts. The elapsed-time assertion is what actually pins the timeout:
-    without it, a broad "catch anything, call it wall_clock" shortcut that let the full
-    3-second sleep run to completion could slip past a body-content check alone.
+    """A `final` response is scripted AFTER the slow search, reachable only if nothing cuts the run
+    short, so a missing clock would let this run complete normally rather than raising once the
+    script exhausts. The elapsed-time assertion pins the timeout itself: without it, a broad
+    "catch anything, call it wall_clock" shortcut that ran the full sleep would still pass.
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
@@ -781,23 +737,20 @@ async def test_main_cuts_the_run_short_when_the_wall_clock_expires(
     report_path = Path(lines[-1].strip())
     body = report_path.read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING in body
-    # Names the WALL CLOCK specifically — see the round-cap test for why the generic
-    # heading assertion alone is not enough.
+    # Names the WALL CLOCK specifically — see the round-cap test for why the heading is not enough.
     assert _WALL_CLOCK_TEXT in body
     assert _ROUND_CAP_TEXT not in body
-    # Well under the full 3s sleep: proves the run was actually cut off near the 1s bound,
-    # not merely completed and then happened to be mislabeled.
+    # Well under the full 3s sleep: cut off near the 1s bound rather than completed and mislabeled.
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
 
 
 async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """The clock arms at the first `search_web`/`fetch_pages` call, not at process start
-    (`## Reconciliations` 2026-08-10 — Phase 5). A pre-research `ask_user` wait of any
-    length must not trip it — proven by making the wait (2s) longer than the configured
-    wall clock (1s) and asserting the run still finishes clean. Paired with the mid-run
-    test below; both must exist or neither pins where the clock starts.
+    """The clock arms at the first `search_web`/`fetch_pages` call, not at process start, so a
+    pre-research `ask_user` wait of any length must not trip it — the wait (2s) is longer than the
+    configured clock (1s) and the run must still finish clean. Paired with the mid-run test below;
+    neither alone pins where the clock starts.
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
@@ -836,15 +789,11 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
 async def test_a_mid_run_clarification_is_bounded_by_the_wall_clock(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """Pairs with the pre-research test above: once research has begun the clock is
-    running and is not paused for an interrupt, so an unanswered mid-run ask still ends
-    the run at the bound (`## Reconciliations` 2026-08-10 — Phase 5, consequence 3).
+    """Pairs with the pre-research test above: once research has begun the clock runs and is not
+    paused for an interrupt, so an unanswered mid-run ask still ends the run at the bound.
 
-    A `final` response is scripted for AFTER the resume — reachable only if the wait is
-    never cut short — so an unimplemented clock would let this run complete normally
-    rather than coincidentally raising once the 4-item script exhausts (same reasoning as
-    the wall-clock-expiry test above). The elapsed-time assertion is what actually pins
-    the timeout to the wait itself.
+    A `final` response is scripted for AFTER the resume, reachable only if the wait is never cut
+    short, and the elapsed-time assertion pins the timeout to the wait itself.
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
@@ -898,20 +847,17 @@ async def test_a_mid_run_clarification_is_bounded_by_the_wall_clock(
 async def test_main_writes_a_cut_short_report_when_the_run_dies_mid_flight(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """The model's script runs out (`ScriptedChatModel` raises `IndexError` — see
-    tests/conftest.py) right after one real round, standing in for a genuine mid-run
-    failure. `main` must turn ANY such exception into a written report and exit 1, never
-    let a traceback escape.
+    """The script runs out right after one real round (`ScriptedChatModel` then raises
+    `IndexError`), standing in for a genuine mid-run failure: `main` must turn ANY such exception
+    into a written report and exit 1, never let a traceback escape.
     """
     config = make_config(
         agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
     )
     ping = AIMessage(content="pong")
     plan_call = AIMessage(
-        # Carries prose AND a tool call: the last message in the final state is the
-        # write_todos ToolMessage, so this is the only place `_final_answer` has to walk
-        # BACK past tool traffic to find what the model actually said. Taking
-        # `messages[-1].content` would publish "Updated todo list to [...]" as the answer.
+        # Prose AND a tool call: the final state ends in the write_todos ToolMessage, so
+        # `_final_answer` has to walk BACK past tool traffic to find what the model said.
         content="Partial finding: Acme quoted $4.20/unit.",
         tool_calls=[
             {
@@ -939,14 +885,13 @@ async def test_main_writes_a_cut_short_report_when_the_run_dies_mid_flight(
     assert _CUT_SHORT_HEADING in body
     assert _ERROR_TEXT in body
     assert "IndexError" in body
-    # Pins the `_final_answer` WIRING, not just the helper: what the model actually said
-    # survives, and the trailing tool output does not become the answer (3F Major).
+    # Pins the `_final_answer` WIRING, not just the helper: what the model said survives and the
+    # trailing tool output does not become the answer.
     assert "Partial finding: Acme quoted $4.20/unit." in body
     assert "Updated todo list" not in body
-    # The token cost of a run that died still has to be recorded (R7's baseline). Both this
-    # and the answer above come from the run state, which is only captured DURING the
-    # stream — a cut-short run leaves the loop by exception, so anything gathered after it
-    # is never gathered at all.
+    # A died run's token cost still has to be recorded (R7). This and the answer above both come
+    # from state captured DURING the stream — a cut-short run leaves the loop by exception, so
+    # anything gathered after it is never gathered at all.
     assert "- Total tokens: 48" in body
 
 
@@ -978,27 +923,22 @@ async def test_a_run_inside_both_bounds_reports_no_cut_short(
 async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """A round-capped run whose partial answer cites a real, captured source.
+    """A round-capped run whose partial answer cites a real, captured source — the cut-short x
+    verification seam. Every other cut-short test scripts an answer with no `[Sn]` marker, so
+    verification only ever takes its trivial no-call path, and reaching the model-call branch
+    needs `patch_run`'s patch of `harness.verify`'s own `build_chat_model` binding.
 
-    This is the seam nothing covered (PR #4 review, Major). Every existing cut-short test
-    scripts an answer with no `[Sn]` marker, or no answer at all, so `verify_claims` only
-    ever took its trivial "no marker → no model call" path; the suite asserted cut-short
-    headings and bound text and *looked* like it covered the interaction. It could not
-    cover it, because `harness.verify` holds its own `build_chat_model` binding that no
-    test patched — reaching the model-call branch would have dialed the fake endpoint for
-    real. `patch_run` now patches that binding too, which is what makes this possible.
-
-    The verification model is scripted SEPARATELY from the run model: how many rounds the
-    cap allows is a langgraph implementation detail, so a shared script would make the
-    verify reply's index depend on it.
+    The verification model is scripted SEPARATELY from the run model: how many rounds the cap
+    allows is a langgraph detail, so a shared script would make the verify reply's index depend
+    on it.
     """
     agent = AgentSettings(
         max_rounds=2, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
     )
     config = make_config(agent=agent)
 
-    # `main` builds the registry itself, so a pre-populated one is injected in its place —
-    # standing in for the `fetch_pages` calls a real run would have made before the cap.
+    # `main` builds the registry itself, so a pre-populated one is injected in its place, standing
+    # in for the `fetch_pages` calls a real run would have made before the cap.
     registry = SourceRegistry(run_id="2020-01-01-000000")
     source_id = registry.add("https://example.test/pricing", title="Pricing")
     write_source_capture(config, registry, source_id, "Acme lists $5.10 per unit.")
@@ -1048,12 +988,11 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
 async def test_a_clarifying_question_can_arrive_without_a_question_argument(
     make_config, monkeypatch, capsys
 ):
-    """`args["question"] or description or str(args)` — only the first branch was exercised.
-
-    Nothing guarantees deepagents keeps putting the prompt under `args`, and the fallbacks
-    are all that stand between a schema change and an empty prompt at the terminal
-    (PR #4 review, nit). Driven through `_answer_questions` directly, since an action
-    request that omits `args["question"]` is a shape no real model can be scripted into.
+    """Exercises the `description` and `str(args)` fallbacks of `args["question"] or description or
+    str(args)`: nothing guarantees deepagents keeps putting the prompt under `args`, and those
+    fallbacks are all that stand between a schema change and an empty prompt at the terminal.
+    Driven through `_answer_questions` directly, since no real model can be scripted into that
+    shape.
     """
 
     async def _record(prompt: str = "> ") -> str:

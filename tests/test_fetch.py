@@ -177,7 +177,7 @@ async def test_equivalent_url_spellings_are_fetched_once_with_one_source_id(
         registry,
     )
 
-    # One crawl, one page, one heading — never two [Sn] blocks over one identity.
+    # One crawl, one page, one heading: never two [Sn] blocks over one identity.
     assert fake_cls.calls[0].urls == ["https://dup.test/a"]
     assert len(pages) == 1
     assert registry.get(pages[0].source_id) is not None
@@ -253,8 +253,7 @@ def test_text_with_no_boundary_before_the_cap_falls_back_to_a_hard_cut():
 
 
 def test_an_early_boundary_is_taken_even_though_it_discards_most_of_the_allowance():
-    # Supersedes test_a_boundary_too_early_to_be_worth_taking_falls_back_to_the_hard_cut:
-    # the `_MIN_BOUNDARY_FRACTION` floor was removed, so the latest boundary always wins.
+    # There is no minimum-boundary floor: the latest boundary always wins.
     cap = 100
     text = "A" * 10 + "\n\n" + "B" * 200
 
@@ -332,8 +331,8 @@ async def test_dispatcher_is_memory_bounded_and_rate_limited(install_crawler, ma
     dispatcher = fake_cls.calls[0].dispatcher
     # 75%, not crawl4ai's 90% default: each permit is a real browser page.
     assert dispatcher.memory_threshold_percent == 75.0
-    # Not a retry count — 0.9.2 re-fetches nothing on a 429/503; this caps how many times a
-    # domain's backoff delay doubles, and that sleep holds a concurrency permit.
+    # Not a retry count: 0.9.2 re-fetches nothing on a 429/503. It caps how many times a domain's
+    # backoff delay doubles, and that sleep holds a concurrency permit.
     assert dispatcher.rate_limiter is not None
     assert dispatcher.rate_limiter.max_retries == 1
 
@@ -484,8 +483,8 @@ async def test_content_type_header_on_the_result_drives_non_html_classification(
 
     _, pages = await fetch._fetch(["https://pdf.test/doc"], config, registry)
 
-    # Exercises _content_type's case-insensitive header lookup through the real
-    # pipeline — the classify() unit tests bypass it with a plain string.
+    # Exercises `_content_type`'s case-insensitive header lookup through the real pipeline, which
+    # the `classify()` unit tests bypass with a plain string.
     assert pages[0].outcome == "non_html"
 
 
@@ -498,8 +497,7 @@ async def test_input_url_with_no_result_reports_a_single_error_outcome(
 
     _, pages = await fetch._fetch(["https://a.test"], config, registry)
 
-    # This is the `None`-pairing branch (fetch.py:212-224), which was previously
-    # untested; it must survive the removal of the positional fallback.
+    # The `None`-pairing branch: it must survive the removal of the positional fallback.
     assert len(pages) == 1
     assert pages[0].url == "https://a.test"
     assert pages[0].outcome == "error"
@@ -510,8 +508,8 @@ async def test_input_url_with_no_result_reports_a_single_error_outcome(
 async def test_the_first_of_two_results_for_one_url_is_the_one_reported(
     install_crawler, make_config
 ):
-    # Pins `_pair`'s documented `bucket.pop(0)`: under memory pressure the dispatcher can
-    # return a "Requeued" placeholder AND re-queue the crawl, and the first result wins.
+    # Pins `_pair`'s `bucket.pop(0)`: under memory pressure the dispatcher can return a
+    # "Requeued" placeholder AND re-queue the crawl, and the first result wins.
     config = make_config()
     registry = SourceRegistry()
     results = [
@@ -534,9 +532,8 @@ async def test_the_first_of_two_results_for_one_url_is_the_one_reported(
 async def test_result_matching_no_input_url_never_supplies_another_urls_body(
     install_crawler, make_config
 ):
-    # Supersedes the deleted test_result_whose_url_diff_from_input_paired, which asserted
-    # the opposite: that an unrelated result could be handed to an input URL positionally.
-    # A visible `error` is strictly safer than a plausible wrong citation.
+    # A visible `error` is safer than pairing an unrelated result to an input URL positionally,
+    # which would produce a plausible wrong citation.
     config = make_config()
     registry = SourceRegistry()
     results = [
@@ -564,9 +561,8 @@ def _tool_call(urls: list[str], call_id: str) -> dict:
 
 
 async def test_a_call_over_the_url_limit_is_rejected_before_any_fetch(install_crawler, make_config):
-    # R7 / D2 — the schema rejects the call before any fetch happens, and the rejection comes
-    # back as a recoverable tool message rather than an exception escaping the call (risk #3),
-    # so the caller can resend fewer URLs.
+    # R7/D2: the schema rejects the call before any fetch, and the rejection returns as a
+    # recoverable tool message rather than an exception, so the caller can resend fewer URLs.
     config = make_config()
     limit = config.fetch.max_urls_per_call
     registry = SourceRegistry()
@@ -585,9 +581,8 @@ async def test_a_call_over_the_url_limit_is_rejected_before_any_fetch(install_cr
 
 
 async def test_duplicate_urls_still_count_toward_the_limit(install_crawler, make_config):
-    # R7 sub-bullet: the limit counts URLs as submitted, not after deduplication. Six URLs of
-    # which two are equivalent spellings is rejected, not silently collapsed to four and
-    # accepted — the cap lives in the schema, which runs before `_fetch` dedups.
+    # The limit counts URLs as submitted, not after deduplication: the cap lives in the schema,
+    # which runs before `_fetch` dedups, so six URLs of which two are duplicates is rejected.
     config = make_config(max_urls_per_call=5)
     registry = SourceRegistry()
     fake_cls = install_crawler([])
@@ -614,9 +609,8 @@ async def test_duplicate_urls_still_count_toward_the_limit(install_crawler, make
 async def test_a_malformed_call_is_reported_as_itself_not_as_an_over_limit_call(
     install_crawler, make_config
 ):
-    # The `handle_validation_error` hook swallows EVERY validation failure for this tool, so it
-    # must report the real cause — a fixed over-limit string would leave a wrong type looking
-    # like a too-long list and give the caller nothing to correct.
+    # The `handle_validation_error` hook swallows EVERY validation failure for this tool, so a
+    # fixed over-limit string would make a wrong type look like a too-long list.
     config = make_config()
     registry = SourceRegistry()
     fake_cls = install_crawler([])
@@ -780,8 +774,8 @@ async def test_failed_fetch_writes_a_stub_naming_its_outcome(
     assert "https://fail.test" in text
     assert page_text not in text
 
-    # The stub keeps the status code and error text the artifact carries, omitting
-    # a bullet when its value is absent rather than printing `None`.
+    # The stub keeps the artifact's status code and error text, omitting a bullet whose value is
+    # absent rather than printing `None`.
     if page.status_code is not None:
         assert f"- Status: {page.status_code}" in text
     else:
@@ -848,9 +842,8 @@ async def test_one_source_write_failure_does_not_poison_the_batch_or_go_silent(
     install_crawler(results)
     fetch_pages = fetch.build_fetch_tool(config, registry)
 
-    # Source IDs are minted in input order by a fresh registry, so the first URL is
-    # S1 and the second S2 — predictable before the call, letting us target exactly
-    # one write for failure.
+    # A fresh registry mints IDs in input order, so the first URL is S1 and the second S2 —
+    # predictable before the call, which is what lets exactly one write be targeted.
     failing_path = fetch._sources_dir(config, registry) / "S1.md"
     ok_path = fetch._sources_dir(config, registry) / "S2.md"
     real_write_text = Path.write_text
@@ -866,9 +859,9 @@ async def test_one_source_write_failure_does_not_poison_the_batch_or_go_silent(
         _tool_call(["https://a.test", "https://b.test"], "call-write-fail")
     )
 
-    # The batch was not failed — both pages still come back.
+    # The batch was not failed: both pages still come back.
     assert [page.url for page in message.artifact] == ["https://a.test", "https://b.test"]
-    # One failure did not poison the rest — the second file was still written.
+    # And one failure did not poison the rest: the second file was still written.
     assert not failing_path.exists()
     assert ok_path.exists()
 
@@ -917,11 +910,9 @@ async def test_refetching_the_same_url_overwrites_the_same_source_file(
 async def test_a_failed_refetch_does_not_overwrite_a_successful_capture(
     install_crawler, make_config, tmp_path
 ):
-    """A transient failure on a URL already captured must not destroy the evidence.
-
-    Both attempts share one `[Sn]` and one file, and `harness/verify.py` reads only that
-    file — so a stub written over real content would report a claim the model genuinely
-    sourced as unverifiable (PR #4 review, Major).
+    """A transient failure on a URL already captured must not destroy the evidence: both attempts
+    share one `[Sn]` and one file, and `harness/verify.py` reads only that file, so a stub written
+    over real content would report a genuinely sourced claim as unverifiable.
     """
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
@@ -941,7 +932,7 @@ async def test_a_failed_refetch_does_not_overwrite_a_successful_capture(
     install_crawler([_FakeResult("https://flaky.test", status_code=429, markdown=None)])
     second = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-blocked"))
 
-    # The model still learns the refetch was blocked — only the captured file is spared.
+    # The model still learns the refetch was blocked: only the captured file is spared.
     assert second.artifact[0].outcome == "blocked"
     text = (fetch._sources_dir(config, registry) / f"{source_id}.md").read_text(encoding="utf-8")
     assert not fetch.is_failed_capture(text)
@@ -951,7 +942,7 @@ async def test_a_failed_refetch_does_not_overwrite_a_successful_capture(
 async def test_a_successful_refetch_still_replaces_a_failure_stub(
     install_crawler, make_config, tmp_path
 ):
-    """The no-downgrade guard is one-way — a later success must still win."""
+    """The no-downgrade guard is one-way: a later success must still win."""
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
     fetch_pages = fetch.build_fetch_tool(config, registry)
