@@ -384,10 +384,13 @@ indices.
 **Contracts:**
 - `RunOutcome.paragraphs: list[Paragraph]` — index-aligned with
   `RunOutcome.verification.verdicts` when verification ran.
-- Rendered paragraph format: stripped prose, then `Sources: <link> <link>` when
-  `source_ids` is non-empty, then `Verdict: <label> - <detail>` where `<label>` is the
-  verdict with underscores replaced by spaces. List blocks carry `*` on each
-  `unsupported_items` bullet and open `<detail>` with `n/m bullets verified`.
+- Rendered paragraph format: stripped prose, then ~~`Sources: <link> <link>`~~ a blank
+  line and `**Sources:** <link> <link>` when `source_ids` is non-empty, then
+  ~~`Verdict: <label> - <detail>`~~ `**Verdict:** <label> - <detail>` where `<label>` is
+  the verdict with underscores replaced by spaces. List blocks carry `*` on each
+  `unsupported_items` bullet and open `<detail>` with `n/m bullets verified`. The struck
+  text is what this phase shipped; the bold, blank-line-separated pair superseded it
+  after the first live report — see docs/decisions.md 2026-08-14.
 
 **Out of scope:**
 - ~~`_gaps_section`~~, `_sources_section`, `_notes_section`, `_usage_lines` — the coverage

@@ -316,7 +316,11 @@ def _paragraph_block(
         return "\n".join(lines)
 
     links = " ".join(registry.link(sid) for sid in registered)
-    lines.append("")
+    # Guarded, not unconditional: a paragraph that is nothing but a citation marker
+    # (`[S1]`) strips to no prose at all, and a separator with nothing above it opens the
+    # block with a blank line the joined answer does not need.
+    if lines:
+        lines.append("")
     lines.append(f"{SOURCES_LABEL} {links}{_HARD_BREAK}")
 
     if verdict is None:

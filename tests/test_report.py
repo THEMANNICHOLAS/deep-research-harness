@@ -717,6 +717,12 @@ def test_the_sources_verdict_pair_is_separated_from_its_prose_by_a_blank_line(ma
     blank line separates it, both labels are bold, and the `Sources:` line ends in
     markdown's two-space hard break so a renderer keeps `Verdict:` on its own line
     instead of joining them.
+
+    The one test that spells both labels LITERALLY rather than through `SOURCES_LABEL` /
+    `VERDICT_LABEL` (PR #10 review, Minor). Every other assertion in this suite goes
+    through the constants and so would follow them anywhere; without this one, renaming
+    a label to anything at all leaves the whole suite green and the reader-facing
+    vocabulary unpinned.
     """
     config = make_config()
     registry = SourceRegistry()
@@ -741,8 +747,43 @@ def test_the_sources_verdict_pair_is_separated_from_its_prose_by_a_blank_line(ma
 
     prose_index = lines.index("The pump failed under load.")
     assert lines[prose_index + 1] == ""
-    assert lines[prose_index + 2] == f"{SOURCES_LABEL} {registry.link(source_id)}  "
-    assert lines[prose_index + 3] == f"{VERDICT_LABEL} supported - Confirmed."
+    assert lines[prose_index + 2] == f"**Sources:** {registry.link(source_id)}  "
+    assert lines[prose_index + 3] == "**Verdict:** supported - Confirmed."
+
+
+def test_a_citation_only_paragraph_opens_with_its_sources_line_not_a_blank_one(make_config):
+    """The blank separator above is a separator, not a prefix.
+
+    A paragraph that is nothing but a citation marker strips to no prose at all, so there
+    is nothing for a blank line to separate the pair FROM — emitting one anyway opens the
+    block with a stray empty line (PR #10 review, Nit).
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/pump")
+    write_source_capture(config, registry, source_id, "Body text.")
+    answer = f"[{source_id}]"
+    outcome = RunOutcome(
+        question="What failed?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=split_paragraphs(answer),
+        verification=VerificationResult(
+            verdicts=[
+                ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[source_id])
+            ]
+        ),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    # Asserted on the exact prefix, not on "the first non-empty line": a stray blank does
+    # not change which line is first non-empty, so only counting the newlines before
+    # `Sources:` can catch it. `_section` returns the newline ending the heading line plus
+    # `_render_body`'s blank line — two, and the paragraph's own text starts right after.
+    assert answer_section.startswith(f"\n\n{SOURCES_LABEL} {registry.link(source_id)}  \n")
 
 
 def test_write_report_resolves_registered_sources_and_discloses_unregistered_markers(
