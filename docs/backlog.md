@@ -110,3 +110,10 @@ to address.
   whole message history. To address: read the process's RSS at the first tool call and
   again at completion during a normal-length run, and compare against the run's total
   input tokens.
+
+- **An agentic verification search tool (greps source text instead of one pooled call per
+  paragraph).** Deferred as a non-goal in @docs/plans/PLAN-reader-delegation.md: today's
+  `verify_paragraphs` (@harness/verify.py) pools a paragraph's whole cited-source text into
+  one model call, which does not scale if a source capture grows large enough that pooling
+  several of them stops fitting the model's context. To address: a verifier that can search
+  within captured source text on demand rather than having it all pooled up front.

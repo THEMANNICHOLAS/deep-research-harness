@@ -1,6 +1,6 @@
 # PLAN: Reader Subagent Delegation
 
-**Status:** In Progress
+**Status:** Complete
 **Created:** 2026-08-14
 **Type:** Single plan
 
@@ -207,8 +207,9 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Wire the reader subagent (tracer bullet)
 - [x] Phase 2: Failure path — retry, catch, fallback tool
 - [x] Phase 3: Disclosure and prompt wiring
-- [ ] Phase 4: End-to-end regression + docs
-- [ ] Final verification
+- [x] Phase 4: End-to-end regression + docs
+- [x] Final verification (manual live smoke remains a post-merge operator step — see the
+  Phase 4 handoff-log entry)
 
 ## Phases
 
@@ -413,11 +414,11 @@ and the documentation reflects the wired tier.
   not silent fixing).
 
 **Tests (write first, confirm red):**
-- [ ] End-to-end scripted run: lead issues `task(subagent_type="reader")`; reader's scripted
+- [x] End-to-end scripted run: lead issues `task(subagent_type="reader")`; reader's scripted
   model drives the shared fetch tool (fake crawler); digest returns to the lead; final
   report cites `[Sn]` IDs that resolve through the shared registry (R4) and discloses
   read modes.
-- [ ] Verification regression: `verify_paragraphs` on that run consumes the capture FILES
+- [x] Verification regression: `verify_paragraphs` on that run consumes the capture FILES
   (fake-crawler content), not the digest text (R3) — assert the verification prompt's
   source payload contains capture text absent from the digest.
 
@@ -428,15 +429,18 @@ and the documentation reflects the wired tier.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full quality gate green (see ## Verification).
-- [ ] A manual live smoke run is documented as an OPERATOR step (command + what to watch:
+- [x] Full quality gate green (see ## Verification).
+- [x] A manual live smoke run is documented as an OPERATOR step (command + what to watch:
   token spend vs the ~796k head baseline, docs/decisions.md D10) — not executed by CI.
+  (Delivered in-session per developer choice — surfaced by the 3F review as a gap in the
+  written docs; the full step is recorded in the Phase 4 handoff-log entry below so it
+  survives the chat.)
 
 ## Verification
-- [ ] `uv run pytest` — full suite, including the Phase 4 e2e scripted run.
-- [ ] `uv run ruff check .`
-- [ ] `uv run ruff format --check .`
-- [ ] `uv run mypy .`
+- [x] `uv run pytest` — full suite, including the Phase 4 e2e scripted run (351 passed).
+- [x] `uv run ruff check .`
+- [x] `uv run ruff format --check .`
+- [x] `uv run mypy .`
 - [ ] Manual (operator, post-merge): one live research run; confirm the report shows
   digested sources, `[Sn]` links resolve, and disclosure lists any fallbacks.
 
@@ -537,6 +541,27 @@ absence-test was replaced with behavioral pins on the new `## Source reading` se
   deepagents' per-subagent assembly (risk !#4); use `patch_models_by_role` (conftest)
   for role-distinct scripting; surface seam problems rather than weakening to
   "task was called".
+
+### 2026-08-14 — Phase 4: End-to-end regression + docs
+- Done: tests/test_delegation_e2e.py (2 tests) drives the whole loop through main() —
+  role-distinct scripted models, fake crawler, R3/R4 three-way unique-marker checks,
+  reader.md-prompt sanity (risk !#4 answered: deepagents invokes OUR model instance);
+  fake-crawler harness consolidated into conftest.py; four docs updated (architecture,
+  INDEX, decisions D1-D5 bullets, backlog). 351 tests + full gate green. E2e was green
+  on first run; assertions inversion-checked instead of red-first.
+- Learned: single-source all-digested runs render the summary line, not [S1] bullets
+  (frozen Phase 3 behavior). 3F flagged the missing operator smoke-run doc ([Major]);
+  developer chose in-chat delivery. OPERATOR SMOKE STEP (post-merge): run
+  `uv run python -m harness "<question>"`; watch (1) total token spend vs the ~796k
+  head baseline (decisions.md D10; delegation priced 3-10x — if far past band, drop
+  task retry 1 -> 0 per risk !#3), (2) `## Source reading` shows digested sources and
+  any fallback carries a reason, (3) `[Sn]` links resolve, (4) wall-clock per round,
+  (5) LATER-PROBLEMS.md #7 shares this first live run — attribute its failures
+  correctly.
+- Drift: none.
+- Watch-next: run the live smoke above; if the delegation multiplier is pathological,
+  reconcile retry to 0. Wiring the researcher tier is the next round and may force the
+  [roles.reader] split (D3 consequence).
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so

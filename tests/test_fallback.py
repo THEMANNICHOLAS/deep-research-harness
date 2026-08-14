@@ -1,26 +1,11 @@
 """Behavioral tests for harness.tools.fallback (the `fetch_raw` recovery tool, D2/R2/R5)."""
 
-import pytest
 from langchain_core.tools import BaseTool
 
 from harness.config import AgentSettings
 from harness.sources import SourceRegistry
 from harness.tools import fallback, fetch
-from tests.test_fetch import _FakeMarkdown, _FakeResult, _make_fake_crawler_class
-
-
-@pytest.fixture
-def install_crawler(monkeypatch):
-    """Patch AsyncWebCrawler in fetch.py's namespace: fallback reuses fetch's `_fetch`, and
-    that is where the crawler is actually constructed.
-    """
-
-    def _install(results: list[_FakeResult]) -> type:
-        fake_cls = _make_fake_crawler_class(results)
-        monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
-        return fake_cls
-
-    return _install
+from tests.conftest import _FakeMarkdown, _FakeResult
 
 
 def _tool_call(urls: list[str], reason: str, call_id: str) -> dict:
