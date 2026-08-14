@@ -6,9 +6,9 @@ from harness.paragraphs import Paragraph, split_paragraphs, strip_markers
 
 
 def test_fenced_code_block_is_its_own_code_paragraph_keeping_its_content():
-    """A fence is excluded from the VERIFICATION unit without being dropped from the
-    answer: it becomes an `is_code` paragraph carrying no citations and no bullets, so it
-    takes the zero-call `no_sources_cited` path while its text survives for rendering.
+    """A fence is excluded from the VERIFICATION unit without being dropped from the answer: as an
+    `is_code` paragraph with no citations and no bullets it takes the zero-call path, and its text
+    still renders.
     """
     answer = (
         "Intro paragraph one.\n\n```python\ndef f():\n    return 1\n```\n\nClosing paragraph two."
@@ -27,8 +27,8 @@ def test_fenced_code_block_is_its_own_code_paragraph_keeping_its_content():
 
 
 def test_a_marker_inside_a_fence_is_not_treated_as_a_citation():
-    """A `[S1]` in a code sample is syntax, not a citation — it must not pull a source
-    onto a `Sources:` line or trigger a verification call.
+    """A `[S1]` in a code sample is syntax, not a citation: it must not pull a source onto a
+    `Sources:` line or trigger a verification call.
     """
     paragraphs = split_paragraphs("```\nlookup(table[S1])\n```")
 
@@ -103,8 +103,8 @@ def test_strip_markers_drops_a_line_that_holds_only_a_marker():
 
 
 def test_strip_markers_drops_a_bullet_that_held_only_a_marker():
-    """The list-syntax half of the test above. `- [S1]` used to survive as a contentless
-    `-`: the dash kept the line truthy once the marker was gone (PR #7 review).
+    """The list-syntax half of the test above: `- [S1]` survived as a contentless `-`, because the
+    dash kept the line truthy once the marker was gone.
     """
     text = "- Real finding [S1].\n- [S2]\n1. [S3]"
 

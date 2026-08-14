@@ -102,8 +102,7 @@ async def test_request_targets_the_configured_searxng_json_endpoint(
     assert request.url.host == "searx.test"
     assert request.url.path == "/search"
     assert request.url.params["q"] == "solar panels"
-    # Without format=json SearXNG serves HTML — the failure this pins would only ever
-    # surface against a live instance.
+    # Without format=json SearXNG serves HTML, a failure that would only surface live.
     assert request.url.params["format"] == "json"
 
 

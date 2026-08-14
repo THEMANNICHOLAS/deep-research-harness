@@ -1,15 +1,13 @@
 """The pre-research clarification tool, gated by the agent's `interrupt_on` middleware.
 
-`ask_user` is never actually executed on the real path (Phase 4 plan, settled fact 3):
-`harness/agent.py` registers it in `interrupt_on` with `allowed_decisions=["respond"]`, so
-`HumanInTheLoopMiddleware` intercepts the call, prints/collects the developer's answer, and
-synthesizes the tool's `ToolMessage` result itself before the function body ever runs. The
-function below exists only to give the model a name, description, and schema to call.
+`ask_user` never executes on the real path: `harness/agent.py` registers it in `interrupt_on`
+with `allowed_decisions=["respond"]`, so `HumanInTheLoopMiddleware` intercepts the call,
+collects the developer's answer, and synthesizes the `ToolMessage` itself. The function exists
+only to give the model a name, description and schema to call.
 
 Its body therefore raises rather than returning a stand-in answer. Reaching it means the
 `interrupt_on` registration is gone, and a run that silently answered its own clarifying
-question would research the wrong thing and never say so — the failure must be loud
-(PR #4 review: the stand-in string was unreachable and untestable dead code).
+question would research the wrong thing without ever saying so.
 """
 
 from langchain_core.tools import BaseTool, tool
@@ -23,8 +21,8 @@ ASK_USER_TOOL_NAME = "ask_user"
 def build_ask_user_tool(config: HarnessConfig) -> BaseTool:
     """Build the `ask_user` tool.
 
-    `config` is unused today but kept — every sibling tool builder takes it, and the
-    plan freezes this signature.
+    `config` is unused today but kept: every sibling tool builder takes it, and this signature
+    is frozen.
     """
 
     class AskUserInput(BaseModel):

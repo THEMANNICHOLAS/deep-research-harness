@@ -35,22 +35,18 @@ _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form",
 # box also hosts SearXNG and Chromium.
 _MEMORY_THRESHOLD_PERCENT = 75.0
 
-# The single home for this policy string: `_write_source_file` writes it as the first
-# line of any non-`fetched` source's captured file, and `harness/report.py` imports it
-# to judge, from that same captured file, whether a registered source is usable evidence
-# (CLAUDE.md: a constant or policy statement lives in exactly one place).
+# The single home for this policy string: `_write_source_file` writes it as the first line of
+# any non-`fetched` capture, and `harness/report.py` reads it to judge whether a registered
+# source is usable evidence.
 FETCH_FAILED_PREFIX = "FETCH FAILED: "
 
 
 def is_failed_capture(source_text: str) -> bool:
     """Whether a captured source file's text is a failure stub rather than real content.
 
-    The single home for READING the policy `FETCH_FAILED_PREFIX` writes, as opposed to
-    the prefix itself. `harness/report.py` (is this source usable evidence?) and
-    `harness/verify.py` (can this source settle a claim?) both ask the same question and
-    had each implemented "split the first line, test the prefix" separately (PR #4
-    review, Minor) — a change to the stub shape had to land in two places or leave the
-    two disagreeing about which sources count as evidence.
+    The single home for READING what `FETCH_FAILED_PREFIX` writes. `report.py` (is this usable
+    evidence?) and `verify.py` (can this settle a claim?) ask the same question, and two copies
+    of "split the first line, test the prefix" could disagree about which sources count.
     """
     return source_text.split("\n", 1)[0].startswith(FETCH_FAILED_PREFIX)
 
@@ -61,11 +57,11 @@ def _sources_dir(config: HarnessConfig, registry: SourceRegistry) -> Path:
 
 
 # Despite the name, crawl4ai 0.9.2 re-fetches nothing — this caps how many times a domain's
-# backoff delay may double. See @docs/plans/PLAN-crawler-refinement.md Reconciliation #1.
+# backoff delay may double.
 _RATE_LIMIT_MAX_RETRIES = 1
 
-# crawl4ai hands us flat strings with no heading tree, so a cut boundary has to be
-# found in the text itself.
+# crawl4ai hands us flat strings with no heading tree, so a cut boundary has to be found in the
+# text itself.
 _HEADING_LINE = re.compile(r"^#{1,6} ", re.MULTILINE)
 
 
@@ -77,8 +73,8 @@ def classify(
 ) -> FetchOutcome:
     """Classify one crawl result into the frozen outcome vocabulary.
 
-    Success is inferred from `error_message` being absent — there is no `success` flag,
-    so no error plus empty markdown means an empty (non-HTML) page, not an error.
+    Success is inferred from `error_message` being absent: there is no `success` flag, so no
+    error plus empty markdown means an empty (non-HTML) page rather than a failure.
     """
     if status_code in _BLOCKED_STATUSES:
         return "blocked"
@@ -135,10 +131,9 @@ def _title_of(result: object) -> str | None:
 def _pair(urls: list[str], results: list[object]) -> list[tuple[str, object | None]]:
     """Pair each URL with the result crawl4ai keyed to it exactly.
 
-    Never positional: an unclaimed result could attribute one page's body to another's
-    `[Sn]`. No match pairs with `None` and reports `error`. One URL can yield two results
-    under memory pressure; the first is taken. See
-    @docs/plans/PLAN-crawler-refinement.md Phase 1.
+    Never positional: an unclaimed result could attribute one page's body to another's `[Sn]`.
+    No match pairs with `None` and reports `error`. One URL can yield two results under memory
+    pressure; the first is taken.
     """
     by_url: dict[str | None, list[object]] = {}
     for result in results:
@@ -154,8 +149,8 @@ def _pair(urls: list[str], results: list[object]) -> list[tuple[str, object | No
 def _holds_successful_capture(path: Path) -> bool:
     """Whether `path` already holds real captured content rather than a failure stub.
 
-    A missing or unreadable file answers False — the caller only asks in order to decide
-    whether overwriting would LOSE evidence, and neither case has any to lose.
+    A missing or unreadable file answers False: the caller asks only to decide whether
+    overwriting would LOSE evidence, and neither case has any to lose.
     """
     try:
         return not is_failed_capture(path.read_text(encoding="utf-8"))
@@ -166,16 +161,15 @@ def _holds_successful_capture(path: Path) -> bool:
 def _write_source_file(sources_dir: Path, page: FetchedPage) -> None:
     """Write `page`'s full-text capture to `<sources_dir>/<source_id>.md`.
 
-    A `fetched` page gets its full untruncated markdown; any other outcome gets a stub
-    whose first line names the outcome (`FETCH FAILED: <outcome>`) so Phase 6 can treat
-    it as unusable without parsing further. A refetched URL reuses its registry ID and
-    rewrites its file rather than duplicating it (D10) — but only ever upward: a later
-    failure never overwrites content an earlier fetch captured. The registry hands the
-    same `[Sn]` to both attempts, so downgrading the file would make Phase 6 report a
-    claim cited from the good capture as unverifiable (PR #4 review, Major).
+    A `fetched` page gets its full untruncated markdown; any other outcome gets a stub whose
+    first line names the outcome, so a reader can treat it as unusable without parsing further.
+    A refetched URL reuses its registry ID and rewrites its file rather than duplicating it
+    (D10) — but only ever upward: a later failure never overwrites captured content, because
+    both attempts share one `[Sn]` and downgrading the file would make a claim cited from the
+    good capture report as unverifiable.
 
-    A write failure here degrades to a skipped file, never an exception into the model —
-    Phase 6 treats a missing source file exactly as it treats a stub.
+    A write failure degrades to a skipped file, never an exception into the model; a missing
+    capture is treated exactly like a stub.
     """
     path = sources_dir / f"{page.source_id}.md"
     if page.outcome != "fetched" and _holds_successful_capture(path):
@@ -226,8 +220,8 @@ def _render(page: FetchedPage, cap: int) -> str:
     text = page.markdown
     if len(text) > cap:
         window = text[:cap]
-        # Cut at the latest paragraph break or heading start (a heading with no body is
-        # noise). No boundary, or one at 0 that would empty the block, takes the full cap.
+        # Cut at the latest paragraph break or heading start (a heading with no body is noise).
+        # No boundary, or one at 0 that would empty the block, takes the full cap.
         boundary = max([window.rfind("\n\n"), *(m.start() for m in _HEADING_LINE.finditer(window))])
         cut = boundary if boundary > 0 else cap
         text = (
@@ -243,8 +237,8 @@ async def _fetch(
     urls: list[str], config: HarnessConfig, registry: SourceRegistry
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL, returning model-facing markdown and the full per-URL artifact."""
-    # Crawl each canonical URL once: the registry dedups by normalized URL, so two
-    # spellings would otherwise render duplicate [Sn] headings over different bodies.
+    # Crawl each canonical URL once: the registry dedups by normalized URL, so two spellings
+    # would otherwise render duplicate [Sn] headings over different bodies.
     seen: set[str] = set()
     unique_urls: list[str] = []
     for url in urls:
@@ -321,9 +315,8 @@ async def _fetch(
 def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseTool:
     """Build the `fetch_pages` tool, closing over `config` and the shared `registry`.
 
-    Creates `<workspace_dir>/<run_id>/sources` up front, so an unwritable workspace
-    fails at startup — before any research is spent — rather than silently losing
-    captures mid-run.
+    Creates `<workspace_dir>/<run_id>/sources` up front, so an unwritable workspace fails at
+    startup rather than silently losing captures mid-run.
     """
     _sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
@@ -346,15 +339,14 @@ def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseToo
     async def fetch_pages(urls: list[str]) -> tuple[str, list[FetchedPage]]:
         """Fetch the given URLs and return boilerplate-stripped markdown for each.
 
-        Failures (blocked, timed out, non-HTML, or otherwise unfetchable pages) are
-        reported per URL with their outcome rather than raising, so one bad URL never
-        fails the whole batch. URLs that are equivalent spellings of the same page
-        (trailing slash, fragment, case) are fetched once and reported once.
+        Failures (blocked, timed out, non-HTML, otherwise unfetchable) are reported per URL with
+        their outcome rather than raising, so one bad URL never fails the batch. Equivalent
+        spellings of the same page (trailing slash, fragment, case) are fetched once.
         """
         return await _fetch(urls, config, registry)
 
-    # Appended rather than written into the docstring above: the limit is config, and a
-    # literal would go stale the moment an operator changed it (D2).
+    # Appended rather than written into the docstring: the limit is config, and a literal would
+    # go stale the moment an operator changed it (D2).
     fetch_pages.description = (
         f"{fetch_pages.description}\n\nAt most {max_urls} URLs may be requested per call; "
         "a call carrying more is rejected without fetching anything."
@@ -368,8 +360,8 @@ def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseToo
             f"At most {max_urls} URLs may be requested per call."
         )
 
-    # A callable, not a fixed string: this swallows EVERY validation failure for the tool, so
-    # a wrong type must not be misreported as an over-limit call (D2, risk #3).
+    # A callable, not a fixed string: this swallows EVERY validation failure for the tool, so a
+    # wrong type must not be misreported as an over-limit call (D2).
     fetch_pages.handle_validation_error = _explain_validation_error
 
     return fetch_pages
