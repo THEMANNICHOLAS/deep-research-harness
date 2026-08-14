@@ -25,6 +25,17 @@ from harness.verify import MODEL_VERDICTS, ParagraphVerdict, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
+
+# The one spelling of each per-paragraph label. Bold, and preceded by a blank line, because
+# an unstyled `Sources:` on the line right after the prose read as another sentence of the
+# paragraph rather than as machinery about it. Public so tests assert the rendered label
+# rather than re-spelling it.
+SOURCES_LABEL = "**Sources:**"
+VERDICT_LABEL = "**Verdict:**"
+# Two trailing spaces: markdown's hard line break. Without it `Sources:` and `Verdict:`
+# are one paragraph and a renderer joins them onto a single line; a blank line between
+# them instead would space the pair further apart than the paragraph it belongs to.
+_HARD_BREAK = "  "
 _NO_SOURCES_TEXT = "No usable sources were found for this run."
 _UNUSABLE_HEADING = "Not usable as evidence (fetch failed or capture missing):"
 
@@ -288,9 +299,10 @@ def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> 
 def _paragraph_block(
     paragraph: Paragraph, verdict: ParagraphVerdict | None, registry: SourceRegistry
 ) -> str:
-    """Render one paragraph: marker-stripped prose, then `Sources:`/`Verdict:` when the
-    paragraph cites at least one REGISTERED source — gated on citation alone, never on
-    the verdict value, so a `supported` paragraph gets a line exactly like any other.
+    """Render one paragraph: marker-stripped prose, a blank line, then the bold
+    `**Sources:**`/`**Verdict:**` pair when the paragraph cites at least one REGISTERED
+    source — gated on citation alone, never on the verdict value, so a `supported`
+    paragraph gets a line exactly like any other.
 
     A fenced block is emitted verbatim: stripping markers or re-wrapping it would corrupt
     the code, and it cites nothing, so it carries no `Sources:`/`Verdict:` pair anyway.
@@ -303,7 +315,9 @@ def _paragraph_block(
     if not registered:
         return "\n".join(lines)
 
-    lines.append(f"Sources: {' '.join(registry.link(sid) for sid in registered)}")
+    links = " ".join(registry.link(sid) for sid in registered)
+    lines.append("")
+    lines.append(f"{SOURCES_LABEL} {links}{_HARD_BREAK}")
 
     if verdict is None:
         label = "not verified"
@@ -319,7 +333,7 @@ def _paragraph_block(
         if counted and verdict.verdict in MODEL_VERDICTS:
             unsupported_count = len(set(verdict.unsupported_items) & set(counted))
             detail = f"{len(counted) - unsupported_count}/{len(counted)} bullets verified. {detail}"
-    lines.append(f"Verdict: {label} - {detail}")
+    lines.append(f"{VERDICT_LABEL} {label} - {detail}")
     return "\n".join(lines)
 
 

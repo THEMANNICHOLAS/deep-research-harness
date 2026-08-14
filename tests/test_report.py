@@ -29,6 +29,8 @@ from harness.report import (
     _ROUND_CAP_TEXT,
     _UNUSABLE_HEADING,
     _WALL_CLOCK_TEXT,
+    SOURCES_LABEL,
+    VERDICT_LABEL,
     RunOutcome,
     write_report,
 )
@@ -633,7 +635,7 @@ def test_write_report_renders_a_verdict_line_for_every_citing_paragraph_regardle
 
     for v in verdict_values:
         label = v.replace("_", " ")
-        assert f"Verdict: {label} - Detail for {v}." in answer_section
+        assert f"{VERDICT_LABEL} {label} - Detail for {v}." in answer_section
     # Exactly one Verdict: line per paragraph — the count assertion the old per-claim
     # marker count (`body.count("**[") == 5`) becomes under the new format.
     assert answer_section.count("Verdict:") == 4
@@ -672,7 +674,7 @@ def test_no_marker_or_markdown_link_ever_appears_inside_a_paragraphs_prose(make_
     assert prose_line == "The pump failed under load."
     assert "[S" not in prose_line
     assert "](" not in prose_line
-    assert f"Sources: {registry.link(source_id)}" in answer_section
+    assert f"{SOURCES_LABEL} {registry.link(source_id)}" in answer_section
 
 
 def test_sources_line_is_space_separated_deduped_first_appearance_order_before_verdict(
@@ -704,9 +706,43 @@ def test_sources_line_is_space_separated_deduped_first_appearance_order_before_v
     body = write_report(outcome, config).read_text(encoding="utf-8")
     answer_section = _section(body, "## Answer")
 
-    expected_sources_line = f"Sources: {registry.link(id2)} {registry.link(id1)}"
+    expected_sources_line = f"{SOURCES_LABEL} {registry.link(id2)} {registry.link(id1)}"
     assert expected_sources_line in answer_section
     assert answer_section.index("Sources:") < answer_section.index("Verdict:")
+
+
+def test_the_sources_verdict_pair_is_separated_from_its_prose_by_a_blank_line(make_config):
+    """The pair is machinery ABOUT the paragraph, not more of the paragraph. Rendered
+    flush against the last prose line and unstyled, it read as another sentence — so a
+    blank line separates it, both labels are bold, and the `Sources:` line ends in
+    markdown's two-space hard break so a renderer keeps `Verdict:` on its own line
+    instead of joining them.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/pump")
+    write_source_capture(config, registry, source_id, "Body text.")
+    answer = f"The pump failed under load [{source_id}]."
+    outcome = RunOutcome(
+        question="What failed?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=split_paragraphs(answer),
+        verification=VerificationResult(
+            verdicts=[
+                ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[source_id])
+            ]
+        ),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    lines = _section(body, "## Answer").splitlines()
+
+    prose_index = lines.index("The pump failed under load.")
+    assert lines[prose_index + 1] == ""
+    assert lines[prose_index + 2] == f"{SOURCES_LABEL} {registry.link(source_id)}  "
+    assert lines[prose_index + 3] == f"{VERDICT_LABEL} supported - Confirmed."
 
 
 def test_write_report_resolves_registered_sources_and_discloses_unregistered_markers(
@@ -931,7 +967,8 @@ def test_write_report_a_list_paragraphs_lead_in_and_bullets_render_cleanly_with_
     assert "- The vendor quoted $4.20. *" in lines
     assert "- Lead time is six weeks." in lines
     assert (
-        "Verdict: partially supported - 1/2 bullets verified. The quote does not match the source."
+        f"{VERDICT_LABEL} partially supported - 1/2 bullets verified. "
+        "The quote does not match the source."
     ) in answer_section
 
 
@@ -1052,7 +1089,7 @@ def test_a_list_that_was_never_verified_carries_no_bullets_verified_rollup(make_
     answer_section = _section(body, "## Answer")
 
     assert "bullets verified" not in answer_section
-    assert f"Verdict: not verified - {CHECK_FAILED_DETAIL}" in answer_section
+    assert f"{VERDICT_LABEL} not verified - {CHECK_FAILED_DETAIL}" in answer_section
 
 
 def test_a_fenced_code_block_reaches_the_answer_verbatim(make_config):
@@ -1087,8 +1124,8 @@ def test_a_fenced_code_block_reaches_the_answer_verbatim(make_config):
 
     assert "```bash\nuv run alembic upgrade head\n```" in answer_section
     # The fence cites nothing, so it carries no pair of its own — the prose above keeps its.
-    assert answer_section.count("Sources: ") == 1
-    assert answer_section.count("Verdict: ") == 1
+    assert answer_section.count(SOURCES_LABEL) == 1
+    assert answer_section.count(VERDICT_LABEL) == 1
 
 
 def test_write_report_a_hard_wrapped_paragraph_renders_as_one_clean_prose_block(make_config):
@@ -1125,7 +1162,7 @@ def test_write_report_a_hard_wrapped_paragraph_renders_as_one_clean_prose_block(
     assert "The vendor quoted a price of" in answer_section
     assert "$4.20 per unit" in answer_section
     assert answer_section.count("Verdict:") == 1
-    assert "Verdict: not supported - The source disagrees." in answer_section
+    assert f"{VERDICT_LABEL} not supported - The source disagrees." in answer_section
 
 
 def test_a_paragraphs_verdict_binds_to_its_own_prose_not_the_next_paragraphs(make_config):
@@ -1160,9 +1197,9 @@ def test_a_paragraphs_verdict_binds_to_its_own_prose_not_the_next_paragraphs(mak
     body = write_report(outcome, config).read_text(encoding="utf-8")
     answer_section = _section(body, "## Answer")
 
-    first_verdict_pos = answer_section.index("Verdict: not supported - Says $5.10.")
+    first_verdict_pos = answer_section.index(f"{VERDICT_LABEL} not supported - Says $5.10.")
     second_prose_pos = answer_section.index("Lead time is six weeks")
-    second_verdict_pos = answer_section.index("Verdict: supported - Confirmed.")
+    second_verdict_pos = answer_section.index(f"{VERDICT_LABEL} supported - Confirmed.")
     assert first_verdict_pos < second_prose_pos < second_verdict_pos
 
 
@@ -1204,7 +1241,7 @@ def test_a_paragraph_citing_multiple_sources_still_renders_exactly_one_verdict_l
     answer_section = _section(body, "## Answer")
 
     assert answer_section.count("Verdict:") == 1
-    assert "Verdict: supported - One source confirms it." in answer_section
+    assert f"{VERDICT_LABEL} supported - One source confirms it." in answer_section
 
 
 def test_a_paragraph_no_source_supports_renders_the_models_single_not_supported_verdict(
@@ -1243,7 +1280,7 @@ def test_a_paragraph_no_source_supports_renders_the_models_single_not_supported_
     answer_section = _section(body, "## Answer")
 
     assert answer_section.count("Verdict:") == 1
-    assert "Verdict: not supported - Neither source confirms it." in answer_section
+    assert f"{VERDICT_LABEL} not supported - Neither source confirms it." in answer_section
 
 
 def test_an_out_of_range_unsupported_item_index_is_ignored_rather_than_raising(make_config):
@@ -1279,7 +1316,7 @@ def test_an_out_of_range_unsupported_item_index_is_ignored_rather_than_raising(m
 
     assert "- First item *" in lines
     assert "- Second item" in lines
-    assert "Verdict: partially supported - 1/2 bullets verified" in answer_section
+    assert f"{VERDICT_LABEL} partially supported - 1/2 bullets verified" in answer_section
 
 
 def test_a_verdicts_list_shorter_than_paragraphs_renders_not_verified_for_the_rest(
@@ -1311,8 +1348,10 @@ def test_a_verdicts_list_shorter_than_paragraphs_renders_not_verified_for_the_re
     body = write_report(outcome, config).read_text(encoding="utf-8")
     answer_section = _section(body, "## Answer")
 
-    assert "Verdict: supported - Confirmed." in answer_section
-    assert "Verdict: not verified - verification did not run for this paragraph." in answer_section
+    assert f"{VERDICT_LABEL} supported - Confirmed." in answer_section
+    assert (
+        f"{VERDICT_LABEL} not verified - verification did not run for this paragraph."
+    ) in answer_section
 
 
 def test_write_report_discloses_skipped_verification_when_the_run_died(make_config):
@@ -1374,7 +1413,9 @@ def test_write_report_with_verification_none_still_flags_a_citing_paragraph_as_n
 
     assert "Answer text with a marker" in answer_section
     assert f"[{source_id}]" not in answer_section
-    assert "Verdict: not verified - verification did not run for this paragraph." in answer_section
+    assert (
+        f"{VERDICT_LABEL} not verified - verification did not run for this paragraph."
+    ) in answer_section
     assert "## Conflicting sources" not in body
     assert "## Gaps and disclosures" not in body
 
