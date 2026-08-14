@@ -155,11 +155,24 @@ def _is_usable(config: HarnessConfig, registry: SourceRegistry, source: Source) 
     return not is_failed_capture(source_text)
 
 
-def _sources_section(config: HarnessConfig, registry: SourceRegistry) -> str:
+def partition_sources(
+    config: HarnessConfig, registry: SourceRegistry
+) -> tuple[list[Source], list[Source]]:
+    """Split this run's registered sources into `(usable, unusable)`.
+
+    The one public entry to `_is_usable`: the report body and the CLI's end-of-run summary
+    both need this split, and computing it twice let the summary's counts drift from what the
+    report lists once usability semantics changed.
+    """
     usable: list[Source] = []
     unusable: list[Source] = []
     for source in registry.all():
         (usable if _is_usable(config, registry, source) else unusable).append(source)
+    return usable, unusable
+
+
+def _sources_section(config: HarnessConfig, registry: SourceRegistry) -> str:
+    usable, unusable = partition_sources(config, registry)
 
     lines: list[str] = []
     if usable:

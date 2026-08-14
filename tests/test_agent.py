@@ -9,7 +9,6 @@ import asyncio
 import threading
 import time
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
@@ -20,6 +19,7 @@ from langgraph.types import Interrupt
 import harness.__main__ as main_module
 from harness.agent import build_agent
 from harness.config import AgentSettings, run_workspace_dir
+from harness.display import PlainRenderer
 from harness.report import (
     _CUT_SHORT_HEADING,
     _ERROR_TEXT,
@@ -31,6 +31,7 @@ from harness.report import (
 from harness.sources import SourceRegistry
 from tests.conftest import (
     drain_stdout,
+    install_search_transport,
     patch_model,
     patch_run,
     verify_reply,
@@ -423,26 +424,13 @@ async def test_main_prints_the_report_path_as_the_final_line_of_stdout(
 
 
 def _install_slow_search(monkeypatch, delay_seconds: float) -> None:
-    """Route `harness.tools.search`'s `httpx.AsyncClient` through a transport that sleeps.
-
-    Same technique as `tests/test_search.py`'s `_install`, reproduced rather than imported
-    because that helper is private to its own module.
-
-    CALL THIS AFTER `scripted_model(...)`, never before: this replaces the process-global
-    `httpx.AsyncClient`, and `openai`'s constructor rejects anything that is not an instance of
-    whatever that name is bound to at build time — including `langchain_openai`'s wrapper, which
-    subclasses the ORIGINAL class. Building the model first means that check has already run.
-    """
-    real = httpx.AsyncClient
+    """Stall `search_web` so a bounds test can expire mid-call (ordering caveat: see helper)."""
 
     async def handler(request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(delay_seconds)
         return httpx.Response(200, json={"query": "x", "results": []})
 
-    def factory(**kwargs: Any) -> httpx.AsyncClient:
-        return real(transport=httpx.MockTransport(handler), **kwargs)
-
-    monkeypatch.setattr("harness.tools.search.httpx.AsyncClient", factory)
+    install_search_transport(monkeypatch, handler)
 
 
 def test_final_answer_skips_trailing_tool_output():
@@ -566,7 +554,7 @@ async def test_read_answer_returns_what_was_typed(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": "  Yes, region EU-West  ")
     interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which region?"}}]})
 
-    decisions = await main_module._answer_questions(interrupt)
+    decisions = await main_module._answer_questions(interrupt, PlainRenderer())
 
     assert decisions == [{"type": "respond", "message": "Yes, region EU-West"}]
 
@@ -1010,10 +998,13 @@ async def test_a_clarifying_question_can_arrive_without_a_question_argument(
         }
     )
 
-    decisions = await main_module._answer_questions(interrupt)
+    decisions = await main_module._answer_questions(interrupt, PlainRenderer())
 
     out, _ = drain_stdout(capsys)
     asked = [line for line in out.splitlines() if line.strip()]
-    assert asked[0] == "Metal or album?", "the description fallback never fired"
-    assert "isotope" in asked[1], "the str(args) last resort never fired"
+    metal_line = next(line for line in asked if line == "Metal or album?")
+    isotope_line = next(line for line in asked if "isotope" in line)
+    assert asked.index(metal_line) < asked.index(isotope_line), (
+        "the description fallback never fired, or fired out of order"
+    )
     assert [d["message"] for d in decisions] == ["answered", "answered"]
