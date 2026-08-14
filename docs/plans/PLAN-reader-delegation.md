@@ -206,7 +206,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 - [x] Phase 1: Wire the reader subagent (tracer bullet)
 - [x] Phase 2: Failure path — retry, catch, fallback tool
-- [ ] Phase 3: Disclosure and prompt wiring
+- [x] Phase 3: Disclosure and prompt wiring
 - [ ] Phase 4: End-to-end regression + docs
 - [ ] Final verification
 
@@ -362,11 +362,13 @@ teaches the lead the full delegation protocol.
   (docs/decisions.md); any change to verify.py.
 
 **Tests (write first, confirm red):**
-- [ ] Report renders each read-mode bucket correctly, including the all-digested and
+- [x] Report renders each read-mode bucket correctly, including the all-digested and
   mixed-mode cases.
-- [ ] Orchestrator prompt contains the delegation protocol and renders with its
+- [x] Orchestrator prompt contains the delegation protocol and renders with its
   required variables (pinned set updated).
-- [ ] Stale "not yet wired" line is gone from the run-config rendering.
+- [x] Stale "not yet wired" line is gone from the run-config rendering. (Turned out to be
+  a source comment, never rendered — comment updated; the new rendered behavior is
+  pinned instead. See Discoveries 2026-08-14.)
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -374,8 +376,8 @@ teaches the lead the full delegation protocol.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full suite green; report output for a scripted mixed-mode run reads correctly by
-  inspection (paste one rendered report section into the phase notes).
+- [x] Full suite green; report output for a scripted mixed-mode run reads correctly by
+  inspection (rendered section pasted in the Phase 3 handoff-log entry).
 
 ### Phase 4: End-to-end regression + docs
 **Risk:** flagged (!#4)
@@ -481,6 +483,13 @@ correction. Empty at plan creation. -->
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+### 2026-08-14 — Phase 3: "not yet wired" was a comment, not rendered output
+The report.py:405 "configured but not yet wired" text the phase file list targeted is a
+source comment above the pinned `- Subagent Model:` line; nothing rendered ever said
+"not yet wired". Acted: comment updated to reflect the wired reader; the planned
+absence-test was replaced with behavioral pins on the new `## Source reading` section
+(a never-rendered string cannot produce a meaningful red). Pinned model lines unchanged.
+
 ## Phase Handoff Log
 
 ### 2026-08-14 — Phase 1: Wire the reader subagent (tracer bullet)
@@ -510,6 +519,24 @@ Append-only, empty at plan creation. -->
 - Watch-next: Phase 3 prompt work — delegation protocol references `READER FAILED`
   prefix, empty-digest-as-failure, and max_urls_per_call batching; report reads
   read_mode buckets from the registry.
+
+### 2026-08-14 — Phase 3: Disclosure and prompt wiring
+- Done: `## Source reading` report section (`_read_modes_section`, rendered after
+  `## Sources`) bucketing digested/fallback/unread from the registry; orchestrator.md
+  Tools swap (task delegation + fetch_raw recovery) and `# Reading sources` protocol;
+  349 tests + gates green; quality scan clean; 1 simplification applied. Rendered
+  mixed-mode sample: "Digested via the reader: - [S1] ... / Read raw (fallback...):
+  - [S2] ... / Not read at all (fetch never succeeded): - [S3] ...".
+- Learned: the "not yet wired" target was a comment, not rendered output (see
+  Discoveries). Section placement matters: pre-existing tests assume the first `[Sn]`
+  occurrence lands inside `## Sources` — new source-listing sections must render after
+  it. `.claude/planning-mode` was flipped to "active" mid-session (concurrent session?)
+  and blocked a source edit — reset to "inactive" if it recurs.
+- Drift: none.
+- Watch-next: Phase 4 e2e — ScriptedChatModel must reach the reader's model slot inside
+  deepagents' per-subagent assembly (risk !#4); use `patch_models_by_role` (conftest)
+  for role-distinct scripting; surface seam problems rather than weakening to
+  "task was called".
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so
