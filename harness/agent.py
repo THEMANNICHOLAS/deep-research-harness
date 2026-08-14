@@ -1,9 +1,9 @@
 """Compile the lead research agent: model, tools, workspace backend, and middleware.
 
-This is the ONLY module that imports `deepagents` — every other module works with plain
+The ONLY module that imports `deepagents`: every other module works with plain
 LangChain/pydantic types, so the rest of the harness stays independent of the agent
-framework's API surface. Mirrors `harness/tools/search.py`'s module shape: one builder
-function, closing over `config` and the caller's `registry`, no class.
+framework's API surface. Same shape as `harness/tools/search.py` — one builder function
+closing over `config` and the caller's `registry`, no class.
 """
 
 from datetime import date
@@ -31,22 +31,17 @@ from harness.sources import SourceRegistry
 from harness.tools import build_tools
 from harness.tools.ask_user import ASK_USER_TOOL_NAME
 
-# The summarizer's own policy constants (not config-driven — see D7). `trigger` is set
-# above the profile-driven fallback that would apply if unset (settled finding 6, which
-# matched it at 170,000): 200,000 tokens is deliberately generous for a reasoning model
-# that spends heavily on output, and defers compression — and the attribution loss D7
-# guards against — as long as the head role's context window allows. `keep` is set
-# explicitly, per D7, rather than left to fall back to deepagents' smaller profile
-# default of 6 messages — a larger kept tail gives recent `[Sn]`-bearing findings more
-# room to survive into synthesis.
+# The summarizer's policy, deliberately not config-driven (D7). `trigger` sits above the
+# profile fallback of 170,000: generous for a reasoning model that spends heavily on output,
+# and it defers the attribution loss D7 guards against as long as the context window allows.
+# `keep` is explicit rather than deepagents' default of 6 messages, so recent `[Sn]`-bearing
+# findings have room to survive into synthesis.
 _SUMMARIZATION_TRIGGER: tuple[Literal["tokens"], int] = ("tokens", 200_000)
 _SUMMARIZATION_KEEP: tuple[Literal["messages"], int] = ("messages", 20)
 
-# `allowed_decisions` is `["respond"]` only — the developer answers on behalf of the tool
-# and the tool never executes (Phase 4 plan, settled fact 3); and our filesystem
-# `permissions` are `mode="allow"`, which generates no filesystem interrupt entries
-# (settled fact 2), so this is the whole interrupt surface, which is what the plan's Out
-# of scope requires.
+# `["respond"]` only: the developer answers on behalf of the tool and the tool never executes.
+# Filesystem `permissions` are `mode="allow"`, which generates no interrupt entries, so this is
+# the whole interrupt surface.
 _INTERRUPT_ON: dict[str, bool | InterruptOnConfig] = {
     ASK_USER_TOOL_NAME: InterruptOnConfig(allowed_decisions=["respond"])
 }
@@ -55,23 +50,21 @@ _INTERRUPT_ON: dict[str, bool | InterruptOnConfig] = {
 def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
     """Compile the lead research agent, driven with `ainvoke`/`astream` (substrate D1).
 
-    The research question is NOT baked into the system prompt here — `build_agent`'s
-    signature (frozen by the plan's Contracts) has no access to it. It travels instead as
-    the initial `HumanMessage` the caller sends into `ainvoke`/`astream`; the rendered
-    orchestrator prompt only carries `$current_date` and `$max_urls_per_call`.
+    The research question is NOT baked into the system prompt: this signature has no access to
+    it. It travels as the initial `HumanMessage` the caller streams in, and the rendered
+    orchestrator prompt carries only `$current_date` and `$max_urls_per_call`.
     """
     model = build_chat_model(config, "head")
 
-    # deepagents keys its harness-profile registry by `f"{provider}:{identifier}"`,
-    # derived from the model instance itself (settled finding 4) — not assembled from
-    # config string literals, so it tracks whatever `build_chat_model` actually returns.
+    # deepagents keys its harness-profile registry by `f"{provider}:{identifier}"`, derived from
+    # the model instance rather than from config literals, so it tracks whatever
+    # `build_chat_model` actually returns.
     provider = get_model_provider(model)
     identifier = get_model_identifier(model)
     profile_key = f"{provider}:{identifier}"
-    # Accepted residue (plan `## Reconciliations` 2026-08-09 (b)): this registry is
-    # process-global and keyed by provider:model-name only, not scoped to our `base_url`.
-    # Re-registering on every `build_agent` call is idempotent — the same key always maps
-    # to this same profile, so a second run in the same process is unaffected.
+    # Accepted residue: the registry is process-global and keyed by provider:model-name, not
+    # scoped to our `base_url`. Re-registering per call is idempotent — the same key always maps
+    # to the same profile, so a second run in one process is unaffected.
     register_harness_profile(
         profile_key,
         HarnessProfile(
@@ -99,17 +92,15 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
         tools=tools,
         system_prompt=system_prompt,
         backend=backend,
-        # `FilesystemPermission.paths` are virtual POSIX paths relative to the backend's
-        # own root (`virtual_mode=True` by default), never real OS paths — `"/**"` is
-        # "everything under the confined root", which `FilesystemBackend` already is.
-        # This is the second, belt-and-suspenders confinement layer; the first is the
-        # backend itself rejecting any path that would traverse outside its root.
+        # `paths` are virtual POSIX paths relative to the backend's own root, never real OS
+        # paths, so `"/**"` means "everything under the confined root". Second layer of
+        # confinement; the first is the backend rejecting any path that traverses outside it.
         permissions=[
             FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="allow")
         ],
         middleware=_middleware(model, backend),
-        # One saver per `build_agent` call; it holds this run's thread (D5: in-memory
-        # keeps the no-database invariant — no durable, cross-invocation checkpointing).
+        # One saver per call, holding this run's thread. In-memory keeps the no-database
+        # invariant (D5): no durable, cross-invocation checkpointing.
         checkpointer=InMemorySaver(),
         interrupt_on=_INTERRUPT_ON,
     )
@@ -118,17 +109,14 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
 def _middleware(model: Any, backend: BackendProtocol) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build the middleware list with an explicit, broad element type.
 
-    Without this annotation mypy unifies the list's element type from the first entry and
-    then rejects the second as incompatible — a known false positive with heterogeneous
-    lists of generic `AgentMiddleware` subclasses, not a real type error.
+    Without the annotation mypy unifies the element type from the first entry and rejects the
+    second — a false positive with heterogeneous lists of generic `AgentMiddleware` subclasses.
 
-    Uses `deepagents.middleware.summarization.SummarizationMiddleware` (Blocker 1 fix), not
-    langchain's plain one — both classes publish the same `.name`
-    (`"SummarizationMiddleware"`), so `create_deep_agent` still merges down to exactly one
-    summarizer, but only the deepagents wrapper offloads evicted messages to `backend`
-    before dropping them from the model's context, which is what D7/R3/R7 depend on:
-    langchain's plain middleware issues a destructive `RemoveMessage(REMOVE_ALL_MESSAGES)`
-    with no recovery path for a dropped `[Sn]`↔finding association.
+    The summarizer is deepagents', not langchain's plain one. Both publish the same `.name`, so
+    `create_deep_agent` still merges down to one summarizer, but only the deepagents wrapper
+    offloads evicted messages to `backend` before dropping them from context — langchain's
+    issues a destructive `RemoveMessage(REMOVE_ALL_MESSAGES)` with no recovery path for a
+    dropped `[Sn]`-to-finding association, which D7/R3/R7 depend on.
     """
     return [
         TodoListMiddleware(),

@@ -36,10 +36,10 @@ class SearchFailure(BaseModel):
 def _parse_results(payload: dict, max_results: int) -> list[SearchResult] | SearchFailure:
     """Extract and normalize the `results` array, slicing to `max_results` after parsing.
 
-    Skips any entry that is not a dict, lacks a truthy `url`, or is wrong-typed — one
-    engine emitting a non-string must degrade to a skipped entry, not an exception.
-    `raw.get(key) or ""` maps both `None` and missing keys to `""`, matching the frozen
-    `str` fields (SearXNG declares `engine` as `str | None`).
+    Skips any entry that is not a dict, lacks a truthy `url`, or is wrong-typed: one engine
+    emitting a non-string degrades to a skipped entry, not an exception. `raw.get(key) or ""`
+    maps `None` and missing keys alike to `""`, matching the frozen `str` fields (SearXNG
+    declares `engine` as `str | None`).
     """
     raw_results = payload.get("results")
     if not isinstance(raw_results, list):

@@ -1,12 +1,10 @@
 """Sequential, pooled-per-paragraph verification of a finished answer against its sources.
 
-One model call per PARAGRAPH, seeing every one of that paragraph's usable cited sources
-pooled together — the model judges the paragraph as a whole rather than one source at a
-time (D3 reversed the earlier per-(sentence x source) isolation once contradiction
-detection needed to compare sources against each other, not just each source against the
-paragraph). Reads only captured files under `harness.tools.fetch._sources_dir`, never
-refetches (D10/R8): by the time this runs the agent loop is finished and the wall clock has
-stopped (R7), so no network call belongs here at all.
+One model call per PARAGRAPH, with every usable source that paragraph cites pooled into it,
+so the model judges the paragraph as a whole (D3 — contradiction detection needs the sources
+compared against each other, not each one against the paragraph in isolation). Reads only
+captured files under `harness.tools.fetch._sources_dir` and never refetches (D10/R8): the
+agent loop is finished and the wall clock stopped (R7) by the time this runs.
 
 Calls are made ONE AT A TIME, in the input list's order — see `verify_paragraphs`.
 """
@@ -28,16 +26,14 @@ Verdict = Literal[
     "supported", "partially_supported", "not_supported", "no_sources_cited", "not_verified"
 ]
 
-# The last two are assigned deterministically by this module and are NEVER returned by the
-# model — `no_sources_cited` when a paragraph cites nothing registered, `not_verified` when
-# a check could not be run at all (no usable source, a malformed reply, an unknown verdict,
-# or a raised exception). Public because `report.py` gates its bullet rollup on the same
-# distinction, and this is the one place that line is drawn.
+# The other two are assigned by this module, never returned by the model: `no_sources_cited`
+# when a paragraph cites nothing registered, `not_verified` when no check could run (no usable
+# source, malformed reply, unknown verdict, raised exception). Public because `report.py` gates
+# its bullet rollup on the same distinction, and this is where that line is drawn.
 MODEL_VERDICTS = {"supported", "partially_supported", "not_supported"}
 
-# The reader-facing `Verdict:` detail for a check that could not run. Reports are read by
-# production technicians, so the exception text stays in `check_failures` — which
-# `## Gaps and disclosures` prints — instead of reaching the answer (PR #7 review).
+# The reader-facing `Verdict:` detail for a check that could not run. The exception text stays
+# in `check_failures`, which `## Gaps and disclosures` prints, instead of reaching the answer.
 CHECK_FAILED_DETAIL = "This paragraph could not be checked because the verification step failed."
 
 
@@ -69,15 +65,14 @@ class VerifyError(Exception):
 def _parse_reply(content: str) -> tuple[Verdict, str, bool, list[int]]:
     """Parse a model reply into `(verdict, detail, sources_conflict, unsupported_items)`.
 
-    Raises `VerifyError` (or lets a `json.JSONDecodeError` propagate) on anything malformed
-    — the caller treats both as a per-paragraph failure, never a pass-ending one.
+    Raises `VerifyError` (or lets a `json.JSONDecodeError` propagate) on anything malformed —
+    the caller treats both as a per-paragraph failure, never a pass-ending one.
     """
-    # Take the substring from the first `{` to the last `}`, which absorbs every wrapper
-    # risk #1 predicted at once: a markdown fence, prose before the object, and prose after
-    # it. Unconditional on purpose — gating this on a leading `{` let a reply that OPENED
-    # with the object and then trailed prose reach `json.loads` whole, where "Extra data"
-    # turned a genuine verdict into `not_verified`. A reply with no `{` raises `ValueError`,
-    # which the caller already treats as a per-paragraph failure.
+    # First `{` to last `}`, which absorbs every wrapper shape at once: a markdown fence,
+    # prose before the object, prose after it. Unconditional on purpose — gating it on a
+    # leading `{` let a reply that OPENED with the object and then trailed prose reach
+    # `json.loads` whole, where "Extra data" turned a genuine verdict into `not_verified`. A
+    # reply with no `{` raises `ValueError`, already handled as a per-paragraph failure.
     text = content[content.index("{") : content.rindex("}") + 1]
     data = json.loads(text)
     verdict = data["verdict"]
@@ -86,10 +81,9 @@ def _parse_reply(content: str) -> tuple[Verdict, str, bool, list[int]]:
         raise VerifyError(f"model returned an unknown verdict: {verdict!r}")
     if not isinstance(detail, str):
         raise VerifyError("model's 'detail' field is not a string")
-    # A real boolean only, matching how `unsupported_items` below drops anything that is
-    # not an int: `bool("false")` is True, so a quoted boolean would file the paragraph
-    # under `## Conflicting sources` against its own reply. Anything unparseable reads as
-    # "no conflict claimed" rather than failing the whole check.
+    # A real boolean only, matching how `unsupported_items` drops non-ints: `bool("false")` is
+    # True, so a quoted boolean would file the paragraph under `## Conflicting sources` against
+    # its own reply. Anything else reads as "no conflict claimed" rather than failing the check.
     sources_conflict = data.get("sources_conflict", False) is True
     raw_items = data.get("unsupported_items", [])
     unsupported_items = [
@@ -103,15 +97,14 @@ async def verify_paragraphs(
 ) -> VerificationResult:
     """Check every paragraph against its cited source(s), one pooled call at a time.
 
-    Sequential only (D4) — a plain `for` loop with `await` inside. No `asyncio.gather`, no
-    `TaskGroup`, no concurrency of any kind. One failed check never fails the whole pass:
-    the loop always continues (same independent-per-item stance as `fetch.py`'s batch
-    handling).
+    Sequential only (D4): a plain `for` loop with `await` inside, no `gather`, no `TaskGroup`.
+    One failed check never fails the pass — the loop always continues, the same
+    independent-per-item stance as `fetch.py`'s batch handling.
 
-    A paragraph that cites no REGISTERED source is `no_sources_cited` without a model call.
-    A paragraph whose sources are all unreadable (missing capture, or a `FETCH FAILED`
-    stub) is `not_verified` without a model call, naming which sources were skipped and
-    why. Anything else pools every usable source's captured text into one prompt.
+    A paragraph citing no REGISTERED source is `no_sources_cited` with no model call. One whose
+    sources are all unreadable (missing capture or a `FETCH FAILED` stub) is `not_verified`
+    with no model call, naming what was skipped. Anything else pools every usable source's
+    captured text into one prompt.
     """
     model = build_chat_model(config, "head")
     sources_dir = _sources_dir(config, registry)
@@ -142,9 +135,8 @@ async def verify_paragraphs(
             assert source is not None  # guaranteed by `registered`'s filter above
             path = sources_dir / f"{sid}.md"
             # `UnicodeDecodeError` (a `ValueError`, not an `OSError`) alongside the
-            # missing-file case: a capture whose write died mid-flush can end
-            # mid-character, and an unreadable source is a paragraph we cannot settle,
-            # not a pass we should abandon (PR #4 review, carried onto the pooled read).
+            # missing-file case: a capture whose write died mid-flush can end mid-character,
+            # and an unreadable source costs one paragraph, not the whole pass.
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):

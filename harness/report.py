@@ -1,12 +1,10 @@
 """Assemble a finished run into a report file.
 
-Pure string work: no model, no network — this module never calls a model itself. The
-verification pass's one pooled model call per paragraph happens in `harness.verify`,
-before `write_report` is ever called; by the time a `RunOutcome` reaches this module its
-`verification` field is already-computed data. The only I/O here is writing the one
-report file and reading the captured `<workspace_dir>/<run_id>/sources/S<n>.md` files to
-judge which registered sources are usable evidence (3F fix pass, Major finding), so this
-module stays fully offline-testable (Phase 3 plan, `## Execution order` step 5).
+Pure string work: no model, no network. Verification runs in `harness.verify` before
+`write_report` is called, so a `RunOutcome`'s `verification` field is already-computed data
+by the time it arrives here. The only I/O is writing the report file and reading the captured
+`<workspace_dir>/<run_id>/sources/S<n>.md` files to judge which sources are usable evidence,
+which keeps this module fully offline-testable.
 """
 
 import re
@@ -28,8 +26,8 @@ _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
 _NO_SOURCES_TEXT = "No usable sources were found for this run."
 _UNUSABLE_HEADING = "Not usable as evidence (fetch failed or capture missing):"
 
-# Mirrors `harness/tools/fetch.py`'s `FetchOutcome` — a typed value, not an exception, for
-# why a run ended early (the phase's Reuse pattern).
+# Mirrors `harness/tools/fetch.py`'s `FetchOutcome`: a typed value, not an exception, for why
+# a run ended early.
 CutShortReason = Literal["round_cap", "wall_clock", "error"]
 
 _CUT_SHORT_HEADING = "## Run cut short"
@@ -41,21 +39,19 @@ _NO_ANSWER_TEXT = "The run produced no final answer."
 _NO_UNFINISHED_TODOS_TEXT = "No planned todos remained unfinished."
 _DEAD_BRANCHES_HEADING = "Planned steps that were never completed (dead branches):"
 
-# Workspace subdirectories that hold machine-written bulk, not the agent's own notes:
-# `sources/` is Phase 2's captured page text (already summarized under `## Sources`), and
-# the other two are the summarizer's evicted history. See `_notes_section`.
+# Machine-written bulk, not the agent's own notes: `sources/` is captured page text (already
+# under `## Sources`) and the other two are the summarizer's evicted history.
 _NOTES_EXCLUDED_DIRS = frozenset({"sources", "conversation_history", "large_tool_results"})
 
-# Slack allowed when deciding whether a workspace note belongs to THIS run. Filesystem
-# mtime granularity is coarser than `datetime.now()` (2s on FAT32, and Windows can report
-# a stamp fractionally behind the clock), so a note written moments AFTER the run started
-# can carry an mtime moments before it. Erring by two seconds is harmless — runs are
-# minutes apart at least — while erring the other way silently drops this run's findings.
+# Slack allowed when deciding whether a workspace note belongs to THIS run. Filesystem mtime
+# granularity is coarser than `datetime.now()` (2s on FAT32, and Windows can report a stamp
+# fractionally behind the clock), so a note written just after the run started can carry an
+# mtime just before it. Erring by two seconds is harmless — runs are minutes apart — while
+# erring the other way silently drops this run's findings.
 _MTIME_TOLERANCE_SECONDS = 2.0
 
-# One distinct phrase per reason. Each must be a substring of none of the others — the
-# tests assert one is present AND another absent, to prove the right bound was named
-# rather than a swapped `except` label in `__main__` slipping past a looser check.
+# One distinct phrase per reason, none a substring of another: the tests assert one present
+# AND another absent, so a swapped `except` label in `__main__` cannot slip past.
 _ROUND_CAP_TEXT = "the round cap"
 _WALL_CLOCK_TEXT = "the wall clock"
 _ERROR_TEXT = "an unrecoverable error"
@@ -64,12 +60,10 @@ _ERROR_TEXT = "an unrecoverable error"
 class RunOutcome(BaseModel):
     """The seam between a finished run and report assembly.
 
-    `registry` rides on `RunOutcome` rather than being passed alongside it, because
-    `report.py` needs it to render each paragraph's `Sources:` links, and `write_report`'s
-    signature is frozen as `(outcome, config)` — there is no other route for the registry
-    to get there. `arbitrary_types_allowed=True` is required because `SourceRegistry` is a
-    plain class, not a pydantic model. Keep fields additive: Phase 5 landed cut-short
-    state; Phase 2+3 add paragraph boundaries and pooled verification results.
+    `registry` rides along rather than being passed alongside because `write_report`'s
+    signature is frozen as `(outcome, config)` and rendering each paragraph's `Sources:`
+    links needs it. `arbitrary_types_allowed=True` is required because `SourceRegistry` is a
+    plain class, not a pydantic model. Keep fields additive.
     """
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
@@ -81,26 +75,24 @@ class RunOutcome(BaseModel):
     cut_short: CutShortReason | None = None
     cut_short_detail: str | None = None  # only meaningful when cut_short == "error"
     todos: list[dict[str, Any]] = Field(default_factory=list)
-    # When the run began, used to keep a PREVIOUS run's workspace notes out of this
-    # report — see `_notes_section`. `None` means "unknown", which keeps every note.
+    # When the run began, used to keep a PREVIOUS run's workspace notes out of this report
+    # (`_notes_section`). `None` means "unknown", which keeps every note.
     started_at: datetime | None = None
-    # The ONLY source of paragraph boundaries for `## Answer` (D2) — `report.py` never
-    # re-splits `answer`. `harness/__main__.py` calls `split_paragraphs` exactly once and
-    # hands the result straight through.
+    # The ONLY source of paragraph boundaries for `## Answer` (D2); `report.py` never
+    # re-splits `answer`.
     paragraphs: list[Paragraph] = Field(default_factory=list)
-    # `None` means the verification pass did not run. A paragraph that cites a
-    # REGISTERED source still renders a `Verdict: not verified - ...` line in that case
-    # (item 4) — only a NON-citing paragraph, or the absence of `## Conflicting
-    # sources`/`## Gaps and disclosures`, is unaffected by `verification` being unset.
+    # `None` means the pass did not run. A paragraph citing a REGISTERED source still gets a
+    # `Verdict: not verified - ...` line then; only a non-citing paragraph and the two
+    # disclosure sections are unaffected by this being unset.
     verification: VerificationResult | None = None
 
 
 def format_todos(todos: list[dict[str, Any]]) -> str:
     """Render todo entries as `- [status] content` lines.
 
-    Public and living here, not in `harness/__main__.py`, because both the terminal echo
-    (R10) and the cut-short report's unfinished-steps list must show the same shape — one
-    home for the format, per CLAUDE.md. `__main__` imports `report`, never the reverse.
+    Lives here, not in `__main__.py`, because the terminal echo (R10) and the cut-short
+    report's unfinished-steps list must show the same shape, and `__main__` imports `report`
+    rather than the reverse.
     """
     return "\n".join(f"- [{todo['status']}] {todo['content']}" for todo in todos)
 
@@ -121,8 +113,7 @@ def _filename(question: str, now: datetime) -> str:
 def _usage_lines(usage: UsageMetadata) -> list[str]:
     """Render input/output/total tokens, keeping the reasoning split visible on its own.
 
-    Finding 9: `kimi-k3` is a reasoning model whose output tokens are mostly reasoning —
-    folding that into a bare total would misprice the pyramid.
+    A reasoning model's output tokens are mostly reasoning, so a bare total misprices the run.
     """
     reasoning = usage.get("output_token_details", {}).get("reasoning", 0)
     return [
@@ -135,16 +126,13 @@ def _usage_lines(usage: UsageMetadata) -> list[str]:
 def _is_usable(config: HarnessConfig, registry: SourceRegistry, source: Source) -> bool:
     """A registered source is usable evidence iff its captured file exists and isn't a stub.
 
-    `harness/tools/fetch.py` registers every attempted URL, including 404s, blocked pages,
-    and empty ones — the registry alone cannot tell a real finding from a dead URL. The
-    captured `<workspace_dir>/<run_id>/sources/S<n>.md` file is Phase 2's frozen record of
-    what actually came back, so usability is judged from it, not from registry
-    membership. A missing file counts as NOT usable, per the Phase 2 handoff note:
-    absence is treated exactly like a stub — and so does an unreadable or non-UTF-8 one.
-    A `write_text` that dies mid-flush (ENOSPC, EIO) leaves a byte prefix that can end
-    mid-character, and `UnicodeDecodeError` is a `ValueError`, so catching `OSError`
-    alone let it escape all the way out of `write_report`, losing the whole report of an
-    otherwise finished run (PR #4 review, Major).
+    `fetch.py` registers every attempted URL, including 404s and blocked pages, so the
+    registry alone cannot tell a real finding from a dead one. The captured file is the frozen
+    record of what came back, so usability is judged from it. A missing, unreadable or
+    non-UTF-8 file counts as NOT usable, exactly like a stub: a `write_text` dying mid-flush
+    leaves a byte prefix that can end mid-character, and `UnicodeDecodeError` is a
+    `ValueError`, so catching `OSError` alone let it escape `write_report` and lose the whole
+    report of an otherwise finished run.
     """
     path = _sources_dir(config, registry) / f"{source.id}.md"
     if not path.exists():
@@ -180,11 +168,9 @@ def _sources_section(config: HarnessConfig, registry: SourceRegistry) -> str:
 def _cut_short_section(outcome: RunOutcome, config: HarnessConfig) -> str:
     """One sentence naming the bound that ended the run, then the unfinished todos."""
     if outcome.cut_short == "round_cap":
-        # "per pass", not a flat run total: the cap is a LangGraph `recursion_limit`, and
-        # langgraph recomputes the budget from the resumed step on every `astream` call,
-        # so each clarification resume grants a fresh allowance (plan `## Discoveries`
-        # 2026-08-12 — Phase 5; PR #4 review, Major). Naming it as a run-level bound
-        # overstated a number the reader could not reconcile with a clarified run.
+        # "per pass", not a flat run total: langgraph recomputes the budget from the resumed
+        # step on every `astream` call, so each clarification resume grants a fresh allowance.
+        # A run-level phrasing overstates a number the reader cannot reconcile.
         bound_line = (
             f"The run was cut short by {_ROUND_CAP_TEXT} "
             f"(configured at {config.agent.max_rounds} rounds per pass)."
@@ -208,27 +194,20 @@ def _notes_section(
 ) -> str:
     """Render this run's workspace files, at any depth, sorted by relative path.
 
-    Recursive, and NOT restricted to `*.md` (PR #4 review, Major). The lead agent is told
-    only "Write findings into your workspace as you go" — `harness/prompts/orchestrator.md`
-    pins neither a directory nor an extension — and deepagents' `FilesystemBackend.write`
-    creates parent directories for a nested path like `notes/pricing.md` rather than
-    rejecting or flattening it. A top-level `*.md` glob therefore printed "no working
-    notes were written" while this run's findings sat on disk: an affirmatively false
-    disclosure on exactly the path D2 exists to protect, since it is a cut-short run that
-    has nothing else to show.
+    Recursive and NOT restricted to `*.md`: the lead is told only "Write findings into your
+    workspace as you go" — no directory, no extension — and deepagents' `FilesystemBackend`
+    creates parents for a nested path like `notes/pricing.md`. A top-level `*.md` glob
+    therefore printed "no working notes were written" while this run's findings sat on disk,
+    on exactly the cut-short run that has nothing else to show.
 
-    `_NOTES_EXCLUDED_DIRS` does explicitly what the old glob's lack of recursion did
-    accidentally — keeps captured page text (`sources/`) and the summarizer's evicted
-    history (`conversation_history/`, `large_tool_results/`) out of the report. Files
-    that are not UTF-8 text are skipped alongside unreadable ones, matching `_is_usable`.
+    `_NOTES_EXCLUDED_DIRS` keeps captured page text and evicted history out. Non-UTF-8 files
+    are skipped alongside unreadable ones, matching `_is_usable`.
 
-    Scans THIS run's workspace subdirectory alone (`run_workspace_dir`), which is what
-    keeps another run's notes out — including a run still in flight, whose files the
-    `started_at` filter below cannot exclude because they are newer than this run's start
-    (PR #4 review). That filter is now the second line rather than the only one: it still
-    catches an explicitly reused `run_id`, which `SourceRegistry(run_id=...)` permits.
-    `None` means "no run start known" (a directly-constructed `RunOutcome` in a test) and
-    keeps every file.
+    Scans THIS run's workspace subdirectory alone, which is what keeps another run's notes
+    out — including a run still in flight, whose files are newer than this run's start and so
+    survive the `started_at` filter. That filter is the second line of defense: it still
+    catches an explicitly reused `run_id`. `None` means "no run start known" and keeps
+    every file.
     """
     workspace_dir = run_workspace_dir(config, registry.run_id)
     if not workspace_dir.exists():
@@ -253,19 +232,18 @@ def _notes_section(
 
 
 def _verdict_label(verdict: str) -> str:
-    """The reader-facing spelling of a verdict — reports are read by non-technical people."""
+    """The reader-facing spelling of a verdict."""
     return verdict.replace("_", " ")
 
 
 def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> list[str]:
-    """Marker-stripped prose lines for `paragraph`, with a trailing ` *` appended to each
-    bullet line whose zero-based index is in `verdict.unsupported_items` (D4: an index
-    outside `range(len(paragraph.items))` is ignored rather than raising).
+    """Marker-stripped prose lines for `paragraph`, with a trailing ` *` on each bullet whose
+    zero-based index is in `verdict.unsupported_items` (an out-of-range index is ignored, D4).
 
-    A bullet is identified by `LIST_ITEM_RE` — the same test `split_paragraphs` uses to
-    build `items` — so the Nth list line IS `items[N]`. Matching on rendered text instead
-    let a lead-in line ending in the first bullet's wording consume that bullet's slot,
-    putting the `*` on prose and leaving the failing bullet unmarked.
+    Bullets are identified by `LIST_ITEM_RE`, the same test `split_paragraphs` uses to build
+    `items`, so the Nth list line IS `items[N]`. Matching on rendered text instead let a
+    lead-in ending in the first bullet's wording consume that bullet's slot, putting the `*`
+    on prose and leaving the failing bullet unmarked.
     """
     unsupported = set(verdict.unsupported_items) if verdict is not None else set()
     valid = {i for i in unsupported if 0 <= i < len(paragraph.items)}
@@ -275,8 +253,7 @@ def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> 
     for raw_line in paragraph.text.split("\n"):
         rendered = strip_markers(raw_line)
         if LIST_ITEM_RE.match(raw_line):
-            # `rendered` is empty for a citation-only bullet, which renders no line at all
-            # — a bare ` *` would be a mark with nothing to mark.
+            # A citation-only bullet renders no line, so a bare ` *` would mark nothing.
             if rendered and item_index in valid:
                 rendered = f"{rendered} *"
             item_index += 1
@@ -289,11 +266,11 @@ def _paragraph_block(
     paragraph: Paragraph, verdict: ParagraphVerdict | None, registry: SourceRegistry
 ) -> str:
     """Render one paragraph: marker-stripped prose, then `Sources:`/`Verdict:` when the
-    paragraph cites at least one REGISTERED source — gated on citation alone, never on
-    the verdict value, so a `supported` paragraph gets a line exactly like any other.
+    paragraph cites at least one REGISTERED source. Gated on citation alone, never on the
+    verdict value, so a `supported` paragraph gets a line like any other.
 
-    A fenced block is emitted verbatim: stripping markers or re-wrapping it would corrupt
-    the code, and it cites nothing, so it carries no `Sources:`/`Verdict:` pair anyway.
+    A fenced block is emitted verbatim — stripping markers would corrupt the code — and it
+    cites nothing, so it carries no pair anyway.
     """
     if paragraph.is_code:
         return paragraph.text
@@ -311,10 +288,10 @@ def _paragraph_block(
     else:
         label = _verdict_label(verdict.verdict)
         detail = verdict.detail
-        # Only a verdict the MODEL returned can carry a bullet rollup. `not_verified` means
-        # no check ran, so "n/m bullets verified" would assert a count nothing measured.
-        # Counted by the bullets the reader can SEE: a citation-only bullet (`- [S1]`)
-        # renders no line, so counting it would inflate the denominator past the list.
+        # Only a MODEL verdict can carry a rollup: `not_verified` means no check ran, so
+        # "n/m bullets verified" would assert a count nothing measured. Counted over the
+        # bullets the reader can SEE — a citation-only bullet renders no line, so counting it
+        # would inflate the denominator past the list.
         counted = [i for i, item in enumerate(paragraph.items) if strip_markers(item)]
         if counted and verdict.verdict in MODEL_VERDICTS:
             unsupported_count = len(set(verdict.unsupported_items) & set(counted))
@@ -326,8 +303,7 @@ def _paragraph_block(
 def _answer_section(outcome: RunOutcome) -> str:
     """Render every paragraph in `outcome.paragraphs`, in order.
 
-    The ONLY source of paragraph boundaries (D2) — this never re-splits `outcome.answer`;
-    `harness/__main__.py` calls `split_paragraphs` exactly once and hands the list here.
+    Never re-splits `outcome.answer` (D2): `__main__.py` splits once and hands the list here.
     """
     verdicts = outcome.verification.verdicts if outcome.verification is not None else []
     blocks = [
@@ -338,23 +314,23 @@ def _answer_section(outcome: RunOutcome) -> str:
 
 
 def _conflicts_section(outcome: RunOutcome, verification: VerificationResult) -> str:
-    """One block per paragraph whose verdict carries `sources_conflict`. Adjudicates
-    nothing (D3): contradiction is MODEL-REPORTED, never derived here.
+    """One block per paragraph whose verdict carries `sources_conflict`. Adjudicates nothing
+    (D3): contradiction is MODEL-REPORTED, never derived here.
     """
     blocks: list[str] = []
     for i, verdict in enumerate(verification.verdicts):
         if not verdict.sources_conflict or i >= len(outcome.paragraphs):
             continue
         paragraph = outcome.paragraphs[i]
-        # Guard the STRIPPED result, not the raw text: a block that is nothing but a
-        # marker (`[S1]`) is truthy raw and empty once stripped, and `[0]` would raise.
+        # Guard the STRIPPED result: a block that is nothing but a marker is truthy raw and
+        # empty once stripped, so `[0]` would raise.
         stripped_lines = strip_markers(paragraph.text).splitlines()
         excerpt = stripped_lines[0] if stripped_lines else ""
         lines = [
             excerpt,
             "",
             # The model's own statement of WHAT they disagree about — without it the block
-            # names the sources but never the disagreement (PR #7 review).
+            # names the sources but never the disagreement.
             verdict.detail,
             "",
             "The cited sources disagree on this paragraph. The harness does not decide "
@@ -367,14 +343,13 @@ def _conflicts_section(outcome: RunOutcome, verification: VerificationResult) ->
 
 
 def _gaps_section(outcome: RunOutcome, verification: VerificationResult) -> str:
-    """Unresolved citation markers, per-check failures, and — on a run that was NOT cut
-    short — its dead branches.
+    """Unresolved citation markers, per-check failures, and — on a run that was NOT cut short
+    — its dead branches.
 
-    R4 requires dead branches to be disclosed on every run, not only a cut-short one
-    (PR #4 review, Major). `_cut_short_section` already lists unfinished todos when a
-    bound ended the run, so this renders them only when it did not: an agent that simply
-    stops with steps still `pending` has abandoned those branches just as surely, and the
-    reader was previously told nothing at all.
+    R4 requires dead branches on every run, not only a cut-short one. `_cut_short_section`
+    already lists unfinished todos when a bound ended the run, so this renders them only when
+    it did not: an agent that simply stops with steps still `pending` has abandoned those
+    branches just as surely.
     """
     lines: list[str] = []
 
@@ -384,8 +359,8 @@ def _gaps_section(outcome: RunOutcome, verification: VerificationResult) -> str:
             lines.append(_DEAD_BRANCHES_HEADING)
             lines.append(format_todos(unfinished))
 
-    # The RAW answer: `## Answer` strips every marker (registered or not, D4), so reading
-    # the raw text keeps this independent of that rendering step.
+    # The RAW answer: `## Answer` strips every marker (D4), so reading the raw text keeps this
+    # independent of that rendering step.
     unresolved = outcome.registry.unresolved_ids(outcome.answer)
     if unresolved:
         lines.append("Unresolved citation markers (no matching source was registered):")
@@ -406,8 +381,8 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
         "",
         "## Run metadata",
         f"- Timestamp: {now.isoformat()}",
-        # Reports what is CONFIGURED for each role, not whether it was ever invoked — the
-        # subagent tier is configured but not yet wired (R6).
+        # What is CONFIGURED for each role, not whether it was invoked: the subagent tier is
+        # configured but not yet wired (R6).
         f"- Lead Model: {config.roles['head'].model}",
         f"- Subagent Model: {config.roles['subagent'].model}",
         *_usage_lines(outcome.usage),
@@ -421,8 +396,8 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
     lines += [
         "## Answer",
         "",
-        # A cut-short run often has no prose answer at all. Say so, rather than rendering
-        # an empty section that reads as "the answer is nothing" (3F Major).
+        # A cut-short run often has no prose answer. Say so, rather than leaving an empty
+        # section that reads as "the answer is nothing".
         answer_text or _NO_ANSWER_TEXT,
         "",
     ]
@@ -456,12 +431,11 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
 def write_report(outcome: RunOutcome, config: HarnessConfig) -> Path:
     """Render `outcome` and write it to `<reports_dir>/YYYY-MM-DD-HHMMSS-<slug>.md`.
 
-    Marker stripping is UNCONDITIONAL: `_render_body` → `_answer_section` strips every
-    `[Sn]` marker out of each paragraph's prose, registered or not, on every run — so no
-    bare marker survives into `## Answer` (R1). A REGISTERED source's link moves onto its
-    paragraph's own `Sources:` line instead; an unregistered one is disclosed in `## Gaps
-    and disclosures` rather than left inline. What `outcome.verification` gates is only
-    the `Verdict:` line's content (a real verdict, or the deterministic "not verified").
+    Marker stripping is UNCONDITIONAL: every `[Sn]` leaves the prose on every run, registered
+    or not, so no bare marker survives into `## Answer` (R1). A registered source's link moves
+    onto its paragraph's `Sources:` line; an unregistered one is disclosed under `## Gaps and
+    disclosures`. `outcome.verification` gates only the `Verdict:` line's content — a real
+    verdict, or the deterministic "not verified".
     """
     config.agent.reports_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now()

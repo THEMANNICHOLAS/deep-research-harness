@@ -3,9 +3,9 @@
 from pathlib import Path
 from string import Template
 
-# `harness/prompts/` holds ONLY `.md` files. The import works because a real `.py` module
-# wins over a same-named namespace-package directory; adding any `.py` there (especially
-# `__init__.py`) makes it a real package that shadows this module and breaks every import.
+# `harness/prompts/` holds ONLY `.md` files: a real `.py` module wins over a same-named
+# namespace-package directory, so adding any `.py` there — `__init__.py` especially — makes it a
+# package that shadows this module and breaks every import.
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
