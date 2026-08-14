@@ -35,6 +35,11 @@ Verdict = Literal[
 # distinction, and this is the one place that line is drawn.
 MODEL_VERDICTS = {"supported", "partially_supported", "not_supported"}
 
+# The reader-facing `Verdict:` detail for a check that could not run. Reports are read by
+# production technicians, so the exception text stays in `check_failures` — which
+# `## Gaps and disclosures` prints — instead of reaching the answer (PR #7 review).
+CHECK_FAILED_DETAIL = "This paragraph could not be checked because the verification step failed."
+
 
 class ParagraphVerdict(BaseModel):
     """One paragraph's verification outcome."""
@@ -81,7 +86,11 @@ def _parse_reply(content: str) -> tuple[Verdict, str, bool, list[int]]:
         raise VerifyError(f"model returned an unknown verdict: {verdict!r}")
     if not isinstance(detail, str):
         raise VerifyError("model's 'detail' field is not a string")
-    sources_conflict = bool(data.get("sources_conflict", False))
+    # A real boolean only, matching how `unsupported_items` below drops anything that is
+    # not an int: `bool("false")` is True, so a quoted boolean would file the paragraph
+    # under `## Conflicting sources` against its own reply. Anything unparseable reads as
+    # "no conflict claimed" rather than failing the whole check.
+    sources_conflict = data.get("sources_conflict", False) is True
     raw_items = data.get("unsupported_items", [])
     unsupported_items = [
         item for item in raw_items if isinstance(item, int) and not isinstance(item, bool)
@@ -179,7 +188,7 @@ async def verify_paragraphs(
             verdicts.append(
                 ParagraphVerdict(
                     verdict="not_verified",
-                    detail=f"{type(exc).__name__}: {exc}",
+                    detail=CHECK_FAILED_DETAIL,
                     source_ids=pooled_ids,
                     unsupported_items=[],
                 )

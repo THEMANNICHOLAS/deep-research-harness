@@ -18,6 +18,9 @@ _BLANK_LINE_RE = re.compile(r"\n\s*\n")
 # Public: `report.py` gates bullet marking on the same test that builds `items` here, so
 # the Nth list line of a block is `items[N]` by construction rather than by text matching.
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+•–]|\d+[.)])\s+")
+# What a bullet whose only content was a citation (`- [S1]`) leaves behind once the marker
+# is gone: its list syntax alone. See `strip_markers`.
+_LIST_SYNTAX_ONLY_RE = re.compile(r"^(?:[-*+•–]|\d+[.)])$")
 
 
 class Paragraph(BaseModel):
@@ -65,7 +68,9 @@ def split_paragraphs(answer: str) -> list[Paragraph]:
 def strip_markers(text: str) -> str:
     """Remove every `[Sn]` marker from `text` and repair the whitespace it leaves.
 
-    Applied per line so list and nested-list indentation survives.
+    Applied per line so list and nested-list indentation survives. A line left with no
+    content at all is dropped — including a bullet that cited a source and said nothing
+    else, whose list syntax would otherwise survive as a contentless `-` (PR #7 review).
     """
     lines: list[str] = []
     for line in text.split("\n"):
@@ -75,7 +80,7 @@ def strip_markers(text: str) -> str:
         body = re.sub(r"[ \t]{2,}", " ", body)
         body = re.sub(r"[ \t]+([,.;:!?)])", r"\1", body)
         body = body.strip()
-        if not body:
+        if not body or _LIST_SYNTAX_ONLY_RE.match(body):
             continue
         lines.append(indent + body)
 

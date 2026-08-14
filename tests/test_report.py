@@ -34,7 +34,7 @@ from harness.report import (
 )
 from harness.sources import SourceRegistry
 from harness.tools.fetch import _sources_dir
-from harness.verify import ParagraphVerdict, VerificationResult
+from harness.verify import CHECK_FAILED_DETAIL, ParagraphVerdict, VerificationResult
 from tests.conftest import write_failed_capture, write_source_capture, write_workspace_note
 
 _FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-[a-z0-9-]+\.md$")
@@ -786,10 +786,49 @@ def test_write_report_conflicts_section_names_both_sources_with_no_winner(make_c
     assert "The vendor quoted" in section
     assert registry.link(id1) in section
     assert registry.link(id2) in section
+    # The model's own `detail` is the only statement of WHAT they disagree about; a list of
+    # links alone named the sources but never the disagreement (PR #7 review).
+    assert "The two sources disagree on the price." in section
     lowered = section.lower()
     assert "correct" not in lowered
     assert "wrong" not in lowered
     assert "more reliable" not in lowered
+
+
+def test_conflicts_section_survives_a_paragraph_that_is_nothing_but_a_marker(make_config):
+    """Covers the guard `_conflicts_section` already carries: a paragraph whose text is
+    only `[S1]` is truthy raw and empty once stripped, so taking its first line would
+    raise `IndexError`. No test constructed that input (PR #7 review) — the guard is
+    exercised here rather than trusted.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://one.example.test/a", title="One")
+    answer = f"[{source_id}]"
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="A paragraph that is only a citation",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=VerificationResult(
+            verdicts=[
+                ParagraphVerdict(
+                    verdict="not_supported",
+                    detail="The two sources disagree on the price.",
+                    sources_conflict=True,
+                    source_ids=[source_id],
+                )
+            ]
+        ),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    section = _section(body, "## Conflicting sources")
+    assert registry.link(source_id) in section
+    assert "The two sources disagree on the price." in section
 
 
 def test_write_report_gaps_section_lists_check_failures(make_config):
@@ -938,6 +977,47 @@ def test_a_lead_in_repeating_the_first_bullet_does_not_steal_its_unsupported_mar
     assert "- Lead time is six weeks." in lines
 
 
+def test_a_citation_only_bullet_renders_no_line_and_is_left_out_of_the_rollup(make_config):
+    """`- [S1]` is a bullet with nothing in it. It used to render as a contentless `-` and
+    still count toward the rollup denominator, so a list with one visible (and unsupported)
+    bullet read `1/2 bullets verified` — crediting the reader with a verified bullet that
+    is not on the page (PR #7 review).
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/vendor")
+    write_source_capture(config, registry, source_id, "Body text.")
+    answer = f"- The vendor quoted $4.20 [{source_id}].\n- [{source_id}]"
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="A list with a citation-only bullet",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=VerificationResult(
+            verdicts=[
+                ParagraphVerdict(
+                    verdict="not_supported",
+                    detail="The capture quotes a different price.",
+                    unsupported_items=[0],
+                    source_ids=[source_id],
+                )
+            ]
+        ),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+    lines = [line.strip() for line in answer_section.splitlines()]
+
+    assert "- The vendor quoted $4.20. *" in lines
+    assert "-" not in lines, "a citation-only bullet must render no line at all"
+    assert "*" not in lines, "and no orphaned unsupported mark either"
+    assert "0/1 bullets verified." in answer_section
+    assert "1/2" not in answer_section
+
+
 def test_a_list_that_was_never_verified_carries_no_bullets_verified_rollup(make_config):
     """`not_verified` means no check ran, so an `n/m bullets verified` rollup would assert
     a count nothing measured — telling a non-technical reader every bullet checked out at
@@ -959,7 +1039,9 @@ def test_a_list_that_was_never_verified_carries_no_bullets_verified_rollup(make_
             verdicts=[
                 ParagraphVerdict(
                     verdict="not_verified",
-                    detail="JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+                    # The detail `verify.py` actually produces for a failed check — a plain
+                    # sentence, with the exception text left to `check_failures`.
+                    detail=CHECK_FAILED_DETAIL,
                     source_ids=[source_id],
                 )
             ]
@@ -970,10 +1052,7 @@ def test_a_list_that_was_never_verified_carries_no_bullets_verified_rollup(make_
     answer_section = _section(body, "## Answer")
 
     assert "bullets verified" not in answer_section
-    assert (
-        "Verdict: not verified - JSONDecodeError: Expecting value: line 1 column 1 (char 0)"
-        in answer_section
-    )
+    assert f"Verdict: not verified - {CHECK_FAILED_DETAIL}" in answer_section
 
 
 def test_a_fenced_code_block_reaches_the_answer_verbatim(make_config):
@@ -1247,11 +1326,13 @@ def test_write_report_discloses_skipped_verification_when_the_run_died(make_conf
             "verification skipped: the run ended in an error, so claims were not checked"
         ]
     )
+    answer = "Partial finding before the crash."
     outcome = RunOutcome(
         question="What happened to the run?",
-        answer="Partial finding before the crash.",
+        answer=answer,
         registry=SourceRegistry(),
         usage=_usage(),
+        paragraphs=split_paragraphs(answer),
         cut_short="error",
         cut_short_detail="APIConnectionError: getaddrinfo failed",
         verification=verification,
@@ -1471,11 +1552,13 @@ def test_dead_branches_are_disclosed_on_a_run_that_finished_normally(make_config
         {"content": "Check the delivery claim against a second source", "status": "pending"},
         {"content": "Summarize the vendor comparison", "status": "completed"},
     ]
+    answer = "Acme quoted $4.20."
     outcome = RunOutcome(
         question="Which vendor is cheapest?",
-        answer="Acme quoted $4.20.",
+        answer=answer,
         registry=SourceRegistry(),
         usage=_usage(),
+        paragraphs=split_paragraphs(answer),
         cut_short=None,
         todos=todos,
         verification=VerificationResult(),
@@ -1493,11 +1576,13 @@ def test_a_cut_short_run_does_not_list_its_dead_branches_twice(make_config):
     """`## Run cut short` already lists them; the gaps section must not repeat them."""
     config = make_config()
     todos = [{"content": "Check the delivery claim", "status": "pending"}]
+    answer = "Partial answer."
     outcome = RunOutcome(
         question="Which vendor is cheapest?",
-        answer="Partial answer.",
+        answer=answer,
         registry=SourceRegistry(),
         usage=_usage(),
+        paragraphs=split_paragraphs(answer),
         cut_short="wall_clock",
         todos=todos,
         verification=VerificationResult(),
