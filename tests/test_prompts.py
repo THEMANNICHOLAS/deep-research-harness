@@ -6,12 +6,20 @@ import pytest
 
 from harness.prompts import PromptError, render, required_variables
 
+# The frozen delegation-tier contracts (R5). Neither is wired to anything yet.
+TIER_CONTRACTS = ["subagent", "reader"]
+
 
 @pytest.fixture
 def prompt_dir(tmp_path, monkeypatch):
     """Point harness.prompts at a temp directory of .md fixtures."""
     monkeypatch.setattr("harness.prompts._PROMPTS_DIR", tmp_path)
     return tmp_path
+
+
+def _render_shipped(name):
+    """Render a shipped prompt, stubbing every declared variable with its own name."""
+    return render(name, **{v: f"<{v}>" for v in required_variables(name)})
 
 
 def test_render_substitutes_all_variables(prompt_dir):
@@ -92,14 +100,51 @@ def test_json_braces_and_dollar_escape_render_unchanged(prompt_dir):
     assert "$100" in result
 
 
-@pytest.mark.parametrize("name", ["orchestrator", "subagent"])
+@pytest.mark.parametrize("name", ["orchestrator", "verify", *TIER_CONTRACTS])
 def test_shipped_prompts_render_with_their_declared_variables(name):
-    variables = required_variables(name)
+    assert required_variables(name)
 
-    assert variables
-
-    rendered = render(name, **{v: f"<{v}>" for v in variables})
+    rendered = _render_shipped(name)
 
     # No unsubstituted placeholder survives rendering. Checked via get_identifiers rather
     # than `"$" not in rendered`, because a `$$` escape legitimately renders to a literal `$`.
     assert Template(rendered).get_identifiers() == []
+
+
+@pytest.mark.parametrize("name", TIER_CONTRACTS)
+def test_tier_contracts_declare_exactly_their_placeholders(name):
+    # Frozen: a tier receives its task through the delegation call at run time, never by
+    # template substitution, so neither contract declares a task or facet placeholder.
+    assert required_variables(name) == {"current_date", "max_urls_per_call"}
+
+
+@pytest.mark.parametrize("name", TIER_CONTRACTS)
+def test_tier_contract_missing_variable_raises_prompt_error_naming_both(name):
+    supplied = {v: f"<{v}>" for v in required_variables(name) if v != "current_date"}
+
+    with pytest.raises(PromptError) as exc_info:
+        render(name, **supplied)
+
+    message = str(exc_info.value)
+    assert name in message
+    assert "current_date" in message
+
+
+@pytest.mark.parametrize("name", TIER_CONTRACTS)
+def test_tier_contracts_do_not_reference_ask_user(name):
+    # D1: a tier that can interrupt the developer would stall the run mid-fan-out, so no
+    # tier contract may name the clarification tool.
+    assert "ask_user" not in _render_shipped(name)
+
+
+@pytest.mark.parametrize("name", TIER_CONTRACTS)
+@pytest.mark.parametrize(
+    "field",
+    ["Objective", "Output format", "Tools", "Boundaries", "Findings", "Source IDs", "Conflicts"],
+)
+def test_tier_contracts_name_their_frozen_fields(name, field):
+    # R5: the next round builds subagent definitions against exactly these field names —
+    # four a task must carry, three a tier must return. Anchored to the bolded field bullet,
+    # not a bare word: "tools" alone would also match the `# Tools` heading, so a renamed
+    # field would slip through the assertion this test exists to make.
+    assert f"**{field}**" in _render_shipped(name)

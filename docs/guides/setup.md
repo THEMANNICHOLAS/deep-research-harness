@@ -23,26 +23,31 @@
    workstation, and a rebuilt runner VM all read — CI installs its uv from the same key
    (see `.github/workflows/ci.yml` and `docs/plans/PLAN-ci-pipeline.md` `## Discoveries`).
 2. `uv sync` — creates `.venv` and installs runtime deps (pydantic, langchain-core,
-   crawl4ai, httpx) and dev deps (ruff, mypy, pytest, pytest-asyncio, pytest-cov).
-   Python 3.12 is used, pinned by `.python-version`; `requires-python` floor is 3.11.
+   crawl4ai, httpx, deepagents, langchain-openai) and dev deps (ruff, mypy, pytest,
+   pytest-asyncio, pytest-cov). Python 3.12 is used, pinned by `.python-version`;
+   `requires-python` floor is 3.11. `deepagents` and `langchain-openai` are both pinned
+   exactly; the former also pulls in langchain-anthropic, langchain-google-genai and
+   langsmith.
 3. `uv run playwright install chromium` — the fetch tool is crawl4ai-managed
    Playwright/Chromium, and this is not covered by `uv sync`.
 4. Copy `.env.example` to `.env` and fill in:
-   - `OPENCODE_API_KEY` — smart-model orchestration (GLM 5.2 / DeepSeek V4 Pro)
-   - `CEREBRAS_API_KEY` — Gemma 4 31B worker triage (free tier)
+   - `OPENCODE_API_KEY` — the OpenCode endpoint serving both model roles
    - `SEARXNG_SECRET` — cookie signing for the local SearXNG instance; generate
      with `openssl rand -hex 32`
+
+   Every provider declared in `harness.toml` has its key resolved at load time,
+   whether or not a role uses it — so a declared provider with no key set fails
+   `load_config()`. Only `[providers.opencode]` is declared today.
 
    `SEARXNG_URL` is no longer an `.env` variable — it moved into `harness.toml` (see
    below). If you have an existing `.env` with that key, move its value into
    `harness.toml`'s `[search]` table and delete it from `.env`.
-5. Replace `harness.toml`'s remaining `TODO` placeholders with real values: the
-   OpenCode base URL and the head/subagent model IDs. (`[search] base_url` is
-   already set to the local SearXNG below.) These are **not** validated — `TODO`
-   is a well-formed string, so `load_config()` accepts it and the mistake surfaces
-   later as a connection or model error. Check them by eye. Nothing reads the model
-   roles yet — they are the loop plan's concern, so the fetch and search live
-   checks below work with them still unset.
+5. `harness.toml` ships with real values — no `TODO` placeholders remain. If you
+   change the endpoint or a model ID, note that a literal `TODO` still passes
+   `load_config()` (it is a well-formed string), but is rejected at startup by
+   `build_chat_model`, which raises `ModelError` naming the role, the provider, and
+   the offending value. A wrong-but-well-formed endpoint or model ID is caught by
+   `preflight` before any research starts, not mid-run.
 
 ## Running with `.env`
 
@@ -72,6 +77,15 @@ are never stored here — each provider names an environment variable
   maximum URLs one `fetch_pages` call may request (`max_urls_per_call`; a call carrying
   more is rejected without fetching anything).
 - `[search]` — the SearXNG base URL and default result count.
+- `[agent]` — `max_rounds` (default 20) and `wall_clock_seconds` (default 1800), the
+  run's two ceilings. The wall clock starts at the first `search_web`/`fetch_pages`
+  call, not at launch, so an initial clarifying question can be answered at leisure;
+  hitting either bound still writes a report naming which one it was. `max_rounds` is
+  approximate — it maps onto LangGraph supersteps and buys somewhat fewer rounds than
+  its number suggests (see @docs/plans/PLAN-research-loop.md `## Discoveries`).
+- `max_rounds` bounds one PASS, not the whole run: every clarification resume grants a
+  fresh allowance, so a run that asked two questions may use roughly three times the
+  number configured. The wall clock is the only run-level bound once research starts.
 
 ## Prerequisites
 
@@ -185,6 +199,63 @@ results — the rendered content is the one form that reads correctly either way
 Expect real results back from the configured SearXNG. Then point `[search] base_url` at a
 dead URL (e.g. `http://localhost:1`) and re-run — expect a `SearchFailure` with reason
 `unreachable` printed as plain text, never a traceback.
+
+The head model role needs a real provider, so it isn't exercised by `uv run pytest` either.
+This requires `OPENCODE_API_KEY` set. To check it, run:
+
+```
+uv run --env-file .env python -c "
+from harness.config import load_config
+from harness.models import build_chat_model
+
+model = build_chat_model(load_config(), 'head')
+print(model.invoke('Say hi in five words or fewer.').content)
+"
+```
+
+Expect a short sentence back. To check the R6 startup guard — an endpoint or model that is
+well-formed but wrong — point `[providers.opencode] base_url` at a dead URL (e.g.
+`http://localhost:1/v1`) and run:
+
+```
+uv run --env-file .env python -c "
+import asyncio
+from harness.config import load_config
+from harness.models import preflight
+
+asyncio.run(preflight(load_config(), 'head'))
+"
+```
+
+Expect a `ModelError` naming the role, the provider, the base URL, and the model — never a
+raw `openai` or `httpx` traceback. `base_url` is the API **base**, not a full endpoint: the
+client appends `/chat/completions` itself, so a value ending in `/chat/completions` produces
+a doubled path and fails here.
+
+## End-to-end live check
+
+Runs the whole loop for real — model, SearXNG, and a live browser fetch — and writes a
+report. This costs real tokens, so it is not part of `uv run pytest`.
+
+```
+uv run --env-file .env python -m harness "What changed in Python 3.14's free-threading support?"
+```
+
+Expect the research plan to echo at the terminal as the agent works, and the final line of
+stdout to be the path of a timestamped report under `[agent] reports_dir`. Open that file: it
+should answer the question, carry `[Sn]` markers on its claims, and list its sources. Every
+source consulted also leaves a file under `[agent] workspace_dir` in `<run_id>/sources/`.
+Each run owns a `<run_id>` subdirectory of the workspace — its notes, its captures, and its
+evicted history — so two runs started at once never read each other's findings.
+
+**Running from a git worktree:** `.env` is gitignored, so it does not exist inside a worktree.
+Point uv at the main checkout's copy — `uv run --env-file ../../../.env python -m harness
+"..."` — or run from the main checkout instead. Without it the run fails with "No environment
+file found".
+
+Note that `[roles.head]`'s model is a reasoning model, so most of a run's output tokens are
+reasoning tokens; the report records the split rather than a single total, because a bare
+total would misprice any later delegation work against this baseline.
 
 ## Commands
 

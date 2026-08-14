@@ -13,7 +13,7 @@ def test_build_tools_returns_the_frozen_tool_set(make_config):
 
     # Ordered, not a set: the explicit builder list in harness/tools/__init__.py is
     # part of the documented contract.
-    assert [tool.name for tool in tools] == ["fetch_pages", "search_web"]
+    assert [tool.name for tool in tools] == ["fetch_pages", "search_web", "ask_user"]
 
 
 def test_every_tool_exposes_description_and_json_schema(make_config):
@@ -34,6 +34,7 @@ def test_every_tool_exposes_description_and_json_schema(make_config):
     search_props = by_name["search_web"].args_schema.model_json_schema()["properties"]
     assert "query" in search_props
     assert "max_results" in search_props
+    assert "question" in by_name["ask_user"].args_schema.model_json_schema()["properties"]
 
 
 async def test_build_tools_wires_the_callers_registry_into_the_fetch_tool(make_config, monkeypatch):

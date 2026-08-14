@@ -89,3 +89,32 @@ to address.
   other than the three `blocked` codes deserves its own outcome, or whether the caller
   should read `FetchedPage.status_code` (already carried in the artifact) and judge for
   itself. The information is not lost, only unclassified.
+
+- **The wall clock has never been cancelled against a real browser teardown.** Both
+  offline tests expire the clock inside an `httpx.MockTransport` handler sleeping on
+  `asyncio.sleep` — the friendliest possible cancellation target. On a real run the
+  in-flight work at the bound is crawl4ai's `arun_many` inside
+  `async with AsyncWebCrawler(...)` (@harness/tools/fetch.py), whose `__aexit__` tears
+  down a Playwright/Chromium subprocess while the task is being cancelled. Raised by the
+  PR #4 review; nothing offline can settle it. To address: during Phase 5's owed live
+  check, set `wall_clock_seconds` below `fetch.page_timeout_ms` so the clock fires
+  *inside* `arun_many`, then confirm the partial report is still written and no chromium
+  process is left behind.
+
+- **`extract_claims` splits sentences on `.`/`!`/`?` alone.** The PR #4 review fixed
+  block-level merging (a lead-in or heading above a list no longer glues onto the first
+  bullet), but a claim containing "Inc." or "e.g." still splits mid-sentence, and a
+  bullet with no terminal punctuation is one claim however long it runs. To address:
+  decide whether claim boundaries deserve a real sentence segmenter or whether the
+  current approximation is good enough for the marker-placement and per-source-check
+  jobs it feeds.
+
+- **`InMemorySaver` checkpoint growth has never been measured.** Deferred at Phase 4
+  (a checkpointer is required for `interrupt_on`, so it is not optional), inherited by
+  Phase 5, and still untaken after Phase 5's and Phase 6's live checks — the one item
+  the research-loop plan's `## Verification` ticks without evidence behind it. Every
+  superstep writes a full checkpoint to memory and nothing evicts them, so a run long
+  enough to matter is the only thing that can show whether it grows linearly with the
+  whole message history. To address: read the process's RSS at the first tool call and
+  again at completion during a normal-length run, and compare against the run's total
+  input tokens.

@@ -1,0 +1,1197 @@
+"""Behavioral tests for harness.report. Pure string work: no model, no network.
+
+`RunOutcome`'s field names (`question`, `answer`, `registry`, `usage`) are not pinned by
+the plan's Contracts section — only the class name, `write_report`'s signature, and the
+frozen filename format are. This suite fixes those field names as part of writing the
+tests first; `harness/report.py` must match them.
+"""
+
+import os
+import re
+from datetime import datetime
+
+import pytest
+from pydantic import ValidationError
+
+from harness.config import AgentSettings
+from harness.report import (
+    _CUT_SHORT_HEADING,
+    _ERROR_TEXT,
+    _NO_ANSWER_TEXT,
+    _NO_NOTES_TEXT,
+    _NOTES_HEADING,
+    _ROUND_CAP_TEXT,
+    _UNUSABLE_HEADING,
+    _WALL_CLOCK_TEXT,
+    RunOutcome,
+    write_report,
+)
+from harness.sources import SourceRegistry
+from harness.tools.fetch import _sources_dir
+from harness.verify import ClaimCheck, VerificationResult
+from tests.conftest import write_failed_capture, write_source_capture, write_workspace_note
+
+_FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-[a-z0-9-]+\.md$")
+
+# An mtime far enough back that no test run can straddle it — stands in for "written by a
+# previous run of the harness".
+_LONG_AGO = 1_000_000_000.0
+
+
+def _usage(reasoning: int = 0, input_tokens: int = 100, output_tokens: int = 50) -> dict:
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "output_token_details": {"reasoning": reasoning},
+    }
+
+
+def test_write_report_produces_a_frozen_filename_under_reports_dir(make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    registry.add("https://example.test/a", title="Example A")
+    outcome = RunOutcome(
+        question="What is the melting point of tungsten?",
+        answer="Tungsten melts at 3422 C [S1].",
+        registry=registry,
+        usage=_usage(reasoning=12),
+    )
+
+    path = write_report(outcome, config)
+
+    assert path.parent == config.agent.reports_dir
+    assert _FILENAME_RE.match(path.name), path.name
+    assert path.exists()
+    assert path.read_text(encoding="utf-8")
+    # Guards against a stub emitting a constant/placeholder slug: the question's own
+    # words must survive into the filename, not just satisfy the shape regex.
+    assert "melting" in path.name
+    assert "tungsten" in path.name
+
+
+def test_write_report_returns_a_path_whose_body_is_the_answer_actually_written(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="Is the sky blue?",
+        answer="Yes, due to Rayleigh scattering [S1].",
+        registry=SourceRegistry(),
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+
+    assert path.is_file()
+    assert "Yes, due to Rayleigh scattering [S1]." in path.read_text(encoding="utf-8")
+
+
+def test_write_report_with_no_usable_sources_still_writes_a_report_saying_so(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="What is the airspeed velocity of an unladen swallow?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+
+    assert path.exists()
+    body = path.read_text(encoding="utf-8")
+    # Asserted on the rendered text, per the plan, not on a flag anywhere in RunOutcome.
+    assert "no usable sources" in body.lower()
+
+
+def test_write_report_with_usable_sources_does_not_claim_it_has_none(make_config):
+    """The paired negative for the test above.
+
+    Without this, a stub that always prints "no usable sources" regardless of input would
+    pass the no-sources test in isolation. Same `RunOutcome` shape, a registry that is NOT
+    empty AND whose source has a real captured (non-stub) file: the phrase must be absent
+    and the source must be listed instead.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/tungsten", title="Tungsten facts")
+    write_source_capture(config, registry, source_id)
+    outcome = RunOutcome(
+        question="What is the airspeed velocity of an unladen swallow?",
+        answer="African or European? [S1]",
+        registry=registry,
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+
+    assert path.exists()
+    body = path.read_text(encoding="utf-8")
+    assert "no usable sources" not in body.lower()
+    assert "example.test" in body
+
+
+def test_write_report_treats_registered_stub_sources_as_not_usable(make_config):
+    """A registered source whose captured file is a `FETCH FAILED:` stub is not evidence.
+
+    3F Major finding: `fetch.py` registers every attempted URL, including 404s and blocked
+    pages. A registry whose sources are all stubs must NOT list them as usable sources, and
+    must still state plainly that no usable sources were found.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    dead_id = registry.add("https://example.test/dead-link", title=None)
+    write_failed_capture(config, registry, dead_id, outcome="blocked")
+    outcome = RunOutcome(
+        question="What killed the link?",
+        answer="Unable to determine — the only lead was unreachable.",
+        registry=registry,
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert "no usable sources" in body.lower()
+    # The stub is mentioned (plainly, under the "not usable" heading) but never as an
+    # unqualified usable-source bullet ahead of that heading — position, not just
+    # presence, is what proves it was never counted as evidence.
+    no_sources_pos = body.lower().index("no usable sources")
+    heading_pos = body.index(_UNUSABLE_HEADING)
+    dead_bullet_pos = body.index(f"[{dead_id}]")
+    assert no_sources_pos < heading_pos < dead_bullet_pos
+
+
+def test_write_report_survives_a_capture_file_that_is_not_valid_utf8(make_config):
+    """A truncated capture must cost one source, never the whole report (PR #4, Major).
+
+    `write_text` dying mid-flush (ENOSPC, EIO) leaves a byte prefix that can end
+    mid-character. `UnicodeDecodeError` is a `ValueError`, so it used to escape
+    `_is_usable` and `write_report` — which `__main__` does not guard — throwing away a
+    run that had already spent its wall clock, its tokens and its verification pass.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    good_id = registry.add("https://example.test/good", title=None)
+    torn_id = registry.add("https://example.test/torn", title=None)
+    write_source_capture(config, registry, good_id)
+    torn_path = _sources_dir(config, registry) / f"{torn_id}.md"
+    # A valid UTF-8 prefix cut mid-character, exactly as an aborted flush would leave it.
+    torn_path.write_bytes(b"# S2: torn page\n\n- Outcome: fetched\n\ncaf\xc3")
+    outcome = RunOutcome(
+        question="What survived?",
+        answer="The good source did [S1].",
+        registry=registry,
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert "example.test/good" in body
+    # Unreadable is treated exactly like a stub: disclosed as not usable, never as evidence.
+    unusable_pos = body.index(_UNUSABLE_HEADING)
+    assert unusable_pos < body.index(f"[{torn_id}]")
+
+
+def test_write_report_lists_usable_sources_and_marks_stubs_separately(make_config):
+    """Mixed case: one real capture, one stub. Each must be judged on its own file."""
+    config = make_config()
+    registry = SourceRegistry()
+    good_id = registry.add("https://good.example.test/page", title="Good page")
+    bad_id = registry.add("https://bad.example.test/page", title=None)
+    write_source_capture(config, registry, good_id)
+    write_failed_capture(config, registry, bad_id, outcome="timeout")
+    outcome = RunOutcome(
+        question="Mixed source usability",
+        answer="Partial answer [S1].",
+        registry=registry,
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert "no usable sources" not in body.lower()
+    assert "good.example.test" in body
+    assert "bad.example.test" in body
+    assert _UNUSABLE_HEADING in body
+    # Position, not just presence: the usable source is listed normally, before the
+    # "not usable" heading; the stub is listed after it, under that heading.
+    good_pos = body.index(f"[{good_id}]")
+    bad_pos = body.index(f"[{bad_id}]")
+    heading_pos = body.index(_UNUSABLE_HEADING)
+    assert good_pos < heading_pos < bad_pos
+
+
+def test_write_report_creates_reports_dir_if_missing(make_config, tmp_path):
+    agent = AgentSettings(
+        workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports" / "nested"
+    )
+    config = make_config(agent=agent)
+    assert not config.agent.reports_dir.exists()
+    outcome = RunOutcome(
+        question="Does write_report create its own directory?",
+        answer="Yes.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+
+    assert path.exists()
+    assert config.agent.reports_dir.exists()
+
+
+def test_write_report_body_carries_answer_reasoning_split_and_sources(make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a", title="Example A")
+    write_source_capture(config, registry, source_id)
+    outcome = RunOutcome(
+        question="reasoning split check",
+        answer="Answer text with a marker [S1].",
+        registry=registry,
+        usage=_usage(reasoning=37, input_tokens=200, output_tokens=80),
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    # Phase 6 resolves every REGISTERED `[Sn]` marker into a clickable link (R1), so the
+    # prose survives but the raw marker must not — resolution is mechanical (substrate
+    # D4) and runs whether or not the verification pass did.
+    answer_section = _section(body, "## Answer")
+    assert "Answer text with a marker" in answer_section
+    assert "[S1]" not in answer_section
+    assert "example.test" in answer_section
+    # The reasoning-token count must be visible on its own, not folded silently into a
+    # bare total (finding 9: a plain total misprices the pyramid for a reasoning model).
+    assert "37" in body
+    assert "280" in body  # total_tokens = input + output
+    assert "example.test" in body  # the ## Sources list, built from the registry
+
+
+def test_run_outcome_rejects_unknown_fields():
+    with pytest.raises(ValidationError):
+        RunOutcome(
+            question="q",
+            answer="a",
+            registry=SourceRegistry(),
+            usage=_usage(),
+            unexpected_field="nope",
+        )
+
+
+# --- Phase 5: cut-short disclosure -----------------------------------------------------
+
+
+def _section(body: str, heading: str) -> str:
+    """Return the text between `heading` and the next top-level `## ` heading (or EOF).
+
+    Isolates a section by content, not a fixed line offset, so these tests stay correct
+    regardless of exactly where `## Run cut short` / `## Working notes` land relative to
+    the surrounding sections.
+    """
+    start = body.index(heading) + len(heading)
+    rest = body[start:]
+    end = rest.find("\n## ")
+    return rest if end == -1 else rest[:end]
+
+
+def test_write_report_discloses_the_round_cap_bound(make_config, tmp_path):
+    """A hardcoded default cap could never reveal a NON-default configured value."""
+    agent = AgentSettings(
+        max_rounds=17, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
+    )
+    config = make_config(agent=agent)
+    outcome = RunOutcome(
+        question="How far did the run get before the round cap hit?",
+        answer="Partial answer only.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="round_cap",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING in body
+    section = _section(body, _CUT_SHORT_HEADING)
+    assert "17" in section
+    # The untouched AgentSettings default (20) must never appear here — that would mean
+    # the configured value was ignored in favor of a hardcoded default.
+    assert "20" not in section
+
+
+def test_write_report_discloses_the_wall_clock_bound(make_config, tmp_path):
+    """Same shape as the round-cap test, for the other bound."""
+    agent = AgentSettings(
+        wall_clock_seconds=93,
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+    outcome = RunOutcome(
+        question="How long did the run get before the wall clock hit?",
+        answer="Partial answer only.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING in body
+    section = _section(body, _CUT_SHORT_HEADING)
+    assert "93" in section
+    assert "1800" not in section  # the untouched AgentSettings default
+
+
+def test_write_report_names_the_error_when_a_run_dies_mid_flight(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="What happened to the run?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="error",
+        cut_short_detail="APIConnectionError: getaddrinfo failed",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING in body
+    assert "APIConnectionError: getaddrinfo failed" in body
+
+
+def test_write_report_lists_only_planned_todos_not_completed(make_config):
+    config = make_config()
+    todos = [
+        {"content": "Search for pricing sources", "status": "pending"},
+        {"content": "Summarize the vendor comparison", "status": "completed"},
+        {"content": "Cross-check the delivery claim", "status": "in_progress"},
+    ]
+    outcome = RunOutcome(
+        question="Which vendor is cheapest?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="round_cap",
+        todos=todos,
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert "Search for pricing sources" in body
+    assert "Cross-check the delivery claim" in body
+    assert "Summarize the vendor comparison" not in body
+
+
+def test_write_report_includes_workspace_notes_when_cut_short(make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    write_workspace_note(
+        config, registry, "notes.md", "Vendor Acme quoted $4.20/unit, confirmed by two listings."
+    )
+    # A captured source file, written directly to the run's sources/ the way
+    # harness/tools/fetch.py does — never via the registry, so nothing else could surface
+    # its text.
+    write_source_capture(config, registry, "S1")
+    outcome = RunOutcome(
+        question="What pricing was found before the cutoff?",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _NOTES_HEADING in body
+    assert "Vendor Acme quoted $4.20/unit" in body
+    # The notes section reads the workspace root only, never recursing into sources/ — if
+    # it did, this exact capture body would leak into the notes section.
+    assert "Some captured body text." not in body
+    # Guards against a stub that always claims "no notes" regardless of what is on disk.
+    assert _NO_NOTES_TEXT not in body
+
+
+def test_write_report_says_so_when_no_notes_were_written(make_config):
+    config = make_config()
+    config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)
+    outcome = RunOutcome(
+        question="Did anything get written before the cut?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="round_cap",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _NOTES_HEADING in body
+    assert _NO_NOTES_TEXT in body
+
+
+def test_write_report_excludes_notes_left_by_a_previous_run(make_config):
+    """Presenting a PREVIOUS run's notes as this run's findings overstates the evidence
+    (R3) in a way the reader cannot catch. Per-run workspaces are the first defence; this
+    pins the second, which still matters because `SourceRegistry(run_id=...)` lets a run
+    id be reused deliberately. Only files touched at or after `started_at` belong here.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    stale = write_workspace_note(
+        config, registry, "old-run.md", "Acme was cheapest, from last week's run."
+    )
+    os.utime(stale, (_LONG_AGO, _LONG_AGO))
+
+    started_at = datetime.now()
+    write_workspace_note(config, registry, "this-run.md", "Beta quoted $9.10/unit today.")
+
+    outcome = RunOutcome(
+        question="What did this run actually find?",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+        cut_short="wall_clock",
+        started_at=started_at,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Beta quoted $9.10/unit today." in body
+    assert "Acme was cheapest, from last week's run." not in body
+
+
+def test_write_report_keeps_every_note_when_no_start_time_is_known(make_config):
+    """`started_at=None` means "unknown", which must keep notes rather than silently drop
+    them — losing this run's findings would be the worse failure of the two.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    old = write_workspace_note(config, registry, "whenever.md", "A finding of unknown vintage.")
+    os.utime(old, (_LONG_AGO, _LONG_AGO))
+
+    outcome = RunOutcome(
+        question="What is on disk?",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+        cut_short="round_cap",
+        started_at=None,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "A finding of unknown vintage." in body
+
+
+def test_write_report_says_so_when_the_run_produced_no_answer(make_config):
+    """A cut-short run usually has no prose answer. An empty `## Answer` section reads as
+    "the answer is nothing"; the reader must be told the run never got that far.
+    """
+    config = make_config()
+    outcome = RunOutcome(
+        question="Did it answer?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert _NO_ANSWER_TEXT in _section(body, "## Answer")
+
+
+def test_write_report_has_no_cut_short_sections_when_the_run_finished(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="Did the run finish cleanly?",
+        answer="Yes.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short=None,
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING not in body
+    assert _NOTES_HEADING not in body
+
+
+# --- Phase 6: claim verification and disclosure ----------------------------------------
+#
+# `harness.verify` does not exist yet (Phase 6 builds it next) — its classes are imported
+# locally inside each test that needs them so a missing module fails only that test, not
+# collection of this whole file (per the plan's "Expected red" section).
+
+
+def test_write_report_marks_each_non_supported_verdict_and_leaves_supported_bare(make_config):
+    """Every verdict in the frozen vocabulary renders a visible marker except `supported`.
+
+    Each claim below carries exactly one check, so no claim has a supporting source to
+    suppress its marker — that gating is tested separately. The `get_args` assertion keeps
+    this exhaustive: a verdict added later fails here until it is given a case.
+    """
+    from typing import get_args
+
+    from harness.verify import ClaimCheck, Verdict, VerificationResult
+
+    config = make_config()
+    supported = "The sky is blue."
+    unsupported = "The moon is made of cheese."
+    not_addressed = "Jupiter has a great red spot."
+    uncited = "Water boils at 100 degrees Celsius."
+    unresolved = "Mercury is the closest planet to the sun."
+    unverifiable = "Venus has a thick atmosphere."
+    answer = " ".join([supported, unsupported, not_addressed, uncited, unresolved, unverifiable])
+    checks = [
+        ClaimCheck(claim=supported, source_id="S1", verdict="supported"),
+        ClaimCheck(claim=unsupported, source_id="S1", verdict="unsupported", detail="disagrees"),
+        ClaimCheck(
+            claim=not_addressed, source_id="S3", verdict="not_addressed", detail="says nothing"
+        ),
+        ClaimCheck(claim=uncited, source_id=None, verdict="uncited"),
+        ClaimCheck(claim=unresolved, source_id="S9", verdict="unresolved"),
+        ClaimCheck(
+            claim=unverifiable,
+            source_id="S2",
+            verdict="unverifiable",
+            detail="fetch failed",
+        ),
+    ]
+    assert {check.verdict for check in checks} == set(get_args(Verdict))
+    verification = VerificationResult(checks=checks)
+    outcome = RunOutcome(
+        question="Marker rendering",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "**[unsupported — S1]**" in body
+    assert "**[not addressed — S3]**" in body
+    assert "**[uncited]**" in body
+    assert "**[unresolved — S9]**" in body
+    assert "**[unverifiable — S2]**" in body
+    # Exactly the five non-supported claims carry a marker — the supported one does not.
+    assert body.count("**[") == 5
+
+
+def test_write_report_resolves_registered_markers_and_discloses_unregistered_ones(
+    make_config,
+):
+    """R1: every surviving `[Sn]` marker resolves to a link; an unresolvable one is
+    reported by `unresolved_ids` in the gaps section instead.
+    """
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/known", title="Known page")
+    write_source_capture(config, registry, source_id)
+    answer = "A known fact [S1]. An unresolvable fact [S9]."
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(claim="A known fact [S1].", source_id="S1", verdict="supported"),
+            ClaimCheck(claim="An unresolvable fact [S9].", source_id="S9", verdict="unresolved"),
+        ]
+    )
+    outcome = RunOutcome(
+        question="Citation resolution",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    # Scoped to the Answer section, not the whole body: `## Sources` legitimately prints
+    # `- [S1] <link>` as its bullet label (pinned by
+    # `test_write_report_ignores_a_source_captured_under_a_different_run`), so a
+    # whole-body assertion could never pass. What matters is that no bare marker survives
+    # where the reader is reading prose.
+    answer_section = _section(body, "## Answer")
+    assert "[S1]" not in answer_section  # resolved into a markdown link, not left bare
+    assert "example.test" in answer_section
+    assert "[S9]" in answer_section  # unregistered — left visible verbatim
+    gaps = _section(body, "## Gaps and disclosures")
+    assert "S9" in gaps
+
+
+def test_write_report_conflicts_section_names_both_positions_with_no_winner(make_config):
+    """D3: a conflict states both positions and both IDs, and adjudicates nothing."""
+    from harness.verify import ClaimCheck, Conflict, VerificationResult
+
+    config = make_config()
+    registry = SourceRegistry()
+    registry.add("https://one.example.test/a", title="One")
+    registry.add("https://two.example.test/b", title="Two")
+    claim = "The vendor quoted $4.20 per unit [S1] [S2]."
+    positions = [
+        ClaimCheck(
+            claim=claim, source_id="S1", verdict="supported", detail="Source A confirms $4.20"
+        ),
+        ClaimCheck(
+            claim=claim, source_id="S2", verdict="unsupported", detail="Source B says $5.10"
+        ),
+    ]
+    verification = VerificationResult(
+        checks=positions, conflicts=[Conflict(claim=claim, positions=positions)]
+    )
+    outcome = RunOutcome(
+        question="Conflicting prices",
+        answer=claim,
+        registry=registry,
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    section = _section(body, "## Conflicting sources")
+    assert "S1" in section
+    assert "S2" in section
+    assert "Source A confirms $4.20" in section
+    assert "Source B says $5.10" in section
+    lowered = section.lower()
+    assert "correct" not in lowered
+    assert "wrong" not in lowered
+    assert "more reliable" not in lowered
+
+
+def test_write_report_gaps_section_lists_check_failures_and_uncited_count(make_config):
+    """The gaps section carries `check_failures` verbatim and the uncited claim count."""
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    failure_line = "S3: model call raised TimeoutError"
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(
+                claim="First unsupported-by-citation claim.", source_id=None, verdict="uncited"
+            ),
+            ClaimCheck(
+                claim="Second unsupported-by-citation claim.",
+                source_id=None,
+                verdict="uncited",
+            ),
+        ],
+        check_failures=[failure_line],
+    )
+    outcome = RunOutcome(
+        question="Gap disclosure",
+        answer="First unsupported-by-citation claim. Second unsupported-by-citation claim.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    gaps = _section(body, "## Gaps and disclosures")
+    assert failure_line in gaps
+    # Scoped to the count LINE, not the whole section: a bare `"2" in gaps` passed on any
+    # stray "2" anywhere in the text — a regression rendering "1 claim(s)" would still
+    # have found a 2 in the failure line above it (PR #4 review, nit).
+    count_line = next(line for line in gaps.splitlines() if "claim(s)" in line)
+    assert count_line.startswith("2 claim(s)"), count_line
+    assert "uncited" in gaps.lower()
+
+
+def test_write_report_omits_both_new_sections_when_there_is_nothing_to_disclose(make_config):
+    """All-`supported`, no conflicts, no failures → neither new section appears."""
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim="Everything checks out.", source_id="S1", verdict="supported")]
+    )
+    outcome = RunOutcome(
+        question="Clean run",
+        answer="Everything checks out.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "## Conflicting sources" not in body
+    assert "## Gaps and disclosures" not in body
+
+
+def test_write_report_places_marker_for_a_lead_in_plus_bullets_claim(make_config):
+    """3F Major finding: `extract_claims` joins a bulleted block's lines with a single
+    space, so the returned claim is NOT a verbatim substring of the answer (which still
+    has its bullet markers and newlines). The marker must still land in the rendered
+    Answer section rather than silently vanishing.
+    """
+    from harness.verify import ClaimCheck, VerificationResult, extract_claims
+
+    config = make_config()
+    answer = "Key findings:\n- The vendor quoted $4.20 [S1].\n- Lead time is six weeks [S2]."
+    claims = extract_claims(answer)
+    target = next(claim for claim in claims if "vendor quoted" in claim)
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim=target, source_id="S1", verdict="unsupported", detail="mismatch")]
+    )
+    outcome = RunOutcome(
+        question="Lead-in plus bullets",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "**[unsupported — S1]**" in body
+
+
+def test_write_report_places_marker_for_a_hard_wrapped_claim(make_config):
+    """Same finding, the other shape: a claim hard-wrapped across two lines within one
+    paragraph is collapsed to a single space by `extract_claims`, so it is not a verbatim
+    substring of the answer either.
+    """
+    from harness.verify import ClaimCheck, VerificationResult, extract_claims
+
+    config = make_config()
+    answer = "The vendor quoted a price of\n$4.20 per unit [S1]. Lead time is six weeks [S2]."
+    claims = extract_claims(answer)
+    target = next(claim for claim in claims if "vendor quoted a price" in claim)
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim=target, source_id="S1", verdict="unsupported", detail="mismatch")]
+    )
+    outcome = RunOutcome(
+        question="Hard-wrapped claim",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "**[unsupported — S1]**" in body
+
+
+def test_marker_binds_to_the_sentence_it_judges_not_the_one_after_it(make_config):
+    """Found by the Phase 5 live check, which every prior test missed by feeding answers
+    whose judged sentence was the last thing on its line. A marker separated from its claim
+    by a paragraph break reads as a label on whatever follows it, so a reader attributes the
+    verdict to the wrong sentence — the one failure a citation report cannot afford.
+    """
+    from harness.verify import ClaimCheck, VerificationResult, extract_claims
+
+    config = make_config()
+    answer = "The vendor quoted $4.20 [S1]. Lead time is six weeks [S2]."
+    claims = extract_claims(answer)
+    target = next(claim for claim in claims if "vendor quoted" in claim)
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim=target, source_id="S1", verdict="unsupported", detail="mismatch")]
+    )
+    outcome = RunOutcome(
+        question="Two sentences, one paragraph",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    answer_section = body.split("## Answer", 1)[1].split("## ", 1)[0]
+    # The marker trails its own sentence on the same line...
+    assert "$4.20 [S1]. **[unsupported — S1]**" in answer_section
+    # ...and does not open a line, which is what made it read as the next claim's label.
+    assert "\n**[unsupported" not in answer_section
+    assert "Lead time is six weeks" in answer_section
+
+
+def test_a_claim_one_cited_source_supports_carries_no_marker(make_config):
+    """Phase 6 live check: a synthesized sentence cites several sources, each covering
+    part of it, so the sentences that WERE properly evidenced collected a marker for every
+    source that merely didn't speak to them. A reader — non-technical, by design — reads a
+    page of unsupported markers as "none of this is trustworthy", the exact miscalibration
+    D3 rejected paragraph-level claims to avoid. One supporting source is support.
+    """
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    claim = "The vendor quoted $4.20 [S1][S2]."
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(claim=claim, source_id="S1", verdict="supported", detail="Confirms."),
+            ClaimCheck(claim=claim, source_id="S2", verdict="not_addressed", detail="Silent."),
+        ]
+    )
+    outcome = RunOutcome(
+        question="Partial coverage",
+        answer=claim,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    answer_section = body.split("## Answer", 1)[1].split("## ", 1)[0]
+    assert "**[" not in answer_section
+
+
+def test_a_claim_no_cited_source_supports_is_marked_per_failing_source(make_config):
+    """The other half of the same rule: when NOTHING supports the claim, every failing
+    source still shows in place, so the reader sees which source failed it and how.
+    """
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    claim = "The vendor quoted $4.20 [S1][S2]."
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(claim=claim, source_id="S1", verdict="unsupported", detail="Says $5.10."),
+            ClaimCheck(claim=claim, source_id="S2", verdict="not_addressed", detail="Silent."),
+        ]
+    )
+    outcome = RunOutcome(
+        question="No support at all",
+        answer=claim,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    answer_section = body.split("## Answer", 1)[1].split("## ", 1)[0]
+    assert "**[unsupported — S1]**" in answer_section
+    # Rendered for a non-technical reader, not as the raw literal `not_addressed`.
+    assert "**[not addressed — S2]**" in answer_section
+
+
+def test_write_report_discloses_a_verdict_whose_marker_could_not_be_placed(make_config):
+    """A claim that genuinely does not appear in the answer at all (e.g. a stale check
+    against an edited answer) must be disclosed in `## Gaps and disclosures`, never
+    dropped — this is the "never drop silently" half of the Major finding.
+    """
+    from harness.verify import ClaimCheck, VerificationResult
+
+    config = make_config()
+    answer = "The sky is blue."
+    verification = VerificationResult(
+        checks=[
+            ClaimCheck(
+                claim="A claim that does not appear in the answer at all.",
+                source_id="S1",
+                verdict="unsupported",
+                detail="mismatch",
+            )
+        ]
+    )
+    outcome = RunOutcome(
+        question="Unplaceable claim",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    # Never silently placed somewhere wrong in the answer.
+    assert "**[" not in body
+    gaps = _section(body, "## Gaps and disclosures")
+    assert "unsupported" in gaps
+    assert "S1" in gaps
+    assert "could not be positioned" in gaps
+
+
+def test_write_report_discloses_skipped_verification_when_the_run_died(make_config):
+    """3F Minor finding 5: when a run ends `cut_short == "error"`, `__main__` skips the
+    verification pass rather than issuing near-certainly-failing model calls, and
+    discloses the skip here rather than silently omitting it.
+    """
+    from harness.verify import VerificationResult
+
+    config = make_config()
+    verification = VerificationResult(
+        check_failures=[
+            "verification skipped: the run ended in an error, so claims were not checked"
+        ]
+    )
+    outcome = RunOutcome(
+        question="What happened to the run?",
+        answer="Partial finding before the crash.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="error",
+        cut_short_detail="APIConnectionError: getaddrinfo failed",
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    gaps = _section(body, "## Gaps and disclosures")
+    assert "verification skipped" in gaps
+    assert "the run ended in an error" in gaps
+
+
+def test_write_report_with_verification_none_renders_unchanged(make_config):
+    """Backwards-compatibility guard: an unset `verification` renders exactly the report
+    every prior phase already produces — no markers, no new sections.
+    """
+    config = make_config()
+    outcome = RunOutcome(
+        question="Backwards compatibility",
+        answer="Answer text with a marker [S1].",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=None,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    # The registry is empty, so `[S1]` is UNREGISTERED and `resolve()` leaves it alone by
+    # design — this line pins "unknown markers survive verbatim", NOT "no resolution
+    # happens when verification is None". Resolution is unconditional; see
+    # `test_write_report_body_carries_answer_reasoning_split_and_sources`.
+    assert "Answer text with a marker [S1]." in body
+    assert "**[" not in body
+    assert "## Conflicting sources" not in body
+    assert "## Gaps and disclosures" not in body
+
+
+def test_write_report_ignores_a_source_captured_under_a_different_run(make_config):
+    """Regression test for the Drift (see the plan's `## Reconciliations` 2026-08-12 —
+    Phase 6): a capture written under a DIFFERENT run's directory must never be read as
+    this run's evidence, since `agent.workspace_dir` is one directory reused across runs.
+    """
+    config = make_config()
+    other_run = SourceRegistry(run_id="2020-01-01-000000")
+    this_run = SourceRegistry(run_id="2020-01-01-000001")
+    source_id = this_run.add("https://example.test/only-captured-elsewhere", title="Example")
+    write_source_capture(config, other_run, source_id)
+    outcome = RunOutcome(
+        question="Does another run's capture leak in?",
+        answer=f"Should be unusable [{source_id}].",
+        registry=this_run,
+        usage=_usage(),
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert _UNUSABLE_HEADING in body
+    heading_pos = body.index(_UNUSABLE_HEADING)
+    bullet_pos = body.index(f"[{source_id}]", heading_pos)
+    assert bullet_pos > heading_pos
+
+
+# --- PR #4 review -----------------------------------------------------------------------
+
+
+def test_working_notes_are_found_in_a_subdirectory(make_config):
+    """The agent is given no path convention, and nested writes are legal.
+
+    `harness/prompts/orchestrator.md` says only "Write findings into your workspace as you
+    go", and deepagents' `FilesystemBackend.write` creates parent directories rather than
+    rejecting `notes/pricing.md`. A top-level `*.md` glob therefore printed "no working
+    notes were written" over a workspace holding this run's findings — in the one report
+    where the reader has nothing else to fall back on.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    write_workspace_note(config, registry, "notes/pricing.md", "Acme quoted $4.20/unit.")
+
+    outcome = RunOutcome(
+        question="What pricing was found before the cutoff?",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Acme quoted $4.20/unit." in body
+    assert _NO_NOTES_TEXT not in body
+    # Named by its path under the workspace, so two same-named notes stay distinguishable.
+    assert "notes/pricing.md" in body
+
+
+def test_a_concurrent_runs_notes_never_reach_this_report(make_config):
+    """`started_at` cannot separate two runs in flight at once — the other run's files are
+    NEWER than this run's start, so the mtime filter keeps them. Per-run workspace
+    subdirectories are what actually holds them apart (PR #4 review).
+
+    `started_at=None` deliberately disables the mtime filter, so a pass here proves the
+    directory boundary did the work and not the timestamp.
+    """
+    config = make_config()
+    this_run = SourceRegistry()
+    other_run = SourceRegistry()
+    write_workspace_note(config, this_run, "mine.md", "Beta quoted $9.10/unit.")
+    write_workspace_note(config, other_run, "theirs.md", "AN UNRELATED QUESTION'S FINDING.")
+
+    outcome = RunOutcome(
+        question="What did this run find?",
+        answer="",
+        registry=this_run,
+        usage=_usage(),
+        cut_short="wall_clock",
+        started_at=None,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Beta quoted $9.10/unit." in body
+    assert "AN UNRELATED QUESTION'S FINDING." not in body
+
+
+def test_working_notes_are_not_restricted_to_markdown(make_config):
+    """Nothing pins an extension either, so a `.txt` note is still this run's findings."""
+    config = make_config()
+    registry = SourceRegistry()
+    write_workspace_note(config, registry, "findings.txt", "Lead time is six weeks.")
+
+    outcome = RunOutcome(
+        question="What was found?",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Lead time is six weeks." in body
+    assert _NO_NOTES_TEXT not in body
+
+
+def test_machine_written_bulk_still_never_reaches_the_notes_section(make_config):
+    """Recursion must not undo what the old top-level glob got right by accident.
+
+    `sources/` is captured page text and the other two are the summarizer's evicted
+    history — none of it is the agent's own notes, and all of it is large.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    write_workspace_note(config, registry, "notes.md", "A real note.")
+    write_source_capture(config, registry, "S1", "CAPTURED_PAGE_BODY")
+    write_workspace_note(config, registry, "conversation_history/thread.md", "EVICTED_HISTORY_BODY")
+    write_workspace_note(config, registry, "large_tool_results/result.md", "OFFLOADED_RESULT_BODY")
+
+    outcome = RunOutcome(
+        question="Does machine-written bulk leak into the notes?",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "A real note." in body
+    assert "CAPTURED_PAGE_BODY" not in body
+    assert "EVICTED_HISTORY_BODY" not in body
+    assert "OFFLOADED_RESULT_BODY" not in body
+
+
+def test_dead_branches_are_disclosed_on_a_run_that_finished_normally(make_config):
+    """R4 names dead branches unconditionally, not only for a cut-short run.
+
+    An agent that simply stops with steps still `pending` has abandoned those branches
+    just as surely as one the wall clock killed, and the reader was told nothing at all.
+    """
+    config = make_config()
+    todos = [
+        {"content": "Check the delivery claim against a second source", "status": "pending"},
+        {"content": "Summarize the vendor comparison", "status": "completed"},
+    ]
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim="Acme quoted $4.20.", source_id=None, verdict="uncited")]
+    )
+    outcome = RunOutcome(
+        question="Which vendor is cheapest?",
+        answer="Acme quoted $4.20.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short=None,
+        todos=todos,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert _CUT_SHORT_HEADING not in body, "this run was not cut short"
+    gaps = _section(body, "## Gaps and disclosures")
+    assert "Check the delivery claim against a second source" in gaps
+    assert "Summarize the vendor comparison" not in gaps
+
+
+def test_a_cut_short_run_does_not_list_its_dead_branches_twice(make_config):
+    """`## Run cut short` already lists them; the gaps section must not repeat them."""
+    config = make_config()
+    todos = [{"content": "Check the delivery claim", "status": "pending"}]
+    verification = VerificationResult(
+        checks=[ClaimCheck(claim="Partial answer.", source_id=None, verdict="uncited")]
+    )
+    outcome = RunOutcome(
+        question="Which vendor is cheapest?",
+        answer="Partial answer.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="wall_clock",
+        todos=todos,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert body.count("Check the delivery claim") == 1
+
+
+def test_each_cut_short_reason_names_only_its_own_bound(make_config, tmp_path):
+    """The protection `report.py`'s `_ROUND_CAP_TEXT` comment promises a reviewer.
+
+    That comment claims the tests assert one phrase present AND another absent, so a
+    swapped `except` label in `__main__` cannot slip past. No test actually did that
+    (PR #4 review, Minor) — the existing bound tests assert on the configured NUMBER, and
+    a branch rendering "the wall clock (configured at 17 rounds per pass)" passed both.
+    """
+    agent = AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
+    config = make_config(agent=agent)
+    phrases = {
+        "round_cap": _ROUND_CAP_TEXT,
+        "wall_clock": _WALL_CLOCK_TEXT,
+        "error": _ERROR_TEXT,
+    }
+
+    for reason, expected in phrases.items():
+        outcome = RunOutcome(
+            question=f"Which bound ended the {reason} run?",
+            answer="Partial answer.",
+            registry=SourceRegistry(),
+            usage=_usage(),
+            cut_short=reason,
+            cut_short_detail="APIConnectionError: boom" if reason == "error" else None,
+        )
+        body = write_report(outcome, config).read_text(encoding="utf-8")
+        section = _section(body, _CUT_SHORT_HEADING)
+
+        assert expected in section, f"{reason} did not name its own bound"
+        for other_reason, other in phrases.items():
+            if other_reason != reason:
+                assert other not in section, f"{reason} also named {other_reason}'s bound"

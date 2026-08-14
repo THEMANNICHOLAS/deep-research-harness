@@ -260,19 +260,27 @@ def test_missing_top_level_table_raises_config_error_naming_it(
     assert section in str(excinfo.value)
 
 
-def test_shipped_harness_toml_loads_with_its_todo_placeholders(monkeypatch):
-    """Deliberate, disclosed gap: literal "TODO" endpoint/model IDs are well-formed
-    strings, so the checked-in harness.toml loads while nothing reads those values.
-    Validation moves to startup when the agent loop first consumes them — see
-    docs/backlog.md. This test keeps the gap visible instead of accidental.
+def test_shipped_harness_toml_loads_with_no_todo_placeholders_left(monkeypatch):
+    """The gap this test used to keep visible is now closed. Literal "TODO" values are
+    well-formed strings that `load_config` still accepts, so nothing but this test stops
+    one from being reintroduced into the checked-in config; `build_chat_model` rejects a
+    `TODO` it is handed at runtime (see tests/test_models.py), and this guards the file
+    itself.
+
+    Checks shape, not the specific endpoint/model in use: pinning those exact deployment
+    facts would fail this suite on a legitimate endpoint or model swap, working against the
+    config-swappable invariant (CLAUDE.md -> Invariants).
     """
     monkeypatch.setenv("OPENCODE_API_KEY", "any")
-    monkeypatch.setenv("CEREBRAS_API_KEY", "any")
 
     config = load_config()
 
-    assert config.providers["opencode"].base_url == "TODO"
-    assert config.roles["head"].model == "TODO"
+    assert config.providers["opencode"].base_url.startswith("https://")
+    assert config.roles["head"].model != ""
+    offenders = [
+        f"providers.{name}.base_url" for name, p in config.providers.items() if p.base_url == "TODO"
+    ] + [f"roles.{name}.model" for name, r in config.roles.items() if r.model == "TODO"]
+    assert offenders == []
 
 
 def test_shipped_harness_toml_has_no_browser_surface(monkeypatch):
@@ -326,3 +334,64 @@ def test_missing_subagent_role_raises_config_error_naming_subagent(tmp_path, mon
         load_config(path)
 
     assert "subagent" in str(excinfo.value)
+
+
+def test_agent_section_loads_declared_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = (
+        VALID_TOML
+        + """
+[agent]
+max_rounds = 12
+wall_clock_seconds = 600
+workspace_dir = "custom-workspace"
+reports_dir = "custom-reports"
+max_retries = 4
+request_timeout_seconds = 30.0
+"""
+    )
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.agent.max_rounds == 12
+    assert config.agent.wall_clock_seconds == 600
+    assert config.agent.workspace_dir == Path("custom-workspace")
+    assert config.agent.reports_dir == Path("custom-reports")
+    assert config.agent.max_retries == 4
+    assert config.agent.request_timeout_seconds == 30.0
+
+
+def test_agent_section_omitted_falls_back_to_documented_defaults(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+
+    config = load_config(path)
+
+    assert config.agent.max_rounds == 20
+    assert config.agent.wall_clock_seconds == 1800
+    assert config.agent.workspace_dir == Path("workspace")
+    assert config.agent.reports_dir == Path("reports")
+    assert config.agent.max_retries == 2
+    assert config.agent.request_timeout_seconds == 120.0
+
+
+def test_agent_section_rejects_unknown_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = (
+        VALID_TOML
+        + """
+[agent]
+max_rounds = 12
+typo_key = "oops"
+"""
+    )
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "typo_key" in str(excinfo.value)

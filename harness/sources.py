@@ -6,13 +6,31 @@ retrieval is a separate, later concern.
 """
 
 import re
+import secrets
+from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict
 
-_MARKER_RE = re.compile(r"\[S(\d+)\]")
+MARKER_RE = re.compile(r"\[S(\d+)\]")
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def marker_ids(text: str) -> list[str]:
+    """Every `Sn` ID referenced by `text`, deduplicated, in first-appearance order.
+
+    Pure regex scan, no registry lookup — shared by `SourceRegistry.unresolved_ids`
+    (filtered to unknown IDs) and `harness.verify` (which needs every marker a claim
+    carries, known or not), so the dedupe-in-first-appearance-order loop lives in exactly
+    one place (3F fix pass, Minor finding).
+    """
+    seen: list[str] = []
+    for match in MARKER_RE.finditer(text):
+        source_id = f"S{match.group(1)}"
+        if source_id not in seen:
+            seen.append(source_id)
+    return seen
 
 
 def normalize_url(url: str) -> str:
@@ -70,7 +88,19 @@ class Source(BaseModel):
 class SourceRegistry:
     """Mints per-run `S1..Sn` IDs for URLs and resolves `[Sn]` markers into links."""
 
-    def __init__(self) -> None:
+    def __init__(self, run_id: str | None = None) -> None:
+        # Names this run's whole workspace subdirectory, built by
+        # `harness.config.run_workspace_dir` — notes, captures and evicted history all
+        # hang off it. `[Sn]` IDs are per-run, but `agent.workspace_dir` is one shared
+        # directory reused by every run, so without this a shorter run would read a
+        # previous run's `S1.md` (plan `## Reconciliations` 2026-08-12 — Phase 6, and
+        # 2026-08-13 for the widening to the whole workspace). The timestamp alone is only
+        # second-resolution, so two runs launched in the same second shared a directory
+        # and overwrote each other's captures mid-run (PR #4 review); the random suffix
+        # makes the default collision-free while keeping the stamp sortable by start.
+        self.run_id = run_id or (
+            f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}-{secrets.token_hex(4)}"
+        )
         self._by_url: dict[str, Source] = {}
         self._by_id: dict[str, Source] = {}
 
@@ -124,16 +154,11 @@ class SourceRegistry:
                 return self.link(source_id)
             return match.group(0)
 
-        return _MARKER_RE.sub(_replace, text)
+        return MARKER_RE.sub(_replace, text)
 
     def unresolved_ids(self, text: str) -> list[str]:
         """Return every `[Sn]`-shaped marker in `text` with no registry entry.
 
         IDs are returned bare (e.g. `"S9"`), deduplicated, in first-appearance order.
         """
-        seen: list[str] = []
-        for match in _MARKER_RE.finditer(text):
-            source_id = f"S{match.group(1)}"
-            if source_id not in self._by_id and source_id not in seen:
-                seen.append(source_id)
-        return seen
+        return [source_id for source_id in marker_ids(text) if source_id not in self._by_id]
