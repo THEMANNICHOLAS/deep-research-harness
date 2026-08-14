@@ -378,11 +378,11 @@ report path as the frozen final stdout line.
   still ends with the path line.
 
 ## Verification
-- [ ] `uv run pytest` — full suite green.
-- [ ] `uv run ruff check .` and `uv run ruff format --check .` — clean.
-- [ ] `uv run mypy .` — clean.
-- [ ] CI coverage floor: 90% on `harness/` holds with `harness/display.py` counted (CI enforces;
-  locally spot-check with `uv run pytest --cov`).
+- [x] `uv run pytest` — full suite green (324 passed).
+- [x] `uv run ruff check .` and `uv run ruff format --check .` — clean.
+- [x] `uv run mypy .` — clean.
+- [x] CI coverage floor: 90% on `harness/` holds with `harness/display.py` counted (local
+  spot-check: 98% total, display.py 100%).
 - [ ] Manual e2e (needs API keys + SearXNG): one live run on a terminal — spinner, collapsing
   stages, question panel if a clarification fires, end summary, path last; one piped run —
   plain text, no ANSI.
@@ -508,3 +508,15 @@ never add a section below it. -->
 - Watch-next: Final verification — automated gates + coverage spot-check, then the MANUAL
   e2e gates all three deferred manual acceptances (Phase 2 spinner/collapse + piped no-ANSI,
   Phase 3 frozen-spinner clarification, Phase 4 styled summary with path last).
+
+### 2026-08-14 — Final verification (automated half)
+- Done: all four automated verification items pass at HEAD (324 tests, ruff check/format,
+  mypy, coverage 98% with display.py at 100%). All four phases committed.
+- Learned: nothing new.
+- Drift: none
+- Watch-next: the ONLY open item is the manual e2e (needs API keys + SearXNG): one live
+  terminal run — spinner, collapsing stages, question panel freezing the spinner if a
+  clarification fires, styled summary, path last — and one piped run (`> out.txt`) showing
+  plain text with no ANSI. That run also discharges risks #2/#3 and the manual acceptance
+  boxes in Phases 2-4. Then set Status: Complete and check Final verification + the manual
+  boxes.
