@@ -275,7 +275,9 @@ def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> 
     for raw_line in paragraph.text.split("\n"):
         rendered = strip_markers(raw_line)
         if LIST_ITEM_RE.match(raw_line):
-            if item_index in valid:
+            # `rendered` is empty for a citation-only bullet, which renders no line at all
+            # — a bare ` *` would be a mark with nothing to mark.
+            if rendered and item_index in valid:
                 rendered = f"{rendered} *"
             item_index += 1
         if rendered:
@@ -311,10 +313,12 @@ def _paragraph_block(
         detail = verdict.detail
         # Only a verdict the MODEL returned can carry a bullet rollup. `not_verified` means
         # no check ran, so "n/m bullets verified" would assert a count nothing measured.
-        if paragraph.items and verdict.verdict in MODEL_VERDICTS:
-            total = len(paragraph.items)
-            unsupported_count = len({i for i in verdict.unsupported_items if 0 <= i < total})
-            detail = f"{total - unsupported_count}/{total} bullets verified. {detail}"
+        # Counted by the bullets the reader can SEE: a citation-only bullet (`- [S1]`)
+        # renders no line, so counting it would inflate the denominator past the list.
+        counted = [i for i, item in enumerate(paragraph.items) if strip_markers(item)]
+        if counted and verdict.verdict in MODEL_VERDICTS:
+            unsupported_count = len(set(verdict.unsupported_items) & set(counted))
+            detail = f"{len(counted) - unsupported_count}/{len(counted)} bullets verified. {detail}"
     lines.append(f"Verdict: {label} - {detail}")
     return "\n".join(lines)
 
@@ -348,6 +352,10 @@ def _conflicts_section(outcome: RunOutcome, verification: VerificationResult) ->
         excerpt = stripped_lines[0] if stripped_lines else ""
         lines = [
             excerpt,
+            "",
+            # The model's own statement of WHAT they disagree about — without it the block
+            # names the sources but never the disagreement (PR #7 review).
+            verdict.detail,
             "",
             "The cited sources disagree on this paragraph. The harness does not decide "
             "between them — the sources it read are listed below so you can judge for "

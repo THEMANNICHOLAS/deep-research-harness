@@ -102,6 +102,17 @@ def test_strip_markers_drops_a_line_that_holds_only_a_marker():
     assert result == "First line.\nThird line."
 
 
+def test_strip_markers_drops_a_bullet_that_held_only_a_marker():
+    """The list-syntax half of the test above. `- [S1]` used to survive as a contentless
+    `-`: the dash kept the line truthy once the marker was gone (PR #7 review).
+    """
+    text = "- Real finding [S1].\n- [S2]\n1. [S3]"
+
+    result = strip_markers(text)
+
+    assert result == "- Real finding."
+
+
 def test_paragraph_model_round_trips_fields():
     paragraph = Paragraph(text="Some text [S1].", source_ids=["S1"], items=[])
 

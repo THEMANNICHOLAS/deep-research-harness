@@ -28,8 +28,12 @@ should land in one predictable directory instead of two repo-relative ones.
   - Links are deduplicated per paragraph and ordered by first appearance in it.
   - A paragraph citing nothing gets no `Sources:` line.
 - **R4** — Each paragraph that cites sources carries a `Verdict:` line beneath its
-  `Sources:` line, reading one of `supported`, `partially supported`, `not supported`,
-  or `no sources cited`, followed by one plain sentence for a non-technical reader.
+  `Sources:` line, reading one of `supported`, `partially supported`, or `not supported`,
+  followed by one plain sentence for a non-technical reader.
+  - A paragraph citing nothing is identified by carrying no `Sources:`/`Verdict:` pair at
+    all, not by a `no sources cited` verdict label — the label was struck from this list
+    (PR #7 review) because the pair is gated on citing a registered source, making the two
+    conditions mutually exclusive. `no_sources_cited` remains an internal `Verdict` value.
   - The verdict judges the paragraph as a whole against the sources it cites, not
     sentence by sentence.
   - A list block gets one `Sources:`/`Verdict:` pair for the whole list, whose verdict

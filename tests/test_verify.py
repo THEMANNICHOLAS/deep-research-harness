@@ -21,7 +21,7 @@ from pydantic import PrivateAttr, SecretStr
 from harness.paragraphs import Paragraph
 from harness.sources import SourceRegistry
 from harness.tools.fetch import _sources_dir
-from harness.verify import Verdict, verify_paragraphs
+from harness.verify import CHECK_FAILED_DETAIL, Verdict, verify_paragraphs
 from tests.conftest import (
     ScriptedChatModel,
     verify_reply,
@@ -265,6 +265,34 @@ async def test_a_malformed_reply_unknown_verdict_and_raised_exception_all_contin
     assert verdicts == ["not_verified", "not_verified", "not_verified", "supported"]
     assert result.verdicts[3].detail == "The final paragraph checked out."
     assert len(result.check_failures) == 3
+
+
+async def test_a_failed_check_keeps_its_diagnostic_out_of_the_readers_verdict_detail(
+    make_config, scripted_model, monkeypatch
+):
+    """R4 wants verdict wording a production technician can act on, so the exception text
+    goes to `check_failures` — which `## Gaps and disclosures` prints — and never to the
+    paragraph's own `Verdict:` detail (PR #7 review).
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "Body text.")
+    paragraph = _paragraph(f"A claim [{source_id}].", [source_id])
+
+    model = scripted_model([AIMessage(content="this is not json at all")])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    verdict = result.verdicts[0]
+    assert verdict.verdict == "not_verified"
+    assert verdict.detail == CHECK_FAILED_DETAIL
+    # The diagnostic is not lost — it is disclosed, just not on the reader-facing line.
+    assert len(result.check_failures) == 1
+    assert "Error" in result.check_failures[0]
 
 
 # --- item 5: sources_conflict / unsupported_items round-trip, verdicts index-align ------
@@ -580,3 +608,37 @@ async def test_non_integer_bullet_indices_are_dropped_not_carried_through(
     result = await verify_paragraphs([paragraph], config, registry)
 
     assert result.verdicts[0].unsupported_items == [0, 2]
+
+
+async def test_a_quoted_conflict_flag_reads_as_no_conflict(
+    make_config, scripted_model, monkeypatch
+):
+    """Risk #1: the prompt asks for an unquoted boolean, but `bool("false")` is True — a
+    quoted one used to file the paragraph under `## Conflicting sources` against its own
+    reply (PR #7 review). Only a real boolean sets the flag, the same stance the non-int
+    bullet indices above take.
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "Body text.")
+    paragraph = _paragraph(f"A claim [{source_id}].", [source_id])
+
+    model = scripted_model(
+        [
+            AIMessage(
+                content=(
+                    '{"verdict": "supported", "detail": "The capture agrees.", '
+                    '"sources_conflict": "false"}'
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert result.verdicts[0].sources_conflict is False
+    assert result.check_failures == []

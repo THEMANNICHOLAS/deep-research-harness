@@ -70,7 +70,12 @@ holds. Add a test that an answer containing a fence renders that fence in `## An
 
 ---
 
-## 2. [Minor] R4's `no sources cited` verdict label can never appear in a report
+## 2. [Minor — FIXED, PR #7 follow-up] R4's `no sources cited` verdict label can never appear in a report
+
+**Resolved** by option (a), the developer's call: `no sources cited` is struck from R4's
+value list in @docs/plans/PLAN-report-output.md, which now states that an uncited paragraph
+is identified by carrying no `Sources:`/`Verdict:` pair at all. No code changed —
+`no_sources_cited` stays an internal `Verdict` value. Original write-up below.
 
 **What:** R4 lists `no sources cited` as one of the four reader-facing `Verdict:` values,
 but no code path emits it. The `Sources:`/`Verdict:` pair is gated on the paragraph having
@@ -88,7 +93,12 @@ matches the current tests.
 
 ---
 
-## 3. [Minor] Raw exception strings reach the reader-facing `Verdict:` line
+## 3. [Minor — FIXED, PR #7 follow-up] Raw exception strings reach the reader-facing `Verdict:` line
+
+**Resolved** by the suggested fix: a failed check now renders
+`harness/verify.py`'s `CHECK_FAILED_DETAIL` — one plain sentence — while the exception text
+still goes to `check_failures`, which `## Gaps and disclosures` prints. Original write-up
+below.
 
 **What:** a per-paragraph failure renders as e.g.
 `Verdict: not verified - JSONDecodeError: Expecting value: line 1 column 1 (char 0)`.
@@ -107,7 +117,11 @@ the verification step failed.") on the `Verdict:` line and leave the exception t
 
 ---
 
-## 4. [Minor] `## Conflicting sources` names the sources but not the disagreement
+## 4. [Minor — FIXED, PR #7 follow-up] `## Conflicting sources` names the sources but not the disagreement
+
+**Resolved** by the suggested fix: `_conflicts_section` now prints the paragraph's
+`verdict.detail` above the source list, so the block states what the disagreement is.
+Original write-up below.
 
 **What:** the block lists one link per pooled source. The model's `detail` — the only
 statement of WHAT the sources disagree about — is never printed there.
@@ -128,11 +142,11 @@ line, and it turns a list of URLs into an actual disclosure.
   beside `_FENCE_RE` would match the file's own convention. The
   `indent_match ... else ""` guard is unreachable (`[ \t]*` always matches) and exists
   only to satisfy mypy.
-- `harness/verify.py` — `sources_conflict = bool(...)` accepts any truthy value, so a
-  quoted `"false"` from the model would read as True, unlike `detail` and
-  `unsupported_items` which are both type-checked. Raised by the PR #7 review as
-  PLAUSIBLE; left because the prompt asks for an unquoted boolean and no live reply has
-  ever been captured. Confirm or drop it on the first live run (item 7).
+- `harness/verify.py` — FIXED (PR #7 follow-up): `sources_conflict` now accepts a real
+  boolean only (`... is True`), so a quoted `"false"` reads as no conflict instead of
+  filing the paragraph under `## Conflicting sources`. The residual risk is the mirror
+  case — a quoted `"true"` now reads as no conflict too, which item 7's first live run is
+  still the place to catch.
 - `harness/verify.py` — the `registered` list could be built as
   `[(sid, src) for sid in paragraph.source_ids if (src := registry.get(sid)) is not None]`,
   dropping a second `registry.get` call and an `assert source is not None`.
