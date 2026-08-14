@@ -1,6 +1,6 @@
 # PLAN: Reader Subagent Delegation
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-14
 **Type:** Single plan
 
@@ -204,7 +204,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R5 | Report discloses digested vs fallback per page | Phase 2 (recording), Phase 3 (rendering) |
 
 ## Progress
-- [ ] Phase 1: Wire the reader subagent (tracer bullet)
+- [x] Phase 1: Wire the reader subagent (tracer bullet)
 - [ ] Phase 2: Failure path — retry, catch, fallback tool
 - [ ] Phase 3: Disclosure and prompt wiring
 - [ ] Phase 4: End-to-end regression + docs
@@ -249,12 +249,12 @@ directly — delegation is structurally live end-to-end on scripted models.
   report changes (Phase 3), any edits to reader.md or subagent.md, any verify.py changes.
 
 **Tests (write first, confirm red):**
-- [ ] Lead's bound tools include `task` and exclude `fetch_pages` (ScriptedChatModel
+- [x] Lead's bound tools include `task` and exclude `fetch_pages` (ScriptedChatModel
   `_bound_tool_names`).
-- [ ] The declared reader spec carries the subagent-role model, the rendered reader.md
+- [x] The declared reader spec carries the subagent-role model, the rendered reader.md
   prompt, and the same fetch tool instance the run built (identity, not equality).
-- [ ] A profile is registered under the reader model's key excluding `execute`.
-- [ ] `build_tools` split: lead list and reader routing behave per Contracts.
+- [x] A profile is registered under the reader model's key excluding `execute`.
+- [x] `build_tools` split: lead list and reader routing behave per Contracts.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -262,7 +262,7 @@ directly — delegation is structurally live end-to-end on scripted models.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Existing suite still green (`uv run pytest`) — especially test_fetch.py (fetch tool
+- [x] Existing suite still green (`uv run pytest`) — especially test_fetch.py (fetch tool
   itself unchanged) and test_agent.py's interrupt/profile cases.
 
 ### Phase 2: Failure path — retry, catch, fallback tool
@@ -482,6 +482,18 @@ correction. Empty at plan creation. -->
 Append-only, empty at plan creation. -->
 
 ## Phase Handoff Log
+
+### 2026-08-14 — Phase 1: Wire the reader subagent (tracer bullet)
+- Done: reader wired as a declared SubAgent; `build_tools` returns `ToolSets(lead, reader)`;
+  `_register_no_shell_profile` covers both model keys; `_reader_spec` is the test seam;
+  332 tests + all quality gates green; flagged-risk review clean.
+- Learned: deepagents has no public harness-profile read accessor — tests use the private
+  `_get_harness_profile` (impl-plan-sanctioned fallback). conftest gained
+  `patch_models_by_role` for role-distinct scripted models; `patch_model` untouched.
+- Drift: none.
+- Watch-next: Phase 2's middleware must scope retry/error to the `task` tool only;
+  langchain's ToolRetryMiddleware/ToolErrorMiddleware config needs checking for
+  per-tool scoping before hand-rolling anything.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so

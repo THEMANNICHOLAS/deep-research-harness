@@ -126,6 +126,24 @@ def patch_model(monkeypatch: pytest.MonkeyPatch, model: Any) -> None:
         monkeypatch.setattr(target, lambda cfg, role: model)
 
 
+@pytest.fixture
+def patch_models_by_role(monkeypatch: pytest.MonkeyPatch):
+    """Like `patch_model`, but returns a different model per role (e.g. head vs subagent)."""
+
+    def _patch(models: dict[str, Any]) -> None:
+        def _by_role(cfg: Any, role: str) -> Any:
+            return models[role]
+
+        for target in (
+            "harness.agent.build_chat_model",
+            "harness.models.build_chat_model",
+            "harness.verify.build_chat_model",
+        ):
+            monkeypatch.setattr(target, _by_role)
+
+    return _patch
+
+
 def patch_run(
     monkeypatch: pytest.MonkeyPatch,
     config: HarnessConfig,

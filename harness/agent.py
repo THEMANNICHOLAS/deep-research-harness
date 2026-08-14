@@ -13,6 +13,7 @@ from deepagents import (
     FilesystemPermission,
     GeneralPurposeSubagentProfile,
     HarnessProfile,
+    SubAgent,
     create_deep_agent,
     register_harness_profile,
 )
@@ -21,7 +22,9 @@ from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain.agents.middleware import AgentMiddleware, InterruptOnConfig, TodoListMiddleware
+from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import Runnable
+from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from harness.config import HarnessConfig, run_workspace_dir
@@ -47,24 +50,22 @@ _INTERRUPT_ON: dict[str, bool | InterruptOnConfig] = {
 }
 
 
-def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
-    """Compile the lead research agent, driven with `ainvoke`/`astream` (substrate D1).
+def _register_no_shell_profile(model: BaseChatModel) -> None:
+    """Register the no-shell HarnessProfile under `model`'s resolved profile key.
 
-    The research question is NOT baked into the system prompt: this signature has no access to
-    it. It travels as the initial `HumanMessage` the caller streams in, and the rendered
-    orchestrator prompt carries only `$current_date` and `$max_urls_per_call`.
+    deepagents keys its harness-profile registry by `f"{provider}:{identifier}"`, derived from
+    the model instance rather than from config literals, so it tracks whatever
+    `build_chat_model` actually returns. Called for both the head model and the reader model
+    (Risk #1): a profile is resolved PER SUBAGENT MODEL key, so leaving the reader's key
+    unregistered would silently expose it to `execute`.
+
+    Accepted residue: the registry is process-global and keyed by provider:model-name, not
+    scoped to our `base_url`. Re-registering per call is idempotent — the same key always maps
+    to the same profile, so a second run in one process is unaffected.
     """
-    model = build_chat_model(config, "head")
-
-    # deepagents keys its harness-profile registry by `f"{provider}:{identifier}"`, derived from
-    # the model instance rather than from config literals, so it tracks whatever
-    # `build_chat_model` actually returns.
     provider = get_model_provider(model)
     identifier = get_model_identifier(model)
     profile_key = f"{provider}:{identifier}"
-    # Accepted residue: the registry is process-global and keyed by provider:model-name, not
-    # scoped to our `base_url`. Re-registering per call is idempotent — the same key always maps
-    # to the same profile, so a second run in one process is unaffected.
     register_harness_profile(
         profile_key,
         HarnessProfile(
@@ -73,13 +74,52 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
         ),
     )
 
+
+def _reader_spec(
+    config: HarnessConfig, reader_model: BaseChatModel, reader_tools: list[BaseTool]
+) -> SubAgent:
+    """Build the declared `reader` `SubAgent` spec (D1): the lead's only route to `fetch_pages`.
+
+    `interrupt_on` is deliberately left unset — the reader has no checkpointer forwarded and
+    cannot interrupt, so inheriting the lead's `ask_user` entry would register an interrupt
+    that can never fire.
+    """
+    return SubAgent(
+        name="reader",
+        description=(
+            "Fetches and digests the given URLs with its own tool calls, returning a "
+            "source-cited digest of what they say about the requested facet."
+        ),
+        system_prompt=render(
+            "reader",
+            current_date=date.today().isoformat(),
+            max_urls_per_call=config.fetch.max_urls_per_call,
+        ),
+        model=reader_model,
+        tools=reader_tools,
+    )
+
+
+def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
+    """Compile the lead research agent, driven with `ainvoke`/`astream` (substrate D1).
+
+    The research question is NOT baked into the system prompt: this signature has no access to
+    it. It travels as the initial `HumanMessage` the caller streams in, and the rendered
+    orchestrator prompt carries only `$current_date` and `$max_urls_per_call`.
+    """
+    model = build_chat_model(config, "head")
+    _register_no_shell_profile(model)
+
+    reader_model = build_chat_model(config, "subagent")
+    _register_no_shell_profile(reader_model)
+
     # Rooted at THIS run's subdirectory, not the shared workspace: the agent can only
     # reach its own notes, and two concurrent runs cannot read each other's.
     workspace = run_workspace_dir(config, registry.run_id)
     workspace.mkdir(parents=True, exist_ok=True)
     backend = FilesystemBackend(root_dir=workspace)
 
-    tools = build_tools(config, registry)
+    tool_sets = build_tools(config, registry)
 
     system_prompt = render(
         "orchestrator",
@@ -89,7 +129,7 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
 
     return create_deep_agent(
         model=model,
-        tools=tools,
+        tools=tool_sets.lead,
         system_prompt=system_prompt,
         backend=backend,
         # `paths` are virtual POSIX paths relative to the backend's own root, never real OS
@@ -99,6 +139,7 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
             FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="allow")
         ],
         middleware=_middleware(model, backend),
+        subagents=[_reader_spec(config, reader_model, tool_sets.reader)],
         # One saver per call, holding this run's thread. In-memory keeps the no-database
         # invariant (D5): no durable, cross-invocation checkpointing.
         checkpointer=InMemorySaver(),
