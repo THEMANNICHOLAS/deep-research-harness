@@ -19,6 +19,7 @@ from langgraph.types import Interrupt
 import harness.__main__ as main_module
 from harness.agent import build_agent
 from harness.config import AgentSettings, run_workspace_dir
+from harness.display import PlainRenderer
 from harness.report import (
     _CUT_SHORT_HEADING,
     _ERROR_TEXT,
@@ -553,7 +554,7 @@ async def test_read_answer_returns_what_was_typed(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": "  Yes, region EU-West  ")
     interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which region?"}}]})
 
-    decisions = await main_module._answer_questions(interrupt)
+    decisions = await main_module._answer_questions(interrupt, PlainRenderer())
 
     assert decisions == [{"type": "respond", "message": "Yes, region EU-West"}]
 
@@ -997,7 +998,7 @@ async def test_a_clarifying_question_can_arrive_without_a_question_argument(
         }
     )
 
-    decisions = await main_module._answer_questions(interrupt)
+    decisions = await main_module._answer_questions(interrupt, PlainRenderer())
 
     out, _ = drain_stdout(capsys)
     asked = [line for line in out.splitlines() if line.strip()]

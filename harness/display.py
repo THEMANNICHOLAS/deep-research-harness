@@ -4,13 +4,14 @@
 
 import sys
 import time
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from rich.console import Console, Group
 from rich.live import Live
+from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
 
@@ -33,7 +34,12 @@ class Activity:
     text: str
 
 
-DisplayEvent = StageStarted | StageCompleted | Activity
+@dataclass(frozen=True)
+class Question:
+    text: str
+
+
+DisplayEvent = StageStarted | StageCompleted | Activity | Question
 
 
 class Renderer(Protocol):
@@ -57,6 +63,8 @@ class PlainRenderer:
             print(f"{event.stage}...", file=stream)
         elif isinstance(event, StageCompleted):
             print(f"{event.stage} done ({event.elapsed_seconds:.1f}s)", file=stream)
+        elif isinstance(event, Question):
+            print(event.text, file=stream)
         else:  # Activity
             print(f"  {event.text}", file=stream)
 
@@ -115,11 +123,24 @@ class RichRenderer:
         self._live: Live | None = None
         self._stage: Stage | None = None
         self._activities: list[str] = []
+        self._closed = False
 
     def _build_renderable(self) -> Group:
         header = Spinner("dots", text=f"[bold]{self._stage}[/bold]")
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
         return Group(header, *activity_lines)
+
+    def _start_live(self) -> None:
+        self._live = Live(
+            self._build_renderable(),
+            console=self._console,
+            refresh_per_second=4,
+            transient=True,
+            auto_refresh=self._auto_refresh,
+        )
+        # refresh=True paints the first frame immediately — without it the header
+        # (and any pre-stage activity buffer) waits for the next update to render.
+        self._live.start(refresh=True)
 
     def emit(self, event: DisplayEvent) -> None:
         if isinstance(event, StageStarted):
@@ -127,20 +148,10 @@ class RichRenderer:
             # Deliberately NOT clearing `_activities`: events emitted before the first stage
             # (the agent's initial todo plan) buffer here and render with the first frame.
             # `StageCompleted` clears, and the tracker always pairs Completed -> Started.
-            renderable = self._build_renderable()
             if self._live is None:
-                self._live = Live(
-                    renderable,
-                    console=self._console,
-                    refresh_per_second=4,
-                    transient=True,
-                    auto_refresh=self._auto_refresh,
-                )
-                # refresh=True paints the first frame immediately — without it the header
-                # (and any pre-stage activity buffer) waits for the next update to render.
-                self._live.start(refresh=True)
+                self._start_live()
             else:
-                self._live.update(renderable, refresh=True)
+                self._live.update(self._build_renderable(), refresh=True)
         elif isinstance(event, StageCompleted):
             self._stage = None
             self._activities = []
@@ -149,15 +160,30 @@ class RichRenderer:
             self._console.print(
                 f"[green]✓[/green] {event.stage} [dim]({event.elapsed_seconds:.1f}s)[/dim]"
             )
+        elif isinstance(event, Question):
+            self._console.print(Panel(event.text, border_style="cyan"))
         else:  # Activity
             self._activities = (self._activities + [event.text])[-self._ACTIVITY_TAIL :]
             if self._live is not None:
                 self._live.update(self._build_renderable(), refresh=True)
 
     def suspend(self) -> AbstractContextManager[None]:
-        return nullcontext()
+        return self._suspend()
+
+    @contextmanager
+    def _suspend(self) -> Generator[None, None, None]:
+        was_running = self._live is not None
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+        try:
+            yield
+        finally:
+            if was_running and self._stage is not None and not self._closed:
+                self._start_live()
 
     def close(self) -> None:
+        self._closed = True
         if self._live is not None:
             self._live.update("", refresh=True)
             self._live.stop()

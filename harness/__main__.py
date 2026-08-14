@@ -33,7 +33,7 @@ from langgraph.types import Command, Interrupt
 
 from harness.agent import build_agent
 from harness.config import ConfigError, load_config
-from harness.display import Activity, StageTracker, build_renderer
+from harness.display import Activity, Question, Renderer, StageTracker, build_renderer
 from harness.models import ModelError, preflight
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, write_report
@@ -167,8 +167,8 @@ def _describe_tool_call(call: dict[str, Any]) -> str:
     return f"fetch_pages: {len(args.get('urls') or [])} url(s)"
 
 
-async def _answer_questions(interrupt: Interrupt) -> list[dict[str, Any]]:
-    """Print each pending `ask_user` question and collect one answer per action request.
+async def _answer_questions(interrupt: Interrupt, renderer: Renderer) -> list[dict[str, Any]]:
+    """Render each pending `ask_user` question and collect one answer per action request.
 
     One decision per request, in the same order — the middleware raises `ValueError` on a
     count mismatch.
@@ -177,8 +177,9 @@ async def _answer_questions(interrupt: Interrupt) -> list[dict[str, Any]]:
     for request in interrupt.value["action_requests"]:
         args = request.get("args", {})
         question = args.get("question") or request.get("description") or str(args)
-        print(question)
-        answer = await _read_answer()
+        renderer.emit(Question(question))
+        with renderer.suspend():
+            answer = await _read_answer()
         # Best-effort + disclose: a bare Enter must not reach the model as an empty tool
         # result, which reads as "answered with nothing said" and hides the open ambiguity.
         decisions.append({"type": "respond", "message": answer.strip() or _NO_ANSWER_GIVEN})
@@ -302,7 +303,9 @@ async def main(argv: list[str] | None = None) -> int:
                 # `interrupts[0]`, not all of them: the lead is a single agent node, so at
                 # most one is ever pending, and `Command(resume=...)` delivers ONE value —
                 # fanning several into one decisions list would mis-pair them.
-                stream_input = Command(resume={"decisions": await _answer_questions(interrupts[0])})
+                stream_input = Command(
+                    resume={"decisions": await _answer_questions(interrupts[0], renderer)}
+                )
     except TimeoutError as exc:
         # `clock.expired()`, not a bare `except TimeoutError`: a timeout raised INSIDE the
         # run (an `asyncio.wait_for` in a tool, say) would otherwise be reported as "the wall

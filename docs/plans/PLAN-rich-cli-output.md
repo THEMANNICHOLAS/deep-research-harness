@@ -164,7 +164,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 - [x] Phase 1: Event seam + plain renderer
 - [x] Phase 2: Rich live display
-- [ ] Phase 3: ask_user question panel
+- [x] Phase 3: ask_user question panel
 - [ ] Phase 4: End-of-run summary
 - [ ] Final verification
 
@@ -426,6 +426,14 @@ correction. Empty at plan creation. -->
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+### 2026-08-14 — suspend() tests cannot catch a no-op suspend (deferred)
+Phase 3 review (Minor): the recorded-console ordering tests for `RichRenderer.suspend()`
+pass even if `suspend()` were a no-op (`console.print` repaints an active Live region
+anyway), so the automated suite does not gate risk #3's real failure mode — typed input
+interleaving with spinner frames. The manual clarification run in final verification is the
+actual gate. A stronger test needs `auto_refresh=True` plus timing assertions (flaky-prone);
+deferred by the developer.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
@@ -462,3 +470,20 @@ never add a section below it. -->
   ANSI) is still PENDING — fold it into the final-verification manual e2e. Phase 3 implements
   real `suspend()` (stop/restart the Live) + `Question` panel; `close()` while suspended must
   stay legal (risk #3).
+
+### 2026-08-14 — Phase 3: ask_user question panel
+- Done: `Question` event (union extended additively); plain rendering byte-identical to the
+  old `print(question)`; Rich renders a cyan-bordered `Panel`; real `suspend()` —
+  `Live.stop()` (joins the refresh thread), restart in `finally` guarded by
+  `was_running and self._stage is not None and not self._closed`; `_answer_questions(interrupt,
+  renderer)` emits `Question` and wraps only `_read_answer()` in `suspend()`. D5 held:
+  `_read_answer`, resume `Command`, stderr prompt untouched.
+- Learned: the recorded-console suspend tests pass under a no-op suspend too (see
+  `## Discoveries`) — risk #3's true gate is the manual clarification run, still pending.
+  Wall clock firing mid-prompt: `finally` restarts the live briefly, then the normal
+  teardown path closes it — clean, by design.
+- Drift: none
+- Watch-next: manual acceptance for Phases 2 AND 3 rides on the final-verification e2e run
+  (spinner/collapse, panel + frozen spinner during typing, piped no-ANSI). Do NOT commit the
+  stray `docs/plans/PLAN-reader-delegation.md` (concurrent planning session's file). Phase 4
+  is unflagged: `RunFinished` summary in both renderers, path still last.

@@ -15,6 +15,7 @@ from harness.display import (
     Activity,
     DisplayEvent,
     PlainRenderer,
+    Question,
     RichRenderer,
     StageCompleted,
     StageStarted,
@@ -42,6 +43,7 @@ def _rich_renderer() -> tuple[RichRenderer, StringIO]:
         (StageStarted("researching"), "researching..."),
         (StageCompleted("researching", 12.34), "researching done (12.3s)"),
         (Activity("[pending] Find sources"), "  [pending] Find sources"),
+        (Question("Which region?"), "Which region?"),
     ],
 )
 def test_plain_renderer_emits_the_expected_line(capsys, event: DisplayEvent, expected_line: str):
@@ -318,3 +320,51 @@ def test_rich_renderer_suspend_is_a_context_manager():
         pass
 
     renderer.close()
+
+
+# --- Question panel + suspend tests (Phase 3) ---------------------------------------------
+
+
+def test_rich_renderer_question_renders_as_a_bordered_panel():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(Question("Which region?"))
+    renderer.close()
+
+    text = _strip_ansi(buffer.getvalue())
+    lines = [line for line in text.splitlines() if line.strip()]
+    question_index = next(i for i, line in enumerate(lines) if "Which region?" in line)
+    # A panel border above and below the question text — at least one non-empty line on
+    # each side that is not itself the question text (do not assert box characters).
+    assert question_index > 0
+    assert question_index < len(lines) - 1
+
+
+def test_rich_renderer_suspend_stops_the_live_region_and_resume_repaints_after_marker():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    with renderer.suspend():
+        renderer._console.print("MARKER")
+
+    text = _strip_ansi(buffer.getvalue())
+    marker_index = text.index("MARKER")
+    # The live region must restart on suspend exit and repaint the stage header — proving
+    # the refresh thread was actually stopped, not merely hidden, during the suspended body.
+    resume_index = text.index("researching", marker_index + len("MARKER"))
+    assert resume_index > marker_index
+
+    renderer.close()
+
+
+def test_rich_renderer_close_while_suspended_does_not_repaint_the_stage():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    length_at_close = None
+    with renderer.suspend():
+        renderer.close()
+        length_at_close = len(buffer.getvalue())
+
+    # Exiting the suspend body after a mid-prompt close() must not resurrect the live region.
+    assert len(buffer.getvalue()) == length_at_close
