@@ -4,6 +4,11 @@
 the plan's Contracts section — only the class name, `write_report`'s signature, and the
 frozen filename format are. This suite fixes those field names as part of writing the
 tests first; `harness/report.py` must match them.
+
+`outcome.paragraphs` is the ONLY source of paragraph boundaries for the `## Answer`
+section (D2) — `report.py` never re-splits `answer`. Every test here that checks Answer
+content passes `paragraphs=split_paragraphs(answer)` explicitly, exactly as
+`harness/__main__.py` will (Phase 2+3 plan, PART B).
 """
 
 import os
@@ -14,6 +19,7 @@ import pytest
 from pydantic import ValidationError
 
 from harness.config import AgentSettings
+from harness.paragraphs import split_paragraphs
 from harness.report import (
     _CUT_SHORT_HEADING,
     _ERROR_TEXT,
@@ -27,7 +33,7 @@ from harness.report import (
     write_report,
 )
 from harness.sources import SourceRegistry
-from harness.verify import ClaimCheck, VerificationResult
+from harness.verify import ParagraphVerdict, VerificationResult
 from tests.conftest import write_failed_capture, write_source_capture
 
 _FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-[a-z0-9-]+\.md$")
@@ -70,18 +76,24 @@ def test_write_report_produces_a_frozen_filename_under_reports_dir(make_config):
 
 
 def test_write_report_returns_a_path_whose_body_is_the_answer_actually_written(make_config):
+    """`[S1]` is unregistered here, so it is stripped from the prose like any other marker
+    (D4) rather than left bare — the prose itself must still survive verbatim otherwise.
+    """
     config = make_config()
+    answer = "Yes, due to Rayleigh scattering [S1]."
     outcome = RunOutcome(
         question="Is the sky blue?",
-        answer="Yes, due to Rayleigh scattering [S1].",
+        answer=answer,
         registry=SourceRegistry(),
         usage=_usage(),
+        paragraphs=split_paragraphs(answer),
     )
 
     path = write_report(outcome, config)
 
     assert path.is_file()
-    assert "Yes, due to Rayleigh scattering [S1]." in path.read_text(encoding="utf-8")
+    assert "Yes, due to Rayleigh scattering." in path.read_text(encoding="utf-8")
+    assert "[S1]" not in path.read_text(encoding="utf-8")
 
 
 def test_write_report_with_no_usable_sources_still_writes_a_report_saying_so(make_config):
@@ -213,11 +225,13 @@ def test_write_report_body_carries_answer_reasoning_split_and_sources(make_confi
     registry = SourceRegistry()
     source_id = registry.add("https://example.test/a", title="Example A")
     write_source_capture(config, registry, source_id)
+    answer = f"Answer text with a marker [{source_id}]."
     outcome = RunOutcome(
         question="reasoning split check",
-        answer="Answer text with a marker [S1].",
+        answer=answer,
         registry=registry,
         usage=_usage(reasoning=37, input_tokens=200, output_tokens=80),
+        paragraphs=split_paragraphs(answer),
     )
 
     path = write_report(outcome, config)
@@ -495,85 +509,156 @@ def test_write_report_has_no_cut_short_sections_when_the_run_finished(make_confi
     assert _NOTES_HEADING not in body
 
 
-# --- Phase 6: claim verification and disclosure ----------------------------------------
-#
-# `harness.verify` does not exist yet (Phase 6 builds it next) — its classes are imported
-# locally inside each test that needs them so a missing module fails only that test, not
-# collection of this whole file (per the plan's "Expected red" section).
+# --- Phase 2+3 (pooled paragraph verification and rendering): markers, conflicts, gaps -
 
 
-def test_write_report_marks_each_non_supported_verdict_and_leaves_supported_bare(make_config):
-    """Every verdict in the frozen vocabulary renders a visible marker except `supported`.
-
-    Each claim below carries exactly one check, so no claim has a supporting source to
-    suppress its marker — that gating is tested separately. The `get_args` assertion keeps
-    this exhaustive: a verdict added later fails here until it is given a case.
+def test_write_report_renders_a_verdict_line_for_every_citing_paragraph_regardless_of_verdict(
+    make_config,
+):
+    """Every verdict in the frozen vocabulary renders its own `Verdict:` line —
+    INCLUDING `supported`. Under the pooled-paragraph contract the Sources:/Verdict:
+    block is gated on whether a paragraph cites a REGISTERED source, never on the verdict
+    value (item 2), so the old "supported renders no marker" distinction from the
+    per-claim scheme no longer exists. `no_sources_cited` is exercised elsewhere (it can
+    only occur on a paragraph with NO registered source, which by definition renders no
+    Verdict: line at all).
     """
     from typing import get_args
 
-    from harness.verify import ClaimCheck, Verdict, VerificationResult
+    from harness.verify import Verdict
 
     config = make_config()
-    supported = "The sky is blue."
-    unsupported = "The moon is made of cheese."
-    not_addressed = "Jupiter has a great red spot."
-    uncited = "Water boils at 100 degrees Celsius."
-    unresolved = "Mercury is the closest planet to the sun."
-    unverifiable = "Venus has a thick atmosphere."
-    answer = " ".join([supported, unsupported, not_addressed, uncited, unresolved, unverifiable])
-    checks = [
-        ClaimCheck(claim=supported, source_id="S1", verdict="supported"),
-        ClaimCheck(claim=unsupported, source_id="S1", verdict="unsupported", detail="disagrees"),
-        ClaimCheck(
-            claim=not_addressed, source_id="S3", verdict="not_addressed", detail="says nothing"
-        ),
-        ClaimCheck(claim=uncited, source_id=None, verdict="uncited"),
-        ClaimCheck(claim=unresolved, source_id="S9", verdict="unresolved"),
-        ClaimCheck(
-            claim=unverifiable,
-            source_id="S2",
-            verdict="unverifiable",
-            detail="fetch failed",
-        ),
+    registry = SourceRegistry()
+    verdict_values = ("supported", "partially_supported", "not_supported", "not_verified")
+    ids = {v: registry.add(f"https://example.test/{v}") for v in verdict_values}
+    for v, sid in ids.items():
+        write_source_capture(config, registry, sid, f"Body for {v}.")
+
+    texts = {
+        "supported": "The sky is blue.",
+        "partially_supported": "The moon is partly made of rock.",
+        "not_supported": "The moon is made of cheese.",
+        "not_verified": "Mercury is the closest planet to the sun.",
+    }
+    answer = "\n\n".join(f"{texts[v]} [{ids[v]}]" for v in verdict_values)
+    paragraphs = split_paragraphs(answer)
+    verdicts = [
+        ParagraphVerdict(verdict=v, detail=f"Detail for {v}.", source_ids=[ids[v]])
+        for v in verdict_values
     ]
-    assert {check.verdict for check in checks} == set(get_args(Verdict))
-    verification = VerificationResult(checks=checks)
+    # Exhaustive over every value this test exercises, plus the one deterministic value it
+    # deliberately does not (`no_sources_cited` — see docstring).
+    assert set(verdict_values) | {"no_sources_cited"} == set(get_args(Verdict))
     outcome = RunOutcome(
         question="Marker rendering",
         answer=answer,
-        registry=SourceRegistry(),
+        registry=registry,
         usage=_usage(),
+        paragraphs=paragraphs,
+        verification=VerificationResult(verdicts=verdicts),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    for v in verdict_values:
+        label = v.replace("_", " ")
+        assert f"Verdict: {label} - Detail for {v}." in answer_section
+    # Exactly one Verdict: line per paragraph — the count assertion the old per-claim
+    # marker count (`body.count("**[") == 5`) becomes under the new format.
+    assert answer_section.count("Verdict:") == 4
+
+
+def test_no_marker_or_markdown_link_ever_appears_inside_a_paragraphs_prose(make_config):
+    """Item 1: no `[Sn]` marker and no markdown link survives inside prose — every link
+    lives on its own `Sources:` line.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id, "Body.")
+    answer = f"The pump failed under load [{source_id}]."
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[
+            ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[source_id])
+        ]
+    )
+    outcome = RunOutcome(
+        question="No inline links",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
         verification=verification,
     )
 
     body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
 
-    assert "**[unsupported — S1]**" in body
-    assert "**[not addressed — S3]**" in body
-    assert "**[uncited]**" in body
-    assert "**[unresolved — S9]**" in body
-    assert "**[unverifiable — S2]**" in body
-    # Exactly the five non-supported claims carry a marker — the supported one does not.
-    assert body.count("**[") == 5
+    # `_section` includes the blank line `_render_body` puts right after the `## Answer`
+    # heading, so the prose is the first NON-empty line, not literally index 0.
+    prose_line = next(line for line in answer_section.splitlines() if line.strip())
+    assert prose_line == "The pump failed under load."
+    assert "[S" not in prose_line
+    assert "](" not in prose_line
+    assert f"Sources: {registry.link(source_id)}" in answer_section
 
 
-def test_write_report_resolves_registered_markers_and_discloses_unregistered_ones(
+def test_sources_line_is_space_separated_deduped_first_appearance_order_before_verdict(
     make_config,
 ):
-    """R1: every surviving `[Sn]` marker resolves to a link; an unresolvable one is
-    reported by `unresolved_ids` in the gaps section instead.
+    """Item 2: `Sources:` lists space-separated, deduped links in first-appearance order,
+    followed by `Verdict:`.
     """
-    from harness.verify import ClaimCheck, VerificationResult
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Body one.")
+    write_source_capture(config, registry, id2, "Body two.")
+    answer = f"The pump [{id2}] failed [{id1}] again [{id2}]."
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[id2, id1])]
+    )
+    outcome = RunOutcome(
+        question="Dedupe order",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
 
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    expected_sources_line = f"Sources: {registry.link(id2)} {registry.link(id1)}"
+    assert expected_sources_line in answer_section
+    assert answer_section.index("Sources:") < answer_section.index("Verdict:")
+
+
+def test_write_report_resolves_registered_sources_and_discloses_unregistered_markers(
+    make_config,
+):
+    """R1: a registered `[Sn]` marker resolves into a `Sources:` link — D4: links only
+    ever appear on the `Sources:` line, never inline in prose. An unregistered marker's
+    citation is stripped from the prose the same as any other marker (D4) and is
+    disclosed by `_gaps_section`'s `unresolved_ids` scan of the RAW answer instead of
+    being left visible in the answer text (the old per-claim scheme's behavior — see
+    `## Discoveries`).
+    """
     config = make_config()
     registry = SourceRegistry()
     source_id = registry.add("https://example.test/known", title="Known page")
     write_source_capture(config, registry, source_id)
-    answer = "A known fact [S1]. An unresolvable fact [S9]."
+    answer = "A known fact [S1].\n\nAn unresolvable fact [S9]."
+    paragraphs = split_paragraphs(answer)
     verification = VerificationResult(
-        checks=[
-            ClaimCheck(claim="A known fact [S1].", source_id="S1", verdict="supported"),
-            ClaimCheck(claim="An unresolvable fact [S9].", source_id="S9", verdict="unresolved"),
+        verdicts=[
+            ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[source_id]),
+            ParagraphVerdict(verdict="no_sources_cited", detail="Nothing to check.", source_ids=[]),
         ]
     )
     outcome = RunOutcome(
@@ -581,87 +666,73 @@ def test_write_report_resolves_registered_markers_and_discloses_unregistered_one
         answer=answer,
         registry=registry,
         usage=_usage(),
+        paragraphs=paragraphs,
         verification=verification,
     )
 
     body = write_report(outcome, config).read_text(encoding="utf-8")
 
-    # Scoped to the Answer section, not the whole body: `## Sources` legitimately prints
-    # `- [S1] <link>` as its bullet label (pinned by
-    # `test_write_report_ignores_a_source_captured_under_a_different_run`), so a
-    # whole-body assertion could never pass. What matters is that no bare marker survives
-    # where the reader is reading prose.
     answer_section = _section(body, "## Answer")
-    assert "[S1]" not in answer_section  # resolved into a markdown link, not left bare
-    assert "example.test" in answer_section
-    assert "[S9]" in answer_section  # unregistered — left visible verbatim
+    assert "[S1]" not in answer_section  # stripped from prose; resolved onto a Sources: link
+    assert "[S9]" not in answer_section  # stripped too — never left bare in the prose
+    assert "example.test" in answer_section  # the registered source's Sources: link
     gaps = _section(body, "## Gaps and disclosures")
     assert "S9" in gaps
 
 
-def test_write_report_conflicts_section_names_both_positions_with_no_winner(make_config):
-    """D3: a conflict states both positions and both IDs, and adjudicates nothing."""
-    from harness.verify import ClaimCheck, Conflict, VerificationResult
-
+def test_write_report_conflicts_section_names_both_sources_with_no_winner(make_config):
+    """D3: contradiction is now MODEL-REPORTED via `sources_conflict`, not derived from
+    disagreeing per-source verdicts. The section identifies the paragraph and lists both
+    cited sources as links, adjudicating nothing.
+    """
     config = make_config()
     registry = SourceRegistry()
-    registry.add("https://one.example.test/a", title="One")
-    registry.add("https://two.example.test/b", title="Two")
-    claim = "The vendor quoted $4.20 per unit [S1] [S2]."
-    positions = [
-        ClaimCheck(
-            claim=claim, source_id="S1", verdict="supported", detail="Source A confirms $4.20"
-        ),
-        ClaimCheck(
-            claim=claim, source_id="S2", verdict="unsupported", detail="Source B says $5.10"
-        ),
-    ]
+    id1 = registry.add("https://one.example.test/a", title="One")
+    id2 = registry.add("https://two.example.test/b", title="Two")
+    answer = f"The vendor quoted $4.20 per unit [{id1}] [{id2}]."
+    paragraphs = split_paragraphs(answer)
     verification = VerificationResult(
-        checks=positions, conflicts=[Conflict(claim=claim, positions=positions)]
+        verdicts=[
+            ParagraphVerdict(
+                verdict="not_supported",
+                detail="The two sources disagree on the price.",
+                sources_conflict=True,
+                source_ids=[id1, id2],
+            )
+        ]
     )
     outcome = RunOutcome(
         question="Conflicting prices",
-        answer=claim,
+        answer=answer,
         registry=registry,
         usage=_usage(),
+        paragraphs=paragraphs,
         verification=verification,
     )
 
     body = write_report(outcome, config).read_text(encoding="utf-8")
 
     section = _section(body, "## Conflicting sources")
-    assert "S1" in section
-    assert "S2" in section
-    assert "Source A confirms $4.20" in section
-    assert "Source B says $5.10" in section
+    assert "The vendor quoted" in section
+    assert registry.link(id1) in section
+    assert registry.link(id2) in section
     lowered = section.lower()
     assert "correct" not in lowered
     assert "wrong" not in lowered
     assert "more reliable" not in lowered
 
 
-def test_write_report_gaps_section_lists_check_failures_and_uncited_count(make_config):
-    """The gaps section carries `check_failures` verbatim and the uncited claim count."""
-    from harness.verify import ClaimCheck, VerificationResult
-
+def test_write_report_gaps_section_lists_check_failures(make_config):
+    """The gaps section carries `check_failures` verbatim. The uncited-claim count this
+    test used to also assert no longer exists (plan `## Reconciliations` 2026-08-13,
+    second entry) — `_gaps_section` no longer denominates anything by claim count.
+    """
     config = make_config()
     failure_line = "S3: model call raised TimeoutError"
-    verification = VerificationResult(
-        checks=[
-            ClaimCheck(
-                claim="First unsupported-by-citation claim.", source_id=None, verdict="uncited"
-            ),
-            ClaimCheck(
-                claim="Second unsupported-by-citation claim.",
-                source_id=None,
-                verdict="uncited",
-            ),
-        ],
-        check_failures=[failure_line],
-    )
+    verification = VerificationResult(check_failures=[failure_line])
     outcome = RunOutcome(
         question="Gap disclosure",
-        answer="First unsupported-by-citation claim. Second unsupported-by-citation claim.",
+        answer="",
         registry=SourceRegistry(),
         usage=_usage(),
         verification=verification,
@@ -671,27 +742,31 @@ def test_write_report_gaps_section_lists_check_failures_and_uncited_count(make_c
 
     gaps = _section(body, "## Gaps and disclosures")
     assert failure_line in gaps
-    # Scoped to the count LINE, not the whole section: a bare `"2" in gaps` passed on any
-    # stray "2" anywhere in the text — a regression rendering "1 claim(s)" would still
-    # have found a 2 in the failure line above it (PR #4 review, nit).
-    count_line = next(line for line in gaps.splitlines() if "claim(s)" in line)
-    assert count_line.startswith("2 claim(s)"), count_line
-    assert "uncited" in gaps.lower()
+    # Proves the removal, not just its absence by accident.
+    assert "claim(s)" not in gaps
 
 
 def test_write_report_omits_both_new_sections_when_there_is_nothing_to_disclose(make_config):
-    """All-`supported`, no conflicts, no failures → neither new section appears."""
-    from harness.verify import ClaimCheck, VerificationResult
-
+    """`supported`, no conflict, no failures, no unresolved markers → neither new section
+    appears.
+    """
     config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id)
+    answer = f"Everything checks out [{source_id}]."
+    paragraphs = split_paragraphs(answer)
     verification = VerificationResult(
-        checks=[ClaimCheck(claim="Everything checks out.", source_id="S1", verdict="supported")]
+        verdicts=[
+            ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[source_id])
+        ]
     )
     outcome = RunOutcome(
         question="Clean run",
-        answer="Everything checks out.",
-        registry=SourceRegistry(),
+        answer=answer,
+        registry=registry,
         usage=_usage(),
+        paragraphs=paragraphs,
         verification=verification,
     )
 
@@ -701,190 +776,278 @@ def test_write_report_omits_both_new_sections_when_there_is_nothing_to_disclose(
     assert "## Gaps and disclosures" not in body
 
 
-def test_write_report_places_marker_for_a_lead_in_plus_bullets_claim(make_config):
-    """3F Major finding: `extract_claims` joins a bulleted block's lines with a single
-    space, so the returned claim is NOT a verbatim substring of the answer (which still
-    has its bullet markers and newlines). The marker must still land in the rendered
-    Answer section rather than silently vanishing.
+def test_write_report_a_list_paragraphs_lead_in_and_bullets_render_cleanly_with_bullet_marks(
+    make_config,
+):
+    """A lead-in line plus its bullets is ONE paragraph and gets ONE Sources:/Verdict:
+    pair; only the failing bullet carries a trailing `*`, and the detail opens with an
+    `n/m bullets verified` rollup (item 3). Supersedes the old marker-placement guard
+    against `extract_claims` collapsing whitespace: `outcome.paragraphs` is now the only
+    source of paragraph boundaries (D2), so there is no text re-matching step left to
+    fail — placement is correct by construction, not by locating a claim string back
+    inside the raw answer.
     """
-    from harness.verify import ClaimCheck, VerificationResult, extract_claims
-
     config = make_config()
-    answer = "Key findings:\n- The vendor quoted $4.20 [S1].\n- Lead time is six weeks [S2]."
-    claims = extract_claims(answer)
-    target = next(claim for claim in claims if "vendor quoted" in claim)
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/vendor")
+    write_source_capture(config, registry, source_id, "Body text.")
+    answer = f"Key findings:\n- The vendor quoted $4.20 [{source_id}].\n- Lead time is six weeks."
+    paragraphs = split_paragraphs(answer)
     verification = VerificationResult(
-        checks=[ClaimCheck(claim=target, source_id="S1", verdict="unsupported", detail="mismatch")]
-    )
-    outcome = RunOutcome(
-        question="Lead-in plus bullets",
-        answer=answer,
-        registry=SourceRegistry(),
-        usage=_usage(),
-        verification=verification,
-    )
-
-    body = write_report(outcome, config).read_text(encoding="utf-8")
-
-    assert "**[unsupported — S1]**" in body
-
-
-def test_write_report_places_marker_for_a_hard_wrapped_claim(make_config):
-    """Same finding, the other shape: a claim hard-wrapped across two lines within one
-    paragraph is collapsed to a single space by `extract_claims`, so it is not a verbatim
-    substring of the answer either.
-    """
-    from harness.verify import ClaimCheck, VerificationResult, extract_claims
-
-    config = make_config()
-    answer = "The vendor quoted a price of\n$4.20 per unit [S1]. Lead time is six weeks [S2]."
-    claims = extract_claims(answer)
-    target = next(claim for claim in claims if "vendor quoted a price" in claim)
-    verification = VerificationResult(
-        checks=[ClaimCheck(claim=target, source_id="S1", verdict="unsupported", detail="mismatch")]
-    )
-    outcome = RunOutcome(
-        question="Hard-wrapped claim",
-        answer=answer,
-        registry=SourceRegistry(),
-        usage=_usage(),
-        verification=verification,
-    )
-
-    body = write_report(outcome, config).read_text(encoding="utf-8")
-
-    assert "**[unsupported — S1]**" in body
-
-
-def test_marker_binds_to_the_sentence_it_judges_not_the_one_after_it(make_config):
-    """Found by the Phase 5 live check, which every prior test missed by feeding answers
-    whose judged sentence was the last thing on its line. A marker separated from its claim
-    by a paragraph break reads as a label on whatever follows it, so a reader attributes the
-    verdict to the wrong sentence — the one failure a citation report cannot afford.
-    """
-    from harness.verify import ClaimCheck, VerificationResult, extract_claims
-
-    config = make_config()
-    answer = "The vendor quoted $4.20 [S1]. Lead time is six weeks [S2]."
-    claims = extract_claims(answer)
-    target = next(claim for claim in claims if "vendor quoted" in claim)
-    verification = VerificationResult(
-        checks=[ClaimCheck(claim=target, source_id="S1", verdict="unsupported", detail="mismatch")]
-    )
-    outcome = RunOutcome(
-        question="Two sentences, one paragraph",
-        answer=answer,
-        registry=SourceRegistry(),
-        usage=_usage(),
-        verification=verification,
-    )
-
-    body = write_report(outcome, config).read_text(encoding="utf-8")
-
-    answer_section = body.split("## Answer", 1)[1].split("## ", 1)[0]
-    # The marker trails its own sentence on the same line...
-    assert "$4.20 [S1]. **[unsupported — S1]**" in answer_section
-    # ...and does not open a line, which is what made it read as the next claim's label.
-    assert "\n**[unsupported" not in answer_section
-    assert "Lead time is six weeks" in answer_section
-
-
-def test_a_claim_one_cited_source_supports_carries_no_marker(make_config):
-    """Phase 6 live check: a synthesized sentence cites several sources, each covering
-    part of it, so the sentences that WERE properly evidenced collected a marker for every
-    source that merely didn't speak to them. A reader — non-technical, by design — reads a
-    page of unsupported markers as "none of this is trustworthy", the exact miscalibration
-    D3 rejected paragraph-level claims to avoid. One supporting source is support.
-    """
-    from harness.verify import ClaimCheck, VerificationResult
-
-    config = make_config()
-    claim = "The vendor quoted $4.20 [S1][S2]."
-    verification = VerificationResult(
-        checks=[
-            ClaimCheck(claim=claim, source_id="S1", verdict="supported", detail="Confirms."),
-            ClaimCheck(claim=claim, source_id="S2", verdict="not_addressed", detail="Silent."),
-        ]
-    )
-    outcome = RunOutcome(
-        question="Partial coverage",
-        answer=claim,
-        registry=SourceRegistry(),
-        usage=_usage(),
-        verification=verification,
-    )
-
-    body = write_report(outcome, config).read_text(encoding="utf-8")
-
-    answer_section = body.split("## Answer", 1)[1].split("## ", 1)[0]
-    assert "**[" not in answer_section
-
-
-def test_a_claim_no_cited_source_supports_is_marked_per_failing_source(make_config):
-    """The other half of the same rule: when NOTHING supports the claim, every failing
-    source still shows in place, so the reader sees which source failed it and how.
-    """
-    from harness.verify import ClaimCheck, VerificationResult
-
-    config = make_config()
-    claim = "The vendor quoted $4.20 [S1][S2]."
-    verification = VerificationResult(
-        checks=[
-            ClaimCheck(claim=claim, source_id="S1", verdict="unsupported", detail="Says $5.10."),
-            ClaimCheck(claim=claim, source_id="S2", verdict="not_addressed", detail="Silent."),
-        ]
-    )
-    outcome = RunOutcome(
-        question="No support at all",
-        answer=claim,
-        registry=SourceRegistry(),
-        usage=_usage(),
-        verification=verification,
-    )
-
-    body = write_report(outcome, config).read_text(encoding="utf-8")
-
-    answer_section = body.split("## Answer", 1)[1].split("## ", 1)[0]
-    assert "**[unsupported — S1]**" in answer_section
-    # Rendered for a non-technical reader, not as the raw literal `not_addressed`.
-    assert "**[not addressed — S2]**" in answer_section
-
-
-def test_write_report_discloses_a_verdict_whose_marker_could_not_be_placed(make_config):
-    """A claim that genuinely does not appear in the answer at all (e.g. a stale check
-    against an edited answer) must be disclosed in `## Gaps and disclosures`, never
-    dropped — this is the "never drop silently" half of the Major finding.
-    """
-    from harness.verify import ClaimCheck, VerificationResult
-
-    config = make_config()
-    answer = "The sky is blue."
-    verification = VerificationResult(
-        checks=[
-            ClaimCheck(
-                claim="A claim that does not appear in the answer at all.",
-                source_id="S1",
-                verdict="unsupported",
-                detail="mismatch",
+        verdicts=[
+            ParagraphVerdict(
+                verdict="partially_supported",
+                detail="The quote does not match the source.",
+                unsupported_items=[0],
+                source_ids=[source_id],
             )
         ]
     )
     outcome = RunOutcome(
-        question="Unplaceable claim",
+        question="Lead-in plus bullets",
         answer=answer,
-        registry=SourceRegistry(),
+        registry=registry,
         usage=_usage(),
+        paragraphs=paragraphs,
         verification=verification,
     )
 
     body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+    lines = [line.strip() for line in answer_section.splitlines()]
 
-    # Never silently placed somewhere wrong in the answer.
-    assert "**[" not in body
-    gaps = _section(body, "## Gaps and disclosures")
-    assert "unsupported" in gaps
-    assert "S1" in gaps
-    assert "could not be positioned" in gaps
+    assert "Key findings:" in answer_section
+    # `strip_markers` preserves trailing punctuation, so the `*` mark appends after the
+    # full rendered (already-punctuated) line, per B4: "append ` *` to the rendered line".
+    assert "- The vendor quoted $4.20. *" in lines
+    assert "- Lead time is six weeks." in lines
+    assert (
+        "Verdict: partially supported - 1/2 bullets verified. The quote does not match the source."
+    ) in answer_section
+
+
+def test_write_report_a_hard_wrapped_paragraph_renders_as_one_clean_prose_block(make_config):
+    """A sentence hard-wrapped across two lines is still ONE `Paragraph` (blank-line
+    delimited, not sentence-delimited), so its Sources:/Verdict: pair renders once,
+    beneath the whole prose block — the wrap is not a splitting boundary.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/vendor")
+    write_source_capture(config, registry, source_id, "Body text.")
+    answer = f"The vendor quoted a price of\n$4.20 per unit [{source_id}]."
+    paragraphs = split_paragraphs(answer)
+    assert len(paragraphs) == 1  # the wrap is one paragraph, not two
+    verification = VerificationResult(
+        verdicts=[
+            ParagraphVerdict(
+                verdict="not_supported", detail="The source disagrees.", source_ids=[source_id]
+            )
+        ]
+    )
+    outcome = RunOutcome(
+        question="Hard-wrapped paragraph",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert "The vendor quoted a price of" in answer_section
+    assert "$4.20 per unit" in answer_section
+    assert answer_section.count("Verdict:") == 1
+    assert "Verdict: not supported - The source disagrees." in answer_section
+
+
+def test_a_paragraphs_verdict_binds_to_its_own_prose_not_the_next_paragraphs(make_config):
+    """Found by the Phase 5 live check against the old sentence-marker scheme: a verdict
+    separated from its own claim read as a label on whatever followed. Paragraphs make
+    this structural now — each paragraph's Sources:/Verdict: pair sits directly beneath
+    its own prose and before the next paragraph's prose begins.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Body one.")
+    write_source_capture(config, registry, id2, "Body two.")
+    answer = f"The vendor quoted $4.20 [{id1}].\n\nLead time is six weeks [{id2}]."
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[
+            ParagraphVerdict(verdict="not_supported", detail="Says $5.10.", source_ids=[id1]),
+            ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[id2]),
+        ]
+    )
+    outcome = RunOutcome(
+        question="Two paragraphs",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    first_verdict_pos = answer_section.index("Verdict: not supported - Says $5.10.")
+    second_prose_pos = answer_section.index("Lead time is six weeks")
+    second_verdict_pos = answer_section.index("Verdict: supported - Confirmed.")
+    assert first_verdict_pos < second_prose_pos < second_verdict_pos
+
+
+def test_a_paragraph_citing_multiple_sources_still_renders_exactly_one_verdict_line(
+    make_config,
+):
+    """The model judges a paragraph's pooled sources together and returns ONE verdict
+    (D3) — `report.py` never re-derives per-source noise from that; it renders exactly
+    what it was given, once, no matter how many sources the paragraph cited. Successor to
+    the old "one supporting source suppresses the others' markers" property, which was a
+    `report.py`-level aggregation rule that no longer exists — that judgment now happens
+    entirely inside the model's pooled verdict (`harness.verify`).
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Confirms the price.")
+    write_source_capture(config, registry, id2, "Says nothing about price.")
+    answer = f"The vendor quoted $4.20 [{id1}][{id2}]."
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[
+            ParagraphVerdict(
+                verdict="supported", detail="One source confirms it.", source_ids=[id1, id2]
+            )
+        ]
+    )
+    outcome = RunOutcome(
+        question="Partial coverage",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert answer_section.count("Verdict:") == 1
+    assert "Verdict: supported - One source confirms it." in answer_section
+
+
+def test_a_paragraph_no_source_supports_renders_the_models_single_not_supported_verdict(
+    make_config,
+):
+    """The other half: when nothing supports the paragraph, the model's single
+    `not_supported` verdict is what renders — `report.py` does not fan it out per source.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Says $5.10.")
+    write_source_capture(config, registry, id2, "Says nothing about price.")
+    answer = f"The vendor quoted $4.20 [{id1}][{id2}]."
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[
+            ParagraphVerdict(
+                verdict="not_supported",
+                detail="Neither source confirms it.",
+                source_ids=[id1, id2],
+            )
+        ]
+    )
+    outcome = RunOutcome(
+        question="No support at all",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert answer_section.count("Verdict:") == 1
+    assert "Verdict: not supported - Neither source confirms it." in answer_section
+
+
+def test_an_out_of_range_unsupported_item_index_is_ignored_rather_than_raising(make_config):
+    """Item 4: an out-of-range bullet index is ignored, not raised."""
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id, "Body.")
+    answer = f"- First item [{source_id}]\n- Second item"
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[
+            ParagraphVerdict(
+                verdict="partially_supported",
+                detail="One bullet is off.",
+                unsupported_items=[0, 7],  # 7 is out of range for a two-item list
+                source_ids=[source_id],
+            )
+        ]
+    )
+    outcome = RunOutcome(
+        question="Out of range index",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+    lines = [line.strip() for line in answer_section.splitlines()]
+
+    assert "- First item *" in lines
+    assert "- Second item" in lines
+    assert "Verdict: partially supported - 1/2 bullets verified" in answer_section
+
+
+def test_a_verdicts_list_shorter_than_paragraphs_renders_not_verified_for_the_rest(
+    make_config,
+):
+    """Item 4: a `verdicts` list shorter than `paragraphs` renders `not verified` for the
+    paragraphs with no corresponding entry, rather than raising an index error.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Body one.")
+    write_source_capture(config, registry, id2, "Body two.")
+    answer = f"First paragraph [{id1}].\n\nSecond paragraph [{id2}]."
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[id1])]
+    )
+    outcome = RunOutcome(
+        question="Short verdicts list",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert "Verdict: supported - Confirmed." in answer_section
+    assert "Verdict: not verified - verification did not run for this paragraph." in answer_section
 
 
 def test_write_report_discloses_skipped_verification_when_the_run_died(make_config):
@@ -892,8 +1055,6 @@ def test_write_report_discloses_skipped_verification_when_the_run_died(make_conf
     verification pass rather than issuing near-certainly-failing model calls, and
     discloses the skip here rather than silently omitting it.
     """
-    from harness.verify import VerificationResult
-
     config = make_config()
     verification = VerificationResult(
         check_failures=[
@@ -917,29 +1078,64 @@ def test_write_report_discloses_skipped_verification_when_the_run_died(make_conf
     assert "the run ended in an error" in gaps
 
 
-def test_write_report_with_verification_none_renders_unchanged(make_config):
-    """Backwards-compatibility guard: an unset `verification` renders exactly the report
-    every prior phase already produces — no markers, no new sections.
+def test_write_report_with_verification_none_still_flags_a_citing_paragraph_as_not_verified(
+    make_config,
+):
+    """Reshaped backwards-compatibility guard (item 4): `verification=None` no longer
+    means "no markers, exactly the old plain report" — the Sources:/Verdict: gate is on
+    whether a paragraph cites a REGISTERED source, never on whether verification ran. A
+    citing paragraph with no verification pass still gets a `Verdict: not verified` line
+    saying so, deterministically, never raising.
     """
     config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id)
+    answer = f"Answer text with a marker [{source_id}]."
+    paragraphs = split_paragraphs(answer)
     outcome = RunOutcome(
         question="Backwards compatibility",
-        answer="Answer text with a marker [S1].",
-        registry=SourceRegistry(),
+        answer=answer,
+        registry=registry,
         usage=_usage(),
+        paragraphs=paragraphs,
         verification=None,
     )
 
     body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
 
-    # The registry is empty, so `[S1]` is UNREGISTERED and `resolve()` leaves it alone by
-    # design — this line pins "unknown markers survive verbatim", NOT "no resolution
-    # happens when verification is None". Resolution is unconditional; see
-    # `test_write_report_body_carries_answer_reasoning_split_and_sources`.
-    assert "Answer text with a marker [S1]." in body
-    assert "**[" not in body
+    assert "Answer text with a marker" in answer_section
+    assert f"[{source_id}]" not in answer_section
+    assert "Verdict: not verified - verification did not run for this paragraph." in answer_section
     assert "## Conflicting sources" not in body
     assert "## Gaps and disclosures" not in body
+
+
+def test_write_report_with_verification_none_and_no_registered_source_renders_prose_alone(
+    make_config,
+):
+    """The other half of item 2's "a non-citing paragraph renders neither" — with no
+    registered source there is no Sources:/Verdict: block at all, verification or not.
+    """
+    config = make_config()
+    answer = "Answer text with no citation at all."
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="No citation",
+        answer=answer,
+        registry=SourceRegistry(),
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=None,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert answer_section.strip() == "Answer text with no citation at all."
+    assert "Verdict:" not in answer_section
+    assert "Sources:" not in answer_section
 
 
 def test_write_report_ignores_a_source_captured_under_a_different_run(make_config):
@@ -1071,9 +1267,6 @@ def test_dead_branches_are_disclosed_on_a_run_that_finished_normally(make_config
         {"content": "Check the delivery claim against a second source", "status": "pending"},
         {"content": "Summarize the vendor comparison", "status": "completed"},
     ]
-    verification = VerificationResult(
-        checks=[ClaimCheck(claim="Acme quoted $4.20.", source_id=None, verdict="uncited")]
-    )
     outcome = RunOutcome(
         question="Which vendor is cheapest?",
         answer="Acme quoted $4.20.",
@@ -1081,7 +1274,7 @@ def test_dead_branches_are_disclosed_on_a_run_that_finished_normally(make_config
         usage=_usage(),
         cut_short=None,
         todos=todos,
-        verification=verification,
+        verification=VerificationResult(),
     )
 
     body = write_report(outcome, config).read_text(encoding="utf-8")
@@ -1096,9 +1289,6 @@ def test_a_cut_short_run_does_not_list_its_dead_branches_twice(make_config):
     """`## Run cut short` already lists them; the gaps section must not repeat them."""
     config = make_config()
     todos = [{"content": "Check the delivery claim", "status": "pending"}]
-    verification = VerificationResult(
-        checks=[ClaimCheck(claim="Partial answer.", source_id=None, verdict="uncited")]
-    )
     outcome = RunOutcome(
         question="Which vendor is cheapest?",
         answer="Partial answer.",
@@ -1106,7 +1296,7 @@ def test_a_cut_short_run_does_not_list_its_dead_branches_twice(make_config):
         usage=_usage(),
         cut_short="wall_clock",
         todos=todos,
-        verification=verification,
+        verification=VerificationResult(),
     )
 
     body = write_report(outcome, config).read_text(encoding="utf-8")

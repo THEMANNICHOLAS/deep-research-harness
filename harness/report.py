@@ -1,7 +1,7 @@
 """Assemble a finished run into a report file.
 
 Pure string work: no model, no network — this module never calls a model itself. The
-verification pass's one model call per (claim x source) happens in `harness.verify`,
+verification pass's one pooled model call per paragraph happens in `harness.verify`,
 before `write_report` is ever called; by the time a `RunOutcome` reaches this module its
 `verification` field is already-computed data. The only I/O here is writing the one
 report file and reading the captured `<workspace_dir>/sources/<run_id>/S<n>.md` files to
@@ -18,9 +18,10 @@ from langchain_core.messages import UsageMetadata
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
+from harness.paragraphs import Paragraph, strip_markers
 from harness.sources import Source, SourceRegistry
 from harness.tools.fetch import _sources_dir, is_failed_capture
-from harness.verify import ClaimCheck, VerificationResult
+from harness.verify import ParagraphVerdict, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
@@ -64,11 +65,11 @@ class RunOutcome(BaseModel):
     """The seam between a finished run and report assembly.
 
     `registry` rides on `RunOutcome` rather than being passed alongside it, because
-    Phase 6 needs to call `registry.resolve()` from inside `report.py`, and
-    `write_report`'s signature is frozen as `(outcome, config)` — there is no other route
-    for the registry to get there. `arbitrary_types_allowed=True` is required because
-    `SourceRegistry` is a plain class, not a pydantic model. Keep fields additive: Phase 5
-    has landed cut-short state; Phase 6 adds verification results.
+    `report.py` needs it to render each paragraph's `Sources:` links, and `write_report`'s
+    signature is frozen as `(outcome, config)` — there is no other route for the registry
+    to get there. `arbitrary_types_allowed=True` is required because `SourceRegistry` is a
+    plain class, not a pydantic model. Keep fields additive: Phase 5 landed cut-short
+    state; Phase 2+3 add paragraph boundaries and pooled verification results.
     """
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
@@ -83,9 +84,14 @@ class RunOutcome(BaseModel):
     # When the run began, used to keep a PREVIOUS run's workspace notes out of this
     # report — see `_notes_section`. `None` means "unknown", which keeps every note.
     started_at: datetime | None = None
-    # `None` means the verification pass did not run, and renders exactly the
-    # pre-Phase-6 report — no markers, no "## Conflicting sources"/"## Gaps and
-    # disclosures" sections.
+    # The ONLY source of paragraph boundaries for `## Answer` (D2) — `report.py` never
+    # re-splits `answer`. `harness/__main__.py` calls `split_paragraphs` exactly once and
+    # hands the result straight through.
+    paragraphs: list[Paragraph] = Field(default_factory=list)
+    # `None` means the verification pass did not run. A paragraph that cites a
+    # REGISTERED source still renders a `Verdict: not verified - ...` line in that case
+    # (item 4) — only a NON-citing paragraph, or the absence of `## Conflicting
+    # sources`/`## Gaps and disclosures`, is unaffected by `verification` being unset.
     verification: VerificationResult | None = None
 
 
@@ -245,99 +251,109 @@ def _verdict_label(verdict: str) -> str:
     return verdict.replace("_", " ")
 
 
-def _place_marker(text: str, claim: str, marker: str) -> str | None:
-    """Locate `claim` in `text` whitespace-tolerantly and insert `marker` right after it.
+def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> list[str]:
+    """Marker-stripped prose lines for `paragraph`, with a trailing ` *` appended to each
+    bullet line whose zero-based index is in `verdict.unsupported_items` (D4: an index
+    outside `range(len(paragraph.items))` is ignored rather than raising).
 
-    `extract_claims` joins a block's lines with a single space, so a hard-wrapped or
-    bulleted claim is NOT always a verbatim substring of the answer — a literal
-    `str.replace` then silently no-ops (3F fix pass, Major finding). Matching instead
-    against a regex built from the claim's whitespace-split tokens, joined by `\\s+`,
-    tolerates exactly that collapsing while still requiring the claim's words to appear
-    in order and adjacent. Returns `None` if the claim cannot be located at all, so the
-    caller can disclose it instead of dropping it.
+    Rendered bullet lines are matched back to `paragraph.items` positionally: each
+    stripped line that ENDS WITH that item's own marker-stripped text is, in order, that
+    item's rendered line — `split_paragraphs` only ever strips a bullet's leading syntax
+    off the front of its raw line, so the item text always survives as a verbatim suffix.
     """
-    tokens = claim.split()
-    if not tokens:
-        return None
-    pattern = re.compile(r"\s+".join(re.escape(token) for token in tokens))
-    match = pattern.search(text)
-    if match is None:
-        return None
-    # Known limitation, accepted: if the same sentence appears twice, `pattern.search`
-    # always finds the first occurrence — both markers would land there. Not worth
-    # building an index to fix.
-    return text[: match.end()] + marker + text[match.end() :]
+    unsupported = set(verdict.unsupported_items) if verdict is not None else set()
+    valid = {i for i in unsupported if 0 <= i < len(paragraph.items)}
+    expected = [strip_markers(item) for item in paragraph.items]
+
+    lines: list[str] = []
+    item_index = 0
+    for raw_line in paragraph.text.split("\n"):
+        rendered = strip_markers(raw_line)
+        if not rendered:
+            continue
+        # Skip past any item whose text is empty once markers are stripped (a bullet that
+        # is nothing but a citation, `- [S1]`). Without this the index sticks on it and
+        # every later bullet in the list silently loses its `*`.
+        while item_index < len(expected) and not expected[item_index]:
+            item_index += 1
+        if item_index < len(expected) and rendered.endswith(expected[item_index]):
+            if item_index in valid:
+                rendered = f"{rendered} *"
+            item_index += 1
+        lines.append(rendered)
+    return lines
 
 
-def _annotate(outcome: RunOutcome) -> tuple[str, list[ClaimCheck]]:
-    """Mark every non-`supported` claim in the answer, then resolve `[Sn]` markers.
-
-    Order is load-bearing: markers are inserted while the claim text can still be found
-    in the answer, and `registry.resolve()` runs LAST over the whole thing. Resolving
-    first would rewrite `[S1]` into a link and no claim would match.
-
-    Returns `(annotated_text, unplaced)` — `unplaced` holds every check whose claim could
-    not be located in the answer at all. A verdict that cannot be shown in place must
-    still be disclosed somewhere; the caller renders `unplaced` into
-    `## Gaps and disclosures` (3F fix pass, Major finding).
+def _paragraph_block(
+    paragraph: Paragraph, verdict: ParagraphVerdict | None, registry: SourceRegistry
+) -> str:
+    """Render one paragraph: marker-stripped prose, then `Sources:`/`Verdict:` when the
+    paragraph cites at least one REGISTERED source — gated on citation alone, never on
+    the verdict value, so a `supported` paragraph gets a line exactly like any other.
     """
-    text = outcome.answer
-    unplaced: list[ClaimCheck] = []
-    if outcome.verification is not None:
-        # A claim is marked only when NOT ONE of its cited sources supports it. A
-        # synthesized sentence cites several sources, each covering part of it, so marking
-        # per failing source painted well-evidenced prose as unsupported and read, to the
-        # non-technical reader this report is written for, as "trust none of this" (Phase 6
-        # live check). One supporting source is support; the per-source detail for the
-        # others stays available in `## Conflicting sources`.
-        supported_claims = {
-            check.claim for check in outcome.verification.checks if check.verdict == "supported"
-        }
-        for check in outcome.verification.checks:
-            if check.verdict == "supported" or check.claim in supported_claims:
-                continue
-            # A leading space, never a paragraph break: the marker has to stay on the line
-            # of the sentence it judges. Broken onto its own line it reads as a label on
-            # whatever text follows, which attributes the verdict to the wrong claim
-            # whenever a paragraph holds more than one sentence (Phase 5 live check).
-            if check.source_id is None:
-                marker = " **[uncited]**"
-            else:
-                marker = f" **[{_verdict_label(check.verdict)} — {check.source_id}]**"
-            updated = _place_marker(text, check.claim, marker)
-            if updated is None:
-                unplaced.append(check)
-                continue
-            text = updated
-    return outcome.registry.resolve(text), unplaced
+    lines = _paragraph_prose(paragraph, verdict)
+    registered = [sid for sid in paragraph.source_ids if registry.get(sid) is not None]
+    if not registered:
+        return "\n".join(lines)
+
+    lines.append(f"Sources: {' '.join(registry.link(sid) for sid in registered)}")
+
+    if verdict is None:
+        label = "not verified"
+        detail = "verification did not run for this paragraph."
+    else:
+        label = _verdict_label(verdict.verdict)
+        detail = verdict.detail
+        if paragraph.items:
+            total = len(paragraph.items)
+            unsupported_count = len({i for i in verdict.unsupported_items if 0 <= i < total})
+            detail = f"{total - unsupported_count}/{total} bullets verified. {detail}"
+    lines.append(f"Verdict: {label} - {detail}")
+    return "\n".join(lines)
 
 
-def _conflicts_section(verification: VerificationResult) -> str:
-    """One block per claim where cited sources disagree. Adjudicates nothing (D3)."""
-    if not verification.conflicts:
-        return ""
+def _answer_section(outcome: RunOutcome) -> str:
+    """Render every paragraph in `outcome.paragraphs`, in order.
 
+    The ONLY source of paragraph boundaries (D2) — this never re-splits `outcome.answer`;
+    `harness/__main__.py` calls `split_paragraphs` exactly once and hands the list here.
+    """
+    verdicts = outcome.verification.verdicts if outcome.verification is not None else []
+    blocks = [
+        _paragraph_block(paragraph, verdicts[i] if i < len(verdicts) else None, outcome.registry)
+        for i, paragraph in enumerate(outcome.paragraphs)
+    ]
+    return "\n\n".join(blocks)
+
+
+def _conflicts_section(outcome: RunOutcome, verification: VerificationResult) -> str:
+    """One block per paragraph whose verdict carries `sources_conflict`. Adjudicates
+    nothing (D3): contradiction is MODEL-REPORTED, never derived here.
+    """
     blocks: list[str] = []
-    for conflict in verification.conflicts:
+    for i, verdict in enumerate(verification.verdicts):
+        if not verdict.sources_conflict or i >= len(outcome.paragraphs):
+            continue
+        paragraph = outcome.paragraphs[i]
+        # Guard the STRIPPED result, not the raw text: a block that is nothing but a
+        # marker (`[S1]`) is truthy raw and empty once stripped, and `[0]` would raise.
+        stripped_lines = strip_markers(paragraph.text).splitlines()
+        excerpt = stripped_lines[0] if stripped_lines else ""
         lines = [
-            conflict.claim,
+            excerpt,
             "",
-            "The cited sources disagree on this claim. The harness does not decide "
-            "between them — both positions are given below so you can judge for "
+            "The cited sources disagree on this paragraph. The harness does not decide "
+            "between them — the sources it read are listed below so you can judge for "
             "yourself.",
         ]
-        lines.extend(
-            f"- [{position.source_id}] {position.detail}" for position in conflict.positions
-        )
+        lines.extend(f"- {outcome.registry.link(sid)}" for sid in verdict.source_ids)
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
 
-def _gaps_section(
-    outcome: RunOutcome, verification: VerificationResult, unplaced: list[ClaimCheck]
-) -> str:
-    """Unresolved citation markers, per-check failures, unplaceable markers, the
-    uncited-claim count, and — on a run that was NOT cut short — its dead branches.
+def _gaps_section(outcome: RunOutcome, verification: VerificationResult) -> str:
+    """Unresolved citation markers, per-check failures, and — on a run that was NOT cut
+    short — its dead branches.
 
     R4 requires dead branches to be disclosed on every run, not only a cut-short one
     (PR #4 review, Major). `_cut_short_section` already lists unfinished todos when a
@@ -353,9 +369,8 @@ def _gaps_section(
             lines.append(_DEAD_BRANCHES_HEADING)
             lines.append(format_todos(unfinished))
 
-    # The RAW answer, not the annotated one: annotated markers never introduce or
-    # remove an `[Sn]` marker, but reading the raw text keeps this independent of that
-    # rendering step.
+    # The RAW answer: `## Answer` strips every marker (registered or not, D4), so reading
+    # the raw text keeps this independent of that rendering step.
     unresolved = outcome.registry.unresolved_ids(outcome.answer)
     if unresolved:
         lines.append("Unresolved citation markers (no matching source was registered):")
@@ -366,24 +381,6 @@ def _gaps_section(
             lines.append("")
         lines.append("Verification checks that failed to run:")
         lines.extend(f"- {failure}" for failure in verification.check_failures)
-
-    if unplaced:
-        if lines:
-            lines.append("")
-        lines.append("Verification results whose marker could not be placed in the answer text:")
-        lines.extend(
-            f"- {check.verdict} — {check.source_id or 'no source cited'}: the marker "
-            "could not be positioned in the answer text."
-            for check in unplaced
-        )
-
-    uncited_count = sum(1 for check in verification.checks if check.verdict == "uncited")
-    if uncited_count:
-        if lines:
-            lines.append("")
-        lines.append(
-            f"{uncited_count} claim(s) in the answer carried no citation marker (uncited)."
-        )
 
     return "\n".join(lines)
 
@@ -404,13 +401,13 @@ def _render_body(
     if outcome.cut_short:
         lines += [_CUT_SHORT_HEADING, "", _cut_short_section(outcome, config), ""]
 
-    annotated_answer, unplaced_checks = _annotate(outcome)
+    answer_text = _answer_section(outcome)
     lines += [
         "## Answer",
         "",
         # A cut-short run often has no prose answer at all. Say so, rather than rendering
         # an empty section that reads as "the answer is nothing" (3F Major).
-        annotated_answer or _NO_ANSWER_TEXT,
+        answer_text or _NO_ANSWER_TEXT,
         "",
     ]
 
@@ -418,11 +415,11 @@ def _render_body(
         lines += [_NOTES_HEADING, "", _notes_section(config, outcome.started_at), ""]
 
     if outcome.verification is not None:
-        conflicts_text = _conflicts_section(outcome.verification)
+        conflicts_text = _conflicts_section(outcome, outcome.verification)
         if conflicts_text:
             lines += [_CONFLICTS_HEADING, "", conflicts_text, ""]
 
-        gaps_text = _gaps_section(outcome, outcome.verification, unplaced_checks)
+        gaps_text = _gaps_section(outcome, outcome.verification)
         if gaps_text:
             lines += [_GAPS_HEADING, "", gaps_text, ""]
 
@@ -438,10 +435,12 @@ def _render_body(
 def write_report(outcome: RunOutcome, config: HarnessConfig) -> Path:
     """Render `outcome` and write it to `<reports_dir>/YYYY-MM-DD-HHMMSS-<slug>.md`.
 
-    Citation resolution is UNCONDITIONAL: `_render_body` → `_annotate` calls
-    `registry.resolve()` on every run, whether or not `outcome.verification` is set, so
-    no bare `[Sn]` marker survives into `## Answer` (R1). What `verification` gates is the
-    claim MARKING that happens first, inside the same `_annotate` call.
+    Marker stripping is UNCONDITIONAL: `_render_body` → `_answer_section` strips every
+    `[Sn]` marker out of each paragraph's prose, registered or not, on every run — so no
+    bare marker survives into `## Answer` (R1). A REGISTERED source's link moves onto its
+    paragraph's own `Sources:` line instead; an unregistered one is disclosed in `## Gaps
+    and disclosures` rather than left inline. What `outcome.verification` gates is only
+    the `Verdict:` line's content (a real verdict, or the deterministic "not verified").
     """
     config.agent.reports_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now()

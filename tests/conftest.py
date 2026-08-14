@@ -158,13 +158,29 @@ def patch_run(
     patch_model(monkeypatch, model)
 
 
-def verify_reply(verdict: str, detail: str) -> AIMessage:
-    """A model reply in the JSON envelope `harness/verify.py`'s parser accepts.
+def verify_reply(
+    verdict: str,
+    detail: str,
+    *,
+    sources_conflict: bool = False,
+    unsupported_items: list[int] | None = None,
+) -> AIMessage:
+    """A model reply in the pooled-paragraph JSON envelope `harness/verify.py`'s parser
+    accepts.
 
     Shared so a test driving `main()` end to end can script the verification pass with
     the same envelope `tests/test_verify.py` uses, rather than hand-rolling a third copy.
     """
-    return AIMessage(content=json.dumps({"verdict": verdict, "detail": detail}))
+    return AIMessage(
+        content=json.dumps(
+            {
+                "verdict": verdict,
+                "detail": detail,
+                "sources_conflict": sources_conflict,
+                "unsupported_items": unsupported_items or [],
+            }
+        )
+    )
 
 
 def drain_stdout(capsys: pytest.CaptureFixture[str]) -> tuple[str, list[str]]:

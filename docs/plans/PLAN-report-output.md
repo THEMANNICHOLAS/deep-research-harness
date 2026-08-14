@@ -203,8 +203,8 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Paragraph unit
-- [ ] Phase 2: Pooled paragraph verification
-- [ ] Phase 3: Report rendering
+- [x] Phase 2+3: Pooled paragraph verification and report rendering (merged — see
+  `## Reconciliations` 2026-08-13)
 - [ ] Phase 4: Default paths and run metadata
 - [ ] Final verification
 
@@ -313,7 +313,10 @@ indices.
 - `harness/prompts/verify.md` variables: `$paragraph`, `$sources`.
 
 **Out of scope:**
-- Any rendering — this phase returns data; `report.py` is untouched.
+- Any rendering — this phase returns data; ~~`report.py` is untouched~~ see
+  `## Reconciliations` 2026-08-13 (Phase 2): `report.py` and `__main__.py` import the
+  symbols this phase deletes, so Phases 2 and 3 were merged into one red/green cycle.
+  Rendering is still written only after verification's own tests are green.
 - Context-window guards, truncation, or source-count caps (Intent non-goal).
 - Concurrency: the pass stays strictly sequential.
 
@@ -341,9 +344,9 @@ indices.
 5. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `extract_claims`, `_block_units`, `_check_one`, `ClaimCheck` and `Conflict` no
+- [x] `extract_claims`, `_block_units`, `_check_one`, `ClaimCheck` and `Conflict` no
   longer exist anywhere in `harness/`.
-- [ ] `uv run ruff check .` reports no unused imports left behind by the deletions.
+- [x] `uv run ruff check .` reports no unused imports left behind by the deletions.
 
 ### Phase 3: Report rendering
 
@@ -382,8 +385,10 @@ indices.
   `unsupported_items` bullet and open `<detail>` with `n/m bullets verified`.
 
 **Out of scope:**
-- `_gaps_section`, `_sources_section`, `_notes_section`, `_usage_lines` — the coverage
-  disclosure is an invariant and does not change here.
+- ~~`_gaps_section`~~, `_sources_section`, `_notes_section`, `_usage_lines` — the coverage
+  disclosure is an invariant and does not change here. (`_gaps_section` amended — see
+  `## Reconciliations` 2026-08-13, second entry; the invariant survives, its two
+  dependencies on deleted symbols do not.)
 - Cross-paragraph link dedupe.
 - Any change to `verify.py` or `paragraphs.py`.
 
@@ -409,9 +414,9 @@ indices.
 4. Run the full suite; confirm green.
 
 **Acceptance criteria:**
-- [ ] A full `uv run pytest` passes, with all 16 former marker assertions rewritten
-  rather than removed.
-- [ ] `_place_marker` and `_annotate` no longer exist in `harness/`.
+- [x] A full `uv run pytest` passes, with all ~~16~~ 15 former marker assertions rewritten
+  rather than removed (two retired with their behavior — see `## Discoveries`).
+- [x] `_place_marker` and `_annotate` no longer exist in `harness/`.
 
 ### Phase 4: Default paths and run metadata
 
@@ -515,9 +520,105 @@ directory, and run metadata names both configured models.
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+### 2026-08-13 — Phase 2: "report.py is untouched" cannot hold with the deletions
+**Contradiction:** Phase 2 deletes `ClaimCheck`, `Conflict`, `extract_claims`, and
+`verify_claims`, but `harness/report.py:23` imports `ClaimCheck`/`VerificationResult` and
+`harness/__main__.py:43` imports `extract_claims`/`verify_claims`. With `report.py`
+untouched, `import harness.report` raises `ImportError` and `tests/test_report.py` plus
+`tests/test_agent.py` fail at collection. Phase 2 therefore cannot leave a green suite,
+which its Out-of-scope line implicitly assumed.
+
+**Amendment (developer's call):** Phases 2 and 3 are executed and committed as ONE phase,
+"Phase 2+3: Pooled verification and report rendering". Every file list, contract, reuse
+target, out-of-scope line, test and acceptance criterion of both phases still applies
+verbatim and in the original order — verification first, then rendering — but there is one
+red/green cycle, one commit, and one judgment review covering BOTH flagged risks (!#1 the
+pooled reply contract, !#3 the 20 ported assertions). The merged phase's gate is the full
+`uv run pytest`, so no commit in history is un-importable. Diff budget is the sum:
+~420-580 lines across 8 files.
+
+**Consequence to watch:** the plan sequenced these apart so the pooled reply contract was
+settled before rendering was built on it. Merged, that ordering is preserved only by
+execution order, not by a gate — so the reply contract is implemented and its tests are
+green before any rendering work begins.
+
+**Rejected (superseded by the developer's choice above):** scoping Phase 2's gate to
+`tests/test_verify.py` and accepting one knowingly
+red commit. **Rejected:** keeping `ClaimCheck`/`Conflict` as shims until Phase 3 —
+contradicts Phase 2's acceptance criterion that they exist nowhere in `harness/`, and the
+`## Non-Goals` refusal of a compatibility layer.
+
+### 2026-08-13 — Phase 3: `_gaps_section` cannot be left untouched either
+**Contradiction:** Phase 3 lists `_gaps_section` as out of scope, but its signature is
+`_gaps_section(outcome, verification, unplaced: list[ClaimCheck])` and its body computes
+`uncited_count` from `verification.checks`. `ClaimCheck`, `checks`, and the whole
+"unplaceable marker" concept are deleted by Phase 2 / D2, so the function cannot compile
+unchanged.
+
+**Amendment:** `_gaps_section` changes in exactly two mechanical ways and no others:
+1. The `unplaced` parameter and its "Verification results whose marker could not be placed
+   in the answer text" block are removed — `_place_marker` is gone, so nothing can be
+   unplaceable and the disclosure has no input.
+2. The uncited count is DELETED outright (developer's call), not re-denominated to
+   paragraphs. A paragraph that cites nothing is already visible in the prose by having
+   no `Sources:`/`Verdict:` pair, so the run-level count was restating what the reader can
+   see; the alternative — recomputing it from `no_sources_cited` verdicts — was rejected
+   as redundant.
+
+Everything else in the function is untouched: dead branches on a not-cut-short run,
+unresolved `[Sn]` markers read from the RAW answer, and `check_failures` all render
+exactly as today. The best-effort-and-disclose invariant is preserved — this removes a
+disclosure whose subject no longer exists and re-denominates another, and adds nothing.
+
+### 2026-08-13 — Phase 3: marker-assertion count is 15, not 16
+The Acceptance Criteria say "all 16 former marker assertions"; the tree holds 15 — 14 in
+`tests/test_report.py` across 9 test functions, plus 1 in `tests/test_agent.py:1047`. The
+Tests section's "15" was right. Factual correction only, no scope change: all 15 are
+ported, none dropped.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+
+### 2026-08-13 — Phase 2+3: judgment review findings routed to `LATER-Problems.md`
+The flagged-phase review returned `concern`. Two Minor defects were fixed in place: an
+`IndexError` rendering `## Conflicting sources` for a paragraph that is nothing but a
+marker, and a positional bullet-matching loop that stuck on an empty item and silently
+dropped every later `*` in that list. One Major was fixed by adding tests: the three
+`_parse_reply` tolerances written for risk #1 (prose around the JSON, a missing
+`unsupported_items`, non-int indices) had NO test that could fail them; they do now.
+The remaining findings — chiefly that fenced code blocks are dropped from `## Answer`,
+which needs a Phase 1 contract change — are written up in `LATER-Problems.md` at the repo
+root rather than fixed unattended.
+
+### 2026-08-13 — Phase 2+3: assertions retired with their behavior
+Three test assertions changed because the behavior genuinely no longer exists, not to
+reach green. Two have no successor: `test_write_report_discloses_a_verdict_whose_marker_
+could_not_be_placed` (nothing can be unplaceable once paragraphs are the boundary rather
+than a text search), and the uncited-count assertion inside the gaps-section test (removed
+per the `_gaps_section` amendment; the rest of that test kept its `check_failures`
+assertion). The third DOES have a successor and is a deliberate D4 reversal worth naming:
+an unregistered `[S9]` used to stay visible in the prose, and `strip_markers` now removes
+every marker unconditionally, so it vanishes from the answer and is disclosed only in
+`## Gaps and disclosures`.
+
+### 2026-08-13 — Phase 2+3: `extract_claims` behaviors with no successor test
+The 12 `extract_claims` unit tests were deleted with the function. Five behaviors have no
+equivalent in `tests/test_paragraphs.py`; four are deliberate consequences of the new unit
+and one is a real, accepted limitation:
+1. Heading lines dropped from a claim — REVERSED ON PURPOSE. `split_paragraphs` keeps the
+   heading in `Paragraph.text` (plan Notes call this an improvement).
+2. Sentence-level splitting on `.`/`!`/`?` — RETIRED by R4; paragraphs are block-level.
+   This also closes the `docs/backlog.md` item about splitting on bare punctuation.
+3. Dropping a sentence with no alphanumeric content (a lone `---`) — gone with #2; such a
+   line now passes through as prose.
+4. Dropping a heading that sits directly above a list — same root cause as #1.
+5. Hard-wrapped bullet continuation lines were joined onto their bullet; `Paragraph.items`
+   captures only lines that themselves start with a list marker, so a continuation line is
+   in `text` but not in `items`. ACCEPTED, not fixed: `items` drives only bullet indexing
+   and the `n/m` rollup, both of which stay correct because the bullet COUNT is unchanged;
+   the model judges `text`, which is complete. Revisit only if a wrapped bullet's `*`
+   placement ever looks wrong.
 
 ### 2026-08-13 — Phase 1: uncompiled regexes in `strip_markers` (deferred)
 The per-line loop in `harness/paragraphs.py` uses three inline `re.match`/`re.sub`
@@ -544,3 +645,21 @@ phase). Append-only, empty at plan creation. -->
 - Watch-next: Phase 2 is flagged (!#1). Confirm the pooled reply contract tolerates prose
   around the JSON, a missing `unsupported_items`, and 1-based bullet indices — and check
   it against a live run, not only scripted replies.
+
+### 2026-08-13 — Phase 2+3: Pooled verification and report rendering (merged)
+- Done: `verify.py` rewritten around `verify_paragraphs` + `ParagraphVerdict` (one pooled
+  call per paragraph, `ClaimCheck`/`Conflict`/`extract_claims`/`_block_units`/`_check_one`
+  deleted); `verify.md` rewritten for `$paragraph`/`$sources`; `report.py` renders a
+  per-paragraph `Sources:`/`Verdict:` pair with `_annotate`/`_place_marker` deleted;
+  `__main__.py` splits once and hands paragraphs forward. 275 passed, 97% coverage,
+  ruff/format/mypy clean.
+- Learned: the pooled prompt is built from `registry.get(sid)` + the captured file, so an
+  unregistered marker and an unreadable capture are DIFFERENT paths —
+  `no_sources_cited` (zero model calls) vs `not_verified` (reason named). Conflating them
+  is the easiest mistake to make here. Rendering gates the `Sources:`/`Verdict:` pair on
+  having a REGISTERED source, which is why `no_sources_cited` never reaches a report.
+- Drift: two amendments, both in `## Reconciliations` — Phases 2 and 3 merged into one
+  red/green cycle (the deletions break `report.py`/`__main__.py` imports), and
+  `_gaps_section` lost its `unplaced` parameter and its uncited count.
+- Watch-next: `LATER-Problems.md` item 1 — fenced code blocks are dropped from `## Answer`.
+  It is the one open Major and it needs a Phase 1 contract change to fix.
