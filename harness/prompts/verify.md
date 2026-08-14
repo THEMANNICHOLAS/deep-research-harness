@@ -21,9 +21,19 @@ of three things:
 - `partially_supported` — some of the paragraph is backed by the sources and some is not.
 - `not_supported` — the sources contradict the paragraph, or do not back any of it.
 
-Write `detail` as ONE plain sentence a non-technical production or field technician can
-read — no harness vocabulary (no "claim", "verdict", "marker"), and no source IDs unless
-naming one is the clearest way to say it.
+Write `detail` as ONE plain sentence of AT MOST 25 WORDS that a non-technical production
+or field technician can read — no harness vocabulary (no "claim", "verdict", "marker"),
+and no source IDs unless naming one is the clearest way to say it. Name only what the
+reader needs in order to trust or doubt the paragraph; do not re-list what the paragraph
+already said.
+
+Good: `The sources confirm the forked Ink stack and the command-line tools listed.`
+
+Bad (one sentence, but far too long): `The sources confirm that Claude Code uses a
+customized fork of Ink with Yoga flexbox layout, terminal rendering features like ANSI
+sequences, alternate screen, mouse tracking, synchronized updates, streaming markdown,
+syntax highlighting, and a Rust word-level diff renderer, and that Ink's README lists
+Claude Code and the other named tools as users.`
 
 Set `sources_conflict` to `true` only when two of the sources shown DISAGREE WITH EACH
 OTHER about the paragraph's content — never merely because one of them fails to mention
@@ -40,4 +50,4 @@ Reply with exactly one JSON object and nothing else — no prose before or after
 markdown fence. The object has exactly this shape:
 
 {"verdict": "supported" | "partially_supported" | "not_supported", "detail": "<one
-sentence>", "sources_conflict": true | false, "unsupported_items": [<int>, ...]}
+sentence, 25 words or fewer>", "sources_conflict": true | false, "unsupported_items": [<int>, ...]}

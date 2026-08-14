@@ -118,3 +118,15 @@ sentences each, append-only, newest last.
   whole research history is resent every turn, so the pyramid's 3-10x delegation multiplier
   should be priced against the INPUT figure, not the total. `deepseek-v4-flash` is a reasoning
   model like `kimi-k3` before it, so the reasoning split stays the meaningful number.
+
+- **2026-08-14 — each paragraph's `Sources:`/`Verdict:` pair is bold and blank-line separated,
+  and the verdict detail is capped at 25 words (PR #10, supersedes PLAN-report-output Phase 3's
+  rendered-format contract).** The first live report showed the pair rendering flush against the
+  last prose line and unstyled, where it read as two more sentences of the paragraph rather than
+  as machinery about it, and verdict details running 40-60 words. The pair now sits after a
+  blank line with `**Sources:**` / `**Verdict:**` labels, and the `Sources:` line ends in
+  markdown's two-space hard break — without it a renderer joins the two labels onto one line,
+  and a blank line between them instead would space the pair further apart than the paragraph it
+  belongs to. The 25-word cap lives in @harness/prompts/verify.md alone: rejected a code-level
+  trim in @harness/report.py because clipping mid-sentence is worse to read than a long verdict,
+  so a model that ignores the instruction still gets its full sentence printed.

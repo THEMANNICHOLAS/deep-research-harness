@@ -26,6 +26,7 @@ from harness.report import (
     _NO_ANSWER_TEXT,
     _ROUND_CAP_TEXT,
     _WALL_CLOCK_TEXT,
+    VERDICT_LABEL,
 )
 from harness.sources import SourceRegistry
 from tests.conftest import (
@@ -980,7 +981,7 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     assert _CUT_SHORT_HEADING in body, "this run was supposed to hit the round cap"
     # The check actually ran on the cut-short path — not skipped, not defaulted.
     assert verify_model._call_count == 1
-    assert "Verdict: not supported - The capture reads $5.10." in body
+    assert f"{VERDICT_LABEL} not supported - The capture reads $5.10." in body
     # And R1's citation resolution still happened on the same partial answer.
     assert "https://example.test/pricing" in body
 
