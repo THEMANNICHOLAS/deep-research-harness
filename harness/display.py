@@ -39,7 +39,32 @@ class Question:
     text: str
 
 
-DisplayEvent = StageStarted | StageCompleted | Activity | Question
+@dataclass(frozen=True)
+class RunFinished:
+    stage_timings: tuple[tuple[Stage, float], ...]
+    usable_sources: int
+    unusable_sources: int
+    cut_short: str | None
+    verification_failures: int
+
+
+DisplayEvent = StageStarted | StageCompleted | Activity | Question | RunFinished
+
+
+def _summary_lines(event: RunFinished) -> list[str]:
+    """The end-of-run summary content, shared by both renderers (styling differs, not text)."""
+    lines = ["summary:"]
+    for stage, elapsed in event.stage_timings:
+        lines.append(f"  {stage} {elapsed:.1f}s")
+    sources_line = f"  sources: {event.usable_sources} usable"
+    if event.unusable_sources > 0:
+        sources_line += f", {event.unusable_sources} unusable"
+    lines.append(sources_line)
+    if event.cut_short is not None:
+        lines.append(f"  cut short: {event.cut_short.replace('_', ' ')}")
+    if event.verification_failures > 0:
+        lines.append(f"  verification failures: {event.verification_failures}")
+    return lines
 
 
 class Renderer(Protocol):
@@ -65,6 +90,9 @@ class PlainRenderer:
             print(f"{event.stage} done ({event.elapsed_seconds:.1f}s)", file=stream)
         elif isinstance(event, Question):
             print(event.text, file=stream)
+        elif isinstance(event, RunFinished):
+            for line in _summary_lines(event):
+                print(line, file=stream)
         else:  # Activity
             print(f"  {event.text}", file=stream)
 
@@ -83,6 +111,7 @@ class StageTracker:
         self._clock = clock
         self._current: Stage | None = None
         self._started_at: float = 0.0
+        self._timings: list[tuple[Stage, float]] = []
 
     def advance(self, stage: Stage) -> None:
         """Move to `stage`, completing whatever stage was current. A no-op if already there.
@@ -94,7 +123,9 @@ class StageTracker:
             return
         now = self._clock()
         if self._current is not None:
-            self._renderer.emit(StageCompleted(self._current, now - self._started_at))
+            elapsed = now - self._started_at
+            self._timings.append((self._current, elapsed))
+            self._renderer.emit(StageCompleted(self._current, elapsed))
         self._renderer.emit(StageStarted(stage))
         self._current = stage
         self._started_at = now
@@ -104,8 +135,13 @@ class StageTracker:
         if self._current is None:
             return
         elapsed = self._clock() - self._started_at
+        self._timings.append((self._current, elapsed))
         self._renderer.emit(StageCompleted(self._current, elapsed))
         self._current = None
+
+    def timings(self) -> tuple[tuple[Stage, float], ...]:
+        """Completed `(stage, elapsed_seconds)` pairs, in the order they finished."""
+        return tuple(self._timings)
 
 
 class RichRenderer:
@@ -162,6 +198,11 @@ class RichRenderer:
             )
         elif isinstance(event, Question):
             self._console.print(Panel(event.text, border_style="cyan"))
+        elif isinstance(event, RunFinished):
+            lines = _summary_lines(event)
+            self._console.print(lines[0], style="bold")
+            for line in lines[1:]:
+                self._console.print(line, style="dim")
         else:  # Activity
             self._activities = (self._activities + [event.text])[-self._ACTIVITY_TAIL :]
             if self._live is not None:

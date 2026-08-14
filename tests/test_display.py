@@ -11,12 +11,14 @@ from langchain_core.messages import AIMessage
 from rich.console import Console
 
 import harness.__main__ as main_module
+from harness.config import AgentSettings
 from harness.display import (
     Activity,
     DisplayEvent,
     PlainRenderer,
     Question,
     RichRenderer,
+    RunFinished,
     StageCompleted,
     StageStarted,
     StageTracker,
@@ -368,3 +370,118 @@ def test_rich_renderer_close_while_suspended_does_not_repaint_the_stage():
 
     # Exiting the suspend body after a mid-prompt close() must not resurrect the live region.
     assert len(buffer.getvalue()) == length_at_close
+
+
+# --- RunFinished summary tests (Phase 4) ---------------------------------------------------
+
+
+def _render_lines(kind: str, event: RunFinished, capsys=None) -> list[str]:
+    """Emit `event` through the named renderer kind and return its stripped output lines."""
+    if kind == "plain":
+        plain_renderer = PlainRenderer()
+        plain_renderer.emit(event)
+        plain_renderer.close()
+        return drain_stdout(capsys)[1]
+    rich_renderer, buffer = _rich_renderer()
+    rich_renderer.emit(event)
+    rich_renderer.close()
+    text = _strip_ansi(buffer.getvalue())
+    return [line for line in text.splitlines() if line.strip()]
+
+
+@pytest.mark.parametrize("kind", ["plain", "rich"])
+def test_run_finished_renders_the_full_summary(kind, capsys):
+    event = RunFinished(
+        stage_timings=(("researching", 12.0), ("verifying", 3.0)),
+        usable_sources=3,
+        unusable_sources=1,
+        cut_short="wall_clock",
+        verification_failures=2,
+    )
+
+    lines = _render_lines(kind, event, capsys)
+
+    assert lines[0] == "summary:"
+    assert "  researching 12.0s" in lines
+    assert "  verifying 3.0s" in lines
+    assert lines.index("  researching 12.0s") < lines.index("  verifying 3.0s")
+    assert "  sources: 3 usable, 1 unusable" in lines
+    assert "  cut short: wall clock" in lines
+    assert "  verification failures: 2" in lines
+
+
+@pytest.mark.parametrize("kind", ["plain", "rich"])
+def test_run_finished_omits_empty_sections(kind, capsys):
+    event = RunFinished(
+        stage_timings=(),
+        usable_sources=4,
+        unusable_sources=0,
+        cut_short=None,
+        verification_failures=0,
+    )
+
+    lines = _render_lines(kind, event, capsys)
+
+    assert "  sources: 4 usable" in lines
+    assert not any(line.startswith("  sources: 4 usable,") for line in lines)
+    assert not any("cut short:" in line for line in lines)
+    assert not any("verification failures:" in line for line in lines)
+
+
+def test_stage_tracker_timings_returns_completed_pairs_in_order():
+    renderer = _RecordingRenderer()
+    tracker = StageTracker(renderer, clock=_fake_clock([0.0, 1.0, 4.0]))
+
+    tracker.advance("researching")
+    tracker.advance("verifying")
+    tracker.finish()
+
+    assert tracker.timings() == (("researching", 1.0), ("verifying", 3.0))
+
+
+async def test_a_full_run_prints_a_summary_above_the_report_path(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    config = make_config()
+    ping = AIMessage(content="pong")
+    final = AIMessage(
+        content="Final answer.",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    model = scripted_model([ping, final])
+    patch_run(monkeypatch, config, model)
+
+    await main_module.main(["a question with no tool calls"])
+
+    out, lines = drain_stdout(capsys)
+    assert "summary:" in out
+    assert any(line.strip().startswith("sources:") for line in lines)
+    assert lines[-1].strip().endswith(".md")
+
+
+async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    agent = AgentSettings(
+        max_rounds=1, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
+    )
+    config = make_config(agent=agent)
+    ping = AIMessage(content="pong")
+    keep_going = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_todos",
+                "args": {"todos": [{"content": "Keep researching", "status": "in_progress"}]},
+                "id": "call",
+            }
+        ],
+    )
+    model = scripted_model([ping, *([keep_going] * 20)])
+    patch_run(monkeypatch, config, model)
+
+    await main_module.main(["question that never settles"])
+
+    out, lines = drain_stdout(capsys)
+    assert "cut short: round cap" in out
+    assert lines[-1].strip().endswith(".md")

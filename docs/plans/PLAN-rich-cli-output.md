@@ -165,7 +165,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Event seam + plain renderer
 - [x] Phase 2: Rich live display
 - [x] Phase 3: ask_user question panel
-- [ ] Phase 4: End-of-run summary
+- [x] Phase 4: End-of-run summary
 - [ ] Final verification
 
 ## Phases
@@ -434,6 +434,13 @@ interleaving with spinner frames. The manual clarification run in final verifica
 actual gate. A stronger test needs `auto_refresh=True` plus timing assertions (flaky-prone);
 deferred by the developer.
 
+### 2026-08-14 — RunFinished.cut_short is stringly-typed (deferred)
+Phase 4 review (advisory): `RunFinished.cut_short: str | None` could reuse
+`CutShortReason` (harness/report.py:42), but that adds a display->report import the event
+layer deliberately avoids (display stays standalone for the future frontend). Revisit only
+if the literals ever drift; moving the Literal into display (report imports it) would be
+the clean direction.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
@@ -487,3 +494,17 @@ never add a section below it. -->
   (spinner/collapse, panel + frozen spinner during typing, piped no-ANSI). Do NOT commit the
   stray `docs/plans/PLAN-reader-delegation.md` (concurrent planning session's file). Phase 4
   is unflagged: `RunFinished` summary in both renderers, path still last.
+
+### 2026-08-14 — Phase 4: End-of-run summary
+- Done: `RunFinished` event (stage timings tuple, usable/unusable counts, cut-short reason,
+  verification failure count); `StageTracker` accumulates timings at both emit sites and
+  exposes `timings()`; `_summary_lines` is the single content source for both renderers;
+  `main()` emits between `finish()` and `close()`, path still last. Review verdict: clean;
+  one advisory (stringly-typed cut_short) logged to `## Discoveries` as deferred.
+- Learned: usable/unusable counts reuse `report._is_usable` via private import — sanctioned,
+  keeps report.py untouched. Phase's test_agent.py edits proved unnecessary (graph tests
+  landed in test_display.py instead; no existing test modified).
+- Drift: none
+- Watch-next: Final verification — automated gates + coverage spot-check, then the MANUAL
+  e2e gates all three deferred manual acceptances (Phase 2 spinner/collapse + piped no-ANSI,
+  Phase 3 frozen-spinner clarification, Phase 4 styled summary with path last).
