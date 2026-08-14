@@ -138,3 +138,20 @@ def _describe(exc: ValidationError) -> str:
         message = str(error["msg"])
         parts.append(f"{location}: {message}" if location else message)
     return "; ".join(parts)
+
+
+def run_workspace_dir(config: HarnessConfig, run_id: str) -> Path:
+    """The one place the per-run workspace root `<workspace_dir>/<run_id>` is built.
+
+    Everything a run writes lives under it: the agent's working notes, the captured
+    sources, and the summarizer's evicted history. `workspace_dir` itself is a fixed
+    directory nothing in `harness/` ever clears, so two runs in flight at once used to
+    write notes into one tree and each render the other's as its own findings — the
+    overstatement R3 forbids, in the report a reader can least check (PR #4 review).
+
+    Lives here rather than beside a consumer because all three consumers are peers:
+    `harness/agent.py` roots the backend at it, `harness/tools/fetch.py` hangs
+    `sources/` off it, and `harness/report.py` scans it for notes. It takes the bare
+    `run_id` string, not a `SourceRegistry`, so config stays free of that import.
+    """
+    return config.agent.workspace_dir / run_id

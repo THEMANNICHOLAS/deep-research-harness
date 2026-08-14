@@ -708,7 +708,7 @@ async def test_each_fetched_page_writes_its_source_file(install_crawler, make_co
     message = await fetch_pages.ainvoke(_tool_call(["https://article.test"], "call-source-1"))
 
     source_id = message.artifact[0].source_id
-    source_path = tmp_path / "sources" / registry.run_id / f"{source_id}.md"
+    source_path = fetch._sources_dir(config, registry) / f"{source_id}.md"
     assert source_path.exists()
     text = source_path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -739,7 +739,7 @@ async def test_source_file_text_is_untruncated_even_when_the_render_is_capped(
     assert long_markdown not in message.content
 
     source_id = message.artifact[0].source_id
-    text = (tmp_path / "sources" / registry.run_id / f"{source_id}.md").read_text(encoding="utf-8")
+    text = (fetch._sources_dir(config, registry) / f"{source_id}.md").read_text(encoding="utf-8")
     assert long_markdown in text
 
 
@@ -772,7 +772,7 @@ async def test_failed_fetch_writes_a_stub_naming_its_outcome(
 
     page = message.artifact[0]
     assert page.outcome == outcome
-    text = (tmp_path / "sources" / registry.run_id / f"{page.source_id}.md").read_text(
+    text = (fetch._sources_dir(config, registry) / f"{page.source_id}.md").read_text(
         encoding="utf-8"
     )
     lines = text.splitlines()
@@ -817,10 +817,10 @@ async def test_a_mixed_batch_writes_content_for_successes_and_stubs_for_failures
     )
 
     ok_page, bad_page = message.artifact
-    ok_text = (tmp_path / "sources" / registry.run_id / f"{ok_page.source_id}.md").read_text(
+    ok_text = (fetch._sources_dir(config, registry) / f"{ok_page.source_id}.md").read_text(
         encoding="utf-8"
     )
-    bad_text = (tmp_path / "sources" / registry.run_id / f"{bad_page.source_id}.md").read_text(
+    bad_text = (fetch._sources_dir(config, registry) / f"{bad_page.source_id}.md").read_text(
         encoding="utf-8"
     )
 
@@ -851,8 +851,8 @@ async def test_one_source_write_failure_does_not_poison_the_batch_or_go_silent(
     # Source IDs are minted in input order by a fresh registry, so the first URL is
     # S1 and the second S2 — predictable before the call, letting us target exactly
     # one write for failure.
-    failing_path = tmp_path / "sources" / registry.run_id / "S1.md"
-    ok_path = tmp_path / "sources" / registry.run_id / "S2.md"
+    failing_path = fetch._sources_dir(config, registry) / "S1.md"
+    ok_path = fetch._sources_dir(config, registry) / "S2.md"
     real_write_text = Path.write_text
 
     def raising_write_text(self: Path, *args: object, **kwargs: object) -> int:
@@ -907,8 +907,69 @@ async def test_refetching_the_same_url_overwrites_the_same_source_file(
     second_id = second_message.artifact[0].source_id
 
     assert first_id == second_id
-    sources_dir = tmp_path / "sources" / registry.run_id
+    sources_dir = fetch._sources_dir(config, registry)
     assert list(sources_dir.glob(f"{first_id}*.md")) == [sources_dir / f"{first_id}.md"]
     text = (sources_dir / f"{first_id}.md").read_text(encoding="utf-8")
     assert "second" in text
     assert "first" not in text
+
+
+async def test_a_failed_refetch_does_not_overwrite_a_successful_capture(
+    install_crawler, make_config, tmp_path
+):
+    """A transient failure on a URL already captured must not destroy the evidence.
+
+    Both attempts share one `[Sn]` and one file, and `harness/verify.py` reads only that
+    file — so a stub written over real content would report a claim the model genuinely
+    sourced as unverifiable (PR #4 review, Major).
+    """
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    install_crawler(
+        [
+            _FakeResult(
+                "https://flaky.test",
+                markdown=_FakeMarkdown(raw_markdown="real body", fit_markdown="real body"),
+            )
+        ]
+    )
+    first = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-good"))
+    source_id = first.artifact[0].source_id
+
+    install_crawler([_FakeResult("https://flaky.test", status_code=429, markdown=None)])
+    second = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-blocked"))
+
+    # The model still learns the refetch was blocked — only the captured file is spared.
+    assert second.artifact[0].outcome == "blocked"
+    text = (fetch._sources_dir(config, registry) / f"{source_id}.md").read_text(encoding="utf-8")
+    assert not fetch.is_failed_capture(text)
+    assert "real body" in text
+
+
+async def test_a_successful_refetch_still_replaces_a_failure_stub(
+    install_crawler, make_config, tmp_path
+):
+    """The no-downgrade guard is one-way — a later success must still win."""
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    install_crawler([_FakeResult("https://flaky.test", status_code=429, markdown=None)])
+    first = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-blocked"))
+    source_id = first.artifact[0].source_id
+
+    install_crawler(
+        [
+            _FakeResult(
+                "https://flaky.test",
+                markdown=_FakeMarkdown(raw_markdown="real body", fit_markdown="real body"),
+            )
+        ]
+    )
+    await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-good"))
+
+    text = (fetch._sources_dir(config, registry) / f"{source_id}.md").read_text(encoding="utf-8")
+    assert not fetch.is_failed_capture(text)
+    assert "real body" in text

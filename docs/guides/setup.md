@@ -244,7 +244,9 @@ uv run --env-file .env python -m harness "What changed in Python 3.14's free-thr
 Expect the research plan to echo at the terminal as the agent works, and the final line of
 stdout to be the path of a timestamped report under `[agent] reports_dir`. Open that file: it
 should answer the question, carry `[Sn]` markers on its claims, and list its sources. Every
-source consulted also leaves a file under `[agent] workspace_dir` in `sources/`.
+source consulted also leaves a file under `[agent] workspace_dir` in `<run_id>/sources/`.
+Each run owns a `<run_id>` subdirectory of the workspace — its notes, its captures, and its
+evicted history — so two runs started at once never read each other's findings.
 
 **Running from a git worktree:** `.env` is gitignored, so it does not exist inside a worktree.
 Point uv at the main checkout's copy — `uv run --env-file ../../../.env python -m harness

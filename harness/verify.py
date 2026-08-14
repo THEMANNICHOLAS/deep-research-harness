@@ -199,15 +199,18 @@ async def _check_one(
         return ClaimCheck(claim=claim, source_id=source_id, verdict="unresolved"), None
 
     path = sources_dir / f"{source_id}.md"
+    # `UnicodeDecodeError` (a `ValueError`, not an `OSError`) alongside the missing-file
+    # case: a capture whose write died mid-flush can end mid-character, and an
+    # unreadable source is a claim we cannot settle, not a pass we should abandon.
     try:
         source_text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return (
             ClaimCheck(
                 claim=claim,
                 source_id=source_id,
                 verdict="unverifiable",
-                detail=f"no captured content exists for {source_id}",
+                detail=f"no readable captured content exists for {source_id}",
             ),
             None,
         )

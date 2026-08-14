@@ -1239,6 +1239,33 @@ bounded by config, not the number, so no requirement changes and this does not e
 REQUIREMENTS. Every "default 4" in `## Design Decisions` (D11), `## Requirements Coverage`
 (R9), Phase 2's **Files**/acceptance criteria and its handoff entry reads 5.
 
+2026-08-13 — Phases 2/3/5, on PR #4 review: the per-run directory widens from the captures
+alone to the **whole workspace** — ~~`<workspace_dir>/sources/<run_id>/S<n>.md`~~
+`<workspace_dir>/<run_id>/sources/S<n>.md`, with the agent's `FilesystemBackend` rooted at
+`<workspace_dir>/<run_id>/` rather than `<workspace_dir>/`. The 2026-08-12 reconciliation
+above isolated captures but left working notes in one shared tree, and Phase 5's mtime filter
+cannot separate two runs *in flight at once*: the other run's notes are NEWER than this run's
+`started_at`, so they pass the filter and render as this run's findings in a cut-short report
+— the same silent overstatement R3 forbids, one directory over. The default `run_id` also
+gains a `secrets.token_hex(4)` suffix, because the bare `%Y-%m-%d-%H%M%S` stamp is
+second-resolution and two runs launched in the same second minted the same directory.
+
+Mechanism: one `run_workspace_dir(config, run_id)` in `harness/config.py` — all three
+consumers are peers (`agent.py` roots the backend, `fetch.py` hangs `sources/` off it,
+`report.py` scans it for notes), and it takes the bare string so `config` stays free of a
+`sources` import. `_sources_dir` derives from it, so the layout still has one home. The mtime
+filter is KEPT and re-documented as the second line rather than the only one: `run_id` is
+caller-supplyable via `SourceRegistry(run_id=...)`, so a deliberately reused id is still a
+reachable case. Rejected: a workspace lockfile (prevents the overlap but forecloses parallel
+runs), and documenting the overlap as a known failure mode (cheapest, but leaves a report that
+can silently attribute another question's findings).
+
+Consequences: no requirement text changes — R3 and R8 bind *that* notes and captures are this
+run's, not where they sit — so this does not escalate to REQUIREMENTS. Old
+`sources/<run_id>/` trees from earlier runs are orphaned, not migrated; they are disposable
+run artifacts. `docs/architecture.md`'s topology and `harness/report.py`'s `_notes_section`
+docstring are amended in place.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->

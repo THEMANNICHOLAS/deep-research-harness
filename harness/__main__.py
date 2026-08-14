@@ -214,7 +214,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     # Stamped before the agent can write anything, so a cut-short report can tell THIS
     # run's workspace notes from a previous run's leftovers — see `report._notes_section`.
-    # The same stamp also names this run's `sources/<run_id>/` directory (`SourceRegistry`
+    # The same stamp also names this run's `<workspace_dir>/<run_id>/` directory (`SourceRegistry`
     # below), which is what keeps a previous run's captures out of this run's verification
     # (see the plan's `## Reconciliations` 2026-08-12 — Phase 6).
     started_at = datetime.now()

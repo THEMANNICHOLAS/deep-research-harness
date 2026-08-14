@@ -21,7 +21,7 @@ from langgraph.types import Interrupt
 
 import harness.__main__ as main_module
 from harness.agent import build_agent
-from harness.config import AgentSettings
+from harness.config import AgentSettings, run_workspace_dir
 from harness.report import (
     _CUT_SHORT_HEADING,
     _ERROR_TEXT,
@@ -37,6 +37,20 @@ from tests.conftest import (
     verify_reply,
     write_source_capture,
 )
+
+
+@pytest.fixture
+def noop_agent(make_config, monkeypatch, scripted_model):
+    """A real compiled graph over a model scripted to answer once, plus that model.
+
+    Six tests below need nothing but "a graph built over a model that does nothing", and
+    each was pasting the same four setup lines (PR #4 review, Nit — CLAUDE.md: repeated
+    setup becomes a fixture). The model comes back with it because two of them assert on
+    what actually reached it, which `patch_model` otherwise puts out of reach.
+    """
+    model = scripted_model([AIMessage(content="done")])
+    patch_model(monkeypatch, model)
+    return model, build_agent(make_config(), SourceRegistry())
 
 
 def _tools_by_name(graph):
@@ -86,7 +100,7 @@ async def test_build_agent_drives_research_using_the_configured_model(
 
 
 async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_model(
-    make_config, monkeypatch, scripted_model
+    noop_agent,
 ):
     """Regression guard for risk !#3 (a stale JSON tool-call instruction in the prompt).
 
@@ -94,11 +108,8 @@ async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_
     model — `ScriptedChatModel._received_messages` (3F fix pass, Minor finding) records
     the real request, so this checks it directly instead of trusting the wiring.
     """
-    config = make_config()
-    model = scripted_model([AIMessage(content="done")])
-    patch_model(monkeypatch, model)
+    model, graph = noop_agent
 
-    graph = build_agent(config, SourceRegistry())
     await graph.ainvoke(
         {"messages": [HumanMessage(content="What is the boiling point of gallium?")]},
         config={"configurable": {"thread_id": "test-thread"}},
@@ -119,24 +130,14 @@ async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_
     )
 
 
-async def test_build_agent_exposes_the_harness_tools(make_config, monkeypatch, scripted_model):
-    config = make_config()
-    model = scripted_model([AIMessage(content="done")])
-    patch_model(monkeypatch, model)
-
-    graph = build_agent(config, SourceRegistry())
+async def test_build_agent_exposes_the_harness_tools(noop_agent):
+    _, graph = noop_agent
 
     assert {"fetch_pages", "search_web"} <= _tools_by_name(graph).keys()
 
 
-async def test_build_agent_disables_the_general_purpose_subagent(
-    make_config, monkeypatch, scripted_model
-):
-    config = make_config()
-    model = scripted_model([AIMessage(content="done")])
-    patch_model(monkeypatch, model)
-
-    graph = build_agent(config, SourceRegistry())
+async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):
+    _, graph = noop_agent
 
     # Asserted on the outcome (the tool disappearing), never on the derived profile-key
     # string, so this fails loudly if deepagents changes its key derivation instead of
@@ -144,24 +145,15 @@ async def test_build_agent_disables_the_general_purpose_subagent(
     assert "task" not in _tools_by_name(graph)
 
 
-async def test_build_agent_includes_todo_list_middleware(make_config, monkeypatch, scripted_model):
-    config = make_config()
-    model = scripted_model([AIMessage(content="done")])
-    patch_model(monkeypatch, model)
-
-    graph = build_agent(config, SourceRegistry())
+async def test_build_agent_includes_todo_list_middleware(noop_agent):
+    _, graph = noop_agent
 
     assert "write_todos" in _tools_by_name(graph)
 
 
-async def test_execute_is_excluded_from_the_models_tool_schema(
-    make_config, monkeypatch, scripted_model
-):
-    config = make_config()
-    model = scripted_model([AIMessage(content="done")])
-    patch_model(monkeypatch, model)
+async def test_execute_is_excluded_from_the_models_tool_schema(noop_agent):
+    model, graph = noop_agent
 
-    graph = build_agent(config, SourceRegistry())
     await graph.ainvoke(
         {"messages": [HumanMessage(content="hi")]},
         config={"configurable": {"thread_id": "test-thread"}},
@@ -172,12 +164,8 @@ async def test_execute_is_excluded_from_the_models_tool_schema(
         assert "execute" not in offered
 
 
-def test_filesystem_backend_is_never_a_sandbox(make_config, monkeypatch, scripted_model):
-    config = make_config()
-    model = scripted_model([AIMessage(content="done")])
-    patch_model(monkeypatch, model)
-
-    graph = build_agent(config, SourceRegistry())
+def test_filesystem_backend_is_never_a_sandbox(noop_agent):
+    _, graph = noop_agent
     backend = _filesystem_backend(graph)
 
     assert not isinstance(backend, SandboxBackendProtocol)
@@ -204,15 +192,19 @@ async def test_writes_through_the_agent_land_under_the_workspace_dir(
     )
     patch_model(monkeypatch, model)
 
-    graph = build_agent(config, SourceRegistry())
+    registry = SourceRegistry()
+    graph = build_agent(config, registry)
     await graph.ainvoke(
         {"messages": [HumanMessage(content="write something")]},
         config={"configurable": {"thread_id": "test-thread"}},
     )
 
-    written = config.agent.workspace_dir / "notes.md"
+    # Under THIS run's subdirectory, not the shared workspace root — that is what keeps a
+    # concurrent run from reading these notes as its own.
+    written = run_workspace_dir(config, registry.run_id) / "notes.md"
     assert written.exists()
     assert written.read_text(encoding="utf-8") == "hello"
+    assert not (config.agent.workspace_dir / "notes.md").exists()
 
 
 async def test_writes_cannot_escape_the_workspace_dir(make_config, monkeypatch, scripted_model):
@@ -234,13 +226,16 @@ async def test_writes_cannot_escape_the_workspace_dir(make_config, monkeypatch, 
     )
     patch_model(monkeypatch, model)
 
-    graph = build_agent(config, SourceRegistry())
+    registry = SourceRegistry()
+    graph = build_agent(config, registry)
     result = await graph.ainvoke(
         {"messages": [HumanMessage(content="try to escape")]},
         config={"configurable": {"thread_id": "test-thread"}},
     )
 
-    escaped = config.agent.workspace_dir.parent / "escape.md"
+    # One level up from the run's own root is the shared workspace, where a sibling run's
+    # notes live — the boundary the backend must hold.
+    escaped = run_workspace_dir(config, registry.run_id).parent / "escape.md"
     assert not escaped.exists()
     tool_messages = [m for m in result["messages"] if isinstance(m, ToolMessage)]
     assert any(getattr(m, "status", None) == "error" for m in tool_messages), tool_messages
@@ -310,7 +305,8 @@ async def test_compression_offloads_evicted_history_and_preserves_todos_state(
     model = scripted_model([plan_call, *tool_rounds, final])
     patch_model(monkeypatch, model)
 
-    graph = build_agent(config, SourceRegistry())
+    registry = SourceRegistry()
+    graph = build_agent(config, registry)
     result = await graph.ainvoke(
         {"messages": [HumanMessage(content="research this at length")]},
         config={"configurable": {"thread_id": "test-thread"}},
@@ -330,7 +326,7 @@ async def test_compression_offloads_evicted_history_and_preserves_todos_state(
 
     # Evidence 2: the evicted [S1] finding survives via the backend's offload file, even
     # though later requests to the model no longer carry it directly.
-    history_dir = config.agent.workspace_dir / "conversation_history"
+    history_dir = run_workspace_dir(config, registry.run_id) / "conversation_history"
     offloaded_files = list(history_dir.glob("*.md"))
     assert offloaded_files, "compression fired but wrote no offload file under the backend"
     offloaded_text = "\n".join(f.read_text(encoding="utf-8") for f in offloaded_files)

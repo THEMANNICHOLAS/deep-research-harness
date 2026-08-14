@@ -352,20 +352,9 @@ async def test_preflight_request_is_capped_to_one_token(make_config, monkeypatch
     assert body["max_completion_tokens"] == 1
 
 
-@pytest.mark.parametrize(
-    "handler_factory",
-    [
-        lambda: _RecordingResponder(_raise_connect_error),
-        lambda: _RecordingResponder(_respond_with(401, {"error": {"message": "invalid api key"}})),
-        lambda: _RecordingResponder(_respond_with(404, {"error": {"message": "model not found"}})),
-    ],
-)
-async def test_preflight_does_not_leak_library_exceptions(
-    make_config, monkeypatch, handler_factory
-):
-    config = make_config(agent=AgentSettings(max_retries=0))
-    handler = handler_factory()
-    _patch_chat_openai_with_transport(monkeypatch, handler)
-
-    with pytest.raises(ModelError):
-        await preflight(config, "head")
+# Removed: `test_preflight_does_not_leak_library_exceptions` re-ran the same three
+# scenarios as the unreachable/credentials/unknown-model tests above with only
+# `pytest.raises(ModelError)`. Those three already prove the property — a leaked
+# `httpx.ConnectError` or `openai` error would fail their `raises(ModelError)` too — so
+# the parametrized copy bought three more mock transports to maintain and no coverage
+# (PR #4 review, Nit).

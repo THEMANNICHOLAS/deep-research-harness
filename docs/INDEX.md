@@ -42,7 +42,7 @@
 
 | Resource | Location | Purpose |
 |---|---|---|
-| Config models | @harness/config.py | TOML-backed `HarnessConfig` and settings, secrets by env var |
+| Config models | @harness/config.py | TOML-backed `HarnessConfig` and settings, secrets by env var; `run_workspace_dir` — the per-run workspace root |
 | Model clients | @harness/models.py | `build_chat_model` / `preflight` — role → chat client, fail-fast and bounded retry |
 | Lead agent | @harness/agent.py | `build_agent` — the deepagents lead, its backend, middleware and interrupts |
 | Source registry | @harness/sources.py | Per-run registry assigning `[Sn]` citation IDs to fetched pages |

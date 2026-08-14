@@ -6,6 +6,7 @@ retrieval is a separate, later concern.
 """
 
 import re
+import secrets
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 
@@ -88,13 +89,18 @@ class SourceRegistry:
     """Mints per-run `S1..Sn` IDs for URLs and resolves `[Sn]` markers into links."""
 
     def __init__(self, run_id: str | None = None) -> None:
-        # Names this run's captured-sources directory (`sources/<run_id>/`, built by
-        # `harness.tools.fetch._sources_dir`). `[Sn]` IDs are per-run, but
-        # `agent.workspace_dir` is one shared directory reused by every run, so without
-        # this a shorter run would read a previous run's `S1.md` (see the plan's
-        # `## Reconciliations` 2026-08-12 — Phase 6). The default is a fresh timestamp
-        # (never a shared fallback), so an omitted `run_id` still cannot collide.
-        self.run_id = run_id or datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        # Names this run's whole workspace subdirectory, built by
+        # `harness.config.run_workspace_dir` — notes, captures and evicted history all
+        # hang off it. `[Sn]` IDs are per-run, but `agent.workspace_dir` is one shared
+        # directory reused by every run, so without this a shorter run would read a
+        # previous run's `S1.md` (plan `## Reconciliations` 2026-08-12 — Phase 6, and
+        # 2026-08-13 for the widening to the whole workspace). The timestamp alone is only
+        # second-resolution, so two runs launched in the same second shared a directory
+        # and overwrote each other's captures mid-run (PR #4 review); the random suffix
+        # makes the default collision-free while keeping the stamp sortable by start.
+        self.run_id = run_id or (
+            f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}-{secrets.token_hex(4)}"
+        )
         self._by_url: dict[str, Source] = {}
         self._by_id: dict[str, Source] = {}
 

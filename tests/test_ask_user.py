@@ -177,9 +177,9 @@ async def test_two_questions_in_one_interrupt_get_one_answer_each(
         "call_1": "The metal.",
         "call_2": "Mercury-202.",
     }
-    # The tool body never ran alongside the human's answer — `respond` skips execution, so
-    # its "no answer captured" fallback must appear nowhere.
-    assert all("No answer was captured" not in str(m.content) for m in results)
+    # That the tool body never ran is proven by the equality above, not by a separate
+    # scan: `respond` skips execution, and the body now raises rather than returning a
+    # stand-in string, so any execution would have failed the run outright.
     assert len(results) == 2
 
 
