@@ -33,9 +33,10 @@ from langgraph.types import Command, Interrupt
 
 from harness.agent import build_agent
 from harness.config import ConfigError, load_config
+from harness.display import Activity, StageTracker, build_renderer
 from harness.models import ModelError, preflight
 from harness.paragraphs import split_paragraphs
-from harness.report import CutShortReason, RunOutcome, format_todos, write_report
+from harness.report import CutShortReason, RunOutcome, write_report
 from harness.sources import SourceRegistry
 from harness.verify import VerificationResult, verify_paragraphs
 
@@ -143,17 +144,27 @@ async def _read_answer(prompt: str = "> ") -> str:
     return await future
 
 
-def _proposes_research_tool_call(node_update: dict[str, Any]) -> bool:
-    """Whether one node update carries an `AIMessage` proposing a research tool call.
+def _research_tool_calls(node_update: dict[str, Any]) -> list[dict[str, Any]]:
+    """The research tool calls (`_RESEARCH_TOOLS`) proposed in one node update, if any.
 
-    Arms the wall clock exactly once, at the first such call seen in the stream — see
-    `_RESEARCH_TOOLS`.
+    Also drives the wall clock, which arms exactly once, at the first such call seen in the
+    stream.
     """
+    calls: list[dict[str, Any]] = []
     for message in node_update.get("messages") or []:
         if isinstance(message, AIMessage):
-            if any(call["name"] in _RESEARCH_TOOLS for call in message.tool_calls):
-                return True
-    return False
+            calls.extend(
+                dict(call) for call in message.tool_calls if call["name"] in _RESEARCH_TOOLS
+            )
+    return calls
+
+
+def _describe_tool_call(call: dict[str, Any]) -> str:
+    """One activity line describing a research tool call proposal."""
+    args = call.get("args") or {}
+    if call["name"] == "search_web":
+        return f'search_web: "{args.get("query", "")}"'
+    return f"fetch_pages: {len(args.get('urls') or [])} url(s)"
 
 
 async def _answer_questions(interrupt: Interrupt) -> list[dict[str, Any]]:
@@ -193,6 +204,9 @@ async def main(argv: list[str] | None = None) -> int:
     except ModelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    renderer = build_renderer()
+    tracker = StageTracker(renderer)
 
     # Stamped before the agent can write anything: a cut-short report uses it to tell THIS
     # run's workspace notes from a previous run's leftovers (`report._notes_section`), and it
@@ -255,14 +269,24 @@ async def main(argv: list[str] | None = None) -> int:
                                 continue
                             todos = node_update.get("todos")
                             if todos is not None and todos != last_todos:
-                                print(format_todos(todos))
+                                previous = {t["content"]: t["status"] for t in (last_todos or [])}
+                                for todo in todos:
+                                    if previous.get(todo["content"]) != todo["status"]:
+                                        renderer.emit(
+                                            Activity(f"[{todo['status']}] {todo['content']}")
+                                        )
                                 last_todos = todos
-                            if not clock_armed and _proposes_research_tool_call(node_update):
-                                clock.reschedule(
-                                    asyncio.get_running_loop().time()
-                                    + config.agent.wall_clock_seconds
-                                )
-                                clock_armed = True
+                            calls = _research_tool_calls(node_update)
+                            if calls:
+                                tracker.advance("researching")
+                                for call in calls:
+                                    renderer.emit(Activity(_describe_tool_call(call)))
+                                if not clock_armed:
+                                    clock.reschedule(
+                                        asyncio.get_running_loop().time()
+                                        + config.agent.wall_clock_seconds
+                                    )
+                                    clock_armed = True
                     else:  # mode == "values"
                         pass_state = chunk
                         # Assigned HERE, inside the iteration: every cut-short path leaves
@@ -274,6 +298,7 @@ async def main(argv: list[str] | None = None) -> int:
                 interrupts = (pass_state or {}).get("__interrupt__")
                 if not interrupts:
                     break
+                tracker.advance("clarifying")
                 # `interrupts[0]`, not all of them: the lead is a single agent node, so at
                 # most one is ever pending, and `Command(resume=...)` delivers ONE value —
                 # fanning several into one decisions list would mis-pair them.
@@ -311,9 +336,9 @@ async def main(argv: list[str] | None = None) -> int:
             ]
         )
     elif answer:
-        print(
-            f"verifying {len(paragraphs)} paragraph(s) against their cited sources...",
-            file=sys.stderr,
+        tracker.advance("verifying")
+        renderer.emit(
+            Activity(f"checking {len(paragraphs)} paragraph(s) against their cited sources")
         )
         try:
             verification = await verify_paragraphs(paragraphs, config, registry)
@@ -336,10 +361,13 @@ async def main(argv: list[str] | None = None) -> int:
         paragraphs=paragraphs,
         verification=verification,
     )
+    tracker.advance("writing")
     path = write_report(outcome, config)
     if cut_short == "error":
         # To stderr and before the path, so the path stays the LAST line of stdout.
         print(f"error: {cut_short_detail}", file=sys.stderr)
+    tracker.finish()
+    renderer.close()
     print(path)
     return 1 if cut_short == "error" else 0
 

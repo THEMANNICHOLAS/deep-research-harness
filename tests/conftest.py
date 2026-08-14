@@ -5,6 +5,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models import LanguageModelInput
@@ -148,6 +149,25 @@ def patch_run(
 
         monkeypatch.setattr(main_module, "preflight", _noop_preflight)
     patch_model(monkeypatch, model)
+
+
+def install_search_transport(monkeypatch: pytest.MonkeyPatch, handler: Callable[..., Any]) -> None:
+    """Route `harness.tools.search`'s `httpx.AsyncClient` through a MockTransport on `handler`.
+
+    Shared by the search, agent, and display suites, each supplying its own handler.
+
+    In a `main()`-driven test, CALL THIS AFTER `scripted_model(...)`, never before: it replaces
+    the process-global `httpx.AsyncClient`, and `openai`'s constructor rejects anything that is
+    not an instance of whatever that name was bound to at build time — including
+    `langchain_openai`'s wrapper, which subclasses the ORIGINAL class. Building the model first
+    means that check has already run.
+    """
+    real = httpx.AsyncClient
+
+    def factory(**kwargs: Any) -> httpx.AsyncClient:
+        return real(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("harness.tools.search.httpx.AsyncClient", factory)
 
 
 def verify_reply(

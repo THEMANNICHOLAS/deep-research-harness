@@ -5,16 +5,7 @@ import pytest
 from langchain_core.tools import BaseTool
 
 from harness.tools import search
-
-
-def _install(monkeypatch, handler):
-    """Route the module's AsyncClient through a MockTransport running `handler`."""
-    real = httpx.AsyncClient
-
-    def factory(**kwargs):
-        return real(transport=httpx.MockTransport(handler), **kwargs)
-
-    monkeypatch.setattr("harness.tools.search.httpx.AsyncClient", factory)
+from tests.conftest import install_search_transport
 
 
 async def test_well_formed_response_maps_to_search_results(monkeypatch, make_config):
@@ -40,7 +31,7 @@ async def test_well_formed_response_maps_to_search_results(monkeypatch, make_con
     def handler(request):
         return httpx.Response(200, json=payload)
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("solar panels", 10, config)
@@ -68,7 +59,7 @@ async def test_max_results_bounds_the_number_returned(monkeypatch, make_config):
         captured_requests.append(request)
         return httpx.Response(200, json={"query": "x", "results": results})
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 2, config)
@@ -93,7 +84,7 @@ async def test_request_targets_the_configured_searxng_json_endpoint(
         captured_requests.append(request)
         return httpx.Response(200, json={"query": "x", "results": []})
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config(base_url=base_url)
 
     await search._search("solar panels", 10, config)
@@ -118,7 +109,7 @@ async def test_result_without_a_url_is_skipped(monkeypatch, make_config):
     def handler(request):
         return httpx.Response(200, json=payload)
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 10, config)
@@ -139,7 +130,7 @@ async def test_result_with_a_wrong_typed_field_is_skipped_not_raised(monkeypatch
     def handler(request):
         return httpx.Response(200, json=payload)
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 10, config)
@@ -152,7 +143,7 @@ async def test_non_object_json_body_returns_malformed(monkeypatch, make_config):
     def handler(request):
         return httpx.Response(200, json=["a", "bare", "array"])
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 10, config)
@@ -166,7 +157,7 @@ async def test_connection_error_returns_unreachable_failure(monkeypatch, make_co
     def handler(request):
         raise httpx.ConnectError("refused")
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 10, config)
@@ -181,7 +172,7 @@ async def test_non_200_returns_bad_status_failure_with_the_status_in_detail(
     def handler(request):
         return httpx.Response(500, text="internal error")
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 10, config)
@@ -195,7 +186,7 @@ async def test_non_json_body_returns_malformed(monkeypatch, make_config):
     def handler(request):
         return httpx.Response(200, text="not json at all")
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 10, config)
@@ -208,7 +199,7 @@ async def test_missing_results_key_returns_malformed(monkeypatch, make_config):
     def handler(request):
         return httpx.Response(200, json={"query": "x"})
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 10, config)
@@ -221,7 +212,7 @@ async def test_zero_results_returns_an_empty_list_not_a_failure(monkeypatch, mak
     def handler(request):
         return httpx.Response(200, json={"query": "x", "results": []})
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 10, config)
@@ -249,7 +240,7 @@ async def test_success_content_lists_each_result_with_title_url_and_snippet(
     def handler(request):
         return httpx.Response(200, json=payload)
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, _ = await search._search("solar panels", 10, config)
@@ -262,7 +253,7 @@ async def test_zero_results_content_says_so_without_claiming_failure(monkeypatch
     def handler(request):
         return httpx.Response(200, json={"query": "obscure", "results": []})
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, _ = await search._search("obscure", 10, config)
@@ -275,7 +266,7 @@ async def test_failure_content_states_that_the_search_failed_and_why(monkeypatch
     def handler(request):
         raise httpx.ConnectError("refused")
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("solar panels", 10, config)
@@ -294,7 +285,7 @@ async def test_built_tool_exposes_the_pinned_contract(monkeypatch, make_config):
     def handler(request):
         return httpx.Response(200, json=payload)
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     tool = search.build_search_tool(config)
@@ -328,7 +319,7 @@ async def test_result_missing_optional_fields_still_maps(monkeypatch, make_confi
     def handler(request):
         return httpx.Response(200, json=payload)
 
-    _install(monkeypatch, handler)
+    install_search_transport(monkeypatch, handler)
     config = make_config()
 
     content, artifact = await search._search("x", 10, config)
