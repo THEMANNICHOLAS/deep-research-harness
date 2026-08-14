@@ -1,20 +1,27 @@
-"""Behavioral tests for harness.verify — claim extraction, per-claim checks, conflicts.
+"""Behavioral tests for harness.verify — pooled, one-call-per-paragraph verification.
 
-`harness.verify` does not exist yet — Phase 6 builds it next. Importing it here is
-deliberate collection-error red (see the plan's "Expected red" section); the assertions
-below are written against the module's frozen contract so a stub `verify_claims` still
-fails them on content, not just on import.
+Written against the new pooled contract (Phase 2+3 plan, PART A): one model call per
+`Paragraph` regardless of how many sources it cites, deterministic verdicts assigned
+without a model call, and `sources_conflict`/`unsupported_items` carried straight through
+from the model's reply.
+
+The `_parse_reply` tolerance tests at the end of this file exist for plan risk #1: the
+orchestrator model is not guaranteed to return bare, complete JSON, so every tolerance
+written for that must have a test that fails if the tolerance is removed.
+
 """
 
 import asyncio
-import re
 from typing import get_args
 
+import pytest
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import PrivateAttr, SecretStr
 
+from harness.paragraphs import Paragraph
 from harness.sources import SourceRegistry
-from harness.verify import Conflict, Verdict, extract_claims, verify_claims
+from harness.tools.fetch import _sources_dir
+from harness.verify import Verdict, verify_paragraphs
 from tests.conftest import (
     ScriptedChatModel,
     verify_reply,
@@ -28,117 +35,46 @@ def _flatten(messages) -> str:
     return " ".join(str(getattr(m, "content", "")) for m in messages)
 
 
-async def test_every_verdict_in_the_frozen_vocabulary_is_reachable(
-    make_config, scripted_model, monkeypatch
-):
-    config = make_config()
-    registry = SourceRegistry()
-    supported_id = registry.add("https://example.test/tungsten-melting-point")
-    unsupported_id = registry.add("https://example.test/oven-specs")
-    failed_id = registry.add("https://example.test/dead-source")
-    silent_id = registry.add("https://example.test/kiln-catalogue")
-    write_source_capture(config, registry, supported_id, "Tungsten melts at 3422 degrees Celsius.")
-    write_source_capture(config, registry, unsupported_id, "The oven only reaches 1200 Celsius.")
-    write_failed_capture(config, registry, failed_id, outcome="blocked")
-    write_source_capture(config, registry, silent_id, "Our kilns ship in three colours.")
-
-    supported_claim = "Tungsten melts at 3422 degrees Celsius [S1]."
-    unsupported_claim = "The oven can easily melt tungsten [S2]."
-    not_addressed_claim = "Tungsten is used in light bulb filaments [S4]."
-    uncited_claim = "Tungsten is a very hard metal."
-    unresolved_claim = "Tungsten was discovered in 1781 [S9]."
-    unverifiable_claim = "Tungsten has the highest melting point of any metal [S3]."
-    answer = " ".join(
-        [
-            supported_claim,
-            unsupported_claim,
-            not_addressed_claim,
-            uncited_claim,
-            unresolved_claim,
-            unverifiable_claim,
-        ]
-    )
-
-    model = scripted_model(
-        [
-            verify_reply("supported", "Matches the source exactly."),
-            verify_reply("unsupported", "The oven falls short of tungsten's melting point."),
-            verify_reply("not_addressed", "The catalogue says nothing about filaments."),
-        ]
-    )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
-
-    result = await verify_claims(answer, config, registry)
-
-    by_claim = {check.claim: check for check in result.checks}
-    assert by_claim[supported_claim].verdict == "supported"
-    assert by_claim[supported_claim].source_id == "S1"
-    assert by_claim[unsupported_claim].verdict == "unsupported"
-    assert by_claim[unsupported_claim].source_id == "S2"
-    assert by_claim[not_addressed_claim].verdict == "not_addressed"
-    assert by_claim[not_addressed_claim].source_id == "S4"
-    assert by_claim[uncited_claim].verdict == "uncited"
-    assert by_claim[uncited_claim].source_id is None
-    assert by_claim[unresolved_claim].verdict == "unresolved"
-    assert by_claim[unresolved_claim].source_id == "S9"
-    assert by_claim[unverifiable_claim].verdict == "unverifiable"
-    assert by_claim[unverifiable_claim].source_id == "S3"
-    # Exhaustive by construction: a verdict added later fails here until it gets a case.
-    assert {check.verdict for check in result.checks} == set(get_args(Verdict))
+def _paragraph(text: str, source_ids: list[str], items: list[str] | None = None) -> Paragraph:
+    return Paragraph(text=text, source_ids=source_ids, items=items or [])
 
 
-async def test_a_check_sees_only_its_own_sources_captured_text(
+# --- item 1: one call per paragraph, prompt carries every pooled source ----------------
+
+
+async def test_one_call_per_paragraph_and_prompt_contains_every_pooled_source(
     make_config, scripted_model, monkeypatch
 ):
     config = make_config()
     registry = SourceRegistry()
     id1 = registry.add("https://example.test/one")
     id2 = registry.add("https://example.test/two")
-    write_source_capture(config, registry, id1, "UNIQUE_MARKER_ONE: source one body text.")
-    write_source_capture(config, registry, id2, "UNIQUE_MARKER_TWO: source two body text.")
-    answer = f"Claim about one [{id1}]. Claim about two [{id2}]."
+    id3 = registry.add("https://example.test/three")
+    write_source_capture(config, registry, id1, "UNIQUE_MARKER_ONE: body text.")
+    write_source_capture(config, registry, id2, "UNIQUE_MARKER_TWO: body text.")
+    write_source_capture(config, registry, id3, "UNIQUE_MARKER_THREE: body text.")
+    paragraph = _paragraph(f"The pump failed under load [{id1}] [{id2}] [{id3}].", [id1, id2, id3])
 
-    model = scripted_model([verify_reply("supported", "ok"), verify_reply("supported", "ok")])
+    model = scripted_model([verify_reply("supported", "All three sources agree.")])
     monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
 
-    await verify_claims(answer, config, registry)
+    result = await verify_paragraphs([paragraph], config, registry)
 
-    assert len(model._received_messages) == 2
-    first_call_text = _flatten(model._received_messages[0])
-    second_call_text = _flatten(model._received_messages[1])
-    assert "UNIQUE_MARKER_ONE" in first_call_text
-    assert "UNIQUE_MARKER_TWO" not in first_call_text
-    assert "UNIQUE_MARKER_TWO" in second_call_text
-    assert "UNIQUE_MARKER_ONE" not in second_call_text
-
-
-async def test_a_check_never_fetches(make_config, scripted_model, monkeypatch):
-    config = make_config()
-    registry = SourceRegistry()
-    source_id = registry.add("https://example.test/page")
-    write_source_capture(config, registry, source_id, "Captured content already on disk.")
-    answer = f"A claim about the page [{source_id}]."
-
-    class _ExplodingCrawler:
-        def __init__(self, *args, **kwargs) -> None:
-            raise AssertionError("verification must never fetch — D10/R8")
-
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", _ExplodingCrawler)
-
-    model = scripted_model([verify_reply("supported", "matches")])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
-
-    result = await verify_claims(answer, config, registry)
-
-    assert result.checks[0].verdict == "supported"
+    assert model._call_count == 1
+    prompt_text = _flatten(model._received_messages[0])
+    assert "UNIQUE_MARKER_ONE" in prompt_text
+    assert "UNIQUE_MARKER_TWO" in prompt_text
+    assert "UNIQUE_MARKER_THREE" in prompt_text
+    assert len(result.verdicts) == 1
+    assert result.verdicts[0].verdict == "supported"
 
 
 class _ConcurrencyTrackingModel(ScriptedChatModel):
     """Tracks in-flight `_agenerate` calls to prove the verification loop is sequential.
 
-    The `asyncio.sleep(0)` is load-bearing (D4, plan test 4): without a real await
-    point, a concurrent `asyncio.gather` would still show a peak of 1, since nothing
-    would ever yield control between increment and decrement.
+    The `asyncio.sleep(0)` is load-bearing (D4): without a real await point, a concurrent
+    `asyncio.gather` would still show a peak of 1, since nothing would ever yield control
+    between increment and decrement.
     """
 
     _in_flight: int = PrivateAttr(default=0)
@@ -154,405 +90,493 @@ class _ConcurrencyTrackingModel(ScriptedChatModel):
             self._in_flight -= 1
 
 
-async def test_claims_are_checked_one_at_a_time(make_config, monkeypatch):
+async def test_paragraphs_are_checked_strictly_sequentially(make_config, monkeypatch):
     config = make_config()
     registry = SourceRegistry()
     ids = [registry.add(f"https://example.test/page-{i}") for i in range(3)]
     for source_id in ids:
         write_source_capture(config, registry, source_id, f"Body text for {source_id}.")
-    answer = " ".join(f"Claim {i} about the page [{source_id}]." for i, source_id in enumerate(ids))
+    paragraphs = [
+        _paragraph(f"Paragraph {i} about the page [{source_id}].", [source_id])
+        for i, source_id in enumerate(ids)
+    ]
 
     model = _ConcurrencyTrackingModel(
         model="test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script([verify_reply("supported", "ok")] * len(ids))
     monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
 
-    result = await verify_claims(answer, config, registry)
+    result = await verify_paragraphs(paragraphs, config, registry)
 
     assert model._peak_in_flight == 1
-    assert len(model._received_messages) == len(ids)
-    assert len(result.checks) == len(ids)
+    assert model._call_count == len(paragraphs)
+    assert len(result.verdicts) == len(paragraphs)
 
 
-class _RaisingOnSecondCallModel(ScriptedChatModel):
-    """Raises on its second call only, recording every call it was actually asked to make."""
+# --- item 2: deterministic verdicts bypass the model entirely --------------------------
+
+
+async def test_no_markers_or_all_unregistered_sources_returns_no_sources_cited_without_a_call(
+    make_config, scripted_model, monkeypatch
+):
+    config = make_config()
+    registry = SourceRegistry()
+    no_markers = _paragraph("No citations in this block at all.", [])
+    all_unregistered = _paragraph("Refers to an unregistered source [S99].", ["S99"])
+
+    model = scripted_model([])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([no_markers, all_unregistered], config, registry)
+
+    assert model._call_count == 0
+    assert [v.verdict for v in result.verdicts] == ["no_sources_cited", "no_sources_cited"]
+    assert all(v.source_ids == [] for v in result.verdicts)
+    assert all(v.unsupported_items == [] for v in result.verdicts)
+
+
+# --- item 3: failed/missing captures are excluded; empty pool is not_verified ----------
+
+
+async def test_a_failed_capture_or_missing_file_is_excluded_from_the_pooled_prompt(
+    make_config, scripted_model, monkeypatch
+):
+    config = make_config()
+    registry = SourceRegistry()
+    healthy_id = registry.add("https://example.test/healthy")
+    failed_id = registry.add("https://example.test/failed")
+    write_source_capture(config, registry, healthy_id, "UNIQUE_HEALTHY_BODY text.")
+    write_failed_capture(config, registry, failed_id, outcome="blocked")
+    paragraph = _paragraph(
+        f"The pump failed under load [{healthy_id}] [{failed_id}].", [healthy_id, failed_id]
+    )
+
+    model = scripted_model([verify_reply("supported", "Confirmed by the one usable source.")])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert model._call_count == 1
+    prompt_text = _flatten(model._received_messages[0])
+    assert "UNIQUE_HEALTHY_BODY" in prompt_text
+    assert "FETCH FAILED" not in prompt_text
+    assert result.verdicts[0].source_ids == [healthy_id]
+
+
+async def test_a_paragraph_left_with_no_usable_source_returns_not_verified_naming_the_reason(
+    make_config, scripted_model, monkeypatch
+):
+    config = make_config()
+    registry = SourceRegistry()
+    missing_id = registry.add("https://example.test/missing")
+    failed_id = registry.add("https://example.test/failed")
+    write_failed_capture(config, registry, failed_id, outcome="error")
+    # `missing_id` is registered but never captured — no file exists under sources_dir.
+    paragraph = _paragraph(
+        f"The pump failed under load [{missing_id}] [{failed_id}].", [missing_id, failed_id]
+    )
+
+    model = scripted_model([])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert model._call_count == 0
+    verdict = result.verdicts[0]
+    assert verdict.verdict == "not_verified"
+    # "readable", not just "exists": the catch covers a `UnicodeDecodeError` from a capture
+    # whose write died mid-character, not only a missing file (PR #4 review).
+    assert "no readable captured content exists" in verdict.detail
+    assert "FETCH FAILED: error" in verdict.detail
+    assert verdict.source_ids == []
+
+
+async def test_a_capture_that_is_not_valid_utf8_is_skipped_not_raised(
+    make_config, scripted_model, monkeypatch
+):
+    """PR #4's fix, carried onto the pooled read. A `write_text` dying mid-flush leaves a
+    byte prefix that can end mid-character; `UnicodeDecodeError` is a `ValueError`, not an
+    `OSError`, so catching `OSError` alone let it escape the whole verification pass.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/truncated")
+    write_source_capture(config, registry, source_id, "placeholder")
+    # A lone continuation byte — valid on disk, undecodable as UTF-8.
+    (_sources_dir(config, registry) / f"{source_id}.md").write_bytes(b"Tungsten melts at \xff\xfe")
+
+    paragraph = _paragraph(f"Tungsten melts at 3422 C [{source_id}].", [source_id])
+    model = scripted_model([])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert model._call_count == 0
+    assert result.verdicts[0].verdict == "not_verified"
+    assert "no readable captured content exists" in result.verdicts[0].detail
+
+
+# --- item 4: malformed reply / unknown verdict / raised exception all continue the loop -
+
+
+class _RaisesOnThirdCallModel(ScriptedChatModel):
+    """Raises on its third call only (index 2), recording every call it is actually asked."""
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         call_index = self._call_count
         self._received_messages.append(list(messages))
         self._call_count += 1
-        if call_index == 1:
+        if call_index == 2:
             raise RuntimeError("simulated model outage")
         response = self._script[call_index]
         return ChatResult(generations=[ChatGeneration(message=response)])
 
 
-async def test_one_failing_check_does_not_fail_the_pass(make_config, monkeypatch):
+async def test_a_malformed_reply_unknown_verdict_and_raised_exception_all_continue_the_loop(
+    make_config, monkeypatch
+):
+    from langchain_core.messages import AIMessage
+
     config = make_config()
     registry = SourceRegistry()
-    ids = [registry.add(f"https://example.test/page-{i}") for i in range(3)]
+    ids = [registry.add(f"https://example.test/page-{i}") for i in range(4)]
     for source_id in ids:
         write_source_capture(config, registry, source_id, f"Body text for {source_id}.")
-    answer = " ".join(f"Claim {i} about the page [{source_id}]." for i, source_id in enumerate(ids))
-
-    model = _RaisingOnSecondCallModel(
-        model="test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
-    ).script([verify_reply("supported", "ok")] * len(ids))
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
-
-    result = await verify_claims(answer, config, registry)
-
-    # Every claim was still attempted — the failure did not stop the loop.
-    assert len(model._received_messages) == 3
-    verdicts = [check.verdict for check in result.checks]
-    assert verdicts.count("supported") == 2
-    assert verdicts.count("unverifiable") == 1
-    failing_check = next(c for c in result.checks if c.verdict == "unverifiable")
-    assert failing_check.detail is not None
-    assert "simulated model outage" in failing_check.detail
-    assert len(result.check_failures) == 1
-    assert "simulated model outage" in result.check_failures[0]
-
-
-async def test_disagreeing_sources_produce_a_conflict_with_no_adjudication(
-    make_config, scripted_model, monkeypatch
-):
-    config = make_config()
-    registry = SourceRegistry()
-    id1 = registry.add("https://example.test/one")
-    id2 = registry.add("https://example.test/two")
-    write_source_capture(config, registry, id1, "Source one says the price is $4.20.")
-    write_source_capture(config, registry, id2, "Source two says the price is $5.10.")
-    claim = f"The vendor quoted $4.20 per unit [{id1}] [{id2}]."
-
-    model = scripted_model(
-        [
-            verify_reply("supported", "Confirms $4.20."),
-            verify_reply("unsupported", "Says $5.10 instead."),
-        ]
-    )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
-
-    result = await verify_claims(claim, config, registry)
-
-    assert len(result.checks) == 2
-    assert len(result.conflicts) == 1
-    conflict = result.conflicts[0]
-    assert conflict.claim == claim
-    ids_seen = {position.source_id for position in conflict.positions}
-    assert ids_seen == {id1, id2}
-    verdicts_seen = {position.verdict for position in conflict.positions}
-    assert verdicts_seen == {"supported", "unsupported"}
-    details_seen = {position.detail for position in conflict.positions}
-    assert details_seen == {"Confirms $4.20.", "Says $5.10 instead."}
-    # `extra="forbid"` on `Conflict` pins its fields to `claim`/`positions` only — there
-    # is no attribute anywhere that could name a winner.
-    assert set(Conflict.model_fields) == {"claim", "positions"}
-
-
-async def test_two_sources_on_one_sentence_both_supported_yields_no_conflict(
-    make_config, scripted_model, monkeypatch
-):
-    config = make_config()
-    registry = SourceRegistry()
-    id1 = registry.add("https://example.test/one")
-    id2 = registry.add("https://example.test/two")
-    write_source_capture(config, registry, id1, "Source one confirms the $4.20 price.")
-    write_source_capture(config, registry, id2, "Source two also confirms the $4.20 price.")
-    claim = f"The vendor quoted $4.20 per unit [{id1}] [{id2}]."
-
-    model = scripted_model(
-        [verify_reply("supported", "Confirms."), verify_reply("supported", "Also confirms.")]
-    )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
-
-    result = await verify_claims(claim, config, registry)
-
-    assert len(result.checks) == 2
-    assert result.conflicts == []
-    assert {c.claim for c in result.checks} == {claim}
-    assert {c.source_id for c in result.checks} == {id1, id2}
-    assert all(c.verdict == "supported" for c in result.checks)
-
-
-async def test_a_silent_source_is_not_addressed_and_never_makes_a_conflict(
-    make_config, scripted_model, monkeypatch
-):
-    """Found by the Phase 6 live check. A synthesized sentence typically cites several
-    sources, each covering part of it. Reading "this source does not establish the claim"
-    as disagreement made the report state, in the harness's own voice, that sources
-    disagreed when one had simply said nothing on the point — the same false-confidence
-    failure D3 refuses, pointed the other way.
-    """
-    config = make_config()
-    registry = SourceRegistry()
-    id1 = registry.add("https://example.test/one")
-    id2 = registry.add("https://example.test/two")
-    write_source_capture(config, registry, id1, "Source one confirms the $4.20 price.")
-    write_source_capture(config, registry, id2, "Source two discusses shipping lead times.")
-    claim = f"The vendor quoted $4.20 per unit [{id1}] [{id2}]."
-
-    model = scripted_model(
-        [
-            verify_reply("supported", "Confirms $4.20."),
-            verify_reply("not_addressed", "Says nothing about price."),
-        ]
-    )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
-
-    result = await verify_claims(claim, config, registry)
-
-    by_source = {check.source_id: check for check in result.checks}
-    assert by_source[id1].verdict == "supported"
-    assert by_source[id2].verdict == "not_addressed"
-    # Silence is not disagreement.
-    assert result.conflicts == []
-
-
-async def test_a_contradiction_alongside_a_silent_source_still_conflicts(
-    make_config, scripted_model, monkeypatch
-):
-    """The other half: `not_addressed` must not SUPPRESS a real conflict either. One
-    source confirming, one contradicting and one silent is still a genuine disagreement,
-    and the silent source is listed so the reader sees the full picture.
-    """
-    config = make_config()
-    registry = SourceRegistry()
-    id1 = registry.add("https://example.test/one")
-    id2 = registry.add("https://example.test/two")
-    id3 = registry.add("https://example.test/three")
-    for source_id, text in (
-        (id1, "Source one says the price is $4.20."),
-        (id2, "Source two says the price is $5.10."),
-        (id3, "Source three is about lead times."),
-    ):
-        write_source_capture(config, registry, source_id, text)
-    claim = f"The vendor quoted $4.20 per unit [{id1}] [{id2}] [{id3}]."
-
-    model = scripted_model(
-        [
-            verify_reply("supported", "Confirms $4.20."),
-            verify_reply("unsupported", "Says $5.10 instead."),
-            verify_reply("not_addressed", "Says nothing about price."),
-        ]
-    )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
-
-    result = await verify_claims(claim, config, registry)
-
-    assert len(result.conflicts) == 1
-    positions = result.conflicts[0].positions
-    assert {p.source_id for p in positions} == {id1, id2, id3}
-
-
-# --- 3F fix pass: direct unit tests for extract_claims (Minor finding 2) ----------------
-
-
-def test_extract_claims_removes_fenced_code_blocks_entirely():
-    answer = "Here is a snippet.\n\n```python\nprint('not a claim')\n```\n\nDone talking."
-
-    claims = extract_claims(answer)
-
-    assert not any("not a claim" in claim for claim in claims)
-    assert not any("print(" in claim for claim in claims)
-    assert claims == ["Here is a snippet.", "Done talking."]
-
-
-def test_extract_claims_drops_markdown_headings():
-    answer = "## Findings\n\nThe vendor confirmed the price."
-
-    claims = extract_claims(answer)
-
-    assert claims == ["The vendor confirmed the price."]
-    assert not any("Findings" in claim for claim in claims)
-
-
-def test_extract_claims_strips_list_markers():
-    answer = "- The vendor quoted $4.20.\n- Lead time is six weeks.\n1) A third item."
-
-    claims = extract_claims(answer)
-
-    assert claims == ["The vendor quoted $4.20.", "Lead time is six weeks.", "A third item."]
-
-
-def test_extract_claims_splits_multiple_sentences_on_terminal_punctuation():
-    answer = "The vendor quoted $4.20. Is that final? Yes! Confirmed."
-
-    claims = extract_claims(answer)
-
-    assert claims == ["The vendor quoted $4.20.", "Is that final?", "Yes!", "Confirmed."]
-
-
-def test_extract_claims_handles_a_blank_line_separated_multi_block_answer():
-    answer = "First block sentence one. First block sentence two.\n\nSecond block sentence."
-
-    claims = extract_claims(answer)
-
-    assert claims == [
-        "First block sentence one.",
-        "First block sentence two.",
-        "Second block sentence.",
+    paragraphs = [
+        _paragraph(f"Paragraph {i} about the page [{source_id}].", [source_id])
+        for i, source_id in enumerate(ids)
     ]
 
-
-def test_extract_claims_drops_a_sentence_with_no_alphanumeric_content():
-    answer = "A real claim here. ---. Another real claim."
-
-    claims = extract_claims(answer)
-
-    assert claims == ["A real claim here.", "Another real claim."]
-    assert not any(claim.strip("- ") == "" for claim in claims)
-
-
-# --- PR #4 review: block splitting is decided per LINE, not per block -------------------
-
-
-def test_a_lead_in_above_a_list_does_not_glue_onto_the_first_bullet():
-    """The Blocker's headline shape: `Key findings:` directly above bullets, no blank line.
-
-    The old rule needed EVERY line in the block to be a bullet, so one lead-in flipped the
-    whole block into "join it all with spaces" and the first claim came out as
-    `Key findings: - The vendor quoted $4.20 [S1].`
-    """
-    answer = "Key findings:\n- The vendor quoted $4.20 [S1].\n- Lead time is six weeks [S2]."
-
-    claims = extract_claims(answer)
-
-    assert claims == ["The vendor quoted $4.20 [S1].", "Lead time is six weeks [S2]."]
-    assert not any("Key findings" in claim for claim in claims)
-    assert not any(claim.startswith("-") for claim in claims)
-
-
-def test_unpunctuated_bullets_under_a_lead_in_stay_one_claim_each():
-    """The worse variant: without terminal punctuation the old rule merged the whole list.
-
-    Nothing then split it, because the sentence splitter needs `.`/`!`/`?`, so ONE claim
-    came out carrying every source ID — and `verify_claims` asked each source to support
-    the others' facts. Asserting one ID per claim is what pins that shut.
-    """
-    answer = "Key findings:\n- The vendor quoted $4.20 [S1]\n- Lead time is six weeks [S2]"
-
-    claims = extract_claims(answer)
-
-    assert claims == ["The vendor quoted $4.20 [S1]", "Lead time is six weeks [S2]"]
-    for claim in claims:
-        assert len(re.findall(r"\[S\d+\]", claim)) == 1, claim
-
-
-def test_a_heading_directly_above_a_list_drops_only_the_heading_line():
-    """A heading with no blank line under it used to take the whole block with it.
-
-    Those claims were never checked AND never disclosed — silent, which is worse than a
-    wrong verdict. Only the heading LINE is dropped now.
-    """
-    answer = "## Findings\n- Solar grew 40% [S1]\n- Wind fell 3% [S2]"
-
-    claims = extract_claims(answer)
-
-    assert claims == ["Solar grew 40% [S1]", "Wind fell 3% [S2]"]
-    assert not any("Findings" in claim for claim in claims)
-
-
-def test_a_wrapped_bullet_stays_one_claim_with_its_continuation():
-    answer = "- The vendor quoted $4.20 per unit for the\n  first thousand units [S1]."
-
-    claims = extract_claims(answer)
-
-    assert claims == ["The vendor quoted $4.20 per unit for the first thousand units [S1]."]
-
-
-def test_a_bullet_character_outside_the_ascii_set_still_starts_a_claim():
-    answer = "• Solar grew 40% [S1]\n• Wind fell 3% [S2]"
-
-    claims = extract_claims(answer)
-
-    assert claims == ["Solar grew 40% [S1]", "Wind fell 3% [S2]"]
-
-
-def test_a_colon_line_with_no_list_under_it_is_still_a_claim():
-    """Only a lead-in ABOVE A LIST is dropped — an ordinary colon sentence is an assertion."""
-    answer = "The vendor's position was clear: the price is $4.20 [S1]."
-
-    claims = extract_claims(answer)
-
-    assert claims == ["The vendor's position was clear: the price is $4.20 [S1]."]
-
-
-async def test_a_repeated_sentence_is_checked_once_per_source(
-    make_config, scripted_model, monkeypatch
-):
-    """One model call per (claim x source), even when the answer repeats the sentence.
-
-    The script holds exactly ONE reply: a second call on the same pair overruns it and
-    raises IndexError, which is what makes this test able to fail.
-    """
-    config = make_config()
-    registry = SourceRegistry()
-    source_id = registry.add("https://example.test/quote")
-    write_source_capture(config, registry, source_id, "The vendor quoted $4.20 per unit.")
-    sentence = f"The vendor quoted $4.20 per unit [{source_id}]."
-    answer = f"{sentence}\n\nIn summary. {sentence}"
-
-    model = scripted_model([verify_reply("supported", "Confirms $4.20.")])
+    script = [
+        AIMessage(content="this is not json at all"),
+        verify_reply("bogus_verdict_value", "irrelevant"),
+        verify_reply("supported", "unreachable placeholder"),
+        verify_reply("supported", "The final paragraph checked out."),
+    ]
+    model = _RaisesOnThirdCallModel(
+        model="test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script(script)
     monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
 
-    result = await verify_claims(answer, config, registry)
+    result = await verify_paragraphs(paragraphs, config, registry)
 
-    assert model._call_count == 1
-    checked = [c for c in result.checks if c.source_id == source_id]
-    assert len(checked) == 1
-    assert result.conflicts == []
+    assert model._call_count == 4
+    verdicts = [v.verdict for v in result.verdicts]
+    assert verdicts == ["not_verified", "not_verified", "not_verified", "supported"]
+    assert result.verdicts[3].detail == "The final paragraph checked out."
+    assert len(result.check_failures) == 3
 
 
-async def test_one_source_checked_twice_never_reads_as_sources_disagreeing(
+# --- item 5: sources_conflict / unsupported_items round-trip, verdicts index-align ------
+
+
+async def test_sources_conflict_and_unsupported_items_round_trip_and_verdicts_are_index_aligned(
     make_config, scripted_model, monkeypatch
 ):
-    """A conflict needs two DISTINCT sources, not merely two disagreeing verdicts.
-
-    Feeds the same (claim, source) pair two different verdicts by passing an explicit
-    `claims` list that names the sentence twice, bypassing the dedupe above. Grouping on
-    claim text alone then produced a `Conflict` whose positions both read `[S1]`, and the
-    report stated "the cited sources disagree on this claim" about a single source.
-    """
     config = make_config()
     registry = SourceRegistry()
-    source_id = registry.add("https://example.test/quote")
-    write_source_capture(config, registry, source_id, "The vendor quoted $4.20 per unit.")
-    claim = f"The vendor quoted $4.20 per unit [{source_id}]."
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Source one text.")
+    write_source_capture(config, registry, id2, "Source two text.")
+    list_paragraph = _paragraph(
+        f"- First finding [{id1}]\n- Second finding [{id2}]\n- Third finding [{id1}]",
+        [id1, id2],
+        items=["First finding [S1]", "Second finding [S2]", "Third finding [S1]"],
+    )
+    prose_paragraph = _paragraph(f"The pump failed under load [{id1}] [{id2}].", [id1, id2])
 
     model = scripted_model(
         [
-            verify_reply("supported", "Confirms $4.20."),
-            verify_reply("unsupported", "Reads $5.10 to me."),
+            verify_reply(
+                "partially_supported",
+                "Two of the three findings check out.",
+                sources_conflict=True,
+                unsupported_items=[0, 2],
+            ),
+            verify_reply("supported", "Confirmed by both sources.", sources_conflict=False),
         ]
     )
     monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
 
-    result = await verify_claims(claim, config, registry, claims=[claim, claim])
+    result = await verify_paragraphs([list_paragraph, prose_paragraph], config, registry)
 
-    assert result.conflicts == [], "one source cannot disagree with itself"
+    assert len(result.verdicts) == 2
+    first, second = result.verdicts
+    assert first.verdict == "partially_supported"
+    assert first.detail == "Two of the three findings check out."
+    assert first.sources_conflict is True
+    assert first.unsupported_items == [0, 2]
+    assert second.verdict == "supported"
+    assert second.detail == "Confirmed by both sources."
+    assert second.sources_conflict is False
+    assert second.unsupported_items == []
 
 
-async def test_a_supplied_claims_list_is_what_gets_checked(
+async def test_a_single_pooled_source_can_still_carry_a_conflict(
     make_config, scripted_model, monkeypatch
 ):
-    """`claims=` is the shape `__main__` calls with, and nothing else exercised it.
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/one")
+    write_source_capture(config, registry, source_id, "Source text.")
+    paragraph = _paragraph(f"The pump failed under load [{source_id}].", [source_id])
 
-    The supplied list is deliberately NOT what `extract_claims(answer)` would return, so a
-    `verify_claims` that ignored the argument and recomputed would check the wrong text.
+    model = scripted_model(
+        [verify_reply("not_supported", "Contradicts itself.", sources_conflict=True)]
+    )
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert result.verdicts[0].sources_conflict is True
+    assert result.verdicts[0].source_ids == [source_id]
+
+
+# --- kept in spirit: exhaustive vocabulary, never fetches -------------------------------
+
+
+async def test_every_verdict_in_the_frozen_vocabulary_is_reachable(
+    make_config, scripted_model, monkeypatch
+):
+    config = make_config()
+    registry = SourceRegistry()
+    supported_id = registry.add("https://example.test/tungsten-melting-point")
+    partial_id = registry.add("https://example.test/oven-specs")
+    not_supported_id = registry.add("https://example.test/dead-oven")
+    # Registered but never captured — the "no usable source" path to `not_verified`,
+    # distinct from an unregistered marker (which is `no_sources_cited` instead).
+    uncaptured_id = registry.add("https://example.test/uncaptured")
+    write_source_capture(config, registry, supported_id, "Tungsten melts at 3422 degrees Celsius.")
+    write_source_capture(config, registry, partial_id, "The oven reaches 1200 Celsius, no more.")
+    write_source_capture(config, registry, not_supported_id, "Tungsten never melts in this kiln.")
+
+    supported_paragraph = _paragraph(
+        f"Tungsten melts at 3422 degrees Celsius [{supported_id}].", [supported_id]
+    )
+    partial_paragraph = _paragraph(
+        f"The oven can partially melt tungsten [{partial_id}].", [partial_id]
+    )
+    not_supported_paragraph = _paragraph(
+        f"The kiln easily melts tungsten [{not_supported_id}].", [not_supported_id]
+    )
+    no_sources_paragraph = _paragraph("Tungsten is a very hard metal.", [])
+    not_verified_paragraph = _paragraph(
+        f"Tungsten was discovered in 1781 [{uncaptured_id}].", [uncaptured_id]
+    )
+
+    model = scripted_model(
+        [
+            verify_reply("supported", "Matches the source exactly."),
+            verify_reply("partially_supported", "Only the low end is confirmed."),
+            verify_reply("not_supported", "The kiln specs contradict this."),
+        ]
+    )
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs(
+        [
+            supported_paragraph,
+            partial_paragraph,
+            not_supported_paragraph,
+            no_sources_paragraph,
+            not_verified_paragraph,
+        ],
+        config,
+        registry,
+    )
+
+    seen = {v.verdict for v in result.verdicts}
+    # Exhaustive by construction: a verdict added later fails here until it gets a case.
+    assert seen == set(get_args(Verdict))
+
+
+async def test_a_check_never_fetches(make_config, scripted_model, monkeypatch):
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "Captured content already on disk.")
+    paragraph = _paragraph(f"A claim about the page [{source_id}].", [source_id])
+
+    class _ExplodingCrawler:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("verification must never fetch — D10/R8")
+
+    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", _ExplodingCrawler)
+
+    model = scripted_model([verify_reply("supported", "matches")])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert result.verdicts[0].verdict == "supported"
+
+
+# --- rewrite of test_a_supplied_claims_list_is_what_gets_checked -----------------------
+
+
+async def test_the_input_paragraphs_list_is_exactly_what_gets_checked(
+    make_config, scripted_model, monkeypatch
+):
+    """`verify_paragraphs` has no `claims=`/answer-splitting parameter any more — it always
+    checks the caller's list, each paragraph seeing only its OWN text, never another
+    paragraph's.
     """
     config = make_config()
     registry = SourceRegistry()
-    source_id = registry.add("https://example.test/quote")
-    write_source_capture(config, registry, source_id, "The vendor quoted $4.20 per unit.")
-    answer = f"Some prose the caller already parsed differently [{source_id}]."
-    supplied = [f"The vendor quoted $4.20 per unit [{source_id}]."]
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Source one text.")
+    write_source_capture(config, registry, id2, "Source two text.")
+    first = _paragraph(f"UNIQUE_PARAGRAPH_ONE [{id1}].", [id1])
+    second = _paragraph(f"UNIQUE_PARAGRAPH_TWO [{id2}].", [id2])
 
-    model = scripted_model([verify_reply("supported", "Confirms $4.20.")])
+    model = scripted_model([verify_reply("supported", "ok"), verify_reply("supported", "ok")])
     monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
 
-    result = await verify_claims(answer, config, registry, claims=supplied)
+    result = await verify_paragraphs([first, second], config, registry)
 
-    assert [c.claim for c in result.checks] == supplied
-    assert "The vendor quoted $4.20 per unit" in _flatten(model._received_messages[0])
-    assert "Some prose the caller already parsed" not in _flatten(model._received_messages[0])
+    first_prompt = _flatten(model._received_messages[0])
+    second_prompt = _flatten(model._received_messages[1])
+    assert "UNIQUE_PARAGRAPH_ONE" in first_prompt
+    assert "UNIQUE_PARAGRAPH_TWO" not in first_prompt
+    assert "UNIQUE_PARAGRAPH_TWO" in second_prompt
+    assert "UNIQUE_PARAGRAPH_ONE" not in second_prompt
+    assert len(result.verdicts) == 2
+
+
+# --- risk #1: `_parse_reply` tolerances, each able to fail if its tolerance is removed --
+
+
+async def test_a_reply_wrapped_in_prose_is_still_parsed(make_config, scripted_model, monkeypatch):
+    """Risk #1: the model may narrate around its JSON. The object between the first `{`
+    and the last `}` is still the answer, and none of the prose leaks into `detail`.
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "The vendor quoted $4.20.")
+    paragraph = _paragraph(f"The vendor quoted $4.20 [{source_id}].", [source_id])
+
+    model = scripted_model(
+        [
+            AIMessage(
+                content=(
+                    "Sure! Here is my assessment of the paragraph:\n"
+                    '{"verdict": "supported", "detail": "The capture quotes $4.20.", '
+                    '"sources_conflict": false, "unsupported_items": []}\n'
+                    "Let me know if you would like another pass."
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert result.verdicts[0].verdict == "supported"
+    assert result.verdicts[0].detail == "The capture quotes $4.20."
+    assert result.check_failures == []
+
+
+_OBJECT = '{"verdict": "supported", "detail": "The capture quotes $4.20."}'
+
+
+@pytest.mark.parametrize(
+    ("content", "shape"),
+    [
+        (f"{_OBJECT} Hope that helps!", "trailing prose only"),
+        (f"```json\n{_OBJECT}\n```", "markdown fence"),
+    ],
+)
+async def test_a_reply_wrapped_on_either_side_is_still_parsed(
+    make_config, scripted_model, monkeypatch, content, shape
+):
+    """Risk #1, both remaining wrapper shapes. Trailing-prose-only is the one that used to
+    fail: the repair was gated on the reply NOT starting with `{`, so an object followed by
+    a sign-off went to `json.loads` whole and raised "Extra data", turning a genuine
+    `supported` verdict into `not verified` for a correctly-cited paragraph.
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "The vendor quoted $4.20.")
+    paragraph = _paragraph(f"The vendor quoted $4.20 [{source_id}].", [source_id])
+
+    model = scripted_model([AIMessage(content=content)])
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert result.verdicts[0].verdict == "supported", shape
+    assert result.verdicts[0].detail == "The capture quotes $4.20."
+    assert result.check_failures == []
+
+
+async def test_a_reply_omitting_unsupported_items_defaults_to_empty(
+    make_config, scripted_model, monkeypatch
+):
+    """Risk #1: the model may omit `unsupported_items` and `sources_conflict` entirely.
+    A missing list is empty and a missing flag is False — not a parse failure.
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "Body text.")
+    paragraph = _paragraph(f"A claim [{source_id}].", [source_id])
+
+    model = scripted_model(
+        [AIMessage(content='{"verdict": "not_supported", "detail": "The source disagrees."}')]
+    )
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    verdict = result.verdicts[0]
+    assert verdict.verdict == "not_supported"
+    assert verdict.detail == "The source disagrees."
+    assert verdict.unsupported_items == []
+    assert verdict.sources_conflict is False
+    assert result.check_failures == []
+
+
+async def test_non_integer_bullet_indices_are_dropped_not_carried_through(
+    make_config, scripted_model, monkeypatch
+):
+    """Risk #1: `unsupported_items` may arrive with strings or nulls mixed in. Only real
+    ints survive, so the render path never indexes a list with a string. `True` is an int
+    to Python and is dropped too — a boolean is not a bullet index.
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "Body text.")
+    paragraph = _paragraph(
+        f"- First [{source_id}]\n- Second\n- Third",
+        [source_id],
+        items=["First [S1]", "Second", "Third"],
+    )
+
+    model = scripted_model(
+        [
+            AIMessage(
+                content=(
+                    '{"verdict": "partially_supported", "detail": "Mixed.", '
+                    '"unsupported_items": [0, "1", null, true, 2]}'
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert result.verdicts[0].unsupported_items == [0, 2]

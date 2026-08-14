@@ -1029,7 +1029,7 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     model = scripted_model([ping, partial, *([keep_going] * 20)])
     patch_run(monkeypatch, config, model)
 
-    verify_model = scripted_model([verify_reply("unsupported", "The capture reads $5.10.")])
+    verify_model = scripted_model([verify_reply("not_supported", "The capture reads $5.10.")])
     monkeypatch.setattr("harness.verify.build_chat_model", lambda cfg, role: verify_model)
 
     await main_module.main(["what does Acme charge?"])
@@ -1040,7 +1040,7 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     assert _CUT_SHORT_HEADING in body, "this run was supposed to hit the round cap"
     # The check actually ran on the cut-short path — not skipped, not defaulted.
     assert verify_model._call_count == 1
-    assert f"**[unsupported — {source_id}]**" in body
+    assert "Verdict: not supported - The capture reads $5.10." in body
     # And R1's citation resolution still happened on the same partial answer.
     assert "https://example.test/pricing" in body
 

@@ -101,14 +101,6 @@ to address.
   *inside* `arun_many`, then confirm the partial report is still written and no chromium
   process is left behind.
 
-- **`extract_claims` splits sentences on `.`/`!`/`?` alone.** The PR #4 review fixed
-  block-level merging (a lead-in or heading above a list no longer glues onto the first
-  bullet), but a claim containing "Inc." or "e.g." still splits mid-sentence, and a
-  bullet with no terminal punctuation is one claim however long it runs. To address:
-  decide whether claim boundaries deserve a real sentence segmenter or whether the
-  current approximation is good enough for the marker-placement and per-source-check
-  jobs it feeds.
-
 - **`InMemorySaver` checkpoint growth has never been measured.** Deferred at Phase 4
   (a checkpointer is required for `interrupt_on`, so it is not optional), inherited by
   Phase 5, and still untaken after Phase 5's and Phase 6's live checks — the one item

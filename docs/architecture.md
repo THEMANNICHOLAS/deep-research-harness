@@ -42,7 +42,8 @@ a concurrent run's files are newer than this run's start.
 `harness/` holds the source: @harness/config.py (TOML config models),
 @harness/models.py (role → chat client, with preflight and bounded retry),
 @harness/agent.py (the deepagents lead), @harness/sources.py (per-run source
-registry), @harness/verify.py (per-claim check), @harness/report.py (report
+registry), @harness/paragraphs.py (the shared paragraph unit), @harness/verify.py
+(per-paragraph pooled check), @harness/report.py (report
 assembly), @harness/__main__.py (the CLI and its resume loop),
 @harness/prompts.py (prompt loader) with its `.md` files in @harness/prompts/,
 and @harness/tools/ (the tool registry and one module per tool). Tests live in
@@ -107,16 +108,17 @@ bug that was fixed and forgotten — the fix is named so it stays visible.
   dict plus that key, so code that calls `.get` on every update value raises
   `AttributeError` on the first one. Detection must also be scoped to the current
   pass, or a carried-over state re-asks the same question forever.
-- **A verified claim can be silently discarded.** `extract_claims` joins a block's
-  lines with a space, so a claim is not guaranteed to be a verbatim substring of the
-  answer; a `str.replace` then no-ops and the verdict is computed and thrown away.
-  Markers are placed by a whitespace-tolerant regex, anything unplaceable is
-  disclosed, and marker insertion must run *before* `registry.resolve()` — resolving
-  first rewrites `[S1]` into a link and no claim matches.
+- **A verdict must never be matched back onto text.** The answer is split into
+  paragraphs exactly once, in `harness/__main__.py`, and that one list is handed to both
+  verification and rendering, so verdicts align with paragraphs by index (D2). The
+  earlier scheme located a claim string back inside the answer and silently dropped any
+  verdict it could not place. Rendering marks a failing bullet by list-item POSITION for
+  the same reason — anything that recovers the mapping from text is fragile wherever two
+  lines share a suffix. See @docs/plans/PLAN-report-output.md.
 - **A 404 body classifies as `fetched`.** The substrate's fetch classification is
   known-imperfect (see docs/backlog.md) and is left that way deliberately. The
-  mitigation is the per-claim check reading captured source files: an error page
-  cannot support the claim attached to it, so the claim comes back unsupported.
+  mitigation is the per-paragraph check reading captured source files: an error page
+  cannot support the paragraph citing it, so the paragraph comes back unsupported.
 - **The head model 403s without a region opt-in.** `deepseek-v4-flash` requires it on
   the OpenCode workspace dashboard; the endpoint is otherwise reachable and the
   failure looks like a credential problem.

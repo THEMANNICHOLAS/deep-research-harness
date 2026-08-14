@@ -38,9 +38,10 @@ from langgraph.types import Command, Interrupt
 from harness.agent import build_agent
 from harness.config import ConfigError, load_config
 from harness.models import ModelError, preflight
+from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, format_todos, write_report
 from harness.sources import SourceRegistry
-from harness.verify import VerificationResult, extract_claims, verify_claims
+from harness.verify import VerificationResult, verify_paragraphs
 
 _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -329,10 +330,13 @@ async def main(argv: list[str] | None = None) -> int:
     usage = _sum_usage(messages)
 
     answer = _final_answer(messages)
+    # Split exactly once (D2) — every downstream consumer (`verify_paragraphs`, `report.py`'s
+    # `## Answer` renderer) shares this one list; nothing ever re-splits `answer`.
+    paragraphs = split_paragraphs(answer)
     verification = None
     if cut_short == "error":
         # A model-outage death means the head model is near-certainly still unreachable —
-        # running one verification call per claim, each carrying Phase 1's bounded
+        # running one verification call per paragraph, each carrying Phase 1's bounded
         # backoff, would burn minutes on calls that are near-certain to fail before the
         # report is even written. Skipping is disclosed, never silent (3F fix pass,
         # Minor finding) — `## Gaps and disclosures` states it via `check_failures`.
@@ -342,18 +346,16 @@ async def main(argv: list[str] | None = None) -> int:
             ]
         )
     elif answer:
-        claims = extract_claims(answer)
-        # Computed once and reused below — `verify_claims` no longer recomputes it (3F fix
-        # pass, simplification). Worded as "claim(s)", not a call count: the actual number
-        # of model calls is per (claim x cited source), which this count does not claim
-        # to be.
-        print(f"verifying {len(claims)} claim(s) against their cited sources...", file=sys.stderr)
+        print(
+            f"verifying {len(paragraphs)} paragraph(s) against their cited sources...",
+            file=sys.stderr,
+        )
         try:
-            verification = await verify_claims(answer, config, registry, claims=claims)
+            verification = await verify_paragraphs(paragraphs, config, registry)
         except Exception as exc:  # noqa: BLE001
             # Best-effort + disclose: a pass that fails wholesale is reported IN the
-            # report, never silently dropped. Per-claim failures are handled inside the
-            # pass itself.
+            # report, never silently dropped. Per-paragraph failures are handled inside
+            # the pass itself.
             verification = VerificationResult(
                 check_failures=[f"verification pass failed: {type(exc).__name__}: {exc}"]
             )
@@ -367,6 +369,7 @@ async def main(argv: list[str] | None = None) -> int:
         cut_short_detail=cut_short_detail,
         todos=last_todos or [],
         started_at=started_at,
+        paragraphs=paragraphs,
         verification=verification,
     )
     path = write_report(outcome, config)

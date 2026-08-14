@@ -77,8 +77,14 @@ class AgentSettings(_StrictModel):
     # docs/plans/PLAN-research-loop.md Phase 1 Contracts.
     max_rounds: int = Field(default=20, gt=0)  # hard cap on agent-loop rounds
     wall_clock_seconds: int = Field(default=1800, gt=0)  # wall-clock budget, in seconds
-    workspace_dir: Path = Field(default=Path("workspace"))  # scratch dir the loop may write to
-    reports_dir: Path = Field(default=Path("reports"))  # where finished reports land
+    # Defaults live under the user's home dir, not the repo root — overridable per-key
+    # from harness.toml's [agent] section.
+    workspace_dir: Path = Field(
+        default_factory=lambda: Path.home() / "deep-research" / "workspace"
+    )  # scratch dir the loop may write to
+    reports_dir: Path = Field(
+        default_factory=lambda: Path.home() / "deep-research" / "reports"
+    )  # where finished reports land
     # Counts retries AFTER the initial attempt — maps 1:1 onto the OpenAI SDK's
     # `max_retries`, which already applies its own bounded exponential backoff with
     # jitter; there is no separate backoff knob here.

@@ -35,7 +35,7 @@
 | docs/plans/ | Implementation plans from `/devlead` |
 | docs/architecture.md | System architecture, principles, invariants |
 | docs/backlog.md | Deferred work and predicted issues |
-| LATER-PROBLEMS.md | Known defects accepted into a merge rather than fixed (repo root) |
+| LATER-PROBLEMS.md | Known defects accepted into a merge rather than fixed, with why and what fixing takes (repo root) |
 | docs/decisions.md | Decision log |
 | docs/guides/setup.md | Install, env vars, prerequisites |
 
@@ -43,12 +43,13 @@
 
 | Resource | Location | Purpose |
 |---|---|---|
-| Config models | @harness/config.py | TOML-backed `HarnessConfig` and settings, secrets by env var; `run_workspace_dir` — the per-run workspace root |
+| Config models | @harness/config.py | TOML-backed `HarnessConfig` and settings, secrets by env var |
 | Model clients | @harness/models.py | `build_chat_model` / `preflight` — role → chat client, fail-fast and bounded retry |
 | Lead agent | @harness/agent.py | `build_agent` — the deepagents lead, its backend, middleware and interrupts |
 | Source registry | @harness/sources.py | Per-run registry assigning `[Sn]` citation IDs to fetched pages |
-| Claim verification | @harness/verify.py | `extract_claims` / `verify_claims` — per-claim check against its own captured source |
-| Report assembly | @harness/report.py | `RunOutcome` + `write_report` — marker placement, citation resolution, disclosure sections |
+| Paragraph unit | @harness/paragraphs.py | `Paragraph` / `split_paragraphs` / `strip_markers` — the one definition of a paragraph, shared by verification and rendering (D1) |
+| Claim verification | @harness/verify.py | `verify_paragraphs` — one pooled model call per paragraph, judging it against all its cited sources together |
+| Report assembly | @harness/report.py | `RunOutcome` + `write_report` — per-paragraph `Sources:`/`Verdict:` rendering, disclosure sections |
 | Prompt loader | @harness/prompts.py | Loads/renders `harness/prompts/*.md` `$variable` templates |
 | Tier contracts | @harness/prompts/subagent.md, @harness/prompts/reader.md | Frozen researcher and reader delegation contracts — unwired |
 | Tool registry | @harness/tools/ | `build_tools` and the per-tool `build_<name>_tool` factories |
