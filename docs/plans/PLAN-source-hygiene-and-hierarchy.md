@@ -287,3 +287,9 @@ Append-only, empty at plan creation. -->
 - Behavior-identical reorder available: hoist the arxiv hostname rule above the single
   netloc construction in `normalize_url` to drop a duplicated netloc line. (3F simplify,
   deferred to avoid churning a reviewed diff.)
+
+### 2026-08-15 — Phase 1 Step 2 (deferred)
+- The `result is None` → error-`FetchedPage` block is duplicated between the Playwright and
+  PDF loops in @harness/tools/fetch.py (and the result→classify→page build nearly so); a
+  small `_page_of(url, result, ...)` helper would collapse both. (3F simplify, deferred —
+  loop-body restructure of a just-reviewed diff.)

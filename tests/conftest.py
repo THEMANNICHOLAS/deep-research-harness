@@ -58,15 +58,39 @@ class _FakeResult:
         self.markdown = markdown
 
 
-def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
-    """Build a fake AsyncWebCrawler class recording construction and `arun_many` calls."""
+class _FakePDFCrawlerStrategy:
+    """Stand-in for crawl4ai's `PDFCrawlerStrategy` — the PDF-seam construction marker."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+class _FakePDFContentScrapingStrategy:
+    """Stand-in for crawl4ai's `PDFContentScrapingStrategy`."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+def _make_fake_crawler_class(
+    results: list[_FakeResult], pdf_results: list[_FakeResult] | None = None
+) -> type:
+    """Build a fake AsyncWebCrawler class recording construction and `arun_many` calls.
+
+    One fake class serves both the Playwright batch and the PDF batch — `_fetch` gets both
+    from the same `_crawler_class()` seam, distinguished only by the `crawler_strategy` kwarg
+    passed at construction. `pdf_results` (defaulting to `results`, so existing single-arg
+    callers are unaffected) lets a test give the PDF batch its own canned results distinct
+    from the Playwright batch's.
+    """
 
     class _FakeCrawler:
         constructed_with: list[object] = []
         calls: list[SimpleNamespace] = []
 
-        def __init__(self, config: object = None) -> None:
+        def __init__(self, config: object = None, crawler_strategy: object = None) -> None:
             _FakeCrawler.constructed_with.append(config)
+            self._is_pdf = crawler_strategy is not None
 
         async def __aenter__(self) -> "_FakeCrawler":
             return self
@@ -78,8 +102,12 @@ def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
             self, urls: list[str], config: object = None, dispatcher: object = None
         ) -> list[_FakeResult]:
             _FakeCrawler.calls.append(
-                SimpleNamespace(urls=urls, config=config, dispatcher=dispatcher)
+                SimpleNamespace(
+                    urls=urls, config=config, dispatcher=dispatcher, is_pdf=self._is_pdf
+                )
             )
+            if self._is_pdf:
+                return pdf_results if pdf_results is not None else results
             return results
 
     return _FakeCrawler
@@ -87,18 +115,23 @@ def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
 
 @pytest.fixture
 def install_crawler(monkeypatch):
-    """Patch `harness.tools.fetch._crawler_class` to return a fake serving canned results.
+    """Patch `harness.tools.fetch._crawler_class`/`_pdf_crawler_parts` with fakes.
 
     `_crawler_class` (not a module-level `AsyncWebCrawler` name) because fetch.py imports
     crawl4ai lazily inside `_fetch` — the function is the deliberate patch seam. Patches
     fetch.py's namespace regardless of caller: `fallback.py` reuses fetch.py's `_fetch`,
     and that is where the crawler is actually constructed, so both fetch and fallback
-    tests share this one fixture.
+    tests share this one fixture. `_pdf_crawler_parts` is the parallel seam for the PDF
+    strategy classes fetch.py's PDF batch constructs.
     """
 
-    def _install(results: list[_FakeResult]) -> type:
-        fake_cls = _make_fake_crawler_class(results)
+    def _install(results: list[_FakeResult], pdf_results: list[_FakeResult] | None = None) -> type:
+        fake_cls = _make_fake_crawler_class(results, pdf_results)
         monkeypatch.setattr("harness.tools.fetch._crawler_class", lambda: fake_cls)
+        monkeypatch.setattr(
+            "harness.tools.fetch._pdf_crawler_parts",
+            lambda: (_FakePDFCrawlerStrategy, _FakePDFContentScrapingStrategy),
+        )
         return fake_cls
 
     return _install

@@ -13,7 +13,7 @@ See the parent plan for Intent (R1–R4), Codebase Map, and Design Decisions D1�
 
 ## Progress
 - [x] Step 1: Canonical-URL dedup
-- [ ] Step 2: PDF fetch path
+- [x] Step 2: PDF fetch path
 - [ ] Step 3: Report structure enforcement
 - [ ] Step 4: Verifier role
 - [ ] Phase verification
@@ -90,11 +90,11 @@ not config — hosts are added by editing code when a real dup bites (D1 consequ
   `per_page_char_cap` semantics; a PDF-specific config section; touching `sources.py`.
 
 **Tests (write first, confirm red):**
-- [ ] A PDF URL routes to the PDF strategy (not Playwright) whether detected by extension or
+- [x] A PDF URL routes to the PDF strategy (not Playwright) whether detected by extension or
   content-type, and its extracted text lands in a fetched-shaped capture.
-- [ ] Empty extraction and extraction exceptions each produce a `FETCH FAILED` stub —
+- [x] Empty extraction and extraction exceptions each produce a `FETCH FAILED` stub —
   never a fetched capture with junk, never a silent `non_html`.
-- [ ] Non-PDF URLs are untouched by the new branch (existing tests stay green).
+- [x] Non-PDF URLs are untouched by the new branch (existing tests stay green).
 
 **Details:**
 Red→green. Detection order: URL extension first (cheap, pre-fetch routing), content-type as
@@ -103,7 +103,7 @@ the post-fetch check for extensionless PDF URLs. Keep the PDF crawler constructi
 crawler. Char cap applies to extracted PDF text exactly as to markdown.
 
 **Acceptance criteria:**
-- [ ] `uv lock` records exactly one new top-level dependency (pypdf), pinned `==`.
+- [x] `uv lock` records exactly one new top-level dependency (pypdf), pinned `==` (6.16.1).
 
 ### Step 3: Report structure enforcement
 **Risk:** none
@@ -215,3 +215,17 @@ never add a section below it. -->
   re-encode asymmetry; netloc-construction reorder).
 - Watch-next: Step 2 (PDF fetch path) adds pinned `pypdf` — pin the exact current version
   and confirm `uv lock` records exactly one new top-level dep.
+
+### 2026-08-15 — Step 2: PDF fetch path
+- Done: `pypdf==6.16.1` added; `_fetch` partitions batches by `.pdf` extension, new lazy
+  `_pdf_crawler_parts()` seam, new `"pdf"` FetchOutcome as a one-shot content-type reroute
+  signal (PDF-batch results classify with `"text/html"`, so no loop); empty extraction is
+  force-failed into the `FETCH FAILED` stub. 6 new tests + repointed `non_html` rows.
+- Learned: crawl4ai fixes crawler strategy at construction and scraping strategy per run
+  config — mixed batches need two `arun_many` calls, which is why the partition exists.
+  `PDFContentScrapingStrategy()` raises ImportError at CONSTRUCTION without pypdf.
+  `fetch_raw` (fallback.py) reuses `_fetch`, so PDFs work there with no extra code.
+- Drift: none. One 3F simplify deferred to central `## Discoveries` (duplicated
+  result-is-None block between the two loops).
+- Watch-next: Step 3 (report structure) — heading demotion must skip fenced code blocks;
+  mirror `harness/paragraphs.py` line-level style.

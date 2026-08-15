@@ -12,6 +12,7 @@ overlapped with the model's first research turn.
 import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,7 +28,7 @@ from harness.sources import (
     sources_dir,
 )
 
-FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
+FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error", "pdf"]
 
 _BLOCKED_STATUSES = frozenset({403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
@@ -46,6 +47,32 @@ def _crawler_class() -> Any:
     from crawl4ai import AsyncWebCrawler  # type: ignore[import-untyped]
 
     return AsyncWebCrawler
+
+
+def _pdf_crawler_parts() -> tuple[Any, Any]:
+    """The `(PDFCrawlerStrategy, PDFContentScrapingStrategy)` pair the PDF batch constructs.
+
+    A function, mirroring `_crawler_class`'s shape, so both stay unimported (and pypdf's
+    presence unchecked) until a PDF fetch actually happens — and so tests can patch this one
+    seam instead of the classes themselves.
+    """
+    from crawl4ai import PDFContentScrapingStrategy
+    from crawl4ai.processors.pdf import PDFCrawlerStrategy  # type: ignore[import-untyped]
+
+    return PDFCrawlerStrategy, PDFContentScrapingStrategy
+
+
+def _looks_like_pdf_url(url: str) -> bool:
+    """Whether `url`'s path (lowercased, query/fragment ignored) ends with `.pdf`.
+
+    Cheap, pre-fetch routing for the common case; an extensionless PDF URL still gets caught
+    post-fetch by `classify`'s content-type check and rerouted once.
+    """
+    try:
+        path = urlsplit(url).path
+    except ValueError:
+        return False
+    return path.lower().endswith(".pdf")
 
 
 # Despite the name, crawl4ai 0.9.2 re-fetches nothing — this caps how many times a domain's
@@ -72,6 +99,11 @@ def classify(
         return "blocked"
     if error_message and "timeout" in error_message.lower():
         return "timeout"
+    if content_type and "application/pdf" in content_type.lower():
+        # The internal reroute signal: an extensionless PDF URL, discovered only after the
+        # Playwright fetch. `_fetch` never writes this to a capture — it reroutes the URL
+        # through the PDF batch once, whose own classification is the final outcome.
+        return "pdf"
     if content_type and "html" not in content_type.lower():
         return "non_html"
     if not error_message and not markdown.strip():
@@ -263,6 +295,13 @@ async def _fetch(
     if not urls:
         return "", []
 
+    # One crawler cannot mix strategies in one `arun_many`: partition the batch by extension
+    # first (cheap, pre-fetch routing); an extensionless PDF is only discoverable after the
+    # Playwright fetch, via its content-type, and is rerouted below.
+    pdf_urls = [url for url in urls if _looks_like_pdf_url(url)]
+    pdf_url_set = set(pdf_urls)
+    playwright_urls = [url for url in urls if url not in pdf_url_set]
+
     run_config = CrawlerRunConfig(
         page_timeout=config.fetch.page_timeout_ms,
         excluded_tags=_EXCLUDED_TAGS,
@@ -277,18 +316,21 @@ async def _fetch(
         rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
     )
 
-    # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
-    async with _crawler_class()(config=BrowserConfig(verbose=False)) as crawler:
-        raw_results = await crawler.arun_many(urls, config=run_config, dispatcher=dispatcher)
-        results = list(raw_results)
+    pages_by_url: dict[str, FetchedPage] = {}
+    reroute_urls: list[str] = []
 
-    pages: list[FetchedPage] = []
-    for url, result in _pair(urls, results):
-        if result is None:
-            source_id = registry.add(url)
-            pages.append(
-                FetchedPage(
-                    source_id=source_id,
+    if playwright_urls:
+        # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
+        async with _crawler_class()(config=BrowserConfig(verbose=False)) as crawler:
+            raw_results = await crawler.arun_many(
+                playwright_urls, config=run_config, dispatcher=dispatcher
+            )
+            results = list(raw_results)
+
+        for url, result in _pair(playwright_urls, results):
+            if result is None:
+                pages_by_url[url] = FetchedPage(
+                    source_id=registry.add(url),
                     url=url,
                     outcome="error",
                     status_code=None,
@@ -296,17 +338,21 @@ async def _fetch(
                     markdown="",
                     error="no result returned for this URL",
                 )
-            )
-            continue
+                continue
 
-        markdown = _markdown_of(result)
-        title = _title_of(result)
-        status_code = getattr(result, "status_code", None)
-        error_message = getattr(result, "error_message", None)
-        outcome = classify(status_code, error_message, _content_type(result), markdown)
-        source_id = registry.add(url, title=title)
-        pages.append(
-            FetchedPage(
+            markdown = _markdown_of(result)
+            title = _title_of(result)
+            status_code = getattr(result, "status_code", None)
+            error_message = getattr(result, "error_message", None)
+            outcome = classify(status_code, error_message, _content_type(result), markdown)
+            if outcome == "pdf":
+                # An extensionless PDF URL, discovered only after the fetch: reroute it
+                # through the PDF batch once rather than reporting the internal signal.
+                reroute_urls.append(url)
+                continue
+
+            source_id = registry.add(url, title=title)
+            pages_by_url[url] = FetchedPage(
                 source_id=source_id,
                 url=url,
                 outcome=outcome,
@@ -315,7 +361,62 @@ async def _fetch(
                 markdown=markdown,
                 error=error_message,
             )
+
+    pdf_batch_urls = pdf_urls + reroute_urls
+    if pdf_batch_urls:
+        pdf_crawler_strategy_cls, pdf_scraping_strategy_cls = _pdf_crawler_parts()
+        pdf_run_config = CrawlerRunConfig(
+            page_timeout=config.fetch.page_timeout_ms,
+            scraping_strategy=pdf_scraping_strategy_cls(),
+            cache_mode=CacheMode.BYPASS,
+            stream=False,
+            verbose=False,
         )
+        async with _crawler_class()(
+            crawler_strategy=pdf_crawler_strategy_cls(), config=BrowserConfig(verbose=False)
+        ) as pdf_crawler:
+            raw_pdf_results = await pdf_crawler.arun_many(
+                pdf_batch_urls, config=pdf_run_config, dispatcher=dispatcher
+            )
+            pdf_results = list(raw_pdf_results)
+
+        for url, result in _pair(pdf_batch_urls, pdf_results):
+            if result is None:
+                pages_by_url[url] = FetchedPage(
+                    source_id=registry.add(url),
+                    url=url,
+                    outcome="error",
+                    status_code=None,
+                    title=None,
+                    markdown="",
+                    error="no result returned for this URL",
+                )
+                continue
+
+            markdown = _markdown_of(result)
+            title = _title_of(result)
+            status_code = getattr(result, "status_code", None)
+            error_message = getattr(result, "error_message", None)
+            if not error_message and not markdown.strip():
+                # Empty extraction must never register as `non_html` (R2): it is a failure of
+                # this specific fetch, not evidence the page was never HTML in the first place.
+                error_message = "empty PDF extraction"
+            # An HTML-equivalent content type: `PDFCrawlerStrategy` hardcodes `application/pdf`
+            # response headers on success, and reclassifying with that would re-trigger the
+            # "pdf" reroute signal forever.
+            outcome = classify(status_code, error_message, "text/html", markdown)
+            source_id = registry.add(url, title=title)
+            pages_by_url[url] = FetchedPage(
+                source_id=source_id,
+                url=url,
+                outcome=outcome,
+                status_code=status_code,
+                title=title,
+                markdown=markdown,
+                error=error_message,
+            )
+
+    pages = [pages_by_url[url] for url in urls]
 
     # Recorded here, in the shared path, so `fetch_pages` and `fetch_raw` disclose alike.
     # The model already sees each failure in its rendered block; this is the operator's copy.

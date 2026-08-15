@@ -81,7 +81,7 @@ async def test_mixed_batch_returns_one_entry_per_url_with_successes_intact(
         (429, None, "text/html", "content", "blocked"),
         (503, None, "text/html", "content", "blocked"),
         (200, "Timeout after 15000ms", "text/html", "", "timeout"),
-        (200, None, "application/pdf", "", "non_html"),
+        (200, None, "application/pdf", "", "pdf"),
         (200, None, "text/html", "", "non_html"),
         (500, "internal server error", "text/html", "", "error"),
         (200, None, "text/html", "# Title\ncontent", "fetched"),
@@ -403,25 +403,35 @@ async def test_title_from_result_metadata_reaches_the_page_and_the_registry(
     assert source.title == "An Article Title"
 
 
-async def test_content_type_header_on_the_result_drives_non_html_classification(
+async def test_content_type_header_on_the_result_reroutes_through_the_pdf_batch(
     install_crawler, make_config
 ):
+    # R2: an extensionless PDF URL used to degrade silently to `non_html`. Now the
+    # Playwright result's `application/pdf` header (exercised via `_content_type`'s
+    # case-insensitive lookup, which the `classify()` unit tests bypass with a plain string)
+    # reroutes it through the PDF batch instead, landing a real fetched capture.
     config = make_config()
     registry = SourceRegistry()
-    results = [
+    playwright_results = [
         _FakeResult(
             "https://pdf.test/doc",
             response_headers={"Content-Type": "application/pdf"},
             markdown=_FakeMarkdown(raw_markdown="%PDF junk", fit_markdown="%PDF junk"),
         )
     ]
-    install_crawler(results)
+    pdf_results = [
+        _FakeResult(
+            "https://pdf.test/doc",
+            markdown=_FakeMarkdown(raw_markdown="Extracted text", fit_markdown="Extracted text"),
+        )
+    ]
+    fake_cls = install_crawler(playwright_results, pdf_results=pdf_results)
 
     _, pages = await fetch._fetch(["https://pdf.test/doc"], config, registry, RunLog())
 
-    # Exercises `_content_type`'s case-insensitive header lookup through the real pipeline, which
-    # the `classify()` unit tests bypass with a plain string.
-    assert pages[0].outcome == "non_html"
+    assert [call.is_pdf for call in fake_cls.calls] == [False, True]
+    assert pages[0].outcome == "fetched"
+    assert pages[0].markdown == "Extracted text"
 
 
 async def test_input_url_with_no_result_reports_a_single_error_outcome(
@@ -678,7 +688,7 @@ async def test_source_file_text_is_untruncated_even_when_the_render_is_capped(
     [
         ("blocked", {"status_code": 403}),
         ("timeout", {"error_message": "Timeout after 15000ms", "status_code": 200}),
-        ("non_html", {"response_headers": {"Content-Type": "application/pdf"}}),
+        ("non_html", {"response_headers": {"Content-Type": "application/octet-stream"}}),
         ("error", {"status_code": 500, "error_message": "internal server error"}),
     ],
 )
@@ -902,6 +912,151 @@ async def test_a_successful_refetch_still_replaces_a_failure_stub(
     text = (sources_dir(config, registry) / f"{source_id}.md").read_text(encoding="utf-8")
     assert not fetch.is_failed_capture(text)
     assert "real body" in text
+
+
+async def test_pdf_extension_url_is_routed_to_the_pdf_crawler_and_lands_fetched(
+    install_crawler, make_config, tmp_path
+):
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    pdf_results = [
+        _FakeResult(
+            "https://docs.test/report.pdf",
+            markdown=_FakeMarkdown(
+                raw_markdown="Extracted PDF text", fit_markdown="Extracted PDF text"
+            ),
+        )
+    ]
+    fake_cls = install_crawler([], pdf_results=pdf_results)
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(
+        _tool_call(["https://docs.test/report.pdf"], "call-pdf-ext")
+    )
+
+    # The Playwright batch never ran: the fake recorded exactly one call, via the PDF seam.
+    assert len(fake_cls.calls) == 1
+    assert fake_cls.calls[0].is_pdf is True
+    assert fake_cls.calls[0].urls == ["https://docs.test/report.pdf"]
+
+    page = message.artifact[0]
+    assert page.outcome == "fetched"
+    assert page.markdown == "Extracted PDF text"
+    text = (sources_dir(config, registry) / f"{page.source_id}.md").read_text(encoding="utf-8")
+    assert "- Outcome: fetched" in text
+    assert "Extracted PDF text" in text
+
+
+async def test_empty_pdf_extraction_writes_a_stub_and_never_fetched_or_non_html(
+    install_crawler, make_config, tmp_path
+):
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    pdf_results = [
+        _FakeResult(
+            "https://docs.test/empty.pdf", markdown=_FakeMarkdown(raw_markdown="", fit_markdown="")
+        )
+    ]
+    install_crawler([], pdf_results=pdf_results)
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(
+        _tool_call(["https://docs.test/empty.pdf"], "call-empty-pdf")
+    )
+
+    page = message.artifact[0]
+    assert page.outcome not in ("fetched", "non_html")
+    text = (sources_dir(config, registry) / f"{page.source_id}.md").read_text(encoding="utf-8")
+    assert text.splitlines()[0] == f"FETCH FAILED: {page.outcome}"
+
+
+@pytest.mark.parametrize(
+    ("result_kwargs", "expected_outcome"),
+    [
+        ({"status_code": 500, "error_message": "internal server error"}, "error"),
+        ({"status_code": 403}, "blocked"),
+    ],
+)
+async def test_pdf_batch_failure_writes_a_stub_naming_its_outcome(
+    install_crawler, make_config, tmp_path, result_kwargs, expected_outcome
+):
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    pdf_results = [_FakeResult("https://docs.test/broken.pdf", markdown=None, **result_kwargs)]
+    install_crawler([], pdf_results=pdf_results)
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(
+        _tool_call(["https://docs.test/broken.pdf"], f"call-pdf-fail-{expected_outcome}")
+    )
+
+    page = message.artifact[0]
+    assert page.outcome == expected_outcome
+    text = (sources_dir(config, registry) / f"{page.source_id}.md").read_text(encoding="utf-8")
+    assert text.splitlines()[0] == f"FETCH FAILED: {expected_outcome}"
+
+
+async def test_a_mixed_html_and_pdf_batch_writes_both_captures_with_existing_shapes(
+    install_crawler, make_config, tmp_path
+):
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    html_results = [
+        _FakeResult(
+            "https://article.test/page",
+            markdown=_FakeMarkdown(raw_markdown="html body", fit_markdown="html body"),
+        )
+    ]
+    pdf_results = [
+        _FakeResult(
+            "https://docs.test/report.pdf",
+            markdown=_FakeMarkdown(raw_markdown="pdf body", fit_markdown="pdf body"),
+        )
+    ]
+    fake_cls = install_crawler(html_results, pdf_results=pdf_results)
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(
+        _tool_call(["https://article.test/page", "https://docs.test/report.pdf"], "call-mixed-pdf")
+    )
+
+    assert [call.is_pdf for call in fake_cls.calls] == [False, True]
+    assert fake_cls.calls[0].urls == ["https://article.test/page"]
+    assert fake_cls.calls[1].urls == ["https://docs.test/report.pdf"]
+
+    html_page, pdf_page = message.artifact
+    assert html_page.outcome == "fetched"
+    assert pdf_page.outcome == "fetched"
+    html_text = (sources_dir(config, registry) / f"{html_page.source_id}.md").read_text(
+        encoding="utf-8"
+    )
+    pdf_text = (sources_dir(config, registry) / f"{pdf_page.source_id}.md").read_text(
+        encoding="utf-8"
+    )
+    assert "html body" in html_text
+    assert "pdf body" in pdf_text
+
+
+async def test_char_cap_applies_to_extracted_pdf_text_same_as_markdown(
+    install_crawler, make_config
+):
+    cap = 50
+    config = make_config(per_page_char_cap=cap)
+    registry = SourceRegistry()
+    long_text = "z" * 500
+    pdf_results = [
+        _FakeResult(
+            "https://docs.test/long.pdf",
+            markdown=_FakeMarkdown(raw_markdown=long_text, fit_markdown=long_text),
+        )
+    ]
+    install_crawler([], pdf_results=pdf_results)
+
+    content, pages = await fetch._fetch(["https://docs.test/long.pdf"], config, registry, RunLog())
+
+    assert len(content) < len(long_text)
+    assert str(cap) in content
+    assert pages[0].markdown == long_text
 
 
 async def test_failed_fetch_outcomes_are_recorded_on_the_run_log(install_crawler, make_config):
