@@ -189,7 +189,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Full-screen TUI renderer
 - [x] Phase 2: Startup search preflight + cap raise
 - [x] Phase 3: Consecutive-search-failure abort
-- [ ] Phase 4: Report gating and abort semantics
+- [x] Phase 4: Report gating and abort semantics
 - [ ] Phase 5: Docs reconciliation
 - [ ] Final verification
 
@@ -369,11 +369,11 @@ wall-clock expiry; keep disclosed reports for round cap and post-answer wall-clo
 - No new outcome kinds beyond mapping Ctrl+C onto the existing hard-error path.
 
 **Tests (write first, confirm red):**
-- [ ] Outcome table: hard error → no file in the reports dir, exit 1; wall clock without
+- [x] Outcome table: hard error → no file in the reports dir, exit 1; wall clock without
       answer → no file, exit 1; wall clock with answer → file with disclosure, exit 0;
       round cap → file with disclosure, exit 0; clean finish → file, exit 0.
-- [ ] `KeyboardInterrupt` mid-stream → no file, exit 1.
-- [ ] The no-report paths still emit `RunFinished` so the summary shows the error.
+- [x] `KeyboardInterrupt` mid-stream → no file, exit 1.
+- [x] The no-report paths still emit `RunFinished` so the summary shows the error.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -382,7 +382,9 @@ wall-clock expiry; keep disclosed reports for round cap and post-answer wall-clo
 
 **Acceptance criteria:**
 - [ ] Live check: stop SearXNG mid-run — run aborts, normal terminal shows the error
-      summary, the reports dir gained no file.
+      summary, the reports dir gained no file. — NOT performed live (no endpoints in
+      the implement environment); the offline full-main() abort test covers the same
+      path. Verify at final verification.
 
 ### Phase 5: Docs reconciliation
 **Risk:** none
@@ -462,6 +464,17 @@ correction. Empty at plan creation. -->
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+### 2026-08-14 — Ctrl+C inside a model/tool call escapes as CancelledError (deferred)
+Phase 4's KeyboardInterrupt handling covers a Ctrl+C that raises in `main()`'s own
+`async for` loop, but a Ctrl+C landing INSIDE a langgraph node (model or tool call —
+arguably the likeliest moment) surfaces at `main()`'s boundary as
+`asyncio.CancelledError`, which neither `except Exception` nor `except
+KeyboardInterrupt` catches — a raw traceback would escape. The same window exists
+around `verify_paragraphs` (outside the guarded try). Handling `CancelledError` is a
+design decision not covered by this plan (it also cancels legitimate task
+cancellation), so DEFERRED to a follow-up decision rather than patched here.
+Disposition: defer (blanket-approval session; developer to confirm).
+
 ## Phase Handoff Log
 
 ### 2026-08-14 — Phase 1: Full-screen TUI renderer
@@ -503,6 +516,18 @@ Append-only, empty at plan creation. -->
   and no report — if the exception is swallowed by ToolNode, that is a Drift
   Reconciliation on D3, not a test to weaken. The phase's own full-main() acceptance
   criterion was deferred to Phase 4 per the plan's note.
+
+### 2026-08-14 — Phase 4: Report gating and abort semantics
+- Done: D2 gate around `write_report` (`should_write_report`; exit 1 on every
+  no-report outcome); `except KeyboardInterrupt` mapping to the hard-error path; full
+  outcome-table tests plus the deferred Phase 3 search-abort main() test.
+- Learned: D3 CONFIRMED empirically — deepagents/langgraph's default tool handling
+  re-raises non-ToolInvocationError exceptions, so `SearchUnavailableError` reaches
+  `main()`'s generic handler. Also: Ctrl+C inside a node surfaces as CancelledError
+  (see `## Discoveries`, deferred).
+- Drift: none.
+- Watch-next: Phase 5 is docs-only; the two live checks (Phase 1 TUI smoke, mid-run
+  container stop) remain for final verification.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so

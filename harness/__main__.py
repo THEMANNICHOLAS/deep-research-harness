@@ -22,6 +22,7 @@ import sys
 import threading
 from datetime import datetime
 from functools import reduce
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -335,9 +336,14 @@ async def main(argv: list[str] | None = None) -> int:
             cut_short_detail = f"{type(exc).__name__}: {exc}"
     except GraphRecursionError:  # must precede `Exception` — it subclasses RuntimeError
         cut_short = "round_cap"
-    except Exception as exc:  # noqa: BLE001 — never `BaseException`; Ctrl-C must still work
+    except Exception as exc:  # noqa: BLE001 — never `BaseException`; KeyboardInterrupt has its own clause below
         cut_short = "error"
         cut_short_detail = f"{type(exc).__name__}: {exc}"
+    except KeyboardInterrupt:
+        # D2: a user abort maps onto the existing hard-error path (no new outcome kind) — its
+        # own clause because `KeyboardInterrupt` is a `BaseException`, not caught by `Exception`.
+        cut_short = "error"
+        cut_short_detail = "user abort (Ctrl+C)"
 
     messages: list[BaseMessage] = final_state["messages"] if final_state else []
     usage = _sum_usage(messages)
@@ -382,13 +388,27 @@ async def main(argv: list[str] | None = None) -> int:
         paragraphs=paragraphs,
         verification=verification,
     )
+    # D2's gate: a hard error, a user abort (mapped onto `cut_short == "error"` above), and a
+    # wall-clock expiry with no final answer all write NO report — stderr error, exit 1. Round
+    # cap and any wall-clock expiry that already has an answer keep the disclosed report.
+    has_answer = bool(answer.strip())
+    should_write_report = (
+        cut_short is None or cut_short == "round_cap" or (cut_short == "wall_clock" and has_answer)
+    )
+
     tracker.advance("writing")
     # `finally`, because the live region owns terminal state: `Live.start` hides the cursor and
     # rich registers no atexit restore, so a `write_report` OSError (unwritable or full reports
     # dir) escaping here would leave the developer's shell with no cursor after the traceback.
+    path: Path | None = None
     try:
-        path = write_report(outcome, config)
-        if cut_short == "error":
+        if should_write_report:
+            path = write_report(outcome, config)
+        elif cut_short == "wall_clock":
+            # To stderr: the wall clock fired before a final answer existed (risk #2's blank/
+            # whitespace-answer case lands here too, via `has_answer`).
+            print("error: the wall clock expired before a final answer existed", file=sys.stderr)
+        else:
             # To stderr and before the path, so the path stays the LAST line of stdout.
             print(f"error: {cut_short_detail}", file=sys.stderr)
         tracker.finish()
@@ -404,8 +424,9 @@ async def main(argv: list[str] | None = None) -> int:
         )
     finally:
         renderer.close()
-    print(path)
-    return 1 if cut_short == "error" else 0
+    if path is not None:
+        print(path)
+    return 0 if should_write_report else 1
 
 
 if __name__ == "__main__":

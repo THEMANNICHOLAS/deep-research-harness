@@ -9,6 +9,7 @@ import asyncio
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -18,11 +19,10 @@ from langgraph.types import Interrupt
 
 import harness.__main__ as main_module
 from harness.agent import build_agent
-from harness.config import AgentSettings, run_workspace_dir
+from harness.config import AgentSettings, HarnessConfig, run_workspace_dir
 from harness.display import PlainRenderer
 from harness.report import (
     _CUT_SHORT_HEADING,
-    _ERROR_TEXT,
     _NO_ANSWER_TEXT,
     _ROUND_CAP_TEXT,
     _WALL_CLOCK_TEXT,
@@ -446,6 +446,20 @@ async def test_main_exits_nonzero_and_writes_no_report_when_searxng_is_unreachab
 # --- Phase 5: round cap, wall clock, and cut-short reporting ---------------------------
 
 
+async def _run_main(
+    argv: list[str], config: HarnessConfig, capsys: pytest.CaptureFixture[str]
+) -> tuple[int, list[Path], str, str]:
+    """Run `main()`; return (exit code, reports-dir listing, stdout, stderr).
+
+    Shared by the D2 gating tests below, each of which cares about the same four facts:
+    whether a report landed on disk, and what reached each stream.
+    """
+    exit_code = await main_module.main(argv)
+    captured = capsys.readouterr()
+    files = list(config.agent.reports_dir.iterdir()) if config.agent.reports_dir.exists() else []
+    return exit_code, files, captured.out, captured.err
+
+
 def _install_slow_search(monkeypatch, delay_seconds: float) -> None:
     """Stall `search_web` so a bounds test can expire mid-call (ordering caveat: see helper)."""
 
@@ -710,13 +724,14 @@ async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
     assert "Updated todo list" not in body
 
 
-async def test_main_cuts_the_run_short_when_the_wall_clock_expires(
+async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """A `final` response is scripted AFTER the slow search, reachable only if nothing cuts the run
-    short, so a missing clock would let this run complete normally rather than raising once the
-    script exhausts. The elapsed-time assertion pins the timeout itself: without it, a broad
-    "catch anything, call it wall_clock" shortcut that ran the full sleep would still pass.
+    """D2: the wall clock expires while the only model turn is a bare tool-call proposal (no
+    prose), so `_final_answer` sees nothing — no report, exit 1, stderr names the wall clock.
+
+    The elapsed-time assertion pins the timeout itself: without it, a broad "catch anything,
+    call it wall_clock" shortcut that ran the full sleep would still pass.
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
@@ -730,28 +745,63 @@ async def test_main_cuts_the_run_short_when_the_wall_clock_expires(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
-    final = AIMessage(
-        content="Final answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-    )
-    model = scripted_model([ping, search_call, final])
+    model = scripted_model([ping, search_call])
     patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=3)
 
     started = time.monotonic()
-    exit_code = await main_module.main(["a question that starts researching"])
+    exit_code, files, out, err = await _run_main(
+        ["a question that starts researching"], config, capsys
+    )
     elapsed = time.monotonic() - started
 
-    out, lines = drain_stdout(capsys)
+    assert exit_code == 1
+    assert files == [], f"a report was written despite no final answer: {files}"
+    assert any("wall clock" in line for line in err.splitlines()), err
+    # Post-run summary still reaches the normal terminal (Phase 1's post-run summary path).
+    assert "summary:" in out
+    assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
+
+
+async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """D2's other wall-clock branch: the same expiry, but the interrupted turn already carried
+    prose alongside its tool call, so a final answer exists — the report is still written,
+    disclosing the cut-short, and the exit code stays 0.
+    """
+    agent = AgentSettings(
+        wall_clock_seconds=1,
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+
+    ping = AIMessage(content="pong")
+    partial_then_search = AIMessage(
+        content="Partial finding: Acme quoted $4.20/unit.",
+        tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
+    )
+    model = scripted_model([ping, partial_then_search])
+    patch_run(monkeypatch, config, model)
+    # After the model is built — see `_install_slow_search`'s docstring.
+    _install_slow_search(monkeypatch, delay_seconds=3)
+
+    started = time.monotonic()
+    exit_code, files, out, err = await _run_main(
+        ["a question that starts researching"], config, capsys
+    )
+    elapsed = time.monotonic() - started
+
     assert exit_code == 0
-    assert lines, "main() printed no report path"
-    report_path = Path(lines[-1].strip())
-    body = report_path.read_text(encoding="utf-8")
+    assert len(files) == 1
+    body = files[0].read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING in body
     # Names the WALL CLOCK specifically — see the round-cap test for why the heading is not enough.
     assert _WALL_CLOCK_TEXT in body
     assert _ROUND_CAP_TEXT not in body
+    assert "Partial finding: Acme quoted $4.20/unit." in body
     # Well under the full 3s sleep: cut off near the 1s bound rather than completed and mislabeled.
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
 
@@ -798,14 +848,16 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
     assert _CUT_SHORT_HEADING not in body
 
 
-async def test_a_mid_run_clarification_is_bounded_by_the_wall_clock(
+async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clock(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
     """Pairs with the pre-research test above: once research has begun the clock runs and is not
     paused for an interrupt, so an unanswered mid-run ask still ends the run at the bound.
 
-    A `final` response is scripted for AFTER the resume, reachable only if the wait is never cut
-    short, and the elapsed-time assertion pins the timeout to the wait itself.
+    D2: nothing in this scripted run ever produces prose (`search_call` and `ask` are both
+    content-less tool-call proposals), so this is the wall-clock NO-answer case — no report,
+    exit 1 — not the disclosed-report case this test asserted before Phase 4's gate existed.
+    The elapsed-time assertion pins the timeout to the wait itself.
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
@@ -825,11 +877,7 @@ async def test_a_mid_run_clarification_is_bounded_by_the_wall_clock(
             {"name": "ask_user", "args": {"question": "Narrower scope?"}, "id": "call_ask"}
         ],
     )
-    final = AIMessage(
-        content="Final answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-    )
-    model = scripted_model([ping, search_call, ask, final])
+    model = scripted_model([ping, search_call, ask])
     patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=0.1)
@@ -841,35 +889,29 @@ async def test_a_mid_run_clarification_is_bounded_by_the_wall_clock(
     monkeypatch.setattr(main_module, "_read_answer", _slow_answer)
 
     started = time.monotonic()
-    exit_code = await main_module.main(["Research widgets"])
+    exit_code, files, out, err = await _run_main(["Research widgets"], config, capsys)
     elapsed = time.monotonic() - started
 
-    out, lines = drain_stdout(capsys)
-    assert exit_code == 0
-    assert lines, "main() printed no report path"
-    report_path = Path(lines[-1].strip())
-    body = report_path.read_text(encoding="utf-8")
-    assert _CUT_SHORT_HEADING in body
-    assert _WALL_CLOCK_TEXT in body
+    assert exit_code == 1
+    assert files == [], f"a report was written despite no final answer: {files}"
+    assert any("wall clock" in line for line in err.splitlines()), err
     # Well under the full 3s wait: proves the wait was actually cut off near the 1s
     # remaining on the clock, not merely completed and then mislabeled.
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
 
 
-async def test_main_writes_a_cut_short_report_when_the_run_dies_mid_flight(
+async def test_main_writes_no_report_when_the_run_dies_mid_flight(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """The script runs out right after one real round (`ScriptedChatModel` then raises
-    `IndexError`), standing in for a genuine mid-run failure: `main` must turn ANY such exception
-    into a written report and exit 1, never let a traceback escape.
+    """D2: a hard error (the script runs out right after one real round, so `ScriptedChatModel`
+    raises `IndexError`, standing in for a genuine mid-run failure) writes NO report — only the
+    stderr error and exit 1. `main` must still never let a traceback escape.
     """
     config = make_config(
         agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
     )
     ping = AIMessage(content="pong")
     plan_call = AIMessage(
-        # Prose AND a tool call: the final state ends in the write_todos ToolMessage, so
-        # `_final_answer` has to walk BACK past tool traffic to find what the model said.
         content="Partial finding: Acme quoted $4.20/unit.",
         tool_calls=[
             {
@@ -883,28 +925,104 @@ async def test_main_writes_a_cut_short_report_when_the_run_dies_mid_flight(
     model = scripted_model([ping, plan_call])  # no third response — the run dies here
     patch_run(monkeypatch, config, model)
 
-    exit_code = await main_module.main(["question that never gets an answer"])
+    exit_code, files, out, err = await _run_main(
+        ["question that never gets an answer"], config, capsys
+    )
 
-    out, err = capsys.readouterr()
     assert exit_code == 1
     assert any(line.startswith("error:") for line in err.splitlines()), err
     assert "Traceback" not in err
-    lines = [line for line in out.splitlines() if line.strip()]  # `out` already drained above
-    assert lines, "no report path was printed even though the run died mid-flight"
-    report_path = Path(lines[-1].strip())
-    assert report_path.exists()
-    body = report_path.read_text(encoding="utf-8")
-    assert _CUT_SHORT_HEADING in body
-    assert _ERROR_TEXT in body
-    assert "IndexError" in body
-    # Pins the `_final_answer` WIRING, not just the helper: what the model said survives and the
-    # trailing tool output does not become the answer.
-    assert "Partial finding: Acme quoted $4.20/unit." in body
-    assert "Updated todo list" not in body
-    # A died run's token cost still has to be recorded (R7). This and the answer above both come
-    # from state captured DURING the stream — a cut-short run leaves the loop by exception, so
-    # anything gathered after it is never gathered at all.
-    assert "- Total tokens: 48" in body
+    assert "IndexError" in err
+    assert files == [], f"a report was written for a hard error: {files}"
+    # Post-run summary still reaches the normal terminal (Phase 1's post-run summary path).
+    assert "summary:" in out
+
+
+async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """D2: Ctrl+C maps onto the existing hard-error path — no report, exit 1, and the renderer
+    still closes cleanly (no exception escapes `main()`).
+
+    Raises the interrupt directly from `main()`'s own `async for` over `agent.astream(...)`
+    (a monkeypatched stream, per the plan's alternative to scripting a model side-effect) rather
+    than from inside a model/tool call: a KeyboardInterrupt raised THERE was observed to surface
+    at this boundary as `asyncio.CancelledError` instead — see the Phase 4 handoff note — which
+    is neither `Exception` nor `KeyboardInterrupt` and escapes `main()` uncaught. That gap is out
+    of THIS test's scope (it pins `main()`'s own except clause, not langgraph's internals).
+    """
+    config = make_config(
+        agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
+    )
+    ping = AIMessage(content="pong")
+    model = scripted_model([ping])
+    patch_run(monkeypatch, config, model)
+
+    real_build_agent = main_module.build_agent
+
+    def _build_agent_that_interrupts(config: HarnessConfig, registry: Any) -> Any:
+        real_agent = real_build_agent(config, registry)
+
+        class _InterruptingAgent:
+            def astream(self, *args: Any, **kwargs: Any) -> Any:
+                async def _gen() -> Any:
+                    async for mode, chunk in real_agent.astream(*args, **kwargs):
+                        yield mode, chunk
+                        raise KeyboardInterrupt("test abort")
+
+                return _gen()
+
+        return _InterruptingAgent()
+
+    monkeypatch.setattr(main_module, "build_agent", _build_agent_that_interrupts)
+
+    exit_code, files, out, err = await _run_main(["a question"], config, capsys)
+
+    assert exit_code == 1
+    assert files == [], f"a report was written for a Ctrl+C abort: {files}"
+    assert any(line.startswith("error:") for line in err.splitlines()), err
+    assert "ctrl" in err.lower() or "abort" in err.lower()
+    assert "Traceback" not in err
+    assert "summary:" in out
+
+
+async def test_main_aborts_and_writes_no_report_when_searxng_fails_repeatedly_mid_run(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """Phase 3's deferred full-`main()` criterion (D3): three consecutive connection failures
+    during `search_web` trip `SearchUnavailableError`, which the loop's generic exception
+    handler treats like any other hard error — no report, exit 1.
+    """
+    config = make_config(
+        agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
+    )
+    ping = AIMessage(content="pong")
+
+    def _search_call(call_id: str) -> AIMessage:
+        return AIMessage(
+            content="",
+            tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": call_id}],
+        )
+
+    # make_config's default max_consecutive_failures is 3 — three scripted search rounds are
+    # exactly enough for the third tool execution to trip the abort before a fourth model call.
+    model = scripted_model([ping, _search_call("c1"), _search_call("c2"), _search_call("c3")])
+    patch_run(monkeypatch, config, model)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    install_search_transport(monkeypatch, handler)  # after scripted_model — see its docstring
+
+    exit_code, files, out, err = await _run_main(
+        ["a question that starts researching"], config, capsys
+    )
+
+    assert exit_code == 1
+    assert files == [], f"a report was written despite a SearXNG abort: {files}"
+    assert any(line.startswith("error:") for line in err.splitlines()), err
+    assert "SearXNG" in err
+    assert "summary:" in out
 
 
 async def test_a_run_inside_both_bounds_reports_no_cut_short(
