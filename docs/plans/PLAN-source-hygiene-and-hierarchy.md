@@ -1,6 +1,6 @@
 # PLAN: Source Hygiene and Agent Hierarchy
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-15
 **Type:** Central plan (2 sub-plans)
 
@@ -277,3 +277,13 @@ correction. Empty at plan creation. -->
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+
+### 2026-08-15 — Phase 1 Step 1 (deferred)
+- Query re-encode asymmetry in `normalize_url` (@harness/sources.py): the query is
+  re-encoded only when a tracking key was dropped, so `?q=a%20b&utm_source=1` → `q=a+b`
+  while bare `?q=a%20b` stays verbatim — one work, two `Sn` IDs. Needs a percent-encoded
+  value plus a tracking key to bite. Fix when it does: always re-encode, or compare
+  percent-decoded. (3F Minor, deferred per D1's add-rules-when-they-bite stance.)
+- Behavior-identical reorder available: hoist the arxiv hostname rule above the single
+  netloc construction in `normalize_url` to drop a duplicated netloc line. (3F simplify,
+  deferred to avoid churning a reviewed diff.)

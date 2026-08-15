@@ -1,6 +1,6 @@
 # PLAN: Source Hygiene and Agent Hierarchy — Phase 1: Source hygiene & independent verification
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-15
 **Parent:** `PLAN-source-hygiene-and-hierarchy.md`
 **Phase:** 1 of 2
@@ -12,7 +12,7 @@ and meta sections breaking report structure, and the writer model grading its ow
 See the parent plan for Intent (R1–R4), Codebase Map, and Design Decisions D1–D4, D7.
 
 ## Progress
-- [ ] Step 1: Canonical-URL dedup
+- [x] Step 1: Canonical-URL dedup
 - [ ] Step 2: PDF fetch path
 - [ ] Step 3: Report structure enforcement
 - [ ] Step 4: Verifier role
@@ -45,18 +45,19 @@ See the parent plan for Intent (R1–R4), Codebase Map, and Design Decisions D1�
   rewriting URLs at render time (the registered URL is what the report shows).
 
 **Tests (write first, confirm red):**
-- [ ] arxiv abs/html/pdf/version variants of one work all return the same canonical form and
+- [x] arxiv abs/html/pdf/version variants of one work all return the same canonical form and
   therefore one `Sn` ID (the observed S21/S25 and S23/S26 dup pairs are the fixtures).
-- [ ] Tracking params are stripped; meaningful query strings are preserved.
-- [ ] Different arxiv works, and same-path URLs on other hosts, do NOT collapse.
+- [x] Tracking params are stripped; meaningful query strings are preserved.
+- [x] Different arxiv works, and same-path URLs on other hosts, do NOT collapse.
 
 **Details:**
 Red→green. Keep the arxiv table a module-level dict/tuple of rules next to `normalize_url`,
 not config — hosts are added by editing code when a real dup bites (D1 consequence).
 
 **Acceptance criteria:**
-- [ ] Registering the six URLs from the 2026-08-15 report's dup pairs yields 4 distinct IDs,
-  not 6 (named test).
+- [x] Registering the six URLs from the 2026-08-15 report's dup pairs yields 4 distinct IDs,
+  not 6 (named test — representative URLs of the observed dup-pair shapes; the literal
+  live-run URLs were not retrievable locally, reports live on the homelab).
 
 ### Step 2: PDF fetch path
 **Risk:** flagged (!#2)
@@ -201,3 +202,16 @@ error-to-stderr, exit-1 shape.
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so
 never add a section below it. -->
+
+### 2026-08-15 — Step 1: Canonical-URL dedup
+- Done: `normalize_url` extended with tracking-param stripping (`utm_*`, `fbclid`, `gclid`,
+  `ref`) and a module-level arxiv rule table (abs/pdf/html, `vN`, trailing `.pdf`, `www.`
+  alias → `arxiv.org/abs/<id>`); 16 new tests incl. the named 6-URLs→4-IDs acceptance test.
+- Learned: the literal 2026-08-15 dup-pair URLs are only on the homelab — the acceptance
+  test uses representative shapes (disclosed in its docstring). Session started with ~1,100
+  lines of uncommitted prior-session runlog work; committed separately as d5893a6 before any
+  phase work.
+- Drift: none. Two 3F findings deferred to the central plan's `## Discoveries` (query
+  re-encode asymmetry; netloc-construction reorder).
+- Watch-next: Step 2 (PDF fetch path) adds pinned `pypdf` — pin the exact current version
+  and confirm `uv lock` records exactly one new top-level dep.

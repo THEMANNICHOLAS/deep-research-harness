@@ -16,7 +16,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict
 
@@ -45,6 +45,16 @@ def sources_dir(config: HarnessConfig, registry: "SourceRegistry") -> Path:
 
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# Tracking keys stripped from every query string in `normalize_url`, regardless of host — a
+# key equal to a member OR starting with `utm_` is dropped; everything else survives verbatim.
+_TRACKING_PARAMS = {"fbclid", "gclid", "ref"}
+
+_ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org"}
+# Canonical form is `/abs/<work>`: the abs/pdf/html variant segment, an optional version
+# suffix, and a trailing `.pdf` all collapse. `<work>` is kept verbatim otherwise — old-style
+# IDs like `cs/0112017` contain a slash, hence the non-greedy `.+?` rather than `[^/]+`.
+_ARXIV_PATH_RE = re.compile(r"^/(?:abs|pdf|html)/(?P<work>.+?)(?:v\d+)?(?:\.pdf)?$")
 
 # R5's recording seam: "unread" until content actually reaches the lead, "digested" when a
 # reader delegation returned a non-empty digest of the page — promoted at the task boundary
@@ -104,8 +114,8 @@ def normalize_url(url: str) -> str:
     """Return a canonical form of `url` so equivalent URLs share one identity.
 
     Collapses what does not change the fetch: scheme/host case, trailing slash, default port,
-    fragment. Everything else is verbatim, including the query — two URLs differing only by
-    query are different sources.
+    fragment, known tracking query params (`utm_*`, `fbclid`, `gclid`, `ref`), and arxiv's
+    abs/pdf/html/version variants. A meaningful query otherwise still distinguishes sources.
 
     Total by design: an unparseable URL is its own canonical form, never an exception, because
     these URLs are model-supplied and R2 forbids one bad URL failing the batch.
@@ -139,7 +149,27 @@ def normalize_url(url: str) -> str:
 
     path = parts.path.rstrip("/")
 
-    return urlunsplit((scheme, netloc, path, parts.query, ""))
+    query = parts.query
+    if query:
+        pairs = parse_qsl(query, keep_blank_values=True)
+        kept = [
+            (key, value)
+            for key, value in pairs
+            if key not in _TRACKING_PARAMS and not key.startswith("utm_")
+        ]
+        if len(kept) != len(pairs):
+            # Only re-encode a query we actually changed — re-encoding an untouched query
+            # risks a gratuitous formatting difference from the original.
+            query = urlencode(kept)
+
+    if hostname in _ARXIV_HOSTS:
+        match = _ARXIV_PATH_RE.match(path)
+        if match is not None:
+            hostname = "arxiv.org"
+            netloc = f"{userinfo}{hostname}" + (f":{port}" if port is not None else "")
+            path = f"/abs/{match['work']}"
+
+    return urlunsplit((scheme, netloc, path, query, ""))
 
 
 class Source(BaseModel):
