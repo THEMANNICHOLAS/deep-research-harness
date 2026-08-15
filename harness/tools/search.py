@@ -154,6 +154,14 @@ async def preflight_search(config: HarnessConfig) -> None:
         ) from exc
 
 
+class SearchUnavailableError(Exception):
+    """Raised when SearXNG has failed too many consecutive times in a single run (R2/D3).
+
+    The agent loop never special-cases this — it reaches the generic exception handler like
+    any other unexpected error, ending the run as a hard error with no report.
+    """
+
+
 def build_search_tool(config: HarnessConfig) -> BaseTool:
     """Build the `search_web` tool, closing over `config`."""
 
@@ -169,6 +177,11 @@ def build_search_tool(config: HarnessConfig) -> BaseTool:
             description="The maximum number of results to return.",
         )
 
+    # D3: per-tool-instance (i.e. per-run) counter of CONSECUTIVE connection-level failures.
+    # Lives in this closure, not in `_search` or at module scope, so it never leaks across
+    # runs/tests. `malformed` failures neither increment nor reset it.
+    consecutive_failures = 0
+
     @tool("search_web", args_schema=SearchWebInput, response_format="content_and_artifact")
     async def search_web(
         query: str, max_results: int
@@ -177,8 +190,23 @@ def build_search_tool(config: HarnessConfig) -> BaseTool:
 
         Failures (unreachable search backend, a non-200 response, or a malformed body) are
         reported as data rather than raising, so a dead search backend never fails the
-        whole tool call.
+        whole tool call — except after too many consecutive connection-level failures in a
+        row, which raises `SearchUnavailableError` to abort the run.
         """
-        return await _search(query, max_results, config)
+        nonlocal consecutive_failures
+        content, outcome = await _search(query, max_results, config)
+
+        if isinstance(outcome, SearchFailure) and outcome.reason in ("unreachable", "bad_status"):
+            consecutive_failures += 1
+            if consecutive_failures >= config.search.max_consecutive_failures:
+                raise SearchUnavailableError(
+                    f"SearXNG search failed {consecutive_failures} times in a row — "
+                    "aborting the run (is the container still up?)"
+                )
+        elif not isinstance(outcome, SearchFailure):
+            consecutive_failures = 0
+        # reason == "malformed": leave the counter unchanged.
+
+        return content, outcome
 
     return search_web

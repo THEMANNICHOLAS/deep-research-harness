@@ -188,7 +188,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 - [x] Phase 1: Full-screen TUI renderer
 - [x] Phase 2: Startup search preflight + cap raise
-- [ ] Phase 3: Consecutive-search-failure abort
+- [x] Phase 3: Consecutive-search-failure abort
 - [ ] Phase 4: Report gating and abort semantics
 - [ ] Phase 5: Docs reconciliation
 - [ ] Final verification
@@ -327,9 +327,9 @@ the run as a hard error, per D3.
 - No report-gating logic (Phase 4).
 
 **Tests (write first, confirm red):**
-- [ ] N consecutive `unreachable`/`bad_status` results raise `SearchUnavailableError`; a
+- [x] N consecutive `unreachable`/`bad_status` results raise `SearchUnavailableError`; a
       success in between resets the counter; `malformed` neither counts nor resets.
-- [ ] Limit comes from config (non-default value honored).
+- [x] Limit comes from config (non-default value honored).
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -490,6 +490,19 @@ Append-only, empty at plan creation. -->
 - Drift: none (impl-plan-level mechanism correction only, documented in conftest).
 - Watch-next: the live container-stopped acceptance check is deferred to final
   verification along with Phase 1's manual smoke.
+
+### 2026-08-14 — Phase 3: Consecutive-search-failure abort
+- Done: `SearchUnavailableError` + closure-local counter in `build_search_tool`
+  (unreachable/bad_status count, success resets, malformed ignored); `[search]
+  max_consecutive_failures` (default 3) in config.py + harness.toml.
+- Learned: the 3F reviewer flags that langgraph's ToolNode may CATCH tool exceptions
+  and return them as error ToolMessages instead of propagating — D3's "reaches the
+  loop's generic exception handler" is UNVERIFIED until Phase 4's full-main() test.
+- Drift: none.
+- Watch-next: Phase 4's scripted-model down-transport main() test must observe exit 1
+  and no report — if the exception is swallowed by ToolNode, that is a Drift
+  Reconciliation on D3, not a test to weaken. The phase's own full-main() acceptance
+  criterion was deferred to Phase 4 per the plan's note.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so

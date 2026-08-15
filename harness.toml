@@ -28,6 +28,7 @@ max_urls_per_call = 5  # bounds one fetch_pages call, not the run (R9/D11)
 [search]
 base_url = "http://localhost:8080"   # local dev instance — see searxng/docker-compose.yml
 default_max_results = 10
+max_consecutive_failures = 3  # R2: consecutive connection-level search failures that abort the run
 
 [agent]
 # Frozen surface for the agent loop (Phase 3) and its workspace/report capture

@@ -69,6 +69,8 @@ class FetchSettings(_StrictModel):
 class SearchSettings(_StrictModel):
     base_url: str
     default_max_results: int = Field(default=10, gt=0)
+    # R2/D3: consecutive connection-level search failures that abort the run.
+    max_consecutive_failures: int = Field(default=3, gt=0)
 
 
 class AgentSettings(_StrictModel):

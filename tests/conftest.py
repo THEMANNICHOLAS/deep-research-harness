@@ -291,6 +291,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         max_urls_per_call: int = 5,
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
+        max_consecutive_failures: int = 3,
         agent: AgentSettings | None = None,
         head_model: str = "test-model",
         subagent_model: str = "test-model",
@@ -316,7 +317,11 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
                 per_page_char_cap=per_page_char_cap,
                 max_urls_per_call=max_urls_per_call,
             ),
-            search=SearchSettings(base_url=base_url, default_max_results=default_max_results),
+            search=SearchSettings(
+                base_url=base_url,
+                default_max_results=default_max_results,
+                max_consecutive_failures=max_consecutive_failures,
+            ),
             agent=agent,
         )
 
