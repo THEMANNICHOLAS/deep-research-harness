@@ -6,7 +6,11 @@ rewriting markers into links. No model involvement, no fetching (D6).
 
 import re
 import secrets
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
+from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict
@@ -14,6 +18,44 @@ from pydantic import BaseModel, ConfigDict
 MARKER_RE = re.compile(r"\[S(\d+)\]")
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# R5's recording seam: "unread" until content actually reaches the lead, "digested" when a
+# reader delegation returned a non-empty digest of the page — promoted at the task boundary
+# by agent.py's `_ReaderDigestMiddleware` from the candidates fetch.py nominates via
+# `note_digest_candidate`, never at fetch time — and "fallback" when fetch_raw's raw-capture
+# recovery path succeeded (written by fallback.py's tool closure, which never downgrades an
+# existing "digested").
+ReadMode = Literal["unread", "digested", "fallback"]
+
+_PENDING_DIGESTS: ContextVar[list[str] | None] = ContextVar("pending_digests", default=None)
+
+
+def note_digest_candidate(source_id: str) -> None:
+    """Record that the reader captured `source_id` during the current delegation, if any.
+
+    No-op outside a `pending_digest_scope` (e.g. a directly-invoked fetch tool in tests):
+    marking `digested` is the delegation boundary's job, not the fetch's.
+    """
+    pending = _PENDING_DIGESTS.get()
+    if pending is not None:
+        pending.append(source_id)
+
+
+@contextmanager
+def pending_digest_scope() -> Iterator[list[str]]:
+    """Collect the source IDs the reader captures during one `task` attempt.
+
+    Context-local, so two concurrent delegations cannot claim each other's fetches. The
+    caller (agent.py's `_ReaderDigestMiddleware`) promotes the collected IDs to `digested`
+    only when the attempt actually returns a non-empty digest — a crashed or empty delegation
+    leaves them "unread" (R5: the report must not claim a digest the lead never received).
+    """
+    pending: list[str] = []
+    token = _PENDING_DIGESTS.set(pending)
+    try:
+        yield pending
+    finally:
+        _PENDING_DIGESTS.reset(token)
 
 
 def marker_ids(text: str) -> list[str]:
@@ -81,6 +123,7 @@ class Source(BaseModel):
     id: str
     url: str
     title: str | None = None
+    read_mode: ReadMode = "unread"
 
 
 class SourceRegistry:
@@ -117,6 +160,14 @@ class SourceRegistry:
 
     def get(self, source_id: str) -> Source | None:
         return self._by_id.get(source_id)
+
+    def mark_read(self, source_id: str, mode: ReadMode) -> None:
+        """Record how `source_id` was captured. Last write wins if called more than once.
+
+        `source_id` is expected to already be registered — an unknown id raises `KeyError`,
+        which is fine because every caller is an internal tool closure that just minted it.
+        """
+        self._by_id[source_id].read_mode = mode
 
     def all(self) -> list[Source]:
         """Return every registered source, in insertion order."""

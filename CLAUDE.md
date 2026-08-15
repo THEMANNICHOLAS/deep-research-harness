@@ -66,10 +66,11 @@ not the ceiling).
 - No database — reports are timestamped markdown files on disk.
 - Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium.
 - Search: self-hosted SearXNG (JSON API).
-- Models: OpenCode API serves both roles — `[roles.head]` = `deepseek-v4-flash`,
+- Models: OpenCode API serves both roles — `[roles.head]` = `deepseek-v4-pro`,
   `[roles.subagent]` = `gpt-5.6-luna`. Config-swappable; no other provider is
-  declared today. `deepseek-v4-flash` requires a region opt-in on the OpenCode
-  workspace dashboard — without it the endpoint 403s (see docs/decisions.md).
+  declared today. The DeepSeek line required a region opt-in on the OpenCode
+  workspace dashboard for the `-flash` tier — without it the endpoint 403s (see
+  docs/decisions.md); `-pro` worked without a fresh opt-in in a live check.
 - Deployment: homelab Linux machine, operated over SSH.
 
 ## Patterns

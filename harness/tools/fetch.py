@@ -24,7 +24,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig, run_workspace_dir
-from harness.sources import SourceRegistry, normalize_url
+from harness.sources import SourceRegistry, normalize_url, note_digest_candidate
 
 FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
 
@@ -343,25 +343,40 @@ def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseToo
         their outcome rather than raising, so one bad URL never fails the batch. Equivalent
         spellings of the same page (trailing slash, fragment, case) are fetched once.
         """
-        return await _fetch(urls, config, registry)
+        content, pages = await _fetch(urls, config, registry)
+        # Only a real capture is even a digest CANDIDATE (R5) — a failed fetch stays "unread".
+        # The mark itself is deferred to the delegation boundary: agent.py's
+        # `_ReaderDigestMiddleware` promotes these to "digested" only when the reader's digest
+        # actually reaches the lead, so a crash after a successful fetch never over-claims.
+        for page in pages:
+            if page.outcome == "fetched":
+                note_digest_candidate(page.source_id)
+        return content, pages
 
-    # Appended rather than written into the docstring: the limit is config, and a literal would
-    # go stale the moment an operator changed it (D2).
-    fetch_pages.description = (
-        f"{fetch_pages.description}\n\nAt most {max_urls} URLs may be requested per call; "
+    return _install_url_limit_contract(fetch_pages, max_urls)
+
+
+def _install_url_limit_contract(fetch_tool: BaseTool, max_urls: int) -> BaseTool:
+    """Append the config-driven URL cap to `fetch_tool` and install its validation explainer.
+
+    Shared by `build_fetch_tool` and `build_fallback_tool` — the wording is policy, and two
+    hand-pasted copies could drift. Appended rather than written into the docstring: the limit
+    is config, and a literal would go stale the moment an operator changed it (D2).
+    """
+    fetch_tool.description = (
+        f"{fetch_tool.description}\n\nAt most {max_urls} URLs may be requested per call; "
         "a call carrying more is rejected without fetching anything."
     )
 
-    # `exc` is `object`: langchain may hand over a pydantic v1 or v2 `ValidationError`.
+    # `exc` is `object`: langchain may hand over a pydantic v1 or v2 `ValidationError`. A
+    # callable, not a fixed string: this swallows EVERY validation failure for the tool, so a
+    # wrong type must not be misreported as an over-limit call (D2).
     def _explain_validation_error(exc: object) -> str:
         """Turn a rejected call into a message the model can act on and retry."""
         return (
-            f"fetch_pages rejected this call without fetching anything: {exc}. "
+            f"{fetch_tool.name} rejected this call without fetching anything: {exc}. "
             f"At most {max_urls} URLs may be requested per call."
         )
 
-    # A callable, not a fixed string: this swallows EVERY validation failure for the tool, so a
-    # wrong type must not be misreported as an over-limit call (D2).
-    fetch_pages.handle_validation_error = _explain_validation_error
-
-    return fetch_pages
+    fetch_tool.handle_validation_error = _explain_validation_error
+    return fetch_tool

@@ -8,15 +8,18 @@ research question and writes one timestamped, cited markdown report. A single
 head role, streaming its todo plan to the terminal; Python then verifies the
 draft's claims (@harness/verify.py) and assembles the report (@harness/report.py).
 Model roles are config-declared, never literal: `[roles.head]` plans, synthesizes
-and checks claims, `[roles.subagent]` is the cheap worker held for the later
-delegation tiers.
+and checks claims, `[roles.subagent]` is the cheap worker driving the wired reader
+tier.
 
 ## Agent Topology
 
-Today there is exactly one agent. The researcher and reader tiers exist only as
-frozen prompt contracts — @harness/prompts/subagent.md (researcher) and
-@harness/prompts/reader.md (reader) — and nothing delegates to them; wiring them
-is the next round's work. Each contract freezes the four fields a task must carry
+The reader tier is wired: the lead delegates page reading to a declared `reader`
+subagent through deepagents' own `task` tool, and `fetch_pages` lives only on the
+reader's toolset, never the lead's (@harness/agent.py, @harness/tools/__init__.py).
+The researcher tier remains only a frozen prompt contract —
+@harness/prompts/subagent.md — with nothing delegating to it yet; unlike the
+researcher, @harness/prompts/reader.md is now the reader's live system prompt.
+Each contract freezes the four fields a task must carry
 (objective, output format, tools, boundaries) and the three a tier must return
 (findings, source IDs, conflicts), so the tiers can be built without renegotiating
 the seam. Neither tier may ask the developer anything: clarification is the lead's
@@ -119,9 +122,11 @@ bug that was fixed and forgotten — the fix is named so it stays visible.
   known-imperfect (see docs/backlog.md) and is left that way deliberately. The
   mitigation is the per-paragraph check reading captured source files: an error page
   cannot support the paragraph citing it, so the paragraph comes back unsupported.
-- **The head model 403s without a region opt-in.** `deepseek-v4-flash` requires it on
+- **The head model may 403 without a region opt-in.** `deepseek-v4-flash` required it on
   the OpenCode workspace dashboard; the endpoint is otherwise reachable and the
-  failure looks like a credential problem.
+  failure looks like a credential problem. `deepseek-v4-pro` (current `[roles.head]`)
+  worked without it in a live check — same account opt-in likely covers the whole
+  DeepSeek line, but re-verify if this 403s after an account change.
 - **Faked search and a scripted model conflict in tests.** `tests/test_search.py`'s
   client fake patches the process-global `httpx.AsyncClient`, and `openai`'s
   constructor rejects any `http_client` that is not an instance of whatever that name

@@ -6,7 +6,8 @@ import pytest
 
 from harness.prompts import PromptError, render, required_variables
 
-# The frozen delegation-tier contracts (R5). Neither is wired to anything yet.
+# The frozen delegation-tier contracts (R5). The reader tier is wired; the subagent
+# contract is not.
 TIER_CONTRACTS = ["subagent", "reader"]
 
 
@@ -146,3 +147,26 @@ def test_tier_contracts_name_their_frozen_fields(name, field):
     # must carry, three a tier must return. Anchored to the bolded bullet, since a bare "tools"
     # would also match the `# Tools` heading and let a renamed field slip through.
     assert f"**{field}**" in _render_shipped(name)
+
+
+def test_orchestrator_prompt_teaches_the_full_delegation_protocol():
+    """R1's prompt half (Phase 3): the lead delegates reading to the reader subagent rather
+    than fetching directly, and knows what to do when that delegation fails.
+    """
+    rendered = render("orchestrator", current_date="2026-01-01", max_urls_per_call=7)
+
+    assert 'subagent_type="reader"' in rendered
+    # The batching bound must appear near the delegation instruction, not merely anywhere in
+    # the prompt (D5) — a stray "7" elsewhere would pass a looser assertion.
+    delegation_pos = rendered.index('subagent_type="reader"')
+    context = rendered[max(0, delegation_pos - 400) : delegation_pos + 400]
+    assert "7" in context
+
+    assert "never quote raw page text" in rendered.lower()
+
+    assert "fetch_raw" in rendered
+    assert "READER FAILED (" in rendered
+    assert "empty digest" in rendered.lower()
+
+    # The lead no longer calls a fetch tool directly (R1) — it only delegates.
+    assert "fetch_pages" not in rendered

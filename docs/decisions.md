@@ -156,3 +156,54 @@ sentences each, append-only, newest last.
   asserting 200 + parseable JSON catches both container-down and the HTML-only
   stock-container misconfiguration; rejected docker inspection (hardcodes a deployment
   detail). See `preflight_search` in @harness/tools/search.py.
+
+- **2026-08-14 — the reader is wired as a deepagents-native declared `SubAgent`, delegated to
+  through the framework's own `task` tool (PLAN-reader-delegation D1).** Rejected a custom
+  `read_source(url)` tool wrapping a self-compiled reader agent (drives a second agent loop
+  inside a tool coroutine, breaks the "only agent.py imports deepagents" boundary) and a
+  single-call digest folded into the fetch tool (cheaper, but drops the bound spawned-subagent
+  shape R1 requires). The lead's toolset physically excludes `fetch_pages`; the reader's tools
+  carry the SAME instance so the shared `SourceRegistry` and `sources/` directory keep R3/R4
+  intact across the delegation boundary. See @docs/plans/PLAN-reader-delegation.md.
+
+- **2026-08-14 — a reader crash is bounded-retried once, then converted to an error
+  `ToolMessage`, with a lead-visible `fetch_raw` fallback recovering the raw page
+  (PLAN-reader-delegation D2).** Built from langchain's existing `ToolRetryMiddleware`/
+  `ToolErrorMiddleware`, scoped to the `task` tool alone, rather than a middleware that parses
+  URLs out of task descriptions and drives crawl4ai itself (heaviest, most fragile option).
+  Retry count is pinned at 1: retrying `task` re-runs the whole reader session, so the budget
+  already doubles. See @docs/plans/PLAN-reader-delegation.md.
+
+- **2026-08-14 — the reader reuses `[roles.subagent]` rather than a new `[roles.reader]` config
+  role (PLAN-reader-delegation D3).** No present variation point justifies a config surface
+  split; revisit when the researcher tier is wired and the two tiers want different models.
+  See @docs/plans/PLAN-reader-delegation.md.
+
+- **2026-08-14 — read-mode (digested/fallback/unread) is recorded as a field on
+  `SourceRegistry`'s `Source`, not derived from parsing `<undigested>` markers out of capture
+  files (PLAN-reader-delegation D4).** The registry is already the per-source metadata home
+  @harness/report.py walks to render disclosure; string-parsing capture bodies would couple
+  report rendering to page text it must not trust to parse. See
+  @docs/plans/PLAN-reader-delegation.md.
+
+- **2026-08-14 — one delegation may carry one or more URLs, bounded by
+  `fetch.max_urls_per_call`, rather than a strict one-URL-per-task rule
+  (PLAN-reader-delegation D5).** A strict one-URL rule would multiply the 3-10x delegation
+  overhead per page with no fidelity gain; the orchestrator prompt states the batching bound
+  instead. See @docs/plans/PLAN-reader-delegation.md.
+
+- **2026-08-14 — "digested" is marked at the delegation boundary, not at fetch time (PR #13
+  review).** The reader's `fetch_pages` call only nominates the source IDs it captured
+  (@harness/sources.py `note_digest_candidate`, context-local per `task` attempt);
+  @harness/agent.py's `_ReaderDigestMiddleware` promotes them to `digested` only when the
+  task call returns a non-empty digest. Rejected marking inside the fetch tool: a reader that
+  fetched then crashed (or returned empty) left sources disclosed as "Digested via the
+  reader" though no digest ever reached the lead — a false-positive disclosure against R5.
+  For the same reason `fetch_raw` never downgrades an already-`digested` source.
+
+- **2026-08-14 — `[roles.head]` moved from `deepseek-v4-flash` to `deepseek-v4-pro`
+  (developer request).** Confirmed `deepseek-v4-pro` is listed by the OpenCode
+  `/models` endpoint and returns 200 on a live `chat/completions` call with the
+  existing `OPENCODE_API_KEY` and no additional region opt-in — the flash-tier's
+  documented 403 gotcha did not reproduce for pro. `[roles.subagent]` is unchanged
+  (`gpt-5.6-luna`).

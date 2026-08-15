@@ -1,6 +1,6 @@
 # PLAN: Reader Subagent Delegation
 
-**Status:** Not started
+**Status:** Complete
 **Created:** 2026-08-14
 **Type:** Single plan
 
@@ -204,11 +204,12 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R5 | Report discloses digested vs fallback per page | Phase 2 (recording), Phase 3 (rendering) |
 
 ## Progress
-- [ ] Phase 1: Wire the reader subagent (tracer bullet)
-- [ ] Phase 2: Failure path — retry, catch, fallback tool
-- [ ] Phase 3: Disclosure and prompt wiring
-- [ ] Phase 4: End-to-end regression + docs
-- [ ] Final verification
+- [x] Phase 1: Wire the reader subagent (tracer bullet)
+- [x] Phase 2: Failure path — retry, catch, fallback tool
+- [x] Phase 3: Disclosure and prompt wiring
+- [x] Phase 4: End-to-end regression + docs
+- [x] Final verification (manual live smoke remains a post-merge operator step — see the
+  Phase 4 handoff-log entry)
 
 ## Phases
 
@@ -249,12 +250,12 @@ directly — delegation is structurally live end-to-end on scripted models.
   report changes (Phase 3), any edits to reader.md or subagent.md, any verify.py changes.
 
 **Tests (write first, confirm red):**
-- [ ] Lead's bound tools include `task` and exclude `fetch_pages` (ScriptedChatModel
+- [x] Lead's bound tools include `task` and exclude `fetch_pages` (ScriptedChatModel
   `_bound_tool_names`).
-- [ ] The declared reader spec carries the subagent-role model, the rendered reader.md
+- [x] The declared reader spec carries the subagent-role model, the rendered reader.md
   prompt, and the same fetch tool instance the run built (identity, not equality).
-- [ ] A profile is registered under the reader model's key excluding `execute`.
-- [ ] `build_tools` split: lead list and reader routing behave per Contracts.
+- [x] A profile is registered under the reader model's key excluding `execute`.
+- [x] `build_tools` split: lead list and reader routing behave per Contracts.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -262,7 +263,7 @@ directly — delegation is structurally live end-to-end on scripted models.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Existing suite still green (`uv run pytest`) — especially test_fetch.py (fetch tool
+- [x] Existing suite still green (`uv run pytest`) — especially test_fetch.py (fetch tool
   itself unchanged) and test_agent.py's interrupt/profile cases.
 
 ### Phase 2: Failure path — retry, catch, fallback tool
@@ -311,12 +312,12 @@ error-classified ToolMessage, and can recover the page via the marked raw-fallba
   the middleware beyond the `task` tool.
 
 **Tests (write first, confirm red):**
-- [ ] A task-tool exception (including `GraphRecursionError`) becomes an error ToolMessage
+- [x] A task-tool exception (including `GraphRecursionError`) becomes an error ToolMessage
   after one retry; the run continues.
-- [ ] `fetch_raw` returns marker-wrapped content, still writes `sources/Sn.md`, still mints
+- [x] `fetch_raw` returns marker-wrapped content, still writes `sources/Sn.md`, still mints
   `[Sn]` via the shared registry, and records fallback mode.
-- [ ] Read-mode field: default/unread, digested, fallback transitions each observable.
-- [ ] Empty-digest edge: an empty task ToolMessage is distinguishable (documented shape)
+- [x] Read-mode field: default/unread, digested, fallback transitions each observable.
+- [x] Empty-digest edge: an empty task ToolMessage is distinguishable (documented shape)
   so the lead prompt can treat it as failure.
 
 **Steps:**
@@ -325,7 +326,7 @@ error-classified ToolMessage, and can recover the page via the marked raw-fallba
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full suite green; no retry layer added around model clients (inspection against
+- [x] Full suite green; no retry layer added around model clients (inspection against
   models.py guidance).
 
 ### Phase 3: Disclosure and prompt wiring
@@ -362,11 +363,13 @@ teaches the lead the full delegation protocol.
   (docs/decisions.md); any change to verify.py.
 
 **Tests (write first, confirm red):**
-- [ ] Report renders each read-mode bucket correctly, including the all-digested and
+- [x] Report renders each read-mode bucket correctly, including the all-digested and
   mixed-mode cases.
-- [ ] Orchestrator prompt contains the delegation protocol and renders with its
+- [x] Orchestrator prompt contains the delegation protocol and renders with its
   required variables (pinned set updated).
-- [ ] Stale "not yet wired" line is gone from the run-config rendering.
+- [x] Stale "not yet wired" line is gone from the run-config rendering. (Turned out to be
+  a source comment, never rendered — comment updated; the new rendered behavior is
+  pinned instead. See Discoveries 2026-08-14.)
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -374,8 +377,8 @@ teaches the lead the full delegation protocol.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full suite green; report output for a scripted mixed-mode run reads correctly by
-  inspection (paste one rendered report section into the phase notes).
+- [x] Full suite green; report output for a scripted mixed-mode run reads correctly by
+  inspection (rendered section pasted in the Phase 3 handoff-log entry).
 
 ### Phase 4: End-to-end regression + docs
 **Risk:** flagged (!#4)
@@ -411,11 +414,11 @@ and the documentation reflects the wired tier.
   not silent fixing).
 
 **Tests (write first, confirm red):**
-- [ ] End-to-end scripted run: lead issues `task(subagent_type="reader")`; reader's scripted
+- [x] End-to-end scripted run: lead issues `task(subagent_type="reader")`; reader's scripted
   model drives the shared fetch tool (fake crawler); digest returns to the lead; final
   report cites `[Sn]` IDs that resolve through the shared registry (R4) and discloses
   read modes.
-- [ ] Verification regression: `verify_paragraphs` on that run consumes the capture FILES
+- [x] Verification regression: `verify_paragraphs` on that run consumes the capture FILES
   (fake-crawler content), not the digest text (R3) — assert the verification prompt's
   source payload contains capture text absent from the digest.
 
@@ -426,15 +429,18 @@ and the documentation reflects the wired tier.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full quality gate green (see ## Verification).
-- [ ] A manual live smoke run is documented as an OPERATOR step (command + what to watch:
+- [x] Full quality gate green (see ## Verification).
+- [x] A manual live smoke run is documented as an OPERATOR step (command + what to watch:
   token spend vs the ~796k head baseline, docs/decisions.md D10) — not executed by CI.
+  (Delivered in-session per developer choice — surfaced by the 3F review as a gap in the
+  written docs; the full step is recorded in the Phase 4 handoff-log entry below so it
+  survives the chat.)
 
 ## Verification
-- [ ] `uv run pytest` — full suite, including the Phase 4 e2e scripted run.
-- [ ] `uv run ruff check .`
-- [ ] `uv run ruff format --check .`
-- [ ] `uv run mypy .`
+- [x] `uv run pytest` — full suite, including the Phase 4 e2e scripted run (351 passed).
+- [x] `uv run ruff check .`
+- [x] `uv run ruff format --check .`
+- [x] `uv run mypy .`
 - [ ] Manual (operator, post-merge): one live research run; confirm the report shows
   digested sources, `[Sn]` links resolve, and disclosure lists any fallbacks.
 
@@ -477,11 +483,94 @@ and the documentation reflects the wired tier.
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+### 2026-08-14 — Operator smoke step: fallback reasons never reach the report
+The Phase 4 handoff's operator check "(2) ... any fallback carries a reason" is
+unsatisfiable: the model-supplied `reason` lives only in the run's in-context
+`<undigested>` marker and is never persisted to the registry, so the report cannot render
+it (PR #13 review). Corrected check: fallbacks land under the "Read raw (fallback, ...)"
+heading of `## Source reading`. Persisting a per-source reason is deferred to
+docs/backlog.md.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+### 2026-08-14 — Phase 3: "not yet wired" was a comment, not rendered output
+The report.py:405 "configured but not yet wired" text the phase file list targeted is a
+source comment above the pinned `- Subagent Model:` line; nothing rendered ever said
+"not yet wired". Acted: comment updated to reflect the wired reader; the planned
+absence-test was replaced with behavioral pins on the new `## Source reading` section
+(a never-rendered string cannot produce a meaningful red). Pinned model lines unchanged.
+
 ## Phase Handoff Log
+
+### 2026-08-14 — Phase 1: Wire the reader subagent (tracer bullet)
+- Done: reader wired as a declared SubAgent; `build_tools` returns `ToolSets(lead, reader)`;
+  `_register_no_shell_profile` covers both model keys; `_reader_spec` is the test seam;
+  332 tests + all quality gates green; flagged-risk review clean.
+- Learned: deepagents has no public harness-profile read accessor — tests use the private
+  `_get_harness_profile` (impl-plan-sanctioned fallback). conftest gained
+  `patch_models_by_role` for role-distinct scripted models; `patch_model` untouched.
+- Drift: none.
+- Watch-next: Phase 2's middleware must scope retry/error to the `task` tool only;
+  langchain's ToolRetryMiddleware/ToolErrorMiddleware config needs checking for
+  per-tool scoping before hand-rolling anything.
+
+### 2026-08-14 — Phase 2: Failure path — retry, catch, fallback tool
+- Done: task-scoped ToolErrorMiddleware (outer) + ToolRetryMiddleware(max_retries=1,
+  on_failure="error", initial_delay=0, jitter=False) (inner); `fetch_raw` fallback tool
+  (harness/tools/fallback.py) reusing fetch.py's `_fetch`/`_render`/`_sources_dir`;
+  `Source.read_mode` + `SourceRegistry.mark_read`; 344 tests + gates green; flagged
+  review clean.
+- Learned: error ToolMessage content starts `READER FAILED (` — Phase 3's prompt should
+  reference that exact prefix. Empty digest = empty ToolMessage content (tested shape).
+  `<undigested>` bodies are unescaped — rendering must read `read_mode` from the
+  registry (D4), never parse markers.
+- Drift: none (one sanctioned addition: build_fallback_tool mkdirs the sources dir,
+  mirroring build_fetch_tool).
+- Watch-next: Phase 3 prompt work — delegation protocol references `READER FAILED`
+  prefix, empty-digest-as-failure, and max_urls_per_call batching; report reads
+  read_mode buckets from the registry.
+
+### 2026-08-14 — Phase 3: Disclosure and prompt wiring
+- Done: `## Source reading` report section (`_read_modes_section`, rendered after
+  `## Sources`) bucketing digested/fallback/unread from the registry; orchestrator.md
+  Tools swap (task delegation + fetch_raw recovery) and `# Reading sources` protocol;
+  349 tests + gates green; quality scan clean; 1 simplification applied. Rendered
+  mixed-mode sample: "Digested via the reader: - [S1] ... / Read raw (fallback...):
+  - [S2] ... / Not read at all (fetch never succeeded): - [S3] ...".
+- Learned: the "not yet wired" target was a comment, not rendered output (see
+  Discoveries). Section placement matters: pre-existing tests assume the first `[Sn]`
+  occurrence lands inside `## Sources` — new source-listing sections must render after
+  it. `.claude/planning-mode` was flipped to "active" mid-session (concurrent session?)
+  and blocked a source edit — reset to "inactive" if it recurs.
+- Drift: none.
+- Watch-next: Phase 4 e2e — ScriptedChatModel must reach the reader's model slot inside
+  deepagents' per-subagent assembly (risk !#4); use `patch_models_by_role` (conftest)
+  for role-distinct scripting; surface seam problems rather than weakening to
+  "task was called".
+
+### 2026-08-14 — Phase 4: End-to-end regression + docs
+- Done: tests/test_delegation_e2e.py (2 tests) drives the whole loop through main() —
+  role-distinct scripted models, fake crawler, R3/R4 three-way unique-marker checks,
+  reader.md-prompt sanity (risk !#4 answered: deepagents invokes OUR model instance);
+  fake-crawler harness consolidated into conftest.py; four docs updated (architecture,
+  INDEX, decisions D1-D5 bullets, backlog). 351 tests + full gate green. E2e was green
+  on first run; assertions inversion-checked instead of red-first.
+- Learned: single-source all-digested runs render the summary line, not [S1] bullets
+  (frozen Phase 3 behavior). 3F flagged the missing operator smoke-run doc ([Major]);
+  developer chose in-chat delivery. OPERATOR SMOKE STEP (post-merge): run
+  `uv run python -m harness "<question>"`; watch (1) total token spend vs the ~796k
+  head baseline (decisions.md D10; delegation priced 3-10x — if far past band, drop
+  task retry 1 -> 0 per risk !#3), (2) `## Source reading` shows digested sources and
+  ~~any fallback carries a reason~~ any fallback lands under the raw-fallback heading
+  (see Reconciliations), (3) `[Sn]` links resolve, (4) wall-clock per round,
+  (5) LATER-PROBLEMS.md #7 shares this first live run — attribute its failures
+  correctly.
+- Drift: none.
+- Watch-next: run the live smoke above; if the delegation multiplier is pathological,
+  reconcile retry to 0. Wiring the researcher tier is the next round and may force the
+  [roles.reader] split (D3 consequence).
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so

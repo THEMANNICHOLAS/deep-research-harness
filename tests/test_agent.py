@@ -8,6 +8,7 @@ filesystem/todo tools — driving `fetch_pages`/`search_web` would touch a real 
 import asyncio
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,9 @@ from harness.report import (
 )
 from harness.sources import SourceRegistry
 from tests.conftest import (
+    ScriptedChatModel,
+    _FakeMarkdown,
+    _FakeResult,
     drain_stdout,
     install_search_transport,
     patch_model,
@@ -53,6 +57,26 @@ def noop_agent(make_config, monkeypatch, scripted_model):
 
 def _tools_by_name(graph):
     return graph.nodes["tools"].bound.tools_by_name
+
+
+def _declared_subagent_names(graph) -> set[str]:
+    """Recover the declared subagent names backing the `task` tool.
+
+    Mirrors `_filesystem_backend`: deepagents does not expose the subagent-name list on the
+    compiled graph, but the `task` tool's coroutine closes over a `{name: runnable}` dict, so
+    this walks its closure to find it.
+    """
+    task_tool = _tools_by_name(graph)["task"]
+    for cell in task_tool.coroutine.__closure__ or ():
+        candidate = cell.cell_contents
+        if (
+            isinstance(candidate, dict)
+            and candidate
+            and all(isinstance(k, str) for k in candidate)
+            and all(hasattr(v, "invoke") for v in candidate.values())
+        ):
+            return set(candidate)
+    raise AssertionError("could not recover declared subagent names from the task tool")
 
 
 def _filesystem_backend(graph):
@@ -127,15 +151,283 @@ async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_
 async def test_build_agent_exposes_the_harness_tools(noop_agent):
     _, graph = noop_agent
 
-    assert {"fetch_pages", "search_web"} <= _tools_by_name(graph).keys()
+    # `fetch_pages` moved to the reader subagent (Phase 1): the lead delegates through `task`
+    # rather than fetching directly.
+    assert {"search_web", "task"} <= _tools_by_name(graph).keys()
+    assert "fetch_pages" not in _tools_by_name(graph)
 
 
 async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):
     _, graph = noop_agent
 
-    # Asserted on the outcome (the tool disappearing), never on the derived profile key, so a
-    # change in deepagents' key derivation fails loudly instead of passing on a dead profile.
-    assert "task" not in _tools_by_name(graph)
+    # `task` now exists (backing the declared `reader` subagent), so the general-purpose
+    # disable is evidenced by the declared-agent list, not by the tool's absence.
+    assert _declared_subagent_names(graph) == {"reader"}
+
+
+async def test_build_agent_lead_excludes_fetch_and_gains_task(
+    make_config, patch_models_by_role, scripted_model
+):
+    """R1 is structural: the lead's tool set physically excludes `fetch_pages` and gains `task`,
+    the delegation mechanism to the reader subagent (D1).
+    """
+    head_model = scripted_model([AIMessage(content="done")])
+    reader_model = scripted_model([AIMessage(content="reader done")])
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+
+    graph = build_agent(make_config(), SourceRegistry())
+
+    assert "task" in _tools_by_name(graph)
+    assert "fetch_pages" not in _tools_by_name(graph)
+
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    assert head_model._bound_tool_names, "bind_tools was never called on the head model"
+    for offered in head_model._bound_tool_names:
+        assert "task" in offered
+        assert "search_web" in offered
+        assert "ask_user" in offered
+        assert "fetch_pages" not in offered
+
+
+def test_reader_spec_contract(make_config, scripted_model):
+    """The declared reader `SubAgent` spec (D1) carries the subagent-role model, the rendered
+    reader.md prompt, and the run's own `fetch_pages` instance — never a second one.
+    """
+    from harness.agent import _reader_spec
+    from harness.prompts import render
+    from harness.tools import build_tools
+
+    config = make_config()
+    reader_model = scripted_model([AIMessage(content="done")])
+    reader_tools = build_tools(config, SourceRegistry()).reader
+
+    spec = _reader_spec(config, reader_model, reader_tools)
+
+    assert spec["name"] == "reader"
+    assert spec["model"] is reader_model
+    assert spec["system_prompt"] == render(
+        "reader",
+        current_date=date.today().isoformat(),
+        max_urls_per_call=config.fetch.max_urls_per_call,
+    )
+    assert spec["tools"] is reader_tools
+    # The reader has no checkpointer forwarded and cannot interrupt — inheriting the lead's
+    # `ask_user` interrupt entry would register an interrupt that can never fire.
+    assert "interrupt_on" not in spec
+
+
+async def test_reader_model_profile_excludes_execute(make_config, patch_models_by_role):
+    """Risk #1: deepagents resolves a HarnessProfile per SUBAGENT MODEL key — if the reader's
+    key is never registered, the no-shell invariant silently breaks for the reader.
+    """
+    from deepagents._models import get_model_identifier, get_model_provider
+    from deepagents.profiles.harness.harness_profiles import _get_harness_profile
+    from pydantic import SecretStr
+
+    from tests.conftest import ScriptedChatModel
+
+    head_model = ScriptedChatModel(
+        model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="done")])
+    reader_model = ScriptedChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="reader done")])
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+
+    build_agent(make_config(), SourceRegistry())
+
+    provider = get_model_provider(reader_model)
+    identifier = get_model_identifier(reader_model)
+    profile = _get_harness_profile(f"{provider}:{identifier}")
+
+    assert profile is not None
+    assert "execute" in profile.excluded_tools
+
+
+# --- Phase 2: failure path — task-tool retry/error middleware, fetch_raw fallback (D2) --
+
+
+class _RaisingChatModel(ScriptedChatModel):
+    """Raises on every call, recording each invocation — drives the task-tool retry path."""
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        self._received_messages.append(list(messages))
+        self._call_count += 1
+        raise RuntimeError("boom")
+
+
+def _task_call(description: str, call_id: str = "call_task") -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": description, "subagent_type": "reader"},
+                "id": call_id,
+            }
+        ],
+    )
+
+
+async def test_a_reader_crash_becomes_an_error_task_message_after_one_retry(
+    make_config, patch_models_by_role, scripted_model
+):
+    """D2: the task tool is wrapped by ToolRetryMiddleware(max_retries=1) inner and
+    ToolErrorMiddleware outer, so a reader crash surfaces as an error ToolMessage — never a
+    raised exception out of `ainvoke` — after exactly one retry (two reader model calls total).
+    """
+    from pydantic import SecretStr
+
+    head_model = scripted_model(
+        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    )
+    reader_model = _RaisingChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+
+    graph = build_agent(make_config(), SourceRegistry())
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0].status == "error"
+    assert str(task_messages[0].content).startswith("READER FAILED")
+    assert reader_model._call_count == 2  # initial attempt + exactly one retry
+
+
+async def test_a_reader_ending_with_no_final_text_returns_an_empty_task_message(
+    make_config, patch_models_by_role, scripted_model
+):
+    """deepagents' documented empty-ToolMessage behavior: a subagent ending on an AIMessage with
+    no text produces a task ToolMessage with empty content. THIS emptiness is the documented
+    failure signal Phase 3's prompt teaches the lead to treat as a failed digest.
+    """
+    head_model = scripted_model(
+        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    )
+    reader_model = scripted_model([AIMessage(content="")])
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+
+    graph = build_agent(make_config(), SourceRegistry())
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0].content == ""
+
+
+def _reader_fetch_call(url: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "fetch_pages", "args": {"urls": [url]}, "id": "call_fetch"}],
+    )
+
+
+async def test_a_reader_crash_after_a_successful_fetch_leaves_the_source_unread(
+    make_config, patch_models_by_role, scripted_model, install_crawler
+):
+    """R5: "digested" is marked at the delegation boundary, not at fetch time. The reader
+    fetches a page successfully, then crashes (its script runs out, raising `IndexError` —
+    the crash-after-partial-fetch case); no digest ever reaches the lead, so the source must
+    stay "unread". A fetch-time mark here would make the report disclose a digest that never
+    existed.
+    """
+    head_model = scripted_model(
+        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    )
+    # One scripted reply only: the fetch call. The reader's next model call — and the whole
+    # retry attempt — exhausts the script and raises.
+    reader_model = scripted_model([_reader_fetch_call("https://a.test")])
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    install_crawler(
+        [
+            _FakeResult(
+                "https://a.test",
+                markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body"),
+            )
+        ]
+    )
+
+    registry = SourceRegistry()
+    graph = build_agent(make_config(), registry)
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0].status == "error"
+    # The fetch itself succeeded and registered the source...
+    source = registry.get("S1")
+    assert source is not None
+    # ...but with no digest delivered, it is disclosed as unread, never as digested.
+    assert source.read_mode == "unread"
+
+
+async def test_an_empty_digest_leaves_the_fetched_source_unread(
+    make_config, patch_models_by_role, scripted_model, install_crawler
+):
+    """The empty-digest half of the same boundary: the reader fetches successfully but ends
+    with no final text — the documented failure signal the prompt tells the lead to treat as
+    a failed delegation — so the source stays "unread" until a `fetch_raw` recovery marks it.
+    """
+    head_model = scripted_model(
+        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    )
+    reader_model = scripted_model([_reader_fetch_call("https://a.test"), AIMessage(content="")])
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    install_crawler(
+        [
+            _FakeResult(
+                "https://a.test",
+                markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body"),
+            )
+        ]
+    )
+
+    registry = SourceRegistry()
+    graph = build_agent(make_config(), registry)
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    source = registry.get("S1")
+    assert source is not None
+    assert source.read_mode == "unread"
+
+
+async def test_fetch_raw_is_offered_to_the_lead_but_not_the_reader(
+    noop_agent, make_config, scripted_model
+):
+    _, graph = noop_agent
+    assert "fetch_raw" in _tools_by_name(graph)
+
+    from harness.agent import _reader_spec
+    from harness.tools import build_tools
+
+    config = make_config()
+    reader_tools = build_tools(config, SourceRegistry()).reader
+    spec = _reader_spec(config, scripted_model([AIMessage(content="done")]), reader_tools)
+    assert "fetch_raw" not in [t.name for t in spec["tools"]]
 
 
 async def test_build_agent_includes_todo_list_middleware(noop_agent):
