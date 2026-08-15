@@ -174,3 +174,10 @@ sentences each, append-only, newest last.
   fetched then crashed (or returned empty) left sources disclosed as "Digested via the
   reader" though no digest ever reached the lead — a false-positive disclosure against R5.
   For the same reason `fetch_raw` never downgrades an already-`digested` source.
+
+- **2026-08-14 — `[roles.head]` moved from `deepseek-v4-flash` to `deepseek-v4-pro`
+  (developer request).** Confirmed `deepseek-v4-pro` is listed by the OpenCode
+  `/models` endpoint and returns 200 on a live `chat/completions` call with the
+  existing `OPENCODE_API_KEY` and no additional region opt-in — the flash-tier's
+  documented 403 gotcha did not reproduce for pro. `[roles.subagent]` is unchanged
+  (`gpt-5.6-luna`).

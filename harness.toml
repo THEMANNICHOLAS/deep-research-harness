@@ -13,7 +13,7 @@ api_key_env = "OPENCODE_API_KEY"
 
 [roles.head]
 provider = "opencode"
-model = "deepseek-v4-flash"
+model = "deepseek-v4-pro"
 
 [roles.subagent]
 provider = "opencode"
