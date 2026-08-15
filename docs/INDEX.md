@@ -5,11 +5,15 @@
 - **Deployment:** self-hosted homelab Linux machine, operated interactively
   over SSH. No cloud/container deployment.
 - **Status:** research loop runs end to end — `python -m harness "<question>"` drives a
-  single deepagents lead agent over the substrate's tools, may ask clarifying questions
+  deepagents lead agent over the substrate's tools, may ask clarifying questions
   before researching, stops at a round cap or wall clock, checks each claim against its own
   cited source, and writes a timestamped cited report. All seven phases of
-  docs/plans/PLAN-research-loop.md are built. The researcher and reader tiers exist only as
-  frozen prompt contracts — nothing delegates to them yet; wiring them is the next round.
+  docs/plans/PLAN-research-loop.md are built. The reader tier is now wired
+  (docs/plans/PLAN-reader-delegation.md): the lead delegates page reading to a declared
+  `reader` subagent rather than fetching directly, a bounded-retry `fetch_raw` fallback
+  recovers a failed or empty digest, and the report discloses which sources were digested,
+  fell back raw, or went unread. The researcher tier remains only a frozen prompt contract —
+  nothing delegates to it yet.
 - **Integrations:** SearXNG (local Docker instance checked in at
   @searxng/docker-compose.yml, JSON API enabled — a stock container is HTML-only
   and will not work), crawl4ai over
@@ -51,5 +55,6 @@
 | Claim verification | @harness/verify.py | `verify_paragraphs` — one pooled model call per paragraph, judging it against all its cited sources together |
 | Report assembly | @harness/report.py | `RunOutcome` + `write_report` — per-paragraph `Sources:`/`Verdict:` rendering, disclosure sections |
 | Prompt loader | @harness/prompts.py | Loads/renders `harness/prompts/*.md` `$variable` templates |
-| Tier contracts | @harness/prompts/subagent.md, @harness/prompts/reader.md | Frozen researcher and reader delegation contracts — unwired |
+| Reader wiring | @harness/agent.py | Declares the `reader` `SubAgent` spec and routes the shared `fetch_pages` instance to it — the lead's only route to page content |
+| Researcher contract | @harness/prompts/subagent.md | Frozen researcher delegation contract — still unwired |
 | Tool registry | @harness/tools/ | `build_tools` and the per-tool `build_<name>_tool` factories |

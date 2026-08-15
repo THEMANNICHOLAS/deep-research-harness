@@ -1,7 +1,6 @@
 """Behavioral tests for harness.tools.fetch."""
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter  # type: ignore[import-untyped]
@@ -10,62 +9,7 @@ from langchain_core.tools import BaseTool
 from harness.config import AgentSettings
 from harness.sources import SourceRegistry
 from harness.tools import fetch
-
-
-class _FakeMarkdown:
-    """Stand-in for crawl4ai's StringCompatibleMarkdown, exposing raw and fit variants."""
-
-    def __init__(self, raw_markdown: str = "", fit_markdown: str = "") -> None:
-        self.raw_markdown = raw_markdown
-        self.fit_markdown = fit_markdown
-
-
-class _FakeResult:
-    """Stand-in for crawl4ai's CrawlResult, exposing only the attributes fetch.py reads."""
-
-    def __init__(
-        self,
-        url: str,
-        *,
-        error_message: str | None = None,
-        status_code: int | None = 200,
-        response_headers: dict | None = None,
-        metadata: dict | None = None,
-        markdown: _FakeMarkdown | None = None,
-    ) -> None:
-        self.url = url
-        self.error_message = error_message
-        self.status_code = status_code
-        self.response_headers = response_headers
-        self.metadata = metadata
-        self.markdown = markdown
-
-
-def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
-    """Build a fake AsyncWebCrawler class recording construction and `arun_many` calls."""
-
-    class _FakeCrawler:
-        constructed_with: list[object] = []
-        calls: list[SimpleNamespace] = []
-
-        def __init__(self, config: object = None) -> None:
-            _FakeCrawler.constructed_with.append(config)
-
-        async def __aenter__(self) -> "_FakeCrawler":
-            return self
-
-        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
-            return False
-
-        async def arun_many(
-            self, urls: list[str], config: object = None, dispatcher: object = None
-        ) -> list[_FakeResult]:
-            _FakeCrawler.calls.append(
-                SimpleNamespace(urls=urls, config=config, dispatcher=dispatcher)
-            )
-            return results
-
-    return _FakeCrawler
+from tests.conftest import _FakeMarkdown, _FakeResult
 
 
 def _rendered(markdown: str, cap: int) -> str:
@@ -80,18 +24,6 @@ def _rendered(markdown: str, cap: int) -> str:
         error=None,
     )
     return fetch._render(page, cap)
-
-
-@pytest.fixture
-def install_crawler(monkeypatch):
-    """Patch fetch's AsyncWebCrawler with a fake serving canned results; returns the class."""
-
-    def _install(results: list[_FakeResult]) -> type:
-        fake_cls = _make_fake_crawler_class(results)
-        monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
-        return fake_cls
-
-    return _install
 
 
 async def test_empty_url_list_returns_empty_content_and_artifact(install_crawler, make_config):

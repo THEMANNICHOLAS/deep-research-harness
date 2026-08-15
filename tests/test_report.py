@@ -19,11 +19,15 @@ from harness.config import AgentSettings
 from harness.paragraphs import split_paragraphs
 from harness.report import (
     _CUT_SHORT_HEADING,
+    _DIGESTED_HEADING,
     _ERROR_TEXT,
+    _FALLBACK_HEADING,
     _NO_ANSWER_TEXT,
     _NO_NOTES_TEXT,
     _NOTES_HEADING,
+    _READ_MODES_HEADING,
     _ROUND_CAP_TEXT,
+    _UNREAD_HEADING,
     _UNUSABLE_HEADING,
     _WALL_CLOCK_TEXT,
     SOURCES_LABEL,
@@ -1640,3 +1644,121 @@ def test_each_cut_short_reason_names_only_its_own_bound(make_config, tmp_path):
         for other_reason, other in phrases.items():
             if other_reason != reason:
                 assert other not in section, f"{reason} also named {other_reason}'s bound"
+
+
+# --- Phase 3 (reader delegation): read-mode disclosure -----------------------------------
+
+
+def test_write_report_all_digested_run_discloses_a_single_summary_line(make_config):
+    """R5 wants digestion observable even when nothing fell back — a run with no exceptions
+    still gets one line saying every source was actually read via the reader.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1)
+    write_source_capture(config, registry, id2)
+    registry.mark_read(id1, "digested")
+    registry.mark_read(id2, "digested")
+    outcome = RunOutcome(
+        question="All digested",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert _READ_MODES_HEADING in body
+    section = _section(body, _READ_MODES_HEADING)
+    assert "2" in section
+    assert "digest" in section.lower()
+    # No bucket headings on the all-digested path — just the summary line.
+    assert _DIGESTED_HEADING not in section
+    assert _FALLBACK_HEADING not in section
+    assert _UNREAD_HEADING not in section
+
+
+def test_write_report_mixed_read_modes_bucket_each_source_correctly(make_config):
+    """Digested, fallback, and unread (a failed capture) sources each land in their own
+    bucket, in a stable order.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    digested_id = registry.add("https://example.test/digested")
+    fallback_id = registry.add("https://example.test/fallback")
+    failed_id = registry.add("https://example.test/failed")
+    write_source_capture(config, registry, digested_id)
+    write_source_capture(config, registry, fallback_id)
+    write_failed_capture(config, registry, failed_id, outcome="blocked")
+    registry.mark_read(digested_id, "digested")
+    registry.mark_read(fallback_id, "fallback")
+    # failed_id is left at its default "unread" — fetch.py never marks a failed capture read.
+    outcome = RunOutcome(
+        question="Mixed read modes",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    section = _section(body, _READ_MODES_HEADING)
+
+    assert _DIGESTED_HEADING in section
+    assert _FALLBACK_HEADING in section
+    assert _UNREAD_HEADING in section
+    digested_pos = section.index(_DIGESTED_HEADING)
+    fallback_pos = section.index(_FALLBACK_HEADING)
+    unread_pos = section.index(_UNREAD_HEADING)
+    assert digested_pos < fallback_pos < unread_pos
+    assert f"[{digested_id}]" in section[digested_pos:fallback_pos]
+    assert f"[{fallback_id}]" in section[fallback_pos:unread_pos]
+    assert f"[{failed_id}]" in section[unread_pos:]
+
+
+def test_write_report_read_mode_disclosure_ignores_undigested_markers_in_capture_body(
+    make_config,
+):
+    """D4: the disclosure buckets by `registry`'s `read_mode` field, never by parsing
+    `<undigested>` markers out of a capture file's body. A capture whose body happens to
+    literally contain the closing marker string must still bucket by what the registry
+    recorded, since marker bodies are unescaped page text and cannot be trusted to parse.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/marked")
+    write_source_capture(
+        config,
+        registry,
+        source_id,
+        '<undigested source="S1" reason="test">page text</undigested>',
+    )
+    registry.mark_read(source_id, "digested")
+    outcome = RunOutcome(
+        question="Marker text inside a digested capture",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    section = _section(body, _READ_MODES_HEADING)
+
+    assert "digest" in section.lower()
+    assert _FALLBACK_HEADING not in section
+    assert _UNREAD_HEADING not in section
+
+
+def test_write_report_omits_the_read_modes_section_with_no_registered_sources(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="No sources at all",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert _READ_MODES_HEADING not in body

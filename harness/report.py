@@ -37,6 +37,13 @@ _HARD_BREAK = "  "
 _NO_SOURCES_TEXT = "No usable sources were found for this run."
 _UNUSABLE_HEADING = "Not usable as evidence (fetch failed or capture missing):"
 
+# R5's rendering half — see `_read_modes_section` for the D4 bucketing rule.
+_READ_MODES_HEADING = "## Source reading"
+_ALL_DIGESTED_TEMPLATE = "All {count} sources were read via reader digests."
+_DIGESTED_HEADING = "Digested via the reader:"
+_FALLBACK_HEADING = "Read raw (fallback, digestion failed or was skipped):"
+_UNREAD_HEADING = "Not read at all (fetch never succeeded):"
+
 # Mirrors `harness/tools/fetch.py`'s `FetchOutcome`: a typed value, not an exception, for why
 # a run ended early.
 CutShortReason = Literal["round_cap", "wall_clock", "error"]
@@ -185,6 +192,42 @@ def _sources_section(config: HarnessConfig, registry: SourceRegistry) -> str:
             lines.append("")
         lines.append(_UNUSABLE_HEADING)
         lines.extend(f"- [{source.id}] {registry.link(source.id)}" for source in unusable)
+
+    return "\n".join(lines)
+
+
+def _read_modes_section(registry: SourceRegistry) -> str:
+    """Disclose how each registered source was actually read (R5, D4).
+
+    Read STRICTLY from `Source.read_mode` -- never from parsing `<undigested>` markers out of
+    a capture body, since those bodies are unescaped page text a report render must not trust
+    to parse. Empty registry renders nothing at all; an all-digested run still renders one
+    summary line, since digestion is the thing R5 wants observable, not only its exceptions.
+    """
+    sources = registry.all()
+    if not sources:
+        return ""
+
+    by_mode: dict[str, list[Source]] = {"digested": [], "fallback": [], "unread": []}
+    for source in sources:
+        by_mode[source.read_mode].append(source)
+
+    if len(by_mode["digested"]) == len(sources):
+        return _ALL_DIGESTED_TEMPLATE.format(count=len(sources))
+
+    lines: list[str] = []
+    for mode, heading in (
+        ("digested", _DIGESTED_HEADING),
+        ("fallback", _FALLBACK_HEADING),
+        ("unread", _UNREAD_HEADING),
+    ):
+        bucket = by_mode[mode]
+        if not bucket:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(heading)
+        lines.extend(f"- [{source.id}] {registry.link(source.id)}" for source in bucket)
 
     return "\n".join(lines)
 
@@ -412,8 +455,8 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
         "",
         "## Run metadata",
         f"- Timestamp: {now.isoformat()}",
-        # What is CONFIGURED for each role, not whether it was invoked: the subagent tier is
-        # configured but not yet wired (R6).
+        # What is CONFIGURED for each role, not whether it was invoked this run: the subagent
+        # tier is wired as the reader (R6).
         f"- Lead Model: {config.roles['head'].model}",
         f"- Subagent Model: {config.roles['subagent'].model}",
         *_usage_lines(outcome.usage),
@@ -456,6 +499,11 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
         _sources_section(config, outcome.registry),
         "",
     ]
+
+    read_modes_text = _read_modes_section(outcome.registry)
+    if read_modes_text:
+        lines += [_READ_MODES_HEADING, "", read_modes_text, ""]
+
     return "\n".join(lines)
 
 
