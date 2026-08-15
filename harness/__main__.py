@@ -404,13 +404,6 @@ async def main(argv: list[str] | None = None) -> int:
     try:
         if should_write_report:
             path = write_report(outcome, config)
-        elif cut_short == "wall_clock":
-            # To stderr: the wall clock fired before a final answer existed (risk #2's blank/
-            # whitespace-answer case lands here too, via `has_answer`).
-            print("error: the wall clock expired before a final answer existed", file=sys.stderr)
-        else:
-            # To stderr and before the path, so the path stays the LAST line of stdout.
-            print(f"error: {cut_short_detail}", file=sys.stderr)
         tracker.finish()
         usable, unusable = partition_sources(config, registry)
         renderer.emit(
@@ -424,8 +417,18 @@ async def main(argv: list[str] | None = None) -> int:
         )
     finally:
         renderer.close()
+    # Error prints belong AFTER close(): under `Live(screen=True)` anything written to the
+    # terminal — stderr included, it shares the device — while the Live runs lands on the
+    # alternate screen and is discarded with it. Down here the normal buffer is restored, so
+    # the detail survives the run (Phase 4's "the no-report error message becomes visible").
     if path is not None:
         print(path)
+    elif cut_short == "wall_clock":
+        # The wall clock fired before a final answer existed (risk #2's blank/whitespace-answer
+        # case lands here too, via `has_answer`).
+        print("error: the wall clock expired before a final answer existed", file=sys.stderr)
+    else:
+        print(f"error: {cut_short_detail}", file=sys.stderr)
     return 0 if should_write_report else 1
 
 

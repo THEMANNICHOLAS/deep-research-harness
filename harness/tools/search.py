@@ -80,34 +80,45 @@ def _render(query: str, outcome: list[SearchResult] | SearchFailure) -> str:
     return "\n".join(lines)
 
 
-async def _search(
-    query: str, max_results: int, config: HarnessConfig
-) -> tuple[str, list[SearchResult] | SearchFailure]:
-    """Query SearXNG, returning model-facing content and the typed result/failure."""
-    url = f"{config.search.base_url.rstrip('/')}/search"
+def _search_url(config: HarnessConfig) -> str:
+    return f"{config.search.base_url.rstrip('/')}/search"
+
+
+async def _fetch_search_json(query: str, config: HarnessConfig) -> object | SearchFailure:
+    """GET the SearXNG JSON endpoint and parse the body, or return the typed failure.
+
+    The single place the request is made: `_search` and `preflight_search` both go through
+    it, so a change to how SearXNG is called (timeout, headers, TLS) lands in both at once.
+    A bare `httpx.AsyncClient()` so `install_search_transport` swaps it in tests.
+    """
+    url = _search_url(config)
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, params={"q": query, "format": "json"})
     except httpx.RequestError as exc:
-        outcome: list[SearchResult] | SearchFailure = SearchFailure(
-            reason="unreachable", detail=f"{type(exc).__name__}: {exc}"
-        )
-        return _render(query, outcome), outcome
+        return SearchFailure(reason="unreachable", detail=f"{type(exc).__name__}: {exc}")
 
     if response.status_code != 200:
-        outcome = SearchFailure(reason="bad_status", detail=f"HTTP {response.status_code}")
-        return _render(query, outcome), outcome
+        return SearchFailure(reason="bad_status", detail=f"HTTP {response.status_code}")
 
     try:
-        payload = response.json()
+        return response.json()
     except ValueError as exc:
-        outcome = SearchFailure(reason="malformed", detail=f"response body is not JSON: {exc}")
-        return _render(query, outcome), outcome
+        return SearchFailure(reason="malformed", detail=f"response body is not JSON: {exc}")
+
+
+async def _search(
+    query: str, max_results: int, config: HarnessConfig
+) -> tuple[str, list[SearchResult] | SearchFailure]:
+    """Query SearXNG, returning model-facing content and the typed result/failure."""
+    payload = await _fetch_search_json(query, config)
+    if isinstance(payload, SearchFailure):
+        return _render(query, payload), payload
 
     if not isinstance(payload, dict):
         detail = f"response body is not an object (got {type(payload).__name__})"
-        outcome = SearchFailure(reason="malformed", detail=detail)
-        return _render(query, outcome), outcome
+        failure = SearchFailure(reason="malformed", detail=detail)
+        return _render(query, failure), failure
 
     outcome = _parse_results(payload, max_results)
     return _render(query, outcome), outcome
@@ -123,35 +134,30 @@ _CONTAINER_HINT = "is the container running? (docker compose up in searxng/)"
 async def preflight_search(config: HarnessConfig) -> None:
     """Verify the configured SearXNG endpoint answers a real JSON search before any run starts.
 
-    R1/D4: GETs the same JSON search endpoint `_search` uses, asserting 200 and a parseable JSON
-    body — this catches both the container being down AND the documented "stock container is
-    HTML-only" misconfiguration, either of which would otherwise only surface mid-run. Uses a
-    bare `httpx.AsyncClient()` (not `_search`, which is left unchanged) so
-    `install_search_transport` swaps it in tests the same way it does for the tool itself.
+    R1/D4: probes via `_fetch_search_json` — the exact request `_search` makes — asserting 200
+    and a parseable JSON body. This catches both the container being down AND the documented
+    "stock container is HTML-only" misconfiguration, either of which would otherwise only
+    surface mid-run.
 
     Raises `SearchPreflightError` naming SearXNG, the probed URL, and the container hint.
     """
-    url = f"{config.search.base_url.rstrip('/')}/search"
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, params={"q": "ping", "format": "json"})
-    except httpx.RequestError as exc:
-        raise SearchPreflightError(
-            f"SearXNG unreachable at {url} — {_CONTAINER_HINT} ({type(exc).__name__}: {exc})"
-        ) from exc
+    payload = await _fetch_search_json("ping", config)
+    if not isinstance(payload, SearchFailure):
+        return
 
-    if response.status_code != 200:
+    url = _search_url(config)
+    if payload.reason == "unreachable":
         raise SearchPreflightError(
-            f"SearXNG at {url} returned HTTP {response.status_code} — {_CONTAINER_HINT}"
+            f"SearXNG unreachable at {url} — {_CONTAINER_HINT} ({payload.detail})"
         )
-
-    try:
-        response.json()
-    except ValueError as exc:
+    if payload.reason == "bad_status":
         raise SearchPreflightError(
-            f"SearXNG at {url} did not return JSON (got HTML? the JSON API may not be enabled) "
-            f"— {_CONTAINER_HINT} ({exc})"
-        ) from exc
+            f"SearXNG at {url} returned {payload.detail} — {_CONTAINER_HINT}"
+        )
+    raise SearchPreflightError(
+        f"SearXNG at {url} did not return JSON (got HTML? the JSON API may not be enabled) "
+        f"— {_CONTAINER_HINT} ({payload.detail})"
+    )
 
 
 class SearchUnavailableError(Exception):

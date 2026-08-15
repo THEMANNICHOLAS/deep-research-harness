@@ -1,6 +1,7 @@
 """Behavioral tests for harness.display: events, renderers, and StageTracker."""
 
 import re
+import sys
 from contextlib import AbstractContextManager
 from io import StringIO
 from typing import Any
@@ -753,6 +754,47 @@ async def test_a_failing_report_write_still_closes_the_display(
         await main_module.main(["a question whose report cannot be written"])
 
     assert renderer.closes == 1
+
+
+async def test_failed_run_error_prints_only_after_the_renderer_is_closed(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    """Under `Live(screen=True)` anything printed before the Live stops lands on the alternate
+    screen and is discarded with it. capsys cannot see that discard, so this pins the fix by
+    ordering instead: the `error:` detail must reach stderr only AFTER `renderer.close()`.
+    """
+
+    class _CloseMarkingRenderer(_RecordingRenderer):
+        def close(self) -> None:
+            super().close()
+            print("<renderer closed>", file=sys.stderr)
+
+    config = make_config()
+    renderer = _CloseMarkingRenderer()
+    monkeypatch.setattr(main_module, "build_renderer", lambda: renderer)
+
+    ping = AIMessage(content="pong")
+    plan_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_todos",
+                "args": {"todos": [{"content": "Investigate", "status": "in_progress"}]},
+                "id": "call_1",
+            }
+        ],
+    )
+    model = scripted_model([ping, plan_call])  # no third response — the run dies here
+    patch_run(monkeypatch, config, model)
+
+    exit_code = await main_module.main(["question whose run dies mid-flight"])
+
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    marker_at = err.find("<renderer closed>")
+    error_at = err.find("error:")
+    assert marker_at != -1 and error_at != -1, err
+    assert marker_at < error_at, f"the error printed while the Live still owned the screen: {err!r}"
 
 
 async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
