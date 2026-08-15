@@ -248,3 +248,11 @@ sentences each, append-only, newest last.
   finish, so the report carries a real final answer instead of mid-run chatter, with the
   round cap still disclosed. Reusable rule: reach for recursion_limit as a crash-stop
   backstop, never as a semantic budget.
+
+- **2026-08-15 — Phase 2 model availability verified live; rate limits unexamined by choice.**
+  `preflight` against opencode succeeded for both new Phase 2 models: `kimi-k3` OK and
+  `deepseek-v4-flash` OK (the existing region opt-in covers `-flash`; no new opt-in step was
+  required). The R6 role list stands with no substitutes.
+  The OpenCode dashboard exposes no RPM/TPM figures the developer could find; decision
+  (developer, 2026-08-15): ignore limits until one is actually hit, so Step 3's
+  researcher-count guidance uses a conservative default fan-out rather than a measured bound.

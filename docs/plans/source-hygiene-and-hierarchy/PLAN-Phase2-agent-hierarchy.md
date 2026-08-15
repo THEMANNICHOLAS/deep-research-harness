@@ -1,6 +1,6 @@
 # PLAN: Source Hygiene and Agent Hierarchy — Phase 2: Agent hierarchy
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-15
 **Parent:** `PLAN-source-hygiene-and-hierarchy.md`
 **Phase:** 2 of 2
@@ -12,7 +12,7 @@ are rerouted per D7 after live availability checks. See the parent plan for Inte
 Codebase Map (deepagents nesting facts), and Design Decisions D5–D7.
 
 ## Progress
-- [ ] Step 1: Live model & rate-limit checks
+- [x] Step 1: Live model & rate-limit checks
 - [ ] Step 2: Role keys and routing
 - [ ] Step 3: Researcher tier wiring
 - [ ] Step 4: Disclosures end-to-end
@@ -40,10 +40,10 @@ Codebase Map (deepagents nesting facts), and Design Decisions D5–D7.
   benchmarking or latency measurement.
 
 **Manual verification:**
-- [ ] `preflight` against `kimi-k3` succeeds, or its failure mode is recorded.
-- [ ] `preflight` against `deepseek-v4-flash` succeeds (region opt-in confirmed), or its
+- [x] `preflight` against `kimi-k3` succeeds, or its failure mode is recorded.
+- [x] `preflight` against `deepseek-v4-flash` succeeds (region opt-in confirmed), or its
   failure mode is recorded.
-- [ ] OpenCode dashboard rate limits (RPM/TPM) read and recorded in docs/decisions.md.
+- [x] OpenCode dashboard rate limits (RPM/TPM) read and recorded in docs/decisions.md.
 
 **Details:**
 This step is the phase gate (!#3): if kimi-k3 or v4-flash is unavailable, STOP and decide
@@ -51,7 +51,7 @@ substitute assignments with the developer before Step 2 — the parent plan's R6
 the intent, not an assumption to improvise around.
 
 **Acceptance criteria:**
-- [ ] docs/decisions.md entry exists naming all three outcomes with the check date.
+- [x] docs/decisions.md entry exists naming all three outcomes with the check date.
 
 ### Step 2: Role keys and routing
 **Risk:** none
@@ -239,3 +239,15 @@ problem claim is what keeps that tolerable.
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so
 never add a section below it. -->
+
+### 2026-08-15 — Step 1: Live model & rate-limit checks
+- Done: Live preflight passed for both kimi-k3 and deepseek-v4-flash (existing region opt-in
+  suffices); outcomes plus the rate-limit disposition recorded in docs/decisions.md. The
+  three series plan files also moved into docs/plans/source-hygiene-and-hierarchy/
+  (developer-requested reorg, same commit).
+- Learned: OpenCode dashboard exposes no RPM/TPM figures; developer decided to ignore limits
+  until one is hit, so Step 3's researcher-count guidance uses a conservative default fan-out
+  rather than a measured bound.
+- Drift: none.
+- Watch-next: Step 2 renames role keys (head/researcher/reader/verifier, subagent retired) —
+  test-first required; both models it commits to harness.toml are now verified live.
