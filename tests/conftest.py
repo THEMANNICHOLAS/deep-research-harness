@@ -224,12 +224,19 @@ def patch_run(
     model: Any,
     *,
     skip_preflight: bool = False,
+    run_search_preflight: bool = False,
 ) -> None:
     """Patch everything a `main()` test reaches outside the compiled graph.
 
-    `skip_preflight` replaces `preflight` with a no-op. `False` by default, so most tests let the
-    REAL `preflight` run against the scripted model and script a leading reply for it — that
-    keeps R6's call site exercised rather than stubbed out everywhere.
+    `skip_preflight` replaces `preflight` (the model check) with a no-op. `False` by default, so
+    most tests let the REAL `preflight` run against the scripted model and script a leading
+    reply for it — that keeps R6's call site exercised rather than stubbed out everywhere.
+
+    The search preflight (`preflight_search`) is a real HTTP probe against `config.search
+    .base_url`, which has no scripted-model equivalent — most `main()` tests never touch
+    `search_web` and have no transport installed, so it is ALWAYS neutralized here by default
+    (regardless of `skip_preflight`). Pass `run_search_preflight=True` to let the real probe run
+    instead (install a search transport via `install_search_transport` before calling `main()`).
     """
     import harness.__main__ as main_module
 
@@ -240,6 +247,12 @@ def patch_run(
             return None
 
         monkeypatch.setattr(main_module, "preflight", _noop_preflight)
+    if not run_search_preflight:
+
+        async def _noop_search_preflight(cfg: HarnessConfig) -> None:
+            return None
+
+        monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
     patch_model(monkeypatch, model)
 
 
@@ -370,6 +383,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         max_urls_per_call: int = 5,
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
+        max_consecutive_failures: int = 3,
         agent: AgentSettings | None = None,
         head_model: str = "test-model",
         subagent_model: str = "test-model",
@@ -395,7 +409,11 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
                 per_page_char_cap=per_page_char_cap,
                 max_urls_per_call=max_urls_per_call,
             ),
-            search=SearchSettings(base_url=base_url, default_max_results=default_max_results),
+            search=SearchSettings(
+                base_url=base_url,
+                default_max_results=default_max_results,
+                max_consecutive_failures=max_consecutive_failures,
+            ),
             agent=agent,
         )
 

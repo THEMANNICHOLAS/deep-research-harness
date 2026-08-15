@@ -1,6 +1,7 @@
 # PLAN: Rich CLI Output
 
-**Status:** In Progress
+**Status:** Complete — superseded (work merged in PR #12; display shape now owned by
+PLAN-fail-fast-and-pinned-checklist.md)
 **Created:** 2026-08-14
 **Type:** Single plan
 

@@ -1,6 +1,7 @@
 """Behavioral tests for harness.display: events, renderers, and StageTracker."""
 
 import re
+import sys
 from contextlib import AbstractContextManager
 from io import StringIO
 from typing import Any
@@ -22,6 +23,8 @@ from harness.display import (
     StageCompleted,
     StageStarted,
     StageTracker,
+    TodoItem,
+    TodosUpdated,
     build_renderer,
 )
 from harness.sources import SourceRegistry
@@ -43,7 +46,23 @@ def _strip_ansi(text: str) -> str:
 
 def _rich_renderer() -> tuple[RichRenderer, StringIO]:
     buffer = StringIO()
-    console = Console(file=buffer, force_terminal=True, width=80)
+    # `legacy_windows=False` (rather than relying on auto-detection): the alternate-screen
+    # codes `RichRenderer` now relies on (D1/R5) are suppressed by Rich whenever
+    # `legacy_windows` is true, which it auto-detects as True on this platform even over a
+    # `StringIO` file — leaving the alt-screen behavior untestable on Windows otherwise.
+    # `color_system="truecolor"` (rather than "auto"): the `#207d99` pending style (R6) only
+    # emits its literal `38;2;...` truecolor escape under truecolor; "auto" resolves to
+    # 16-color "standard" here, downgrading the hex style to a named ANSI color instead.
+    # `_environ={}`: an ambient NO_COLOR in the invoking shell would strip color styles
+    # even under force_terminal, making the truecolor assertions env-dependent.
+    console = Console(
+        file=buffer,
+        force_terminal=True,
+        width=80,
+        legacy_windows=False,
+        color_system="truecolor",
+        _environ={},
+    )
     return RichRenderer(console=console, auto_refresh=False), buffer
 
 
@@ -63,6 +82,20 @@ def test_plain_renderer_emits_the_expected_line(capsys, event: DisplayEvent, exp
 
     out, lines = drain_stdout(capsys)
     assert lines == [expected_line]
+
+
+def test_plain_renderer_prints_todos_updated_as_sequential_lines_with_no_alt_screen(capsys):
+    renderer = PlainRenderer()
+    todos = (
+        TodoItem(content="Find sources", status="pending"),
+        TodoItem(content="Draft outline", status="completed"),
+    )
+
+    renderer.emit(TodosUpdated(todos))
+
+    out, lines = drain_stdout(capsys)
+    assert lines == ["  [pending] Find sources", "  [completed] Draft outline"]
+    assert "\x1b[?1049" not in out
 
 
 def test_plain_renderer_suspend_is_a_no_op_context_manager(capsys):
@@ -190,19 +223,31 @@ async def test_a_direct_answer_skips_the_clarifying_and_researching_lines(
     assert lines[-1].strip().endswith(".md")
 
 
-async def test_a_research_call_and_todo_produce_activity_lines(
+async def test_a_research_call_and_todo_produce_todos_updated_lines(
     make_config, monkeypatch, scripted_model, capsys
 ):
+    """Todos now arrive via `TodosUpdated` (Contracts), not flattened `Activity` text.
+
+    A second `write_todos` call changes only one item's status; the PlainRenderer's
+    `TodosUpdated` handling reprints the FULL current list (replacement, not a diff) — so the
+    UNCHANGED second item is printed again too, which the old per-item flattening would not
+    have done.
+    """
     config = make_config()
     ping = AIMessage(content="pong")
-    plan_and_search: list[Any] = [
+    plan_search_and_replan: list[Any] = [
         AIMessage(
             content="",
             tool_calls=[
                 {
                     "name": "write_todos",
-                    "args": {"todos": [{"content": "Search for the answer", "status": "pending"}]},
-                    "id": "call_todo",
+                    "args": {
+                        "todos": [
+                            {"content": "Search for the answer", "status": "pending"},
+                            {"content": "Write the summary", "status": "pending"},
+                        ]
+                    },
+                    "id": "call_todo_1",
                 },
             ],
         ),
@@ -216,12 +261,27 @@ async def test_a_research_call_and_todo_produce_activity_lines(
                 }
             ],
         ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "write_todos",
+                    "args": {
+                        "todos": [
+                            {"content": "Search for the answer", "status": "completed"},
+                            {"content": "Write the summary", "status": "pending"},
+                        ]
+                    },
+                    "id": "call_todo_2",
+                },
+            ],
+        ),
     ]
     final = AIMessage(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, *plan_and_search, final])
+    model = scripted_model([ping, *plan_search_and_replan, final])
     patch_run(monkeypatch, config, model)
     _install_stub_search(monkeypatch)
 
@@ -229,7 +289,9 @@ async def test_a_research_call_and_todo_produce_activity_lines(
 
     out, lines = drain_stdout(capsys)
     assert '  search_web: "the answer"' in out
-    assert "  [pending] Search for the answer" in out
+    assert "  [pending] Search for the answer" in lines
+    assert "  [completed] Search for the answer" in lines
+    assert lines.count("  [pending] Write the summary") == 2
     assert lines[-1].strip().endswith(".md")
 
 
@@ -242,18 +304,22 @@ def test_rich_renderer_stage_lifecycle_collapses_to_one_line():
     renderer.emit(StageStarted("researching"))
     renderer.emit(Activity('search_web: "first query"'))
     renderer.emit(Activity('search_web: "second query"'))
+    before = len(buffer.getvalue())
     renderer.emit(StageCompleted("researching", 2.0))
+    frame = _strip_ansi(buffer.getvalue()[before:])
     renderer.close()
 
     text = _strip_ansi(buffer.getvalue())
     assert "researching" in text
     assert 'search_web: "first query"' in text
     assert 'search_web: "second query"' in text
-    lines = [line for line in text.splitlines() if line.strip()]
+    # The completion frame collapses the stage: exactly one timeline line, activities gone.
+    lines = [line for line in frame.splitlines() if line.strip()]
     collapsed = [line for line in lines if re.search(r"researching \(2\.0s\)", line)]
     assert len(collapsed) == 1
     assert re.search(r"ok\s+researching \(2\.0s\)", collapsed[0])
-    assert lines[-1] == collapsed[0]
+    assert "first query" not in frame
+    assert "second query" not in frame
 
 
 def test_rich_renderer_activity_tail_shows_only_last_eight():
@@ -309,7 +375,9 @@ def test_rich_renderer_stage_line_is_ascii_only():
 
     lines = _strip_ansi(buffer.getvalue()).splitlines()
     collapsed = next(line for line in lines if "researching (2.0s)" in line)
-    assert collapsed.isascii()
+    # The timeline line now renders inside the log Panel, whose box-drawing border shares
+    # the row — the ASCII requirement is about the line's CONTENT, so strip the border.
+    assert collapsed.strip().strip("│").strip().isascii()
 
 
 def test_rich_renderer_two_stages_produce_two_collapsed_lines_in_order():
@@ -318,12 +386,16 @@ def test_rich_renderer_two_stages_produce_two_collapsed_lines_in_order():
     renderer.emit(StageStarted("researching"))
     renderer.emit(StageCompleted("researching", 1.0))
     renderer.emit(StageStarted("verifying"))
+    # Timeline lines live INSIDE the frame (a print under `screen=True` would be discarded
+    # with the alt buffer), so every later frame repeats them — assert on the single frame
+    # painted by the final StageCompleted, which must carry both lines in order.
+    before = len(buffer.getvalue())
     renderer.emit(StageCompleted("verifying", 3.5))
+    frame = _strip_ansi(buffer.getvalue()[before:])
     renderer.close()
 
-    text = _strip_ansi(buffer.getvalue())
-    lines = [line for line in text.splitlines() if line.strip()]
-    collapsed = [line for line in lines if line.startswith("ok ")]
+    lines = [line for line in frame.splitlines() if line.strip()]
+    collapsed = [line for line in lines if "ok " in line]
     assert len(collapsed) == 2
     assert re.search(r"researching \(1\.0s\)", collapsed[0])
     assert re.search(r"verifying \(3\.5s\)", collapsed[1])
@@ -358,6 +430,91 @@ def test_rich_renderer_suspend_is_a_context_manager():
     renderer.close()
 
 
+# --- TodosUpdated / pinned checklist tests (Phase 1, D1/R5/R6) -----------------------------
+
+
+def test_rich_renderer_todos_updated_renders_checklist_and_replaces_on_next_update():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(
+        TodosUpdated(
+            (
+                TodoItem(content="Draft outline", status="completed"),
+                TodoItem(content="Search for sources", status="in_progress"),
+                TodoItem(content="Write summary", status="pending"),
+            )
+        )
+    )
+
+    raw = buffer.getvalue()
+    text = _strip_ansi(raw)
+    assert "[x] Draft outline" in text
+    assert "> Search for sources" in text
+    assert "[ ] Write summary" in text
+    # `#207d99` as `Console(force_terminal=True)` truecolor: 0x20, 0x7d, 0x99 = 32, 125, 153.
+    assert "38;2;32;125;153" in raw
+    # in_progress is visually distinct from both completed and pending — distinct markers.
+    assert "[x] Search for sources" not in text
+    assert "[ ] Search for sources" not in text
+
+    before = len(buffer.getvalue())
+    renderer.emit(TodosUpdated((TodoItem(content="Only item", status="pending"),)))
+    last_frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "[ ] Only item" in last_frame
+    assert "Draft outline" not in last_frame
+    assert "Search for sources" not in last_frame
+    assert "Write summary" not in last_frame
+
+
+def test_rich_renderer_layout_order_is_checklist_then_rule_then_activity_then_footer():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(TodosUpdated((TodoItem(content="Find sources", status="pending"),)))
+    # Checklist, rule, and footer are part of EVERY frame (Contracts/D1), so comparing raw
+    # indices across the whole cumulative buffer would just find each one's earliest
+    # occurrence in the FIRST frame — before the activity line exists at all. Isolating the
+    # frame delta since just before this update (mirrors the activity-tail test) captures one
+    # single, self-contained screen to check the top-to-bottom order within.
+    before = len(buffer.getvalue())
+    renderer.emit(Activity('search_web: "a query"'))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    checklist_index = frame.index("Find sources")
+    rule_index = frame.index("─")  # the gray `Rule` separator (R6)
+    activity_index = frame.index('search_web: "a query"')
+    footer_index = frame.index("Ctrl+C to exit")
+    assert checklist_index < rule_index < activity_index < footer_index
+
+    lines = [line for line in frame.splitlines() if line.strip()]
+    footer_lines = [line for line in lines if "Ctrl+C to exit" in line]
+    assert footer_lines
+    assert footer_lines[-1].strip() == "Ctrl+C to exit"
+
+
+def test_rich_renderer_suspend_exits_the_alt_screen_for_a_question_and_restores_after():
+    renderer, buffer = _rich_renderer()
+
+    # Production order (`__main__.py`): the Question is emitted while the Live still owns
+    # the alternate screen, and only then does the run loop enter `suspend()` for input().
+    # The renderer must hold the question and print it on the NORMAL screen inside
+    # `suspend()` — a print while the Live runs would be discarded with the alt buffer.
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(Question("Which region?"))
+    with renderer.suspend():
+        pass
+
+    raw = buffer.getvalue()
+    question_index = raw.index("Which region?")
+    exit_index = raw.rindex("\x1b[?1049l", 0, question_index)
+    reenter_index = raw.index("\x1b[?1049h", question_index)
+    assert exit_index < question_index < reenter_index
+
+    renderer.close()
+
+
 # --- Question panel + suspend tests (Phase 3) ---------------------------------------------
 
 
@@ -365,6 +522,8 @@ def test_rich_renderer_question_renders_as_a_bordered_panel():
     renderer, buffer = _rich_renderer()
 
     renderer.emit(Question("Which region?"))
+    with renderer.suspend():
+        pass
     renderer.close()
 
     text = _strip_ansi(buffer.getvalue())
@@ -385,6 +544,8 @@ def test_rich_renderer_question_is_not_parsed_as_console_markup():
     renderer, buffer = _rich_renderer()
 
     renderer.emit(Question("Which log, [/var/log] or [a] the app's own?"))
+    with renderer.suspend():
+        pass
     renderer.close()
 
     text = _strip_ansi(buffer.getvalue())
@@ -478,6 +639,32 @@ def test_run_finished_omits_empty_sections(kind, capsys):
     assert not any("verification failures:" in line for line in lines)
 
 
+def test_rich_renderer_run_finished_summary_prints_on_the_normal_screen_after_the_tui():
+    """R5: the alternate screen vanishes on `RunFinished`, so the post-run summary must be
+    visible AFTER leaving it, on the normal terminal, not trapped inside the alt-screen pair.
+    """
+    renderer, buffer = _rich_renderer()
+    renderer.emit(TodosUpdated((TodoItem(content="Find sources", status="pending"),)))
+
+    renderer.emit(
+        RunFinished(
+            stage_timings=(),
+            usable_sources=1,
+            unusable_sources=0,
+            cut_short=None,
+            verification_failures=0,
+        )
+    )
+    renderer.close()
+
+    raw = buffer.getvalue()
+    summary_index = raw.index("summary:")
+    last_exit_index = raw.rindex("\x1b[?1049l")
+    assert last_exit_index < summary_index
+    # No FURTHER alt-screen entry after the summary — it stays on the normal screen.
+    assert "\x1b[?1049h" not in raw[summary_index:]
+
+
 def test_stage_tracker_timings_returns_completed_pairs_in_order():
     renderer = _RecordingRenderer()
     tracker = StageTracker(renderer, clock=_fake_clock([0.0, 1.0, 4.0]))
@@ -567,6 +754,47 @@ async def test_a_failing_report_write_still_closes_the_display(
         await main_module.main(["a question whose report cannot be written"])
 
     assert renderer.closes == 1
+
+
+async def test_failed_run_error_prints_only_after_the_renderer_is_closed(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    """Under `Live(screen=True)` anything printed before the Live stops lands on the alternate
+    screen and is discarded with it. capsys cannot see that discard, so this pins the fix by
+    ordering instead: the `error:` detail must reach stderr only AFTER `renderer.close()`.
+    """
+
+    class _CloseMarkingRenderer(_RecordingRenderer):
+        def close(self) -> None:
+            super().close()
+            print("<renderer closed>", file=sys.stderr)
+
+    config = make_config()
+    renderer = _CloseMarkingRenderer()
+    monkeypatch.setattr(main_module, "build_renderer", lambda: renderer)
+
+    ping = AIMessage(content="pong")
+    plan_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_todos",
+                "args": {"todos": [{"content": "Investigate", "status": "in_progress"}]},
+                "id": "call_1",
+            }
+        ],
+    )
+    model = scripted_model([ping, plan_call])  # no third response — the run dies here
+    patch_run(monkeypatch, config, model)
+
+    exit_code = await main_module.main(["question whose run dies mid-flight"])
+
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    marker_at = err.find("<renderer closed>")
+    error_at = err.find("error:")
+    assert marker_at != -1 and error_at != -1, err
+    assert marker_at < error_at, f"the error printed while the Live still owned the screen: {err!r}"
 
 
 async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(

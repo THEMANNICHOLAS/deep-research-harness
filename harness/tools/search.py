@@ -80,37 +80,92 @@ def _render(query: str, outcome: list[SearchResult] | SearchFailure) -> str:
     return "\n".join(lines)
 
 
-async def _search(
-    query: str, max_results: int, config: HarnessConfig
-) -> tuple[str, list[SearchResult] | SearchFailure]:
-    """Query SearXNG, returning model-facing content and the typed result/failure."""
-    url = f"{config.search.base_url.rstrip('/')}/search"
+def _search_url(config: HarnessConfig) -> str:
+    return f"{config.search.base_url.rstrip('/')}/search"
+
+
+async def _fetch_search_json(query: str, config: HarnessConfig) -> object | SearchFailure:
+    """GET the SearXNG JSON endpoint and parse the body, or return the typed failure.
+
+    The single place the request is made: `_search` and `preflight_search` both go through
+    it, so a change to how SearXNG is called (timeout, headers, TLS) lands in both at once.
+    A bare `httpx.AsyncClient()` so `install_search_transport` swaps it in tests.
+    """
+    url = _search_url(config)
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, params={"q": query, "format": "json"})
     except httpx.RequestError as exc:
-        outcome: list[SearchResult] | SearchFailure = SearchFailure(
-            reason="unreachable", detail=f"{type(exc).__name__}: {exc}"
-        )
-        return _render(query, outcome), outcome
+        return SearchFailure(reason="unreachable", detail=f"{type(exc).__name__}: {exc}")
 
     if response.status_code != 200:
-        outcome = SearchFailure(reason="bad_status", detail=f"HTTP {response.status_code}")
-        return _render(query, outcome), outcome
+        return SearchFailure(reason="bad_status", detail=f"HTTP {response.status_code}")
 
     try:
-        payload = response.json()
+        return response.json()
     except ValueError as exc:
-        outcome = SearchFailure(reason="malformed", detail=f"response body is not JSON: {exc}")
-        return _render(query, outcome), outcome
+        return SearchFailure(reason="malformed", detail=f"response body is not JSON: {exc}")
+
+
+async def _search(
+    query: str, max_results: int, config: HarnessConfig
+) -> tuple[str, list[SearchResult] | SearchFailure]:
+    """Query SearXNG, returning model-facing content and the typed result/failure."""
+    payload = await _fetch_search_json(query, config)
+    if isinstance(payload, SearchFailure):
+        return _render(query, payload), payload
 
     if not isinstance(payload, dict):
         detail = f"response body is not an object (got {type(payload).__name__})"
-        outcome = SearchFailure(reason="malformed", detail=detail)
-        return _render(query, outcome), outcome
+        failure = SearchFailure(reason="malformed", detail=detail)
+        return _render(query, failure), failure
 
     outcome = _parse_results(payload, max_results)
     return _render(query, outcome), outcome
+
+
+class SearchPreflightError(Exception):
+    """Raised when the configured SearXNG endpoint fails the startup health check."""
+
+
+_CONTAINER_HINT = "is the container running? (docker compose up in searxng/)"
+
+
+async def preflight_search(config: HarnessConfig) -> None:
+    """Verify the configured SearXNG endpoint answers a real JSON search before any run starts.
+
+    R1/D4: probes via `_fetch_search_json` — the exact request `_search` makes — asserting 200
+    and a parseable JSON body. This catches both the container being down AND the documented
+    "stock container is HTML-only" misconfiguration, either of which would otherwise only
+    surface mid-run.
+
+    Raises `SearchPreflightError` naming SearXNG, the probed URL, and the container hint.
+    """
+    payload = await _fetch_search_json("ping", config)
+    if not isinstance(payload, SearchFailure):
+        return
+
+    url = _search_url(config)
+    if payload.reason == "unreachable":
+        raise SearchPreflightError(
+            f"SearXNG unreachable at {url} — {_CONTAINER_HINT} ({payload.detail})"
+        )
+    if payload.reason == "bad_status":
+        raise SearchPreflightError(
+            f"SearXNG at {url} returned {payload.detail} — {_CONTAINER_HINT}"
+        )
+    raise SearchPreflightError(
+        f"SearXNG at {url} did not return JSON (got HTML? the JSON API may not be enabled) "
+        f"— {_CONTAINER_HINT} ({payload.detail})"
+    )
+
+
+class SearchUnavailableError(Exception):
+    """Raised when SearXNG has failed too many consecutive times in a single run (R2/D3).
+
+    The agent loop never special-cases this — it reaches the generic exception handler like
+    any other unexpected error, ending the run as a hard error with no report.
+    """
 
 
 def build_search_tool(config: HarnessConfig) -> BaseTool:
@@ -128,6 +183,11 @@ def build_search_tool(config: HarnessConfig) -> BaseTool:
             description="The maximum number of results to return.",
         )
 
+    # D3: per-tool-instance (i.e. per-run) counter of CONSECUTIVE connection-level failures.
+    # Lives in this closure, not in `_search` or at module scope, so it never leaks across
+    # runs/tests. `malformed` failures neither increment nor reset it.
+    consecutive_failures = 0
+
     @tool("search_web", args_schema=SearchWebInput, response_format="content_and_artifact")
     async def search_web(
         query: str, max_results: int
@@ -136,8 +196,23 @@ def build_search_tool(config: HarnessConfig) -> BaseTool:
 
         Failures (unreachable search backend, a non-200 response, or a malformed body) are
         reported as data rather than raising, so a dead search backend never fails the
-        whole tool call.
+        whole tool call — except after too many consecutive connection-level failures in a
+        row, which raises `SearchUnavailableError` to abort the run.
         """
-        return await _search(query, max_results, config)
+        nonlocal consecutive_failures
+        content, outcome = await _search(query, max_results, config)
+
+        if isinstance(outcome, SearchFailure) and outcome.reason in ("unreachable", "bad_status"):
+            consecutive_failures += 1
+            if consecutive_failures >= config.search.max_consecutive_failures:
+                raise SearchUnavailableError(
+                    f"SearXNG search failed {consecutive_failures} times in a row — "
+                    "aborting the run (is the container still up?)"
+                )
+        elif not isinstance(outcome, SearchFailure):
+            consecutive_failures = 0
+        # reason == "malformed": leave the counter unchanged.
+
+        return content, outcome
 
     return search_web

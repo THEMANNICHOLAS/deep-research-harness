@@ -310,6 +310,198 @@ async def test_built_tool_exposes_the_pinned_contract(monkeypatch, make_config):
     assert [r.url for r in message.artifact] == ["https://a.test"]
 
 
+async def test_preflight_search_passes_on_200_json_response(monkeypatch, make_config):
+    def handler(request):
+        return httpx.Response(200, json={"results": []})
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+
+    assert await search.preflight_search(config) is None
+
+
+async def test_preflight_search_raises_on_connection_error(monkeypatch, make_config):
+    def handler(request):
+        raise httpx.ConnectError("refused")
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+
+    with pytest.raises(search.SearchPreflightError) as excinfo:
+        await search.preflight_search(config)
+
+    message = str(excinfo.value)
+    assert "SearXNG" in message
+    assert "container" in message.lower() or "docker" in message.lower()
+
+
+async def test_preflight_search_raises_on_non_200_status(monkeypatch, make_config):
+    def handler(request):
+        return httpx.Response(500, text="internal error")
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+
+    with pytest.raises(search.SearchPreflightError) as excinfo:
+        await search.preflight_search(config)
+
+    assert "SearXNG" in str(excinfo.value)
+
+
+async def test_preflight_search_raises_on_html_only_body(monkeypatch, make_config):
+    def handler(request):
+        return httpx.Response(200, text="<html>not json</html>")
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+
+    with pytest.raises(search.SearchPreflightError) as excinfo:
+        await search.preflight_search(config)
+
+    assert "SearXNG" in str(excinfo.value)
+
+
+def _make_tool_call(call_id: str, query: str = "x", max_results: int = 10) -> dict:
+    return {
+        "name": "search_web",
+        "args": {"query": query, "max_results": max_results},
+        "id": call_id,
+        "type": "tool_call",
+    }
+
+
+def _scripted_handler(responses):
+    """A stateful handler returning the next scripted `httpx.Response`/exception per call.
+
+    Each entry in `responses` is either an `httpx.Response` or an exception instance to raise.
+    """
+    calls = {"count": 0}
+
+    def handler(request):
+        index = calls["count"]
+        calls["count"] += 1
+        outcome = responses[index]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    return handler
+
+
+async def test_third_consecutive_connection_failure_raises_search_unavailable(
+    monkeypatch, make_config
+):
+    handler = _scripted_handler(
+        [
+            httpx.ConnectError("refused"),
+            httpx.ConnectError("refused"),
+            httpx.ConnectError("refused"),
+        ]
+    )
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    tool = search.build_search_tool(config)
+
+    await tool.ainvoke(_make_tool_call("c1"))
+    await tool.ainvoke(_make_tool_call("c2"))
+
+    with pytest.raises(search.SearchUnavailableError) as excinfo:
+        await tool.ainvoke(_make_tool_call("c3"))
+
+    message = str(excinfo.value)
+    assert "SearXNG" in message
+    assert "3" in message
+
+
+async def test_mixed_unreachable_and_bad_status_count_together(monkeypatch, make_config):
+    handler = _scripted_handler(
+        [
+            httpx.ConnectError("refused"),
+            httpx.Response(500, text="internal error"),
+            httpx.ConnectError("refused"),
+        ]
+    )
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    tool = search.build_search_tool(config)
+
+    await tool.ainvoke(_make_tool_call("c1"))
+    await tool.ainvoke(_make_tool_call("c2"))
+
+    with pytest.raises(search.SearchUnavailableError):
+        await tool.ainvoke(_make_tool_call("c3"))
+
+
+async def test_success_resets_the_consecutive_failure_counter(monkeypatch, make_config):
+    success = httpx.Response(200, json={"query": "x", "results": []})
+    handler = _scripted_handler(
+        [
+            httpx.ConnectError("refused"),
+            httpx.ConnectError("refused"),
+            success,
+            httpx.ConnectError("refused"),
+            httpx.ConnectError("refused"),
+            httpx.ConnectError("refused"),
+        ]
+    )
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    tool = search.build_search_tool(config)
+
+    for i in range(5):
+        await tool.ainvoke(_make_tool_call(f"c{i}"))
+
+    with pytest.raises(search.SearchUnavailableError):
+        await tool.ainvoke(_make_tool_call("c5"))
+
+
+async def test_malformed_neither_counts_nor_resets(monkeypatch, make_config):
+    handler = _scripted_handler(
+        [
+            httpx.ConnectError("refused"),
+            httpx.ConnectError("refused"),
+            httpx.Response(200, text="not json at all"),
+            httpx.ConnectError("refused"),
+        ]
+    )
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    tool = search.build_search_tool(config)
+
+    await tool.ainvoke(_make_tool_call("c1"))
+    await tool.ainvoke(_make_tool_call("c2"))
+    await tool.ainvoke(_make_tool_call("c3"))
+
+    with pytest.raises(search.SearchUnavailableError):
+        await tool.ainvoke(_make_tool_call("c4"))
+
+
+async def test_malformed_alone_never_raises(monkeypatch, make_config):
+    def handler(request):
+        return httpx.Response(200, text="not json at all")
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    tool = search.build_search_tool(config)
+
+    for i in range(10):
+        await tool.ainvoke(_make_tool_call(f"c{i}"))
+
+
+async def test_config_limit_is_honored(monkeypatch, make_config):
+    def handler(request):
+        raise httpx.ConnectError("refused")
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config(max_consecutive_failures=1)
+    tool = search.build_search_tool(config)
+
+    with pytest.raises(search.SearchUnavailableError) as excinfo:
+        await tool.ainvoke(_make_tool_call("c1"))
+
+    assert "1" in str(excinfo.value)
+
+
 async def test_result_missing_optional_fields_still_maps(monkeypatch, make_config):
     payload = {
         "query": "x",

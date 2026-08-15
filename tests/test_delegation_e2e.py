@@ -103,6 +103,13 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
 
     monkeypatch.setattr(main_module, "preflight", _noop_preflight)
 
+    # Like `patch_run`, the search preflight is neutralized: it is a real HTTP probe against
+    # `config.search.base_url`, and this scenario installs no search transport.
+    async def _noop_search_preflight(cfg):
+        return None
+
+    monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
+
     captured: dict = {}
     real_write_report = main_module.write_report
 

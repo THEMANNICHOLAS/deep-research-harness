@@ -32,6 +32,7 @@ max_urls_per_call = 3
 [search]
 base_url = "http://localhost:8080"
 default_max_results = 7
+max_consecutive_failures = 4
 """
 
 MINIMAL_TOML = """
@@ -87,6 +88,7 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
 
     assert config.search.base_url == "http://localhost:8080"
     assert config.search.default_max_results == 7
+    assert config.search.max_consecutive_failures == 4
 
 
 def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
@@ -101,6 +103,7 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
     assert config.fetch.per_page_char_cap == 12000
     assert config.fetch.max_urls_per_call == 5
     assert config.search.default_max_results == 10
+    assert config.search.max_consecutive_failures == 3
 
 
 def test_missing_env_var_raises_config_error_naming_variable(tmp_path, monkeypatch):
@@ -152,7 +155,9 @@ def test_missing_section_error_names_the_offending_field(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
     toml_content = VALID_TOML.replace(
-        '[search]\nbase_url = "http://localhost:8080"\ndefault_max_results = 7\n', ""
+        '[search]\nbase_url = "http://localhost:8080"\ndefault_max_results = 7\n'
+        "max_consecutive_failures = 4\n",
+        "",
     )
     path = _write(tmp_path, toml_content)
 
@@ -181,6 +186,7 @@ def test_typo_in_key_error_names_the_offending_key(tmp_path, monkeypatch):
         ("max_concurrency", -1),
         ("per_page_char_cap", 0),
         ("max_urls_per_call", 0),
+        ("max_consecutive_failures", 0),
     ],
 )
 def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_value):
@@ -191,6 +197,7 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
         "max_concurrency": 8,
         "per_page_char_cap": 9000,
         "max_urls_per_call": 3,
+        "max_consecutive_failures": 4,
     }
     toml_content = VALID_TOML.replace(
         f"{setting} = {original[setting]}", f"{setting} = {bad_value}"
@@ -364,7 +371,7 @@ def test_agent_section_omitted_falls_back_to_documented_defaults(tmp_path, monke
 
     config = load_config(path)
 
-    assert config.agent.max_rounds == 20
+    assert config.agent.max_rounds == 50
     assert config.agent.wall_clock_seconds == 1800
     assert config.agent.workspace_dir == Path.home() / "deep-research" / "workspace"
     assert config.agent.reports_dir == Path.home() / "deep-research" / "reports"
