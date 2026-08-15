@@ -32,7 +32,7 @@ default_max_results = 10
 [agent]
 # Frozen surface for the agent loop (Phase 3) and its workspace/report capture
 # (Phase 2) — see docs/plans/PLAN-research-loop.md.
-max_rounds = 20
+max_rounds = 50
 wall_clock_seconds = 1800
 # workspace_dir/reports_dir now default to ~/deep-research/{workspace,reports}; set either
 # key here to override.

@@ -72,7 +72,7 @@ class SearchSettings(_StrictModel):
 
 
 class AgentSettings(_StrictModel):
-    max_rounds: int = Field(default=20, gt=0)  # hard cap on agent-loop rounds
+    max_rounds: int = Field(default=50, gt=0)  # hard cap on agent-loop rounds
     wall_clock_seconds: int = Field(default=1800, gt=0)  # wall-clock budget, in seconds
     # Under the user's home dir, not the repo root; overridable per-key from [agent].
     workspace_dir: Path = Field(

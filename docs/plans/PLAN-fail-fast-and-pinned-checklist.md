@@ -187,7 +187,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Full-screen TUI renderer
-- [ ] Phase 2: Startup search preflight + cap raise
+- [x] Phase 2: Startup search preflight + cap raise
 - [ ] Phase 3: Consecutive-search-failure abort
 - [ ] Phase 4: Report gating and abort semantics
 - [ ] Phase 5: Docs reconciliation
@@ -280,11 +280,11 @@ in the existing config/model-error style; raise the round cap to 50.
 - No docker/compose awareness.
 
 **Tests (write first, confirm red):**
-- [ ] Preflight passes on a 200 JSON response; fails (typed error) on connection error,
+- [x] Preflight passes on a 200 JSON response; fails (typed error) on connection error,
       non-200, and non-JSON (HTML-only container) responses.
-- [ ] `main()` with SearXNG down exits 1, prints an error mentioning SearXNG/the container,
+- [x] `main()` with SearXNG down exits 1, prints an error mentioning SearXNG/the container,
       starts no run, and writes nothing to the reports dir (via `patch_run`).
-- [ ] Config default `max_rounds == 50`.
+- [x] Config default `max_rounds == 50`.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -293,7 +293,9 @@ in the existing config/model-error style; raise the round cap to 50.
 
 **Acceptance criteria:**
 - [ ] With the SearXNG container stopped, `uv run python -m harness "q"` exits nonzero
-      within seconds, no report file created.
+      within seconds, no report file created. — NOT performed live (no endpoints in the
+      implement environment); the offline `main()`-level test covers the same path.
+      Verify at final verification.
 
 ### Phase 3: Consecutive-search-failure abort
 **Risk:** none
@@ -476,6 +478,18 @@ Append-only, empty at plan creation. -->
 - Watch-next: the manual smoke (real-terminal run: pinned checklist, clean Ctrl+C exit,
   summary after exit, readable ask_user prompt) was NOT performed — no live endpoints in
   the implement environment. Verify interactively before or at final verification.
+
+### 2026-08-14 — Phase 2: Startup search preflight + cap raise
+- Done: `preflight_search` (D4 JSON probe) + `SearchPreflightError` in
+  harness/tools/search.py; third preflight block in `__main__.py`; `max_rounds` 50 in
+  both config.py and harness.toml.
+- Learned: `patch_run` now neutralizes the search preflight BY DEFAULT
+  (`run_search_preflight=True` opts into the real probe against the mock transport) —
+  the natural-seeming "tie it to skip_preflight" mechanism would have broken every
+  default-path main() test.
+- Drift: none (impl-plan-level mechanism correction only, documented in conftest).
+- Watch-next: the live container-stopped acceptance check is deferred to final
+  verification along with Phase 1's manual smoke.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so

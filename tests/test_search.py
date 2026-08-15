@@ -310,6 +310,57 @@ async def test_built_tool_exposes_the_pinned_contract(monkeypatch, make_config):
     assert [r.url for r in message.artifact] == ["https://a.test"]
 
 
+async def test_preflight_search_passes_on_200_json_response(monkeypatch, make_config):
+    def handler(request):
+        return httpx.Response(200, json={"results": []})
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+
+    assert await search.preflight_search(config) is None
+
+
+async def test_preflight_search_raises_on_connection_error(monkeypatch, make_config):
+    def handler(request):
+        raise httpx.ConnectError("refused")
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+
+    with pytest.raises(search.SearchPreflightError) as excinfo:
+        await search.preflight_search(config)
+
+    message = str(excinfo.value)
+    assert "SearXNG" in message
+    assert "container" in message.lower() or "docker" in message.lower()
+
+
+async def test_preflight_search_raises_on_non_200_status(monkeypatch, make_config):
+    def handler(request):
+        return httpx.Response(500, text="internal error")
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+
+    with pytest.raises(search.SearchPreflightError) as excinfo:
+        await search.preflight_search(config)
+
+    assert "SearXNG" in str(excinfo.value)
+
+
+async def test_preflight_search_raises_on_html_only_body(monkeypatch, make_config):
+    def handler(request):
+        return httpx.Response(200, text="<html>not json</html>")
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+
+    with pytest.raises(search.SearchPreflightError) as excinfo:
+        await search.preflight_search(config)
+
+    assert "SearXNG" in str(excinfo.value)
+
+
 async def test_result_missing_optional_fields_still_maps(monkeypatch, make_config):
     payload = {
         "query": "x",

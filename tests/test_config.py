@@ -364,7 +364,7 @@ def test_agent_section_omitted_falls_back_to_documented_defaults(tmp_path, monke
 
     config = load_config(path)
 
-    assert config.agent.max_rounds == 20
+    assert config.agent.max_rounds == 50
     assert config.agent.wall_clock_seconds == 1800
     assert config.agent.workspace_dir == Path.home() / "deep-research" / "workspace"
     assert config.agent.reports_dir == Path.home() / "deep-research" / "reports"

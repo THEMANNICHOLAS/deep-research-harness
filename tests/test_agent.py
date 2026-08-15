@@ -420,6 +420,29 @@ async def test_main_prints_the_report_path_as_the_final_line_of_stdout(
     assert Path(printed_path).parent == config.agent.reports_dir
 
 
+async def test_main_exits_nonzero_and_writes_no_report_when_searxng_is_unreachable(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    """R1: SearXNG down at startup fails fast, before any run or report."""
+    config = make_config()
+    model = scripted_model([AIMessage(content="unused — the search preflight aborts first")])
+    patch_run(monkeypatch, config, model, skip_preflight=True, run_search_preflight=True)
+
+    def handler(request):
+        raise httpx.ConnectError("refused")
+
+    install_search_transport(monkeypatch, handler)
+
+    exit_code = await main_module.main(["a question"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "error:" in captured.err
+    assert "SearXNG" in captured.err
+    assert "container" in captured.err.lower() or "docker" in captured.err.lower()
+    assert not config.agent.reports_dir.exists() or not any(config.agent.reports_dir.iterdir())
+
+
 # --- Phase 5: round cap, wall clock, and cut-short reporting ---------------------------
 
 

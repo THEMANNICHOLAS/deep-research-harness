@@ -113,6 +113,47 @@ async def _search(
     return _render(query, outcome), outcome
 
 
+class SearchPreflightError(Exception):
+    """Raised when the configured SearXNG endpoint fails the startup health check."""
+
+
+_CONTAINER_HINT = "is the container running? (docker compose up in searxng/)"
+
+
+async def preflight_search(config: HarnessConfig) -> None:
+    """Verify the configured SearXNG endpoint answers a real JSON search before any run starts.
+
+    R1/D4: GETs the same JSON search endpoint `_search` uses, asserting 200 and a parseable JSON
+    body — this catches both the container being down AND the documented "stock container is
+    HTML-only" misconfiguration, either of which would otherwise only surface mid-run. Uses a
+    bare `httpx.AsyncClient()` (not `_search`, which is left unchanged) so
+    `install_search_transport` swaps it in tests the same way it does for the tool itself.
+
+    Raises `SearchPreflightError` naming SearXNG, the probed URL, and the container hint.
+    """
+    url = f"{config.search.base_url.rstrip('/')}/search"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params={"q": "ping", "format": "json"})
+    except httpx.RequestError as exc:
+        raise SearchPreflightError(
+            f"SearXNG unreachable at {url} — {_CONTAINER_HINT} ({type(exc).__name__}: {exc})"
+        ) from exc
+
+    if response.status_code != 200:
+        raise SearchPreflightError(
+            f"SearXNG at {url} returned HTTP {response.status_code} — {_CONTAINER_HINT}"
+        )
+
+    try:
+        response.json()
+    except ValueError as exc:
+        raise SearchPreflightError(
+            f"SearXNG at {url} did not return JSON (got HTML? the JSON API may not be enabled) "
+            f"— {_CONTAINER_HINT} ({exc})"
+        ) from exc
+
+
 def build_search_tool(config: HarnessConfig) -> BaseTool:
     """Build the `search_web` tool, closing over `config`."""
 

@@ -47,6 +47,7 @@ from harness.models import ModelError, preflight
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
 from harness.sources import SourceRegistry
+from harness.tools.search import SearchPreflightError, preflight_search
 from harness.verify import VerificationResult, verify_paragraphs
 
 _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -212,6 +213,12 @@ async def main(argv: list[str] | None = None) -> int:
     try:
         await preflight(config, "head")
     except ModelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        await preflight_search(config)
+    except SearchPreflightError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
