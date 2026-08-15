@@ -23,6 +23,8 @@ from harness.verify import MODEL_VERDICTS, ParagraphVerdict, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
+# Matches a markdown heading marker at the start of any line (per-line, not per-paragraph).
+_HEADING_RE = re.compile(r"^(#{1,6}) ", re.MULTILINE)
 
 # The one spelling of each per-paragraph label. Bold, and preceded by a blank line, because
 # an unstyled `Sources:` on the line right after the prose read as another sentence of the
@@ -302,26 +304,46 @@ def _notes_section(
     return "\n\n".join(sections) if sections else _NO_NOTES_TEXT
 
 
+def _demote_headings(text: str) -> str:
+    """Demote every markdown heading in `text` by two levels, capped at `######`.
+
+    Model `# ` -> `### `, `## ` -> `#### `, so nothing the model writes can collide with the
+    report's own `# <question>` title or its `## `-depth section headings. `#####`/`######`
+    both land at `######` (the cap), which loses distinction only at those two deepest,
+    unrealistic-for-an-answer levels; relative ordering is preserved everywhere else.
+    """
+
+    def _bump(match: re.Match[str]) -> str:
+        return "#" * min(len(match.group(1)) + 2, 6) + " "
+
+    return _HEADING_RE.sub(_bump, text)
+
+
 def _verdict_label(verdict: str) -> str:
     """The reader-facing spelling of a verdict."""
     return verdict.replace("_", " ")
 
 
 def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> list[str]:
-    """Marker-stripped prose lines for `paragraph`, with a trailing ` *` on each bullet whose
-    zero-based index is in `verdict.unsupported_items` (an out-of-range index is ignored, D4).
+    """Marker-stripped, heading-demoted prose lines for `paragraph`, with a trailing ` *` on
+    each bullet whose zero-based index is in `verdict.unsupported_items` (an out-of-range
+    index is ignored, D4).
 
     Bullets are identified by `LIST_ITEM_RE`, the same test `split_paragraphs` uses to build
     `items`, so the Nth list line IS `items[N]`. Matching on rendered text instead let a
     lead-in ending in the first bullet's wording consume that bullet's slot, putting the `*`
     on prose and leaving the failing bullet unmarked.
+
+    Only reached for non-code paragraphs (`_paragraph_block` early-returns on `is_code`), so
+    `_demote_headings` here is the one place a model-authored `#`/`##` heading is pushed below
+    the report's own `# `/`## ` depths before `## Answer` is assembled.
     """
     unsupported = set(verdict.unsupported_items) if verdict is not None else set()
     valid = {i for i in unsupported if 0 <= i < len(paragraph.items)}
 
     lines: list[str] = []
     item_index = 0
-    for raw_line in paragraph.text.split("\n"):
+    for raw_line in _demote_headings(paragraph.text).split("\n"):
         rendered = strip_markers(raw_line)
         if LIST_ITEM_RE.match(raw_line):
             # A citation-only bullet renders no line, so a bare ` *` would mark nothing.

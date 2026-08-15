@@ -220,6 +220,26 @@ def test_reader_spec_contract(make_config, scripted_model):
     assert "interrupt_on" not in spec
 
 
+def test_orchestrator_prompt_names_the_answer_structure_contract(make_config):
+    """Phase 1 Step 3: the rendered orchestrator prompt must tell the model to write headings
+    starting at `## ` (never `# `), lead with a direct answer, and never write its own
+    meta/coverage/disclosure sections — the harness demotes/owns all of that.
+    """
+    from harness.prompts import render
+
+    config = make_config()
+
+    prompt = render(
+        "orchestrator",
+        current_date=date.today().isoformat(),
+        max_urls_per_call=config.fetch.max_urls_per_call,
+    )
+
+    assert "start at `## `" in prompt
+    assert "never `# `" in prompt
+    assert "no meta" in prompt
+
+
 async def test_reader_model_profile_excludes_execute(make_config, patch_models_by_role):
     """Risk #1: deepagents resolves a HarnessProfile per SUBAGENT MODEL key — if the reader's
     key is never registered, the no-shell invariant silently breaks for the reader.

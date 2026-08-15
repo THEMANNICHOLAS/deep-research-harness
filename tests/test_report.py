@@ -1848,3 +1848,91 @@ def test_matching_verdict_and_paragraph_counts_are_not_flagged(make_config):
     body = write_report(outcome, config).read_text(encoding="utf-8")
 
     assert "Verification returned" not in body
+
+
+# --- Phase 1 Step 3: report structure enforcement (heading demotion) -------------------
+
+
+def test_model_authored_headings_are_demoted_inside_the_answer(make_config):
+    """A model-authored `#`/`##`/`###` heading is demoted by two levels each, so nothing
+    inside `## Answer` can collide with the report's own H1 title or H2 section headings.
+    Relative depth ordering among the three levels is preserved.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    answer = "# Title\n\nSome intro prose.\n\n## Section\n\nBody text.\n\n### Sub\n\nMore text."
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="What headings does a model write?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert "### Title" in answer_section
+    assert "#### Section" in answer_section
+    assert "##### Sub" in answer_section
+    for line in answer_section.splitlines():
+        assert not line.startswith("# "), line
+        assert not line.startswith("## "), line
+
+
+def test_a_heading_inside_a_fenced_code_block_is_not_demoted(make_config):
+    """A `# comment` inside a fence is content, not structure — demotion must not touch it,
+    and the fence must stay byte-identical (mirrors
+    `test_a_fenced_code_block_reaches_the_answer_verbatim`).
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    answer = "Some prose.\n\n```python\n# comment\nprint('hi')\n```"
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="Does a fenced heading-looking comment survive?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert "```python\n# comment\nprint('hi')\n```" in answer_section
+
+
+def test_a_model_authored_title_and_meta_answer_renders_with_exactly_one_h1(make_config):
+    """Representative of the shape observed live on 2026-08-15: the model's answer opened
+    with its own `# <title>`, had body sections, and closed with a model-authored
+    `## Coverage`-style meta section. The literal saved answer text was not retrievable
+    locally (reports live on the homelab); this reproduces the observed shape, not the
+    verbatim text. After demotion the ENTIRE report body must contain exactly one
+    `# `-prefixed line: the harness's own report title.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    answer = (
+        "# Tungsten melting point\n\n"
+        "Tungsten melts at 3422 C.\n\n"
+        "## Background\n\n"
+        "It has the highest melting point of any metal.\n\n"
+        "## Coverage\n\n"
+        "All sources were checked and no gaps were found."
+    )
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="What is the melting point of tungsten?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    h1_lines = [line for line in body.splitlines() if line.startswith("# ")]
+    assert len(h1_lines) == 1
+    assert h1_lines[0] == "# What is the melting point of tungsten?"

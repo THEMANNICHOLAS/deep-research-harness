@@ -14,7 +14,7 @@ See the parent plan for Intent (R1–R4), Codebase Map, and Design Decisions D1�
 ## Progress
 - [x] Step 1: Canonical-URL dedup
 - [x] Step 2: PDF fetch path
-- [ ] Step 3: Report structure enforcement
+- [x] Step 3: Report structure enforcement
 - [ ] Step 4: Verifier role
 - [ ] Phase verification
 
@@ -133,11 +133,11 @@ crawler. Char cap applies to extracted PDF text exactly as to markdown.
   ordering beyond heading depth; touching the reader or researcher prompts; any TUI change.
 
 **Tests (write first, confirm red):**
-- [ ] An answer containing `# Title` and `## Section` renders with both demoted below
+- [x] An answer containing `# Title` and `## Section` renders with both demoted below
   `## Answer`; heading depth ordering within the answer is preserved relatively.
-- [ ] Code fences are not treated as headings (a `# comment` inside a fenced block is
+- [x] Code fences are not treated as headings (a `# comment` inside a fenced block is
   untouched).
-- [ ] The orchestrator prompt names the structure and the meta-section prohibition (contract
+- [x] The orchestrator prompt names the structure and the meta-section prohibition (contract
   pin, same style as existing prompt pins).
 
 **Details:**
@@ -145,8 +145,9 @@ Red→green. Demote in the one place the answer body is rendered, downstream of
 `split_paragraphs` so paragraph/citation handling is unaffected.
 
 **Acceptance criteria:**
-- [ ] Rendering the saved 2026-08-15 answer text through the new renderer yields exactly one
-  H1 in the whole report (the report title).
+- [x] Rendering the saved 2026-08-15 answer text through the new renderer yields exactly one
+  H1 in the whole report (the report title). (Named test uses a representative answer of the
+  observed shape — the literal saved answer text is homelab-only.)
 
 ### Step 4: Verifier role
 **Risk:** none
@@ -229,3 +230,15 @@ never add a section below it. -->
   result-is-None block between the two loops).
 - Watch-next: Step 3 (report structure) — heading demotion must skip fenced code blocks;
   mirror `harness/paragraphs.py` line-level style.
+
+### 2026-08-15 — Step 3: Report structure enforcement
+- Done: `_demote_headings` in report.py (+2 levels, cap H6) applied via `_paragraph_prose`
+  to non-code paragraphs only; orchestrator `# Output` gained the answer-first, `##`-depth,
+  no-meta-sections template; 4 new tests incl. the named one-H1 acceptance test
+  (representative answer shape — literal 2026-08-15 answer is homelab-only).
+- Learned: H4-H6 all collapse to H6 at the cap (comment-level imprecision only, conforms to
+  plan). `fetch.py` has a similar private `_HEADING_LINE` regex — deliberately not shared.
+- Drift: none. 3F clean, no deferrals.
+- Watch-next: Step 4 (verifier role) — mirror the existing head preflight block in
+  `__main__.py` exactly, incl. error-to-stderr exit-1 shape; `make_config` in conftest gains
+  the verifier role.
