@@ -193,10 +193,11 @@ error-to-stderr, exit-1 shape.
   if it does not already carry it — one line).
 
 ## Verification
-- [ ] Quality gates: see the central plan's `## Verification` — full suite, ruff, format,
-  mypy.
+- [x] Quality gates: see the central plan's `## Verification` — full suite, ruff, format,
+  mypy. (416 passed, all gates clean, 2026-08-15.)
 - [ ] Live run per the central plan's Phase 1 checklist (deduped sources, PDF evidence or
-  disclosed failure, clean hierarchy, verifier in metadata).
+  disclosed failure, clean hierarchy, verifier in metadata). Developer runs this on the
+  homelab — see the final Phase Handoff Log entry for the exact checklist.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
@@ -259,3 +260,20 @@ never add a section below it. -->
 - Watch-next: Phase verification — full gates are green; what remains is the live e2e run
   (deduped sources, PDF evidence or disclosed failure, one-H1 hierarchy, verifier in
   metadata), which needs the homelab environment (SearXNG + OPENCODE_API_KEY).
+
+### 2026-08-15 — Phase verification (paused at the live run)
+- Done: all four steps implemented, reviewed, and committed (d5893a6 pre-session work,
+  0ed92fa, fe9f9b2, c0d87d3, 578925f); quality gates green (416 tests, ruff, format, mypy).
+- Learned: SearXNG is not running on the dev workstation, so the live check belongs on the
+  homelab. Developer chose to run it there.
+- Drift: none.
+- Watch-next: THE LIVE RUN — on the homelab: `git pull`, `uv sync` (new dep pypdf==6.16.1),
+  confirm SearXNG up, then `python -m harness "<question that surfaces arxiv sources>"`.
+  Checklist: (1) no duplicate `Sn` for arxiv abs/pdf/html variants of one work; (2) a PDF
+  source shows real extracted text or a disclosed FETCH FAILED — never silent non_html;
+  (3) exactly one H1 in the report, nothing inside `## Answer` at `#`/`##` depth, no
+  model-authored meta section; (4) run metadata names `gpt-5.6-luna` as Verifier Model;
+  (5) risk #1: a merged arxiv source still verifies sensibly — if verdicts look wrong on
+  merged sources, narrow the arxiv table to version suffixes only. When it passes, tick the
+  live-run box above, the `Phase verification` Progress box, and Phase 1 in the central
+  plan; then Phase 2 resumes via /implement as usual.
