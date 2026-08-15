@@ -237,7 +237,7 @@ def patch_model(monkeypatch: pytest.MonkeyPatch, model: Any) -> None:
 
 @pytest.fixture
 def patch_models_by_role(monkeypatch: pytest.MonkeyPatch):
-    """Like `patch_model`, but returns a different model per role (e.g. head vs subagent)."""
+    """Like `patch_model`, but returns a different model per role (e.g. head vs reader)."""
 
     def _patch(models: dict[str, Any]) -> None:
         def _by_role(cfg: Any, role: str) -> Any:
@@ -411,8 +411,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
     `AgentSettings()`'s own defaults are HOME-relative and would write into the developer's real
     output directory. A caller-supplied `agent=` wins untouched.
 
-    `head_model`/`subagent_model` default to the same string; pass distinct values when a test
-    must prove the two roles are read from different places.
+    `head_model`/`researcher_model`/`reader_model`/`verifier_model` default to the same string;
+    pass distinct values when a test must prove the roles are read from different places.
     """
 
     def _make(
@@ -426,7 +426,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         max_consecutive_failures: int = 3,
         agent: AgentSettings | None = None,
         head_model: str = "test-model",
-        subagent_model: str = "test-model",
+        researcher_model: str = "test-model",
+        reader_model: str = "test-model",
         verifier_model: str = "test-model",
     ) -> HarnessConfig:
         monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
@@ -442,7 +443,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
             },
             roles={
                 "head": RoleConfig(provider="opencode", model=head_model),
-                "subagent": RoleConfig(provider="opencode", model=subagent_model),
+                "researcher": RoleConfig(provider="opencode", model=researcher_model),
+                "reader": RoleConfig(provider="opencode", model=reader_model),
                 "verifier": RoleConfig(provider="opencode", model=verifier_model),
             },
             fetch=FetchSettings(

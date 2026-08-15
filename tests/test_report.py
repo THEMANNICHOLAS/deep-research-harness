@@ -78,8 +78,8 @@ def test_write_report_produces_a_frozen_filename_under_reports_dir(make_config):
 
 
 def test_write_report_run_metadata_names_both_configured_models(make_config):
-    """Both roles get their own named line (R6) even when configured to the same model, so this
-    asserts on the two labeled lines rather than on the model string appearing somewhere.
+    """Every role gets its own named line (R6) even when configured to the same model, so this
+    asserts on the labeled lines rather than on the model string appearing somewhere.
     """
     config = make_config()
     outcome = RunOutcome(
@@ -92,7 +92,8 @@ def test_write_report_run_metadata_names_both_configured_models(make_config):
     body = write_report(outcome, config).read_text(encoding="utf-8")
 
     assert "- Lead Model: test-model" in body
-    assert "- Subagent Model: test-model" in body
+    assert "- Researcher Model: test-model" in body
+    assert "- Reader Model: test-model" in body
     assert "- Verifier Model: test-model" in body
 
 
@@ -100,7 +101,7 @@ def test_write_report_run_metadata_reads_each_role_from_its_own_config_entry(mak
     """The falsifiable half of R6: with the roles configured to DIFFERENT models, each line must
     carry its own. Rendering the head model twice passes the test above and fails this one.
     """
-    config = make_config(head_model="lead-model-x", subagent_model="worker-model-y")
+    config = make_config(head_model="lead-model-x", reader_model="worker-model-y")
     outcome = RunOutcome(
         question="What is the boiling point of water?",
         answer="100 C at sea level.",
@@ -111,8 +112,8 @@ def test_write_report_run_metadata_reads_each_role_from_its_own_config_entry(mak
     body = write_report(outcome, config).read_text(encoding="utf-8")
 
     assert "- Lead Model: lead-model-x" in body
-    assert "- Subagent Model: worker-model-y" in body
-    assert "- Subagent Model: lead-model-x" not in body
+    assert "- Reader Model: worker-model-y" in body
+    assert "- Reader Model: lead-model-x" not in body
 
 
 def test_write_report_returns_a_path_whose_body_is_the_answer_actually_written(make_config):
