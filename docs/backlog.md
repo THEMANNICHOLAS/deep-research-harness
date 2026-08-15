@@ -117,3 +117,10 @@ to address.
   one model call, which does not scale if a source capture grows large enough that pooling
   several of them stops fitting the model's context. To address: a verifier that can search
   within captured source text on demand rather than having it all pooled up front.
+
+- **Persist `fetch_raw`'s `reason` so the report's fallback bucket can disclose why.** Today
+  the model-supplied reason exists only in the run's in-context `<undigested>` marker
+  (@harness/tools/fallback.py); `Source` carries no reason field, so `## Source reading`
+  can only bucket a fallback, not explain it (PR #13 review). To address: an optional
+  `read_reason` on @harness/sources.py's `Source`, set alongside `mark_read("fallback")`
+  and rendered after the link in @harness/report.py's `_read_modes_section`.

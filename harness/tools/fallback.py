@@ -12,7 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
 from harness.sources import SourceRegistry
-from harness.tools.fetch import FetchedPage, _fetch, _render, _sources_dir
+from harness.tools.fetch import (
+    FetchedPage,
+    _fetch,
+    _install_url_limit_contract,
+    _render,
+    _sources_dir,
+)
 
 
 async def _fetch_raw(
@@ -34,7 +40,13 @@ async def _fetch_raw(
     for page in pages:
         rendered = _render(page, config.fetch.per_page_char_cap)
         if page.outcome == "fetched":
-            registry.mark_read(page.source_id, "fallback")
+            # Never downgrade: a source an earlier delegation already digested keeps its
+            # "digested" mode even if the lead re-fetches it raw (e.g. for a second facet).
+            # The <undigested> wrapper still applies — it describes THIS payload being raw —
+            # but the report's disclosure reflects the strongest coverage the run achieved.
+            current = registry.get(page.source_id)
+            if current is not None and current.read_mode != "digested":
+                registry.mark_read(page.source_id, "fallback")
             rendered = (
                 f'<undigested source="{page.source_id}" reason="{escaped_reason}">\n'
                 f"{rendered}\n"
@@ -80,21 +92,4 @@ def build_fallback_tool(config: HarnessConfig, registry: SourceRegistry) -> Base
         """
         return await _fetch_raw(urls, reason, config, registry)
 
-    # Appended rather than written into the docstring, matching fetch_pages: the limit is
-    # config, and a literal would go stale the moment an operator changed it.
-    fetch_raw.description = (
-        f"{fetch_raw.description}\n\nAt most {max_urls} URLs may be requested per call; "
-        "a call carrying more is rejected without fetching anything."
-    )
-
-    # `exc` is `object`: langchain may hand over a pydantic v1 or v2 `ValidationError`.
-    def _explain_validation_error(exc: object) -> str:
-        """Turn a rejected call into a message the model can act on and retry."""
-        return (
-            f"fetch_raw rejected this call without fetching anything: {exc}. "
-            f"At most {max_urls} URLs may be requested per call."
-        )
-
-    fetch_raw.handle_validation_error = _explain_validation_error
-
-    return fetch_raw
+    return _install_url_limit_contract(fetch_raw, max_urls)

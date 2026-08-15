@@ -6,6 +6,7 @@ framework's API surface. Same shape as `harness/tools/search.py` — one builder
 closing over `config` and the caller's `registry`, no class.
 """
 
+from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import Any, Literal
 
@@ -25,18 +26,21 @@ from langchain.agents.middleware import (
     AgentMiddleware,
     InterruptOnConfig,
     TodoListMiddleware,
+    ToolCallRequest,
     ToolErrorMiddleware,
     ToolRetryMiddleware,
 )
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import ToolMessage
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from harness.config import HarnessConfig, run_workspace_dir
 from harness.models import build_chat_model
 from harness.prompts import render
-from harness.sources import SourceRegistry
+from harness.sources import SourceRegistry, pending_digest_scope
 from harness.tools import build_tools
 from harness.tools.ask_user import ASK_USER_TOOL_NAME
 
@@ -57,10 +61,64 @@ _INTERRUPT_ON: dict[str, bool | InterruptOnConfig] = {
 
 
 # D2: a reader crash must not kill the run. Phase 3's prompt keys off the "READER FAILED"
-# prefix, so it must stay exact.
-def _reader_failure_message(exc: Exception, request: Any) -> str:
-    """Render a reader (`task`) crash as content for an error `ToolMessage`."""
-    return f"READER FAILED ({type(exc).__name__}): {exc}"
+# prefix, so the derived label must stay exact for `subagent_type="reader"`. Derived, not
+# hardcoded: this middleware wraps EVERY `task` dispatch, so a future researcher tier fails as
+# "RESEARCHER FAILED" without touching this function, the prompt contract, or its pinned test.
+def _reader_failure_message(exc: Exception, request: ToolCallRequest) -> str:
+    """Render a subagent (`task`) crash as content for an error `ToolMessage`."""
+    # `.get`: the args are model-supplied, and a malformed call must still get a label
+    # rather than raising a KeyError out of the error handler itself.
+    subagent_type = str(request.tool_call["args"].get("subagent_type", "task"))
+    return f"{subagent_type.upper()} FAILED ({type(exc).__name__}): {exc}"
+
+
+def _digest_text(result: ToolMessage | Command[Any]) -> str:
+    """The task ToolMessage's text inside `result`, however the tool wrapped it.
+
+    deepagents' task tool returns a `Command` carrying the digest as a single ToolMessage in
+    its `messages` update; langchain wraps a plain-string return (e.g. the unknown-subagent
+    notice) into a bare ToolMessage. Anything unrecognized reads as empty, which the caller
+    treats as "no digest reached the lead".
+    """
+    message: ToolMessage | None = None
+    if isinstance(result, ToolMessage):
+        message = result
+    elif isinstance(result.update, dict):
+        candidates = result.update.get("messages") or []
+        message = next((m for m in candidates if isinstance(m, ToolMessage)), None)
+    return message.text.strip() if message is not None else ""
+
+
+class _ReaderDigestMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Promote reader-fetched sources to `digested` only when a digest reaches the lead (R5).
+
+    The reader's `fetch_pages` call only NOMINATES the source IDs it captured
+    (`sources.note_digest_candidate`, context-local per task attempt); this middleware marks
+    them when — and only when — the attempt returns a non-empty digest. A crash (converted to
+    a `... FAILED` error ToolMessage by the outer `ToolErrorMiddleware`) or an empty digest
+    leaves them "unread", so the report never discloses a digest the lead never received.
+
+    Async-only, like the tools it observes: the graph is driven with `ainvoke`/`astream`
+    (substrate D1) and `fetch_pages` itself is coroutine-only.
+    """
+
+    def __init__(self, registry: SourceRegistry) -> None:
+        super().__init__()
+        self._registry = registry
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        if request.tool_call["name"] != "task":
+            return await handler(request)
+        with pending_digest_scope() as fetched:
+            result = await handler(request)
+        if _digest_text(result):
+            for source_id in fetched:
+                self._registry.mark_read(source_id, "digested")
+        return result
 
 
 def _register_no_shell_profile(model: BaseChatModel) -> None:
@@ -151,7 +209,7 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
         permissions=[
             FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="allow")
         ],
-        middleware=_middleware(model, backend),
+        middleware=_middleware(model, backend, registry),
         subagents=[_reader_spec(config, reader_model, tool_sets.reader)],
         # One saver per call, holding this run's thread. In-memory keeps the no-database
         # invariant (D5): no durable, cross-invocation checkpointing.
@@ -160,7 +218,9 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
     )
 
 
-def _middleware(model: Any, backend: BackendProtocol) -> list[AgentMiddleware[Any, Any, Any]]:
+def _middleware(
+    model: Any, backend: BackendProtocol, registry: SourceRegistry
+) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build the middleware list with an explicit, broad element type.
 
     Without the annotation mypy unifies the element type from the first entry and rejects the
@@ -180,6 +240,10 @@ def _middleware(model: Any, backend: BackendProtocol) -> list[AgentMiddleware[An
     budget already doubles at one retry. `initial_delay=0.0, jitter=False`: this retry exists
     for reader crashes, not transient network waits, so it should be deterministic and
     test-fast rather than backed off.
+
+    `_ReaderDigestMiddleware` is defined last (innermost, inside the retry) so each attempt
+    gets its own digest-candidate scope: a crashed first attempt's fetches are discarded, and
+    only the attempt whose digest actually returns marks its sources `digested`.
     """
     return [
         TodoListMiddleware(),
@@ -194,4 +258,5 @@ def _middleware(model: Any, backend: BackendProtocol) -> list[AgentMiddleware[An
             initial_delay=0.0,
             jitter=False,
         ),
+        _ReaderDigestMiddleware(registry),
     ]

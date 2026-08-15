@@ -32,6 +32,8 @@ from harness.report import (
 from harness.sources import SourceRegistry
 from tests.conftest import (
     ScriptedChatModel,
+    _FakeMarkdown,
+    _FakeResult,
     drain_stdout,
     install_search_transport,
     patch_model,
@@ -327,6 +329,90 @@ async def test_a_reader_ending_with_no_final_text_returns_an_empty_task_message(
     ]
     assert len(task_messages) == 1
     assert task_messages[0].content == ""
+
+
+def _reader_fetch_call(url: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "fetch_pages", "args": {"urls": [url]}, "id": "call_fetch"}],
+    )
+
+
+async def test_a_reader_crash_after_a_successful_fetch_leaves_the_source_unread(
+    make_config, patch_models_by_role, scripted_model, install_crawler
+):
+    """R5: "digested" is marked at the delegation boundary, not at fetch time. The reader
+    fetches a page successfully, then crashes (its script runs out, raising `IndexError` —
+    the crash-after-partial-fetch case); no digest ever reaches the lead, so the source must
+    stay "unread". A fetch-time mark here would make the report disclose a digest that never
+    existed.
+    """
+    head_model = scripted_model(
+        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    )
+    # One scripted reply only: the fetch call. The reader's next model call — and the whole
+    # retry attempt — exhausts the script and raises.
+    reader_model = scripted_model([_reader_fetch_call("https://a.test")])
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    install_crawler(
+        [
+            _FakeResult(
+                "https://a.test",
+                markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body"),
+            )
+        ]
+    )
+
+    registry = SourceRegistry()
+    graph = build_agent(make_config(), registry)
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0].status == "error"
+    # The fetch itself succeeded and registered the source...
+    source = registry.get("S1")
+    assert source is not None
+    # ...but with no digest delivered, it is disclosed as unread, never as digested.
+    assert source.read_mode == "unread"
+
+
+async def test_an_empty_digest_leaves_the_fetched_source_unread(
+    make_config, patch_models_by_role, scripted_model, install_crawler
+):
+    """The empty-digest half of the same boundary: the reader fetches successfully but ends
+    with no final text — the documented failure signal the prompt tells the lead to treat as
+    a failed delegation — so the source stays "unread" until a `fetch_raw` recovery marks it.
+    """
+    head_model = scripted_model(
+        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    )
+    reader_model = scripted_model([_reader_fetch_call("https://a.test"), AIMessage(content="")])
+    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    install_crawler(
+        [
+            _FakeResult(
+                "https://a.test",
+                markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body"),
+            )
+        ]
+    )
+
+    registry = SourceRegistry()
+    graph = build_agent(make_config(), registry)
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    source = registry.get("S1")
+    assert source is not None
+    assert source.read_mode == "unread"
 
 
 async def test_fetch_raw_is_offered_to_the_lead_but_not_the_reader(

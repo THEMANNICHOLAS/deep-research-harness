@@ -165,3 +165,12 @@ sentences each, append-only, newest last.
   (PLAN-reader-delegation D5).** A strict one-URL rule would multiply the 3-10x delegation
   overhead per page with no fidelity gain; the orchestrator prompt states the batching bound
   instead. See @docs/plans/PLAN-reader-delegation.md.
+
+- **2026-08-14 — "digested" is marked at the delegation boundary, not at fetch time (PR #13
+  review).** The reader's `fetch_pages` call only nominates the source IDs it captured
+  (@harness/sources.py `note_digest_candidate`, context-local per `task` attempt);
+  @harness/agent.py's `_ReaderDigestMiddleware` promotes them to `digested` only when the
+  task call returns a non-empty digest. Rejected marking inside the fetch tool: a reader that
+  fetched then crashed (or returned empty) left sources disclosed as "Digested via the
+  reader" though no digest ever reached the lead — a false-positive disclosure against R5.
+  For the same reason `fetch_raw` never downgrades an already-`digested` source.

@@ -129,6 +129,34 @@ async def test_fetch_raw_marks_successful_pages_fallback_and_leaves_failures_unr
     assert registry.get(bad_page.source_id).read_mode == "unread"
 
 
+async def test_fetch_raw_never_downgrades_a_digested_source(install_crawler, make_config):
+    """A source an earlier delegation already digested keeps its "digested" mode even when the
+    lead re-fetches it raw (e.g. for a second facet): `mark_read` is last-write-wins, so an
+    unconditional mark here would report a genuinely digested source as a failed-digestion
+    fallback. The `<undigested>` wrapper still applies — it describes THIS payload being raw.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://a.test")
+    registry.mark_read(source_id, "digested")
+    install_crawler(
+        [
+            _FakeResult(
+                "https://a.test",
+                markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body"),
+            )
+        ]
+    )
+    fetch_raw = fallback.build_fallback_tool(config, registry)
+
+    message = await fetch_raw.ainvoke(
+        _tool_call(["https://a.test"], "re-read for a second facet", "call-1")
+    )
+
+    assert "<undigested" in message.content
+    assert registry.get(source_id).read_mode == "digested"
+
+
 async def test_a_call_over_the_url_limit_is_rejected_before_any_fetch(install_crawler, make_config):
     config = make_config()
     limit = config.fetch.max_urls_per_call

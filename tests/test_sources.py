@@ -5,7 +5,12 @@ from datetime import datetime
 
 import pytest
 
-from harness.sources import SourceRegistry, normalize_url
+from harness.sources import (
+    SourceRegistry,
+    normalize_url,
+    note_digest_candidate,
+    pending_digest_scope,
+)
 
 RESOLVE_TEXT = "[S1] Some claim here [S1] and another [S2] in the same sentence. End [S1]"
 
@@ -224,7 +229,8 @@ def test_mark_read_sets_digested_and_fallback_modes_independently():
 
 
 def test_re_marking_a_source_overwrites_its_read_mode():
-    # Last write wins: whichever tool marked a source most recently is authoritative.
+    # Last write wins: `mark_read` itself carries no precedence — fallback.py's own guard is
+    # what keeps `fetch_raw` from downgrading a digested source (see test_fallback.py).
     registry = SourceRegistry()
     source_id = registry.add("https://example.com/a")
 
@@ -232,3 +238,16 @@ def test_re_marking_a_source_overwrites_its_read_mode():
     registry.mark_read(source_id, "fallback")
 
     assert registry.get(source_id).read_mode == "fallback"
+
+
+def test_note_digest_candidate_collects_only_inside_a_pending_scope():
+    """The delegation-boundary seam: a nomination outside any scope is a silent no-op (a
+    directly-invoked fetch tool must not mark anything), and one inside lands in that scope's
+    own list.
+    """
+    note_digest_candidate("S1")  # no scope active: swallowed, never leaks into a later scope
+
+    with pending_digest_scope() as pending:
+        note_digest_candidate("S2")
+
+    assert pending == ["S2"]

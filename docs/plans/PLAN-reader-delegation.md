@@ -483,6 +483,14 @@ and the documentation reflects the wired tier.
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+### 2026-08-14 — Operator smoke step: fallback reasons never reach the report
+The Phase 4 handoff's operator check "(2) ... any fallback carries a reason" is
+unsatisfiable: the model-supplied `reason` lives only in the run's in-context
+`<undigested>` marker and is never persisted to the registry, so the report cannot render
+it (PR #13 review). Corrected check: fallbacks land under the "Read raw (fallback, ...)"
+heading of `## Source reading`. Persisting a per-source reason is deferred to
+docs/backlog.md.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
@@ -555,7 +563,8 @@ absence-test was replaced with behavioral pins on the new `## Source reading` se
   `uv run python -m harness "<question>"`; watch (1) total token spend vs the ~796k
   head baseline (decisions.md D10; delegation priced 3-10x — if far past band, drop
   task retry 1 -> 0 per risk !#3), (2) `## Source reading` shows digested sources and
-  any fallback carries a reason, (3) `[Sn]` links resolve, (4) wall-clock per round,
+  ~~any fallback carries a reason~~ any fallback lands under the raw-fallback heading
+  (see Reconciliations), (3) `[Sn]` links resolve, (4) wall-clock per round,
   (5) LATER-PROBLEMS.md #7 shares this first live run — attribute its failures
   correctly.
 - Drift: none.

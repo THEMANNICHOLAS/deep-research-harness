@@ -6,6 +6,9 @@ rewriting markers into links. No model involvement, no fetching (D6).
 
 import re
 import secrets
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -16,11 +19,43 @@ MARKER_RE = re.compile(r"\[S(\d+)\]")
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
-# R5's recording seam: "unread" until a tool actually captures the page, "digested" when the
-# reader's fetch_pages call succeeded, "fallback" when fetch_raw's raw-capture recovery path
-# succeeded. Written by the tool closures (fetch.py/fallback.py), never inside the shared
-# `_fetch` helper both call, since the mode is a property of which tool was invoked.
+# R5's recording seam: "unread" until content actually reaches the lead, "digested" when a
+# reader delegation returned a non-empty digest of the page — promoted at the task boundary
+# by agent.py's `_ReaderDigestMiddleware` from the candidates fetch.py nominates via
+# `note_digest_candidate`, never at fetch time — and "fallback" when fetch_raw's raw-capture
+# recovery path succeeded (written by fallback.py's tool closure, which never downgrades an
+# existing "digested").
 ReadMode = Literal["unread", "digested", "fallback"]
+
+_PENDING_DIGESTS: ContextVar[list[str] | None] = ContextVar("pending_digests", default=None)
+
+
+def note_digest_candidate(source_id: str) -> None:
+    """Record that the reader captured `source_id` during the current delegation, if any.
+
+    No-op outside a `pending_digest_scope` (e.g. a directly-invoked fetch tool in tests):
+    marking `digested` is the delegation boundary's job, not the fetch's.
+    """
+    pending = _PENDING_DIGESTS.get()
+    if pending is not None:
+        pending.append(source_id)
+
+
+@contextmanager
+def pending_digest_scope() -> Iterator[list[str]]:
+    """Collect the source IDs the reader captures during one `task` attempt.
+
+    Context-local, so two concurrent delegations cannot claim each other's fetches. The
+    caller (agent.py's `_ReaderDigestMiddleware`) promotes the collected IDs to `digested`
+    only when the attempt actually returns a non-empty digest — a crashed or empty delegation
+    leaves them "unread" (R5: the report must not claim a digest the lead never received).
+    """
+    pending: list[str] = []
+    token = _PENDING_DIGESTS.set(pending)
+    try:
+        yield pending
+    finally:
+        _PENDING_DIGESTS.reset(token)
 
 
 def marker_ids(text: str) -> list[str]:
