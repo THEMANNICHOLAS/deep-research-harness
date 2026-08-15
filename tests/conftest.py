@@ -253,14 +253,19 @@ def patch_run(
     config: HarnessConfig,
     model: Any,
     *,
-    skip_preflight: bool = False,
+    skip_preflight: bool = True,
     run_search_preflight: bool = False,
 ) -> None:
     """Patch everything a `main()` test reaches outside the compiled graph.
 
-    `skip_preflight` replaces `preflight` (the model check) with a no-op. `False` by default, so
-    most tests let the REAL `preflight` run against the scripted model and script a leading
-    reply for it — that keeps R6's call site exercised rather than stubbed out everywhere.
+    `skip_preflight` replaces `preflight` (the model check) with a no-op. `True` by default:
+    each preflighted role (`head`, `verifier`, and whatever Phase 2 adds) makes its own real
+    `ainvoke` against the scripted model, consuming one scripted reply per role before the
+    graph ever runs — a test that does not care about preflight itself would otherwise have to
+    keep its script in lockstep with however many roles happen to be preflighted today. Pass
+    `skip_preflight=False` for a test that asserts something about preflight itself (or about a
+    scripted reply preflight is meant to consume) and script a leading reply per preflighted
+    role.
 
     The search preflight (`preflight_search`) is a real HTTP probe against `config.search
     .base_url`, which has no scripted-model equivalent — most `main()` tests never touch
@@ -422,6 +427,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         agent: AgentSettings | None = None,
         head_model: str = "test-model",
         subagent_model: str = "test-model",
+        verifier_model: str = "test-model",
     ) -> HarnessConfig:
         monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
         if agent is None:
@@ -437,6 +443,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
             roles={
                 "head": RoleConfig(provider="opencode", model=head_model),
                 "subagent": RoleConfig(provider="opencode", model=subagent_model),
+                "verifier": RoleConfig(provider="opencode", model=verifier_model),
             },
             fetch=FetchSettings(
                 page_timeout_ms=page_timeout_ms,

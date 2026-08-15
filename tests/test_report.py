@@ -93,6 +93,7 @@ def test_write_report_run_metadata_names_both_configured_models(make_config):
 
     assert "- Lead Model: test-model" in body
     assert "- Subagent Model: test-model" in body
+    assert "- Verifier Model: test-model" in body
 
 
 def test_write_report_run_metadata_reads_each_role_from_its_own_config_entry(make_config):

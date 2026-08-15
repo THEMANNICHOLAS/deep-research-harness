@@ -634,7 +634,6 @@ async def test_todo_updates_surface_at_the_terminal(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    ping = AIMessage(content="pong")  # consumed by preflight, never enters graph state
     plan_call = AIMessage(
         content="",
         tool_calls=[
@@ -649,7 +648,7 @@ async def test_todo_updates_surface_at_the_terminal(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, plan_call, final])
+    model = scripted_model([plan_call, final])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["What is the capital of France?"])
@@ -662,7 +661,6 @@ async def test_run_outcome_records_token_usage_summed_with_reasoning_split(
     make_config, monkeypatch, scripted_model
 ):
     config = make_config()
-    ping = AIMessage(content="pong")
     usage_a = {
         "input_tokens": 40,
         "output_tokens": 10,
@@ -687,7 +685,7 @@ async def test_run_outcome_records_token_usage_summed_with_reasoning_split(
         usage_metadata=usage_a,
     )
     final = AIMessage(content="Final answer [S1].", usage_metadata=usage_b)
-    model = scripted_model([ping, round_one, final])
+    model = scripted_model([round_one, final])
     patch_run(monkeypatch, config, model)
 
     captured = {}
@@ -714,12 +712,11 @@ async def test_main_prints_the_report_path_as_the_final_line_of_stdout(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final])
+    model = scripted_model([final])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["a question with no tool calls"])
@@ -753,6 +750,64 @@ async def test_main_exits_nonzero_and_writes_no_report_when_searxng_is_unreachab
     assert "SearXNG" in captured.err
     assert "container" in captured.err.lower() or "docker" in captured.err.lower()
     assert not config.agent.reports_dir.exists() or not any(config.agent.reports_dir.iterdir())
+
+
+async def test_main_exits_nonzero_when_verifier_role_is_not_declared(
+    make_config, monkeypatch, capsys
+):
+    """Phase 1 Step 4: startup preflights `verifier` alongside `head`; a config missing the
+    role fails the same ModelError path as a missing `head`/`subagent` role would.
+
+    Deliberately bypasses `patch_run`/`patch_model`: those fake `build_chat_model` to ignore
+    `role` entirely, which would hide the very check under test here. Instead the REAL
+    `preflight`/`build_chat_model` run, with only the `ChatOpenAI` transport faked (mirroring
+    `tests/test_models.py`) so the head role's real preflight ping never leaves the process.
+    """
+    import harness.models as models_module
+
+    config = make_config()
+    broken = HarnessConfig(
+        providers=config.providers,
+        roles={name: role for name, role in config.roles.items() if name != "verifier"},
+        fetch=config.fetch,
+        search=config.search,
+        agent=config.agent,
+    )
+    monkeypatch.setattr(main_module, "load_config", lambda: broken)
+
+    real_chat_openai = models_module.ChatOpenAI
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "pong"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    def _factory(**kwargs: Any) -> Any:
+        kwargs["http_async_client"] = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+        return real_chat_openai(**kwargs)
+
+    monkeypatch.setattr(models_module, "ChatOpenAI", _factory)
+
+    exit_code = await main_module.main(["a question"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "error:" in captured.err
+    assert "verifier" in captured.err
 
 
 # --- Phase 5: round cap, wall clock, and cut-short reporting ---------------------------
@@ -921,7 +976,6 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
         max_rounds=1, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
     )
     config = make_config(agent=agent)
-    ping = AIMessage(content="pong")
     keep_going = AIMessage(
         content="",
         tool_calls=[
@@ -932,7 +986,7 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
             }
         ],
     )
-    model = scripted_model([ping, *([keep_going] * 20)])
+    model = scripted_model([*([keep_going] * 20)])
     patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["question that never settles"])
@@ -972,7 +1026,6 @@ async def test_max_rounds_counts_model_turns_not_supersteps(
         reports_dir=tmp_path / "reports",
     )
     config = make_config(agent=agent)
-    ping = AIMessage(content="pong")
     one_round = AIMessage(
         content="",
         tool_calls=[
@@ -987,7 +1040,7 @@ async def test_max_rounds_counts_model_turns_not_supersteps(
         content="Answered after exactly one tool round.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, one_round, final])
+    model = scripted_model([one_round, final])
     patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["a question needing one round"])
@@ -1023,7 +1076,6 @@ async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
         max_rounds=2, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
     )
     config = make_config(agent=agent)
-    ping = AIMessage(content="pong")
     keep_going = AIMessage(
         content="",
         tool_calls=[
@@ -1034,7 +1086,7 @@ async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
             }
         ],
     )
-    model = scripted_model([ping, *([keep_going] * 20)])
+    model = scripted_model([*([keep_going] * 20)])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["question that never settles"])
@@ -1065,12 +1117,11 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
     )
     config = make_config(agent=agent)
 
-    ping = AIMessage(content="pong")
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
-    model = scripted_model([ping, search_call])
+    model = scripted_model([search_call])
     patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=3)
@@ -1103,12 +1154,11 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     )
     config = make_config(agent=agent)
 
-    ping = AIMessage(content="pong")
     partial_then_search = AIMessage(
         content="Partial finding: Acme quoted $4.20/unit.",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
-    model = scripted_model([ping, partial_then_search])
+    model = scripted_model([partial_then_search])
     patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=3)
@@ -1145,7 +1195,6 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
         reports_dir=tmp_path / "reports",
     )
     config = make_config(agent=agent)
-    ping = AIMessage(content="pong")
     ask = AIMessage(
         content="",
         tool_calls=[{"name": "ask_user", "args": {"question": "Which scope?"}, "id": "call_1"}],
@@ -1154,10 +1203,13 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
         content="Final answer, no research needed.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, ask, final])
+    model = scripted_model([ask, final])
     patch_run(monkeypatch, config, model)
 
+    read_answer_called = {"value": False}
+
     async def _slow_answer(prompt: str = "> ") -> str:
+        read_answer_called["value"] = True
         await asyncio.sleep(2)
         return "Whole company."
 
@@ -1171,6 +1223,12 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
     report_path = Path(lines[-1].strip())
     body = report_path.read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING not in body
+    # Proves the interrupt path actually ran rather than the run ending on an unconsumed
+    # leading reply: without this, a stale scripted reply the graph consumes as its final
+    # answer would end the run before `ask_user` ever fires, and the test would go vacuous.
+    assert read_answer_called["value"], "_read_answer was never awaited — ask_user never fired"
+    assert model._call_count == 2, "expected exactly the ask_user call and the final answer"
+    assert "Final answer, no research needed." in body
 
 
 async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clock(
@@ -1191,7 +1249,6 @@ async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clo
     )
     config = make_config(agent=agent)
 
-    ping = AIMessage(content="pong")
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
@@ -1202,7 +1259,7 @@ async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clo
             {"name": "ask_user", "args": {"question": "Narrower scope?"}, "id": "call_ask"}
         ],
     )
-    model = scripted_model([ping, search_call, ask])
+    model = scripted_model([search_call, ask])
     patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=0.1)
@@ -1235,7 +1292,6 @@ async def test_main_writes_no_report_when_the_run_dies_mid_flight(
     config = make_config(
         agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
     )
-    ping = AIMessage(content="pong")
     plan_call = AIMessage(
         content="Partial finding: Acme quoted $4.20/unit.",
         tool_calls=[
@@ -1247,7 +1303,7 @@ async def test_main_writes_no_report_when_the_run_dies_mid_flight(
         ],
         usage_metadata={"input_tokens": 41, "output_tokens": 7, "total_tokens": 48},
     )
-    model = scripted_model([ping, plan_call])  # no third response — the run dies here
+    model = scripted_model([plan_call])  # no second response — the run dies here
     patch_run(monkeypatch, config, model)
 
     exit_code, files, out, err = await _run_main(
@@ -1279,8 +1335,11 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
     config = make_config(
         agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
     )
-    ping = AIMessage(content="pong")
-    model = scripted_model([ping])
+    # Not preflight fodder here (patch_run's default is a no-op preflight): this is the
+    # graph's actual, only real turn — the interrupt fires on its first yielded chunk
+    # regardless of content, so a bare answer with no tool call is enough.
+    reply = AIMessage(content="pong")
+    model = scripted_model([reply])
     patch_run(monkeypatch, config, model)
 
     import harness.agent as agent_module
@@ -1327,7 +1386,6 @@ async def test_main_aborts_and_writes_no_report_when_searxng_fails_repeatedly_mi
     config = make_config(
         agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
     )
-    ping = AIMessage(content="pong")
 
     def _search_call(call_id: str) -> AIMessage:
         return AIMessage(
@@ -1337,7 +1395,7 @@ async def test_main_aborts_and_writes_no_report_when_searxng_fails_repeatedly_mi
 
     # make_config's default max_consecutive_failures is 3 — three scripted search rounds are
     # exactly enough for the third tool execution to trip the abort before a fourth model call.
-    model = scripted_model([ping, _search_call("c1"), _search_call("c2"), _search_call("c3")])
+    model = scripted_model([_search_call("c1"), _search_call("c2"), _search_call("c3")])
     patch_run(monkeypatch, config, model)
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1360,12 +1418,11 @@ async def test_a_run_inside_both_bounds_reports_no_cut_short(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final])
+    model = scripted_model([final])
     patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["a simple question"])
@@ -1405,7 +1462,6 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     write_source_capture(config, registry, source_id, "Acme lists $5.10 per unit.")
     monkeypatch.setattr(main_module, "SourceRegistry", lambda run_id: registry)
 
-    ping = AIMessage(content="pong")
     partial = AIMessage(
         content=f"Acme quoted $4.20 per unit [{source_id}].",
         tool_calls=[
@@ -1427,19 +1483,16 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
             }
         ],
     )
-    model = scripted_model([ping, partial, *([keep_going] * 20)])
+    model = scripted_model([partial, *([keep_going] * 20)])
     patch_run(monkeypatch, config, model)
 
     verify_model = scripted_model([verify_reply("not_supported", "The capture reads $5.10.")])
 
-    # One patch target serves every caller now, so the verify client is told apart by call
-    # order: main() resolves models in a fixed sequence — preflight, lead, reader, then the
-    # verification pass — making the fourth resolution the verify client.
-    resolutions = {"count": 0}
-
+    # One patch target serves every caller now, so the verify client is told apart by ROLE
+    # (Phase 1 Step 4 moved verification onto its own "verifier" role) rather than call order,
+    # which would have to be re-counted every time a new role gets preflighted or resolved.
     def _dispatch(cfg, role):
-        resolutions["count"] += 1
-        return verify_model if resolutions["count"] >= 4 else model
+        return verify_model if role == "verifier" else model
 
     monkeypatch.setattr("harness.models.build_chat_model", _dispatch)
 

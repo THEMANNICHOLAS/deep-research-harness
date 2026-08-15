@@ -15,7 +15,7 @@ See the parent plan for Intent (R1–R4), Codebase Map, and Design Decisions D1�
 - [x] Step 1: Canonical-URL dedup
 - [x] Step 2: PDF fetch path
 - [x] Step 3: Report structure enforcement
-- [ ] Step 4: Verifier role
+- [x] Step 4: Verifier role
 - [ ] Phase verification
 
 ## Steps
@@ -179,9 +179,9 @@ Red→green. Demote in the one place the answer body is rendered, downstream of
   calibration (non-goal).
 
 **Tests (write first, confirm red):**
-- [ ] `verify_paragraphs` builds the `verifier` role, not `head` (asserted via
+- [x] `verify_paragraphs` builds the `verifier` role, not `head` (asserted via
   `patch_models_by_role`).
-- [ ] A config without `[roles.verifier]` fails startup preflight with a `ModelError` naming
+- [x] A config without `[roles.verifier]` fails startup preflight with a `ModelError` naming
   the role (no fallback to head — D4).
 
 **Details:**
@@ -189,7 +189,7 @@ Red→green. The preflight addition mirrors the existing head preflight block in
 error-to-stderr, exit-1 shape.
 
 **Acceptance criteria:**
-- [ ] Run metadata in a written report names the verifier model (extend the metadata block
+- [x] Run metadata in a written report names the verifier model (extend the metadata block
   if it does not already carry it — one line).
 
 ## Verification
@@ -242,3 +242,20 @@ never add a section below it. -->
 - Watch-next: Step 4 (verifier role) — mirror the existing head preflight block in
   `__main__.py` exactly, incl. error-to-stderr exit-1 shape; `make_config` in conftest gains
   the verifier role.
+
+### 2026-08-15 — Step 4: Verifier role
+- Done: `[roles.verifier]` (gpt-5.6-luna) in harness.toml; verify.py builds `"verifier"`;
+  `__main__.py` preflights it beside head (same stderr/exit-1 shape); report metadata names
+  the verifier model. Evidence-span-quoting preference deliberately left (not trivial).
+- Learned: `patch_run`'s `skip_preflight` now defaults True (no-op preflight) — each real
+  role preflight consumes one scripted `ScriptedChatModel` reply, and Phase 2's new roles
+  would have re-broken 17 `main()`-driving tests. Tests asserting preflight behavior bypass
+  `patch_run` (real preflight, faked transport, see
+  `test_main_exits_nonzero_when_verifier_role_is_not_declared`). A 3F review then caught 6
+  stale leading `ping` replies the sweep missed — one had made the wall-clock-arming pin
+  test vacuous; all fixed with consumption assertions (`model._call_count`) so they cannot
+  go vacuous silently again.
+- Drift: none. Fixture decision logged in the central plan's `## Discoveries` (acted on).
+- Watch-next: Phase verification — full gates are green; what remains is the live e2e run
+  (deduped sources, PDF evidence or disclosed failure, one-H1 hierarchy, verifier in
+  metadata), which needs the homelab environment (SearXNG + OPENCODE_API_KEY).

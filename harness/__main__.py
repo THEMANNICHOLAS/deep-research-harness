@@ -1,8 +1,8 @@
 """CLI entrypoint: `python -m harness "<question>"`.
 
-Loads config, preflights the `head` role before anything is spent (R6), builds the agent,
-drives it while echoing todo-list progress (R10), and writes the report. The report path is
-the final line of stdout — frozen, because R1 depends on it. Nothing may print after it.
+Loads config, preflights the `head` and `verifier` roles before anything is spent (R6), builds
+the agent, drives it while echoing todo-list progress (R10), and writes the report. The report
+path is the final line of stdout — frozen, because R1 depends on it. Nothing may print after it.
 
 The agent may ask clarifying questions via `ask_user` before researching (R2, D5): the run
 interrupts, `main` prints each question, reads an answer, and resumes the same thread with
@@ -256,6 +256,14 @@ async def main(argv: list[str] | None = None) -> int:
     renderer.emit(Activity("preflight: checking the head model endpoint"))
     try:
         await preflight(config, "head")
+    except ModelError as exc:
+        renderer.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    renderer.emit(Activity("preflight: checking the verifier model endpoint"))
+    try:
+        await preflight(config, "verifier")
     except ModelError as exc:
         renderer.close()
         print(f"error: {exc}", file=sys.stderr)

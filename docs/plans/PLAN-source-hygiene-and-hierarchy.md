@@ -293,3 +293,10 @@ Append-only, empty at plan creation. -->
   PDF loops in @harness/tools/fetch.py (and the result→classify→page build nearly so); a
   small `_page_of(url, result, ...)` helper would collapse both. (3F simplify, deferred —
   loop-body restructure of a just-reviewed diff.)
+
+### 2026-08-15 — Phase 1 Step 4 (acted on)
+- Adding a role preflight to `__main__.py` shifts every scripted reply in tests that drive
+  `main()` with one shared `ScriptedChatModel` (17 failures). Fix chosen with the developer:
+  `patch_run` in @tests/conftest.py now no-ops `harness.models.preflight` by default, with
+  an opt-out for tests asserting preflight behavior — so Phase 2's researcher/reader role
+  preflights will not re-break the suite. Tests that need a real preflight opt out.

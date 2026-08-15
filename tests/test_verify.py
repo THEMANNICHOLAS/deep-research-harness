@@ -134,6 +134,29 @@ async def test_on_paragraph_fires_once_per_paragraph_including_no_call_ones(
     assert seen == [(1, 2), (2, 2)]
 
 
+async def test_verify_paragraphs_uses_the_verifier_role_not_head(make_config, patch_models_by_role):
+    """Phase 1 Step 4: verification runs on a model that did not write the report (D4)."""
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "Body text.")
+    paragraph = _paragraph(f"A claim [{source_id}].", [source_id])
+
+    head_model = ScriptedChatModel(
+        model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([verify_reply("supported", "wrong role checked this")])
+    verifier_model = ScriptedChatModel(
+        model="verifier-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([verify_reply("supported", "checked by the verifier")])
+    patch_models_by_role({"head": head_model, "verifier": verifier_model})
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert head_model._call_count == 0
+    assert verifier_model._call_count == 1
+    assert result.verdicts[0].detail == "checked by the verifier"
+
+
 # --- item 2: deterministic verdicts bypass the model entirely --------------------------
 
 

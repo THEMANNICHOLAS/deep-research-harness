@@ -118,7 +118,7 @@ async def verify_paragraphs(
     # attribute lookup also keeps `harness.models.build_chat_model` the single patch target.
     from harness import models
 
-    model = models.build_chat_model(config, "head")
+    model = models.build_chat_model(config, "verifier")
     captures_dir = sources_dir(config, registry)
 
     verdicts: list[ParagraphVerdict] = []

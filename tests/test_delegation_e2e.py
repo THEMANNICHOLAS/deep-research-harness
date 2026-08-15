@@ -82,7 +82,9 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
             ),
         ]
     )
-    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    # Verification runs on the "verifier" role (Phase 1 Step 4); this scenario's verify_reply
+    # is scripted on `head_model` itself, so it is routed there too rather than a third model.
+    patch_models_by_role({"head": head_model, "subagent": reader_model, "verifier": head_model})
 
     install_crawler(
         [

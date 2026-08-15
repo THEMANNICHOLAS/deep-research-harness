@@ -209,12 +209,11 @@ async def test_a_direct_answer_skips_the_clarifying_and_researching_lines(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final])
+    model = scripted_model([final])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["a question with no tool calls"])
@@ -236,7 +235,6 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
     have done.
     """
     config = make_config()
-    ping = AIMessage(content="pong")
     plan_search_and_replan: list[Any] = [
         AIMessage(
             content="",
@@ -283,7 +281,7 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, *plan_search_and_replan, final])
+    model = scripted_model([*plan_search_and_replan, final])
     patch_run(monkeypatch, config, model)
     _install_stub_search(monkeypatch)
 
@@ -685,12 +683,11 @@ async def test_a_full_run_prints_a_summary_above_the_report_path(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final])
+    model = scripted_model([final])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["a question with no tool calls"])
@@ -718,18 +715,21 @@ async def test_the_summary_counts_real_usable_and_unusable_sources(
     write_failed_capture(config, registry, blocked)
     monkeypatch.setattr(main_module, "SourceRegistry", lambda run_id: registry)
 
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content=f"Acme lists $5.10 per unit [{fetched}].",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final, verify_reply(True, "The page states $5.10.")])
+    model = scripted_model([final, verify_reply(True, "The page states $5.10.")])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["what does acme charge"])
 
     _, lines = drain_stdout(capsys)
     assert "  sources: 1 usable, 1 unusable" in lines
+    # Proves the cited-claim leg actually ran the verify call rather than the run ending on
+    # an unconsumed leading reply (which would leave `model._call_count` at 1 and no verdict
+    # line at all): both the final answer AND the verify reply above were consumed.
+    assert model._call_count == 2
 
 
 async def test_a_failing_report_write_still_closes_the_display(
@@ -747,12 +747,11 @@ async def test_a_failing_report_write_still_closes_the_display(
 
     monkeypatch.setattr(main_module, "write_report", _unwritable)
 
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final])
+    model = scripted_model([final])
     patch_run(monkeypatch, config, model)
 
     with pytest.raises(OSError, match="reports dir is not writable"):
@@ -778,7 +777,6 @@ async def test_failed_run_error_prints_only_after_the_renderer_is_closed(
     renderer = _CloseMarkingRenderer()
     monkeypatch.setattr(main_module, "build_renderer", lambda: renderer)
 
-    ping = AIMessage(content="pong")
     plan_call = AIMessage(
         content="",
         tool_calls=[
@@ -789,7 +787,7 @@ async def test_failed_run_error_prints_only_after_the_renderer_is_closed(
             }
         ],
     )
-    model = scripted_model([ping, plan_call])  # no third response — the run dies here
+    model = scripted_model([plan_call])  # no second response — the run dies here
     patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["question whose run dies mid-flight"])
@@ -809,7 +807,6 @@ async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
         max_rounds=1, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
     )
     config = make_config(agent=agent)
-    ping = AIMessage(content="pong")
     keep_going = AIMessage(
         content="",
         tool_calls=[
@@ -820,7 +817,7 @@ async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
             }
         ],
     )
-    model = scripted_model([ping, *([keep_going] * 20)])
+    model = scripted_model([*([keep_going] * 20)])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["question that never settles"])
@@ -846,7 +843,6 @@ async def test_a_dead_search_backend_is_disclosed_on_the_terminal_and_in_the_rep
     developer through the CLI as a warning line AND through the report's gaps section — not
     only through model-facing tool output the model may never repeat."""
     config = make_config()
-    ping = AIMessage(content="pong")
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "the answer"}, "id": "call_search"}],
@@ -855,7 +851,7 @@ async def test_a_dead_search_backend_is_disclosed_on_the_terminal_and_in_the_rep
         content="Best-effort answer without sources.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, search_call, final])
+    model = scripted_model([search_call, final])
     patch_run(monkeypatch, config, model)
 
     async def handler(request: httpx.Request) -> httpx.Response:

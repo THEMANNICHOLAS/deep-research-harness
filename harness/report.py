@@ -510,6 +510,7 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
         # tier is wired as the reader (R6).
         f"- Lead Model: {config.roles['head'].model}",
         f"- Subagent Model: {config.roles['subagent'].model}",
+        f"- Verifier Model: {config.roles['verifier'].model}",
         *_usage_lines(outcome.usage),
         "",
     ]
