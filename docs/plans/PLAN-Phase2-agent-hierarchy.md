@@ -16,6 +16,7 @@ Codebase Map (deepagents nesting facts), and Design Decisions D5–D7.
 - [ ] Step 2: Role keys and routing
 - [ ] Step 3: Researcher tier wiring
 - [ ] Step 4: Disclosures end-to-end
+- [ ] Step 5: Consolidated verification verdict
 - [ ] Phase verification
 
 ## Steps
@@ -185,6 +186,49 @@ Step 3 moved the machinery, and to reconcile the docs.
 **Acceptance criteria:**
 - [ ] Live run per the central plan's Phase 2 checklist (researcher fan-out visible,
   disclosure section plausible).
+
+### Step 5: Consolidated verification verdict
+**Risk:** none
+**Test-first:** required
+**Requirements:** developer request 2026-08-15 (report readability; accepted tradeoff)
+**Files:**
+- `harness/verify.py` — after the per-paragraph loop, ONE extra call on the `verifier` role:
+  feed it all per-paragraph verdicts, get back a short reviewer-analysis paragraph (rollup
+  counts plus a sentence naming each claim that was not fully supported).
+- `harness/report.py` — drop the per-paragraph `Sources:`/`Verdict:` blocks from
+  `## Answer`; render the reviewer paragraph under `## Sources`.
+- `tests/test_verify.py`, `tests/test_report.py` — consolidation-call and rendering tests.
+**Diff budget:** ~80–150 lines across 4 files
+
+**Reuse:**
+- Per-paragraph verification is UNCHANGED (verdicts are still computed — they are the
+  consolidator's input and the debugging granularity). Do NOT wrap verification in
+  agents/subagents: verifiers are judge-input-in/verdict-out plain model calls; a manager
+  agent adds per-agent prompt+tool overhead with zero capability gained (decided with the
+  developer 2026-08-15 over a proposed verifier-manager subagent tree).
+
+**Contracts:**
+- `verify_paragraphs` keeps returning per-paragraph verdicts; the consolidated paragraph is
+  additive output, not a replacement.
+
+**Out of scope:**
+- Multi-judge panels / judge calibration (parent non-goal); changing verification pooling;
+  per-source verdicts.
+
+**Tests (write first, confirm red):**
+- [ ] The consolidation call runs on the `verifier` role and receives every per-paragraph
+  verdict.
+- [ ] The rendered report has no `Sources:`/`Verdict:` lines inside `## Answer`, and the
+  reviewer paragraph appears under `## Sources` naming each non-supported claim.
+
+**Details:**
+Accepted tradeoff (developer, 2026-08-15): claim-level verdict pointers survive only as
+prose in the reviewer paragraph, not beside each claim — the consolidator naming each
+problem claim is what keeps that tolerable.
+
+**Acceptance criteria:**
+- [ ] A run with at least one `partially supported` paragraph names that claim in the
+  `## Sources` reviewer paragraph.
 
 ## Verification
 - [ ] Quality gates: see the central plan's `## Verification`.

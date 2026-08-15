@@ -228,6 +228,9 @@ delegates page reading to readers; models routed per D7; disclosures intact.
   explicit recursion bound
 - Orchestrator prompt rewritten to plan angles and delegate to researchers
 - End-to-end scripted-model test proving disclosures survive the hierarchy
+- Consolidated verification verdict: per-paragraph `Sources:`/`Verdict:` blocks leave the
+  answer body; one verifier-role consolidation call renders a reviewer paragraph under
+  `## Sources` (added 2026-08-15 from the first live report's readability feedback)
 
 ## Phase Dependencies
 Phase 2 requires Phase 1 (both edit `harness.toml` roles and `models`/preflight call sites;
