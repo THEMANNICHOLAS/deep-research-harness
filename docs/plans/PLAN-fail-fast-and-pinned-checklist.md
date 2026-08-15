@@ -1,6 +1,6 @@
 # PLAN: Fail-Fast Runs and Pinned Rich Checklist
 
-**Status:** In Progress
+**Status:** Code complete — live end-to-end verification pending (developer)
 **Created:** 2026-08-14
 **Type:** Single plan
 
@@ -421,12 +421,14 @@ wall-clock expiry; keep disclosed reports for round cap and post-answer wall-clo
       no report.
 
 ## Verification
-- [ ] `uv run pytest` (CI also enforces the 90% coverage floor on `harness/`)
-- [ ] `uv run ruff check .`
-- [ ] `uv run ruff format --check .`
-- [ ] `uv run mypy .`
+- [x] `uv run pytest` (CI also enforces the 90% coverage floor on `harness/`) — 349
+      passed, coverage 98%
+- [x] `uv run ruff check .`
+- [x] `uv run ruff format --check .`
+- [x] `uv run mypy .`
 - [ ] End-to-end: container stopped → immediate nonzero exit, no report; container up →
-      TUI run with pinned checklist, report written on clean finish.
+      TUI run with pinned checklist, report written on clean finish. — LIVE check, needs
+      the homelab endpoints; developer to run.
 
 ## Notes
 - Reader-delegation work (PLAN-reader-delegation.md) merged into this branch AFTER the
@@ -538,6 +540,17 @@ Disposition: defer (blanket-approval session; developer to confirm).
 - Watch-next: final verification — quality gates offline, plus the LIVE checks only the
   developer can run (TUI smoke in a real terminal, container stopped at startup, and
   container stopped mid-run).
+
+### 2026-08-15 — Final verification (automated half)
+- Done: full suite 349 passed with 98% coverage on harness/ (CI floor 90); ruff check,
+  ruff format --check, and mypy all clean at HEAD 05656fe.
+- Learned: nothing new.
+- Drift: none.
+- Watch-next: the LIVE end-to-end items remain — (1) real-terminal TUI smoke (pinned
+  checklist, Ctrl+C leaves a clean screen, summary printed after exit, ask_user prompt
+  readable); (2) container stopped at startup -> fast nonzero exit, no report; (3)
+  container stopped mid-run -> abort, error summary, no report; (4) clean run writes a
+  report. Also pending a developer decision: the CancelledError gap in ## Discoveries.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so
