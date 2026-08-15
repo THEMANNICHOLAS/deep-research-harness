@@ -17,6 +17,7 @@ import pytest
 from deepagents.backends.protocol import SandboxBackendProtocol
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import Interrupt
+from pydantic import PrivateAttr
 
 import harness.__main__ as main_module
 from harness.agent import build_agent
@@ -59,12 +60,13 @@ def _tools_by_name(graph):
     return graph.nodes["tools"].bound.tools_by_name
 
 
-def _declared_subagent_names(graph) -> set[str]:
-    """Recover the declared subagent names backing the `task` tool.
+def _declared_subagents(graph) -> dict[str, Any]:
+    """Recover the `{name: runnable}` dict backing the `task` tool's declared subagents.
 
     Mirrors `_filesystem_backend`: deepagents does not expose the subagent-name list on the
-    compiled graph, but the `task` tool's coroutine closes over a `{name: runnable}` dict, so
-    this walks its closure to find it.
+    compiled graph, but the `task` tool's coroutine closes over this dict, so this walks its
+    closure to find it. Returns the runnables (not just the names) so a caller can apply the
+    same walk to a NESTED tier's own `task` tool (Step 3's researcher -> reader nesting).
     """
     task_tool = _tools_by_name(graph)["task"]
     for cell in task_tool.coroutine.__closure__ or ():
@@ -75,8 +77,13 @@ def _declared_subagent_names(graph) -> set[str]:
             and all(isinstance(k, str) for k in candidate)
             and all(hasattr(v, "invoke") for v in candidate.values())
         ):
-            return set(candidate)
-    raise AssertionError("could not recover declared subagent names from the task tool")
+            return candidate
+    raise AssertionError("could not recover declared subagents from the task tool")
+
+
+def _declared_subagent_names(graph) -> set[str]:
+    """The declared subagent names backing the `task` tool (see `_declared_subagents`)."""
+    return set(_declared_subagents(graph))
 
 
 def _filesystem_backend(graph):
@@ -151,33 +158,66 @@ async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_
 async def test_build_agent_exposes_the_harness_tools(noop_agent):
     _, graph = noop_agent
 
-    # `fetch_pages` moved to the reader subagent (Phase 1): the lead delegates through `task`
-    # rather than fetching directly.
-    assert {"search_web", "task"} <= _tools_by_name(graph).keys()
+    # `search_web`/`fetch_pages` both moved off the lead (Step 3): it delegates through `task`
+    # to the researcher tier rather than researching directly.
+    assert "task" in _tools_by_name(graph)
+    assert "search_web" not in _tools_by_name(graph)
     assert "fetch_pages" not in _tools_by_name(graph)
 
 
 async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):
     _, graph = noop_agent
 
-    # `task` now exists (backing the declared `reader` subagent), so the general-purpose
+    # `task` now exists (backing the declared `researcher` subagent), so the general-purpose
     # disable is evidenced by the declared-agent list, not by the tool's absence.
-    assert _declared_subagent_names(graph) == {"reader"}
+    assert _declared_subagent_names(graph) == {"researcher"}
 
 
-async def test_build_agent_lead_excludes_fetch_and_gains_task(
+async def test_the_researchers_own_task_tool_declares_only_the_reader(noop_agent):
+    """TEST-FIRST item 3 (lead tool surface): the 3-tier hierarchy is nested, not flattened —
+    the lead's own declared subagent is exactly `{"researcher"}` (previous test), and the
+    researcher's OWN `task` tool, one level deeper, declares exactly `{"reader"}`.
+    """
+    _, graph = noop_agent
+
+    researcher_runnable = _declared_subagents(graph)["researcher"]
+
+    assert _declared_subagent_names(researcher_runnable) == {"reader"}
+
+
+async def test_the_nested_readers_tool_surface_includes_its_filesystem_workspace(noop_agent):
+    """Developer finding (post Step-3-migration): nesting the reader via a hand-built
+    `SubAgentMiddleware` (rather than `create_deep_agent`'s own top-level `subagents=`, which
+    auto-injects a base middleware stack) does not carry `FilesystemMiddleware` along for free
+    — `reader.md` still promises `write_file`/`read_file`/`edit_file`/`ls`/`glob`/`grep` as a
+    scratch workspace, so the reader must actually have them.
+    """
+    _, graph = noop_agent
+
+    researcher_runnable = _declared_subagents(graph)["researcher"]
+    reader_runnable = _declared_subagents(researcher_runnable)["reader"]
+    reader_tool_names = set(_tools_by_name(reader_runnable))
+
+    assert {"write_file", "read_file", "edit_file", "ls", "glob", "grep"} <= reader_tool_names
+
+
+async def test_build_agent_lead_excludes_search_and_fetch_and_gains_task(
     make_config, patch_models_by_role, scripted_model
 ):
-    """R1 is structural: the lead's tool set physically excludes `fetch_pages` and gains `task`,
-    the delegation mechanism to the reader subagent (D1).
+    """R1 is structural: the lead's tool set physically excludes `search_web`/`fetch_pages` and
+    gains `task`, the delegation mechanism to the researcher subagent (Step 3).
     """
     head_model = scripted_model([AIMessage(content="done")])
+    researcher_model = scripted_model([AIMessage(content="researcher done")])
     reader_model = scripted_model([AIMessage(content="reader done")])
-    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
 
     graph = build_agent(make_config(), SourceRegistry())
 
     assert "task" in _tools_by_name(graph)
+    assert "search_web" not in _tools_by_name(graph)
     assert "fetch_pages" not in _tools_by_name(graph)
 
     await graph.ainvoke(
@@ -188,15 +228,18 @@ async def test_build_agent_lead_excludes_fetch_and_gains_task(
     assert head_model._bound_tool_names, "bind_tools was never called on the head model"
     for offered in head_model._bound_tool_names:
         assert "task" in offered
-        assert "search_web" in offered
         assert "ask_user" in offered
+        assert "search_web" not in offered
         assert "fetch_pages" not in offered
 
 
-def test_reader_spec_contract(make_config, scripted_model):
+def test_reader_spec_contract(make_config, scripted_model, tmp_path):
     """The declared reader `SubAgent` spec (D1) carries the subagent-role model, the rendered
     reader.md prompt, and the run's own `fetch_pages` instance — never a second one.
     """
+    from deepagents import FilesystemMiddleware
+    from deepagents.backends.filesystem import FilesystemBackend
+
     from harness.agent import _reader_spec
     from harness.prompts import render
     from harness.tools import build_tools
@@ -204,8 +247,9 @@ def test_reader_spec_contract(make_config, scripted_model):
     config = make_config()
     reader_model = scripted_model([AIMessage(content="done")])
     reader_tools = build_tools(config, SourceRegistry()).reader
+    backend = FilesystemBackend(root_dir=tmp_path / "workspace")
 
-    spec = _reader_spec(config, reader_model, reader_tools)
+    spec = _reader_spec(config, reader_model, reader_tools, backend)
 
     assert spec["name"] == "reader"
     assert spec["model"] is reader_model
@@ -215,6 +259,10 @@ def test_reader_spec_contract(make_config, scripted_model):
         max_urls_per_call=config.fetch.max_urls_per_call,
     )
     assert spec["tools"] is reader_tools
+    # Restores the scratch workspace `reader.md` promises — nesting via a hand-built
+    # `SubAgentMiddleware` (Step 3) does not auto-inject this the way `create_deep_agent`'s own
+    # top-level `subagents=` path does.
+    assert any(isinstance(m, FilesystemMiddleware) for m in spec["middleware"])
     # The reader has no checkpointer forwarded and cannot interrupt — inheriting the lead's
     # `ask_user` interrupt entry would register an interrupt that can never fire.
     assert "interrupt_on" not in spec
@@ -229,10 +277,14 @@ async def test_build_agent_resolves_each_role_from_its_own_key(
     import harness.agent as agent_module
 
     head_model = scripted_model([AIMessage(content="done")])
+    # A real `ScriptedChatModel`, not a bare `object()`: Step 3 wires the researcher into
+    # `create_deep_agent`'s own `subagents=` list, which resolves its model via
+    # `resolve_model` — a placeholder that is not a `BaseChatModel` fails there now.
+    researcher_model = scripted_model([AIMessage(content="researcher done")])
     reader_model = scripted_model([AIMessage(content="reader done")])
     models_by_role = {
         "head": head_model,
-        "researcher": object(),
+        "researcher": researcher_model,
         "reader": reader_model,
         "verifier": object(),
     }
@@ -247,9 +299,11 @@ async def test_build_agent_resolves_each_role_from_its_own_key(
     captured: dict[str, Any] = {}
     original_reader_spec = agent_module._reader_spec
 
-    def _spy_reader_spec(config: Any, reader_model_arg: Any, reader_tools: Any) -> Any:
+    def _spy_reader_spec(
+        config: Any, reader_model_arg: Any, reader_tools: Any, backend: Any
+    ) -> Any:
         captured["reader_model"] = reader_model_arg
-        return original_reader_spec(config, reader_model_arg, reader_tools)
+        return original_reader_spec(config, reader_model_arg, reader_tools, backend)
 
     monkeypatch.setattr(agent_module, "_reader_spec", _spy_reader_spec)
 
@@ -287,20 +341,14 @@ def test_build_agent_raises_model_error_naming_the_missing_role(make_config):
     assert "researcher" in str(excinfo.value)
 
 
-def test_orchestrator_prompt_names_the_answer_structure_contract(make_config):
+def test_orchestrator_prompt_names_the_answer_structure_contract():
     """Phase 1 Step 3: the rendered orchestrator prompt must tell the model to write headings
     starting at `## ` (never `# `), lead with a direct answer, and never write its own
     meta/coverage/disclosure sections — the harness demotes/owns all of that.
     """
     from harness.prompts import render
 
-    config = make_config()
-
-    prompt = render(
-        "orchestrator",
-        current_date=date.today().isoformat(),
-        max_urls_per_call=config.fetch.max_urls_per_call,
-    )
+    prompt = render("orchestrator", current_date=date.today().isoformat())
 
     assert "start at `## `" in prompt
     assert "never `# `" in prompt
@@ -320,10 +368,18 @@ async def test_reader_model_profile_excludes_execute(make_config, patch_models_b
     head_model = ScriptedChatModel(
         model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script([AIMessage(content="done")])
+    # A real `ScriptedChatModel`, not a bare `object()`: Step 3 wires the researcher into
+    # `create_deep_agent`'s own `subagents=` list, which resolves its model via
+    # `resolve_model` — a placeholder that is not a `BaseChatModel` fails there now.
+    researcher_model = ScriptedChatModel(
+        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="researcher done")])
     reader_model = ScriptedChatModel(
         model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script([AIMessage(content="reader done")])
-    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
 
     build_agent(make_config(), SourceRegistry())
 
@@ -335,7 +391,7 @@ async def test_reader_model_profile_excludes_execute(make_config, patch_models_b
     assert "execute" in profile.excluded_tools
 
 
-# --- Phase 2: failure path — task-tool retry/error middleware, fetch_raw fallback (D2) --
+# --- Phase 2 / Step 3: failure path — task-tool retry/error middleware, fetch_raw fallback --
 
 
 class _RaisingChatModel(ScriptedChatModel):
@@ -347,41 +403,78 @@ class _RaisingChatModel(ScriptedChatModel):
         raise RuntimeError("boom")
 
 
-def _task_call(description: str, call_id: str = "call_task") -> AIMessage:
+def _task_call(
+    description: str, call_id: str = "call_task", subagent_type: str = "researcher"
+) -> AIMessage:
     return AIMessage(
         content="",
         tool_calls=[
             {
                 "name": "task",
-                "args": {"description": description, "subagent_type": "reader"},
+                "args": {"description": description, "subagent_type": subagent_type},
                 "id": call_id,
             }
         ],
     )
 
 
+def _reader_fetch_call(url: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "fetch_pages", "args": {"urls": [url]}, "id": "call_fetch"}],
+    )
+
+
+@pytest.fixture
+def build_researcher(make_config, tmp_path):
+    """Factory: compile a standalone researcher subagent runnable, the same way `build_agent`
+    nests it under the lead (Step 3), but invocable directly so a test can drive the
+    researcher's OWN task-to-reader dispatch (retry/error middleware, digest marking) without
+    also scripting a full lead turn around it.
+    """
+    from deepagents.backends.filesystem import FilesystemBackend
+    from deepagents.middleware.subagents import create_sub_agent
+
+    from harness.agent import _reader_spec, _researcher_spec
+    from harness.tools import build_tools
+
+    def _build(researcher_model: Any, reader_model: Any, registry: SourceRegistry | None = None):
+        config = make_config()
+        registry = registry if registry is not None else SourceRegistry()
+        backend = FilesystemBackend(root_dir=tmp_path / "workspace")
+        tool_sets = build_tools(config, registry)
+        reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
+        researcher_spec = _researcher_spec(
+            config, researcher_model, tool_sets.researcher, reader_spec, backend, registry
+        )
+        return create_sub_agent(researcher_spec), registry
+
+    return _build
+
+
 async def test_a_reader_crash_becomes_an_error_task_message_after_one_retry(
-    make_config, patch_models_by_role, scripted_model
+    build_researcher, scripted_model
 ):
-    """D2: the task tool is wrapped by ToolRetryMiddleware(max_retries=1) inner and
-    ToolErrorMiddleware outer, so a reader crash surfaces as an error ToolMessage — never a
-    raised exception out of `ainvoke` — after exactly one retry (two reader model calls total).
+    """D2 (relocated to the researcher tier, Step 3 — the mechanism, not the semantics, moved):
+    the researcher's own `task` tool (dispatching to the reader) is wrapped by
+    ToolRetryMiddleware(max_retries=1) inner and ToolErrorMiddleware outer, so a reader crash
+    surfaces to the researcher as an error ToolMessage — never a raised exception out of
+    `ainvoke` — after exactly one retry (two reader model calls total).
     """
     from pydantic import SecretStr
 
-    head_model = scripted_model(
-        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
     )
     reader_model = _RaisingChatModel(
         model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     )
-    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
+    researcher, _ = build_researcher(researcher_model, reader_model)
 
-    graph = build_agent(make_config(), SourceRegistry())
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
-    )
+    result = await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
     task_messages = [
         m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
@@ -393,23 +486,22 @@ async def test_a_reader_crash_becomes_an_error_task_message_after_one_retry(
 
 
 async def test_a_reader_ending_with_no_final_text_returns_an_empty_task_message(
-    make_config, patch_models_by_role, scripted_model
+    build_researcher, scripted_model
 ):
     """deepagents' documented empty-ToolMessage behavior: a subagent ending on an AIMessage with
     no text produces a task ToolMessage with empty content. THIS emptiness is the documented
-    failure signal Phase 3's prompt teaches the lead to treat as a failed digest.
+    failure signal the researcher's prompt (Step 3) teaches it to treat as a failed digest.
     """
-    head_model = scripted_model(
-        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
     )
     reader_model = scripted_model([AIMessage(content="")])
-    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
+    researcher, _ = build_researcher(researcher_model, reader_model)
 
-    graph = build_agent(make_config(), SourceRegistry())
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
-    )
+    result = await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
     task_messages = [
         m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
@@ -418,29 +510,24 @@ async def test_a_reader_ending_with_no_final_text_returns_an_empty_task_message(
     assert task_messages[0].content == ""
 
 
-def _reader_fetch_call(url: str) -> AIMessage:
-    return AIMessage(
-        content="",
-        tool_calls=[{"name": "fetch_pages", "args": {"urls": [url]}, "id": "call_fetch"}],
-    )
-
-
 async def test_a_reader_crash_after_a_successful_fetch_leaves_the_source_unread(
-    make_config, patch_models_by_role, scripted_model, install_crawler
+    build_researcher, scripted_model, install_crawler
 ):
     """R5: "digested" is marked at the delegation boundary, not at fetch time. The reader
     fetches a page successfully, then crashes (its script runs out, raising `IndexError` —
-    the crash-after-partial-fetch case); no digest ever reaches the lead, so the source must
-    stay "unread". A fetch-time mark here would make the report disclose a digest that never
-    existed.
+    the crash-after-partial-fetch case); no digest ever reaches the researcher, so the source
+    must stay "unread". A fetch-time mark here would make the report disclose a digest that
+    never existed.
     """
-    head_model = scripted_model(
-        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
     )
     # One scripted reply only: the fetch call. The reader's next model call — and the whole
     # retry attempt — exhausts the script and raises.
     reader_model = scripted_model([_reader_fetch_call("https://a.test")])
-    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
     install_crawler(
         [
             _FakeResult(
@@ -450,12 +537,8 @@ async def test_a_reader_crash_after_a_successful_fetch_leaves_the_source_unread(
         ]
     )
 
-    registry = SourceRegistry()
-    graph = build_agent(make_config(), registry)
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
-    )
+    researcher, registry = build_researcher(researcher_model, reader_model)
+    result = await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
     task_messages = [
         m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
@@ -470,17 +553,20 @@ async def test_a_reader_crash_after_a_successful_fetch_leaves_the_source_unread(
 
 
 async def test_an_empty_digest_leaves_the_fetched_source_unread(
-    make_config, patch_models_by_role, scripted_model, install_crawler
+    build_researcher, scripted_model, install_crawler
 ):
     """The empty-digest half of the same boundary: the reader fetches successfully but ends
-    with no final text — the documented failure signal the prompt tells the lead to treat as
-    a failed delegation — so the source stays "unread" until a `fetch_raw` recovery marks it.
+    with no final text — the documented failure signal the prompt tells the researcher to
+    treat as a failed delegation — so the source stays "unread" until a `fetch_raw` recovery
+    marks it.
     """
-    head_model = scripted_model(
-        [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
     )
     reader_model = scripted_model([_reader_fetch_call("https://a.test"), AIMessage(content="")])
-    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
     install_crawler(
         [
             _FakeResult(
@@ -490,31 +576,194 @@ async def test_an_empty_digest_leaves_the_fetched_source_unread(
         ]
     )
 
-    registry = SourceRegistry()
-    graph = build_agent(make_config(), registry)
-    await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
-    )
+    researcher, registry = build_researcher(researcher_model, reader_model)
+    await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
     source = registry.get("S1")
     assert source is not None
     assert source.read_mode == "unread"
 
 
-async def test_fetch_raw_is_offered_to_the_lead_but_not_the_reader(
-    noop_agent, make_config, scripted_model
+async def test_a_researcher_crash_becomes_an_error_task_message_after_one_retry(
+    make_config, patch_models_by_role, scripted_model
 ):
-    _, graph = noop_agent
-    assert "fetch_raw" in _tools_by_name(graph)
+    """TEST-FIRST item 2: the lead's OWN `task` tool (dispatching to the researcher) carries
+    the same ToolRetryMiddleware(max_retries=1)/ToolErrorMiddleware pair, now guarding a
+    researcher crash — the lead receives a `RESEARCHER FAILED (...)` error ToolMessage after
+    exactly one retry, and the run continues on the lead's next scripted turn.
+    """
+    from pydantic import SecretStr
 
-    from harness.agent import _reader_spec
+    head_model = scripted_model(
+        [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
+    )
+    researcher_model = _RaisingChatModel(
+        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    reader_model = scripted_model([AIMessage(content="unused")])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    graph = build_agent(make_config(), SourceRegistry())
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0].status == "error"
+    assert str(task_messages[0].content).startswith("RESEARCHER FAILED")
+    assert researcher_model._call_count == 2  # initial attempt + exactly one retry
+    # The run continued past the failed dispatch onto the lead's next scripted turn.
+    assert result["messages"][-1].content == "done despite the failed angle"
+
+
+async def test_lead_to_researcher_to_reader_digest_reaches_the_lead(
+    make_config, patch_models_by_role, scripted_model, install_crawler
+):
+    """TEST-FIRST item 1: the full 3-tier chain, scripted end to end — the lead dispatches a
+    researcher, the researcher dispatches a reader, the reader's digest reaches the researcher,
+    the researcher's own report reaches the lead, and the digested source is marked `digested`
+    (R7's mechanism moved, not broken, by nesting it one level deeper).
+    """
+    head_model = scripted_model(
+        [
+            _task_call("Investigate the widget defect angle"),
+            AIMessage(content="Final answer citing the researcher's finding [S1]."),
+        ]
+    )
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="Researcher report: the page confirms the defect [S1]."),
+        ]
+    )
+    reader_model = scripted_model(
+        [
+            _reader_fetch_call("https://a.test"),
+            AIMessage(content="Digest: confirmed defect pattern [S1]."),
+        ]
+    )
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+    install_crawler(
+        [
+            _FakeResult(
+                "https://a.test",
+                markdown=_FakeMarkdown(raw_markdown="Defect body", fit_markdown="Defect body"),
+            )
+        ]
+    )
+
+    registry = SourceRegistry()
+    graph = build_agent(make_config(), registry)
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    assert result["messages"][-1].content == "Final answer citing the researcher's finding [S1]."
+    source = registry.get("S1")
+    assert source is not None
+    assert source.read_mode == "digested"
+
+
+class _ConcurrencyTrackingModel(ScriptedChatModel):
+    """Tracks in-flight `_agenerate` calls to prove concurrent researcher dispatch (mirrors the
+    shape of test_verify.py's own `_ConcurrencyTrackingModel`, which proves the OPPOSITE —
+    strictly sequential verification calls — so a bare `asyncio.sleep(0)` there is enough to
+    rule out a false negative).
+
+    Proving concurrency the other direction needs a real, non-zero yield: with `sleep(0)`, a
+    single-tick yield, the two gathered coroutines' actual scheduling can still interleave such
+    that one fully completes before the other's Task gets its first turn (observed flaky in
+    this suite) — `sleep(0.05)` reliably gives both a chance to increment before either decrements.
+    """
+
+    _in_flight: int = PrivateAttr(default=0)
+    _peak_in_flight: int = PrivateAttr(default=0)
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        self._in_flight += 1
+        self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
+        await asyncio.sleep(0.05)
+        try:
+            return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        finally:
+            self._in_flight -= 1
+
+
+async def test_two_researchers_dispatched_in_one_turn_run_concurrently(
+    make_config, patch_models_by_role
+):
+    """Acceptance criterion: two researchers dispatched by ONE lead turn (a single AIMessage
+    carrying two `task` tool calls) actually run concurrently, not sequentially — peak in-flight
+    researcher model calls > 1.
+    """
+    from pydantic import SecretStr
+
+    head_model = ScriptedChatModel(
+        model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {"description": "Angle A", "subagent_type": "researcher"},
+                        "id": "call_a",
+                    },
+                    {
+                        "name": "task",
+                        "args": {"description": "Angle B", "subagent_type": "researcher"},
+                        "id": "call_b",
+                    },
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    researcher_model = _ConcurrencyTrackingModel(
+        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="Report A."), AIMessage(content="Report B.")])
+    reader_model = ScriptedChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="unused")])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    graph = build_agent(make_config(), SourceRegistry())
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    assert researcher_model._peak_in_flight > 1
+    assert researcher_model._call_count == 2
+
+
+async def test_fetch_raw_is_offered_to_the_researcher_but_not_the_lead_or_reader(
+    noop_agent, make_config
+):
+    """`fetch_raw` moved off the lead onto the researcher (Step 3) — the digest-recovery loop
+    belongs to whoever dispatches readers.
+    """
+    _, graph = noop_agent
+    assert "fetch_raw" not in _tools_by_name(graph)
+
     from harness.tools import build_tools
 
     config = make_config()
-    reader_tools = build_tools(config, SourceRegistry()).reader
-    spec = _reader_spec(config, scripted_model([AIMessage(content="done")]), reader_tools)
-    assert "fetch_raw" not in [t.name for t in spec["tools"]]
+    tool_sets = build_tools(config, SourceRegistry())
+    assert "fetch_raw" in [t.name for t in tool_sets.researcher]
+    assert "fetch_raw" not in [t.name for t in tool_sets.reader]
 
 
 async def test_build_agent_includes_todo_list_middleware(noop_agent):
@@ -1220,6 +1469,11 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
 
     The elapsed-time assertion pins the timeout itself: without it, a broad "catch anything,
     call it wall_clock" shortcut that ran the full sleep would still pass.
+
+    Step 3 (Drift C): the clock now arms on the LEAD's `task(subagent_type="researcher")`
+    dispatch, a top-level call `__main__`'s stream loop actually sees — the nested `search_web`
+    call that stalls lives one tier deeper, inside the researcher `patch_run`'s single model
+    also plays.
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
@@ -1228,11 +1482,12 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
     )
     config = make_config(agent=agent)
 
+    task_call = _task_call("Research widgets")
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
-    model = scripted_model([search_call])
+    model = scripted_model([task_call, search_call])
     patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=3)
@@ -1257,6 +1512,9 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     """D2's other wall-clock branch: the same expiry, but the interrupted turn already carried
     prose alongside its tool call, so a final answer exists — the report is still written,
     disclosing the cut-short, and the exit code stays 0.
+
+    Step 3 (Drift C): the LEAD's own turn carries the prose AND the `task(researcher)` dispatch
+    — the slow `search_web` call that stalls the clock lives one tier deeper.
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
@@ -1265,11 +1523,21 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     )
     config = make_config(agent=agent)
 
-    partial_then_search = AIMessage(
+    partial_then_task = AIMessage(
         content="Partial finding: Acme quoted $4.20/unit.",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": "Research widgets", "subagent_type": "researcher"},
+                "id": "call_task",
+            }
+        ],
+    )
+    search_call = AIMessage(
+        content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
-    model = scripted_model([partial_then_search])
+    model = scripted_model([partial_then_task, search_call])
     patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=3)
@@ -1295,10 +1563,10 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
 async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """The clock arms at the first `search_web`/`fetch_pages` call, not at process start, so a
-    pre-research `ask_user` wait of any length must not trip it — the wait (2s) is longer than the
-    configured clock (1s) and the run must still finish clean. Paired with the mid-run test below;
-    neither alone pins where the clock starts.
+    """The clock arms at the first `task(subagent_type="researcher")` dispatch (Step 3 Drift C),
+    not at process start, so a pre-research `ask_user` wait of any length must not trip it — the
+    wait (2s) is longer than the configured clock (1s) and the run must still finish clean.
+    Paired with the mid-run test below; neither alone pins where the clock starts.
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
@@ -1345,13 +1613,15 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
 async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clock(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """Pairs with the pre-research test above: once research has begun the clock runs and is not
-    paused for an interrupt, so an unanswered mid-run ask still ends the run at the bound.
+    """Pairs with the pre-research test above: once research has begun (a `task(researcher)`
+    dispatch, Step 3 Drift C) the clock runs and is not paused for an interrupt, so an
+    unanswered mid-run ask still ends the run at the bound.
 
-    D2: nothing in this scripted run ever produces prose (`search_call` and `ask` are both
-    content-less tool-call proposals), so this is the wall-clock NO-answer case — no report,
-    exit 1 — not the disclosed-report case this test asserted before Phase 4's gate existed.
-    The elapsed-time assertion pins the timeout to the wait itself.
+    D2: nothing in this scripted run ever produces a final answer on the LEAD's own transcript
+    (`task_call`/`search_call`/`ask` are all content-less tool-call proposals; the researcher's
+    own report becomes a `task` ToolMessage, never an `AIMessage` the lead itself said), so this
+    is the wall-clock NO-answer case — no report, exit 1. The elapsed-time assertion pins the
+    timeout to the wait itself.
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
@@ -1360,17 +1630,19 @@ async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clo
     )
     config = make_config(agent=agent)
 
+    task_call = _task_call("Research widgets")
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
+    researcher_report = AIMessage(content="Researcher report (no citations yet).")
     ask = AIMessage(
         content="",
         tool_calls=[
             {"name": "ask_user", "args": {"question": "Narrower scope?"}, "id": "call_ask"}
         ],
     )
-    model = scripted_model([search_call, ask])
+    model = scripted_model([task_call, search_call, researcher_report, ask])
     patch_run(monkeypatch, config, model)
     # After the model is built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=0.1)
@@ -1493,6 +1765,11 @@ async def test_main_aborts_and_writes_no_report_when_searxng_fails_repeatedly_mi
     """Phase 3's deferred full-`main()` criterion (D3): three consecutive connection failures
     during `search_web` trip `SearchUnavailableError`, which the loop's generic exception
     handler treats like any other hard error — no report, exit 1.
+
+    Step 3 (Drift C): `search_web` now lives on the RESEARCHER, so the abort must propagate up
+    through the lead's own `task` dispatch — proving `_reader_failure_message`'s propagate
+    branch and `_retry_on_non_search_abort`'s exclusion actually let it through rather than
+    stringifying it into a soft `RESEARCHER FAILED` message.
     """
     config = make_config(
         agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
@@ -1504,9 +1781,12 @@ async def test_main_aborts_and_writes_no_report_when_searxng_fails_repeatedly_mi
             tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": call_id}],
         )
 
-    # make_config's default max_consecutive_failures is 3 — three scripted search rounds are
+    # make_config's default max_consecutive_failures is 3 — the lead's task(researcher) dispatch
+    # plus three scripted search rounds (all served by the SAME patched model, one per role) are
     # exactly enough for the third tool execution to trip the abort before a fourth model call.
-    model = scripted_model([_search_call("c1"), _search_call("c2"), _search_call("c3")])
+    model = scripted_model(
+        [_task_call("Research widgets"), _search_call("c1"), _search_call("c2"), _search_call("c3")]
+    )
     patch_run(monkeypatch, config, model)
 
     def handler(request: httpx.Request) -> httpx.Response:

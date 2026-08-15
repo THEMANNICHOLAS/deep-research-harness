@@ -277,9 +277,37 @@ Step 1 (live checks) gates Step 2 (committing model IDs to config).
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+2026-08-15 — Phase 2 Step 3: D6's per-researcher recursion bound is unimplementable —
+deepagents 0.7.5 offers NO per-subagent recursion_limit route (no SubAgent field, no
+`.with_config` on `create_sub_agent`, no task-tool config key; site-packages verified).
+→ Developer decision: run-level bounds only (wall clock, lead round cap, ambient 9,999
+crash-stop) plus prompt-side budget guidance in the researcher contract; D5's
+CompiledSubAgent route stays rejected. Details in the Phase 2 sub-plan's Reconciliations.
+
+2026-08-15 — Phase 2 Step 3: the frozen researcher contract's Tools section
+(search_web + fetch_pages direct) contradicted R5's delegated-reading design.
+→ Developer decision: "frozen" scopes the research contract (mission, output shape), not
+tool mechanics — subagent.md's Tools section is updated to search_web +
+task(subagent_type="reader"). reader.md already assumed a researcher caller.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+
+### 2026-08-15 — Phase 2 Step 3 (acted)
+- deepagents 0.7.5 auto-injects FilesystemMiddleware/summarization/PatchToolCalls ONLY for
+  specs on `create_deep_agent`'s own top-level `subagents=` — a SubAgent nested via a
+  hand-built `SubAgentMiddleware` gets none of them. The nested reader silently lost its
+  scratch workspace (reader.md still promised one). Acted (developer, 2026-08-15): restore
+  via explicit `FilesystemMiddleware(backend=...)` on `_reader_spec`'s middleware, pinned by
+  a nested-tool-surface test. Remember this for ANY future nested tier.
+
+### 2026-08-15 — Phase 2 Step 3 (deferred, 3F Minors)
+- No test pins the researcher spec's `interrupt_on` omission (D6 below-lead half is pinned
+  only for the reader). Code omits it today; add the one-line spec assertion with Step 4's
+  test work.
+- Step 3's diff landed at 769+/246- across 13 files vs the planned ~200–350/4 — fully
+  accounted for by reconciliations Drift A/B/C; recorded so the budget miss is visible.
 
 ### 2026-08-15 — Phase 1 Step 1 (deferred)
 - Query re-encode asymmetry in `normalize_url` (@harness/sources.py): the query is

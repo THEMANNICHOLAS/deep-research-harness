@@ -150,23 +150,25 @@ def test_tier_contracts_name_their_frozen_fields(name, field):
 
 
 def test_orchestrator_prompt_teaches_the_full_delegation_protocol():
-    """R1's prompt half (Phase 3): the lead delegates reading to the reader subagent rather
-    than fetching directly, and knows what to do when that delegation fails.
+    """R1's prompt half (Phase 2 Step 3): the lead delegates research angles to the researcher
+    subagent rather than researching directly, and knows what to do when that delegation fails.
     """
-    rendered = render("orchestrator", current_date="2026-01-01", max_urls_per_call=7)
+    rendered = render("orchestrator", current_date="2026-01-01")
 
-    assert 'subagent_type="reader"' in rendered
-    # The batching bound must appear near the delegation instruction, not merely anywhere in
-    # the prompt (D5) — a stray "7" elsewhere would pass a looser assertion.
-    delegation_pos = rendered.index('subagent_type="reader"')
+    assert 'subagent_type="researcher"' in rendered
+    # The concurrent-researcher bound must appear near the delegation instruction, not merely
+    # anywhere in the prompt (D5) — a stray "3" elsewhere would pass a looser assertion.
+    delegation_pos = rendered.index('subagent_type="researcher"')
     context = rendered[max(0, delegation_pos - 400) : delegation_pos + 400]
-    assert "7" in context
+    assert "3" in context
 
-    assert "never quote raw page text" in rendered.lower()
+    assert "never search or fetch a page yourself" in rendered.lower()
 
-    assert "fetch_raw" in rendered
-    assert "READER FAILED (" in rendered
-    assert "empty digest" in rendered.lower()
+    assert "RESEARCHER FAILED (" in rendered
+    assert "empty report" in rendered.lower()
 
-    # The lead no longer calls a fetch tool directly (R1) — it only delegates.
+    # The lead no longer searches or fetches directly (R1) — it only delegates.
+    assert "search_web" not in rendered
     assert "fetch_pages" not in rendered
+    assert "fetch_raw" not in rendered
+    assert 'subagent_type="reader"' not in rendered

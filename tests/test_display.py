@@ -233,6 +233,11 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
     `TodosUpdated` handling reprints the FULL current list (replacement, not a diff) — so the
     UNCHANGED second item is printed again too, which the old per-item flattening would not
     have done.
+
+    Step 3: "research activity visible in the TUI" now manifests as the LEAD's
+    `task(subagent_type="researcher")` dispatch line — the researcher's own nested `search_web`
+    call (`patch_run` binds one model to every role, so it plays here too) never reaches the
+    top-level stream at all, so only ONE activity line is expected, not one per internal tool.
     """
     config = make_config()
     plan_search_and_replan: list[Any] = [
@@ -255,12 +260,27 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
             content="",
             tool_calls=[
                 {
+                    "name": "task",
+                    "args": {
+                        "description": "Search for the answer",
+                        "subagent_type": "researcher",
+                    },
+                    "id": "call_task",
+                }
+            ],
+        ),
+        # The RESEARCHER's own turns (same patched model plays every role): search, then report.
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
                     "name": "search_web",
                     "args": {"query": "the answer"},
                     "id": "call_search",
                 }
             ],
         ),
+        AIMessage(content="Researcher report: the answer is 42."),
         AIMessage(
             content="",
             tool_calls=[
@@ -288,7 +308,7 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
     await main_module.main(["a question needing research"])
 
     out, lines = drain_stdout(capsys)
-    assert '  search_web: "the answer"' in out
+    assert '  task(researcher): "Search for the answer"' in out
     assert "  [pending] Search for the answer" in lines
     assert "  [completed] Search for the answer" in lines
     assert lines.count("  [pending] Write the summary") == 2
@@ -841,17 +861,35 @@ async def test_a_dead_search_backend_is_disclosed_on_the_terminal_and_in_the_rep
 ):
     """The invariant-pinning path (best-effort + disclose): a SearchFailure must reach the
     developer through the CLI as a warning line AND through the report's gaps section — not
-    only through model-facing tool output the model may never repeat."""
+    only through model-facing tool output the model may never repeat.
+
+    Step 3: `search_web` lives on the researcher now, so the lead first dispatches one
+    (`patch_run` binds one model to every role, so the same script plays both turns) — a
+    single failure does not trip `SearchUnavailableError` (the default
+    `max_consecutive_failures` is 3), so the researcher reports back and the lead still
+    produces a best-effort answer.
+    """
     config = make_config()
+    task_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": "Search for the answer", "subagent_type": "researcher"},
+                "id": "call_task",
+            }
+        ],
+    )
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "the answer"}, "id": "call_search"}],
     )
+    researcher_report = AIMessage(content="Researcher report: no sources found.")
     final = AIMessage(
         content="Best-effort answer without sources.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([search_call, final])
+    model = scripted_model([task_call, search_call, researcher_report, final])
     patch_run(monkeypatch, config, model)
 
     async def handler(request: httpx.Request) -> httpx.Response:
