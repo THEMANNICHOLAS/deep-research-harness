@@ -508,10 +508,10 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
         "",
         "## Run metadata",
         f"- Timestamp: {now.isoformat()}",
-        # What is CONFIGURED for each role, not whether it was invoked this run: the subagent
-        # tier is wired as the reader (R6).
+        # What is CONFIGURED for each role, not whether it was invoked this run (R6).
         f"- Lead Model: {config.roles['head'].model}",
-        f"- Subagent Model: {config.roles['subagent'].model}",
+        f"- Researcher Model: {config.roles['researcher'].model}",
+        f"- Reader Model: {config.roles['reader'].model}",
         f"- Verifier Model: {config.roles['verifier'].model}",
         *_usage_lines(outcome.usage),
         "",

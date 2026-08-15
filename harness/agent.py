@@ -190,7 +190,11 @@ def build_agent(
     model = models.build_chat_model(config, "head")
     _register_no_shell_profile(model)
 
-    reader_model = models.build_chat_model(config, "subagent")
+    # Return value unused until Step 3 wires the researcher spec — the bare call is what makes
+    # an undeclared `researcher` role fail loud at build time, same as `head`/`reader` do.
+    models.build_chat_model(config, "researcher")
+
+    reader_model = models.build_chat_model(config, "reader")
     _register_no_shell_profile(reader_model)
 
     # Rooted at THIS run's subdirectory, not the shared workspace: the agent can only

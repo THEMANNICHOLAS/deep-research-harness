@@ -173,7 +173,7 @@ async def test_build_agent_lead_excludes_fetch_and_gains_task(
     """
     head_model = scripted_model([AIMessage(content="done")])
     reader_model = scripted_model([AIMessage(content="reader done")])
-    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
 
     graph = build_agent(make_config(), SourceRegistry())
 
@@ -220,6 +220,73 @@ def test_reader_spec_contract(make_config, scripted_model):
     assert "interrupt_on" not in spec
 
 
+async def test_build_agent_resolves_each_role_from_its_own_key(
+    make_config, monkeypatch, scripted_model
+):
+    """Frozen role keys (Step 2): `build_agent` must resolve the reader `SubAgent` spec's model
+    from the `reader` key and request the `researcher` role, not the retired `subagent` key.
+    """
+    import harness.agent as agent_module
+
+    head_model = scripted_model([AIMessage(content="done")])
+    reader_model = scripted_model([AIMessage(content="reader done")])
+    models_by_role = {
+        "head": head_model,
+        "researcher": object(),
+        "reader": reader_model,
+        "verifier": object(),
+    }
+    requested_roles: list[str] = []
+
+    def _by_role(cfg: Any, role: str) -> Any:
+        requested_roles.append(role)
+        return models_by_role[role]
+
+    monkeypatch.setattr("harness.models.build_chat_model", _by_role)
+
+    captured: dict[str, Any] = {}
+    original_reader_spec = agent_module._reader_spec
+
+    def _spy_reader_spec(config: Any, reader_model_arg: Any, reader_tools: Any) -> Any:
+        captured["reader_model"] = reader_model_arg
+        return original_reader_spec(config, reader_model_arg, reader_tools)
+
+    monkeypatch.setattr(agent_module, "_reader_spec", _spy_reader_spec)
+
+    build_agent(make_config(), SourceRegistry())
+
+    assert "researcher" in requested_roles
+    assert captured["reader_model"] is reader_model
+
+
+def test_build_agent_raises_model_error_naming_the_missing_role(make_config):
+    """Loud rename (Step 2): a config carrying only the retired `head`/`subagent` roles must
+    fail loud with `ModelError` naming the first new role `build_agent` needs, rather than
+    silently succeeding against the stale `subagent` key. No `patch_models_by_role` here — the
+    REAL `harness.models.build_chat_model` must be the one raising, and it does so before any
+    network call for an undeclared role.
+    """
+    from harness.config import RoleConfig
+    from harness.models import ModelError
+
+    config = make_config()
+    broken = HarnessConfig(
+        providers=config.providers,
+        roles={
+            "head": config.roles["head"],
+            "subagent": RoleConfig(provider="opencode", model="test-model"),
+        },
+        fetch=config.fetch,
+        search=config.search,
+        agent=config.agent,
+    )
+
+    with pytest.raises(ModelError) as excinfo:
+        build_agent(broken, SourceRegistry())
+
+    assert "researcher" in str(excinfo.value)
+
+
 def test_orchestrator_prompt_names_the_answer_structure_contract(make_config):
     """Phase 1 Step 3: the rendered orchestrator prompt must tell the model to write headings
     starting at `## ` (never `# `), lead with a direct answer, and never write its own
@@ -256,7 +323,7 @@ async def test_reader_model_profile_excludes_execute(make_config, patch_models_b
     reader_model = ScriptedChatModel(
         model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script([AIMessage(content="reader done")])
-    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
 
     build_agent(make_config(), SourceRegistry())
 
@@ -308,7 +375,7 @@ async def test_a_reader_crash_becomes_an_error_task_message_after_one_retry(
     reader_model = _RaisingChatModel(
         model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     )
-    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
 
     graph = build_agent(make_config(), SourceRegistry())
     result = await graph.ainvoke(
@@ -336,7 +403,7 @@ async def test_a_reader_ending_with_no_final_text_returns_an_empty_task_message(
         [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
     )
     reader_model = scripted_model([AIMessage(content="")])
-    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
 
     graph = build_agent(make_config(), SourceRegistry())
     result = await graph.ainvoke(
@@ -373,7 +440,7 @@ async def test_a_reader_crash_after_a_successful_fetch_leaves_the_source_unread(
     # One scripted reply only: the fetch call. The reader's next model call — and the whole
     # retry attempt — exhausts the script and raises.
     reader_model = scripted_model([_reader_fetch_call("https://a.test")])
-    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
     install_crawler(
         [
             _FakeResult(
@@ -413,7 +480,7 @@ async def test_an_empty_digest_leaves_the_fetched_source_unread(
         [_task_call("Fetch and digest https://a.test"), AIMessage(content="done")]
     )
     reader_model = scripted_model([_reader_fetch_call("https://a.test"), AIMessage(content="")])
-    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    patch_models_by_role({"head": head_model, "researcher": object(), "reader": reader_model})
     install_crawler(
         [
             _FakeResult(

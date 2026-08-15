@@ -121,7 +121,9 @@ class HarnessConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _cross_check_roles(self) -> "HarnessConfig":
-        for required_role in ("head", "subagent"):
+        # `researcher`/`reader`/`verifier` are not load-required: an undeclared one surfaces as
+        # `ModelError` at build/preflight time instead (mirrors the verifier precedent).
+        for required_role in ("head",):
             if required_role not in self.roles:
                 raise ValueError(f"required role {required_role!r} is missing")
 

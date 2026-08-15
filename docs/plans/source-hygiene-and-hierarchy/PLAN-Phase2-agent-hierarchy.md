@@ -13,7 +13,7 @@ Codebase Map (deepagents nesting facts), and Design Decisions D5–D7.
 
 ## Progress
 - [x] Step 1: Live model & rate-limit checks
-- [ ] Step 2: Role keys and routing
+- [x] Step 2: Role keys and routing
 - [ ] Step 3: Researcher tier wiring
 - [ ] Step 4: Disclosures end-to-end
 - [ ] Step 5: Consolidated verification verdict
@@ -83,16 +83,16 @@ the intent, not an assumption to improvise around.
   touching model IDs beyond what Step 1 cleared.
 
 **Tests (write first, confirm red):**
-- [ ] The reader subagent's model resolves from role `reader` and the researcher's from
+- [x] The reader subagent's model resolves from role `reader` and the researcher's from
   `researcher` (per-role assertion via `patch_models_by_role`).
-- [ ] A config still declaring only `head`/`subagent` fails with a `ModelError` naming the
+- [x] A config still declaring only `head`/`subagent` fails with a `ModelError` naming the
   missing role (loud rename, no silent fallback).
 
 **Details:**
 Red→green. Mechanical rename plus one new role; keep the diff boring.
 
 **Acceptance criteria:**
-- [ ] `grep -r "subagent" harness/ --include="*.py"` finds no role-key usages (prompt
+- [x] `grep -r "subagent" harness/ --include="*.py"` finds no role-key usages (prompt
   filename `subagent.md` is renamed or re-pointed in Step 3, whichever lands there).
 
 ### Step 3: Researcher tier wiring
@@ -251,3 +251,17 @@ never add a section below it. -->
 - Drift: none.
 - Watch-next: Step 2 renames role keys (head/researcher/reader/verifier, subagent retired) —
   test-first required; both models it commits to harness.toml are now verified live.
+
+### 2026-08-15 — Step 2: Role keys and routing
+- Done: Role keys are head/researcher/reader/verifier (subagent retired, no alias); harness.toml
+  carries kimi-k3 head, deepseek-v4-pro researcher, deepseek-v4-flash reader. Red→green
+  (417 tests), all gates clean, quality scan clean.
+- Learned: config.py's load-required tuple shrank to ("head",) so missing new roles surface as
+  ModelError at build_agent (the plan's contract, verifier precedent); agent.py carries a bare
+  `build_chat_model(config, "researcher")` whose return value Step 3 consumes — it exists now
+  only to fail loud. report.py's "Subagent Model" line was in scope via the acceptance grep
+  (now Researcher/Reader Model lines) despite not being in the step's file list.
+- Drift: none.
+- Watch-next: __main__ still preflights only head+verifier — an undeclared researcher/reader
+  fails at build_agent instead; when Step 3 wires the researcher spec, consume the bare build's
+  return value there.

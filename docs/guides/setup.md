@@ -31,7 +31,7 @@
 3. `uv run playwright install chromium` — the fetch tool is crawl4ai-managed
    Playwright/Chromium, and this is not covered by `uv sync`.
 4. Copy `.env.example` to `.env` and fill in:
-   - `OPENCODE_API_KEY` — the OpenCode endpoint serving both model roles
+   - `OPENCODE_API_KEY` — the OpenCode endpoint serving all four model roles
    - `SEARXNG_SECRET` — cookie signing for the local SearXNG instance; generate
      with `openssl rand -hex 32`
 
@@ -65,8 +65,9 @@ are never stored here — each provider names an environment variable
 "Running with `.env`" above).
 
 - `[providers.<name>]` — a model provider's `base_url` and the env var holding its key.
-- `[roles.head]` / `[roles.subagent]` — which provider + model ID each role resolves
-  to. Both keys are required.
+- `[roles.head]` / `[roles.researcher]` / `[roles.reader]` / `[roles.verifier]` — which
+  provider + model ID each role resolves to. All four must resolve; `head` is required at
+  load time, the rest fail loud (`ModelError`) at build/preflight time if undeclared.
 - `[fetch]` — per-page timeout, fetch concurrency, the per-page character cap, and the
   maximum URLs one `fetch_pages` call may request (`max_urls_per_call`; a call carrying
   more is rejected without fetching anything).

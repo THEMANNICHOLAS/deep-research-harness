@@ -54,7 +54,7 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
     Hand-rolls what `patch_run` does (`load_config` + preflight skip) rather than reusing it:
     `patch_run` binds ONE model to every role, and this scenario needs role-distinct models.
     """
-    config = make_config(head_model="head-test-model", subagent_model="reader-test-model")
+    config = make_config(head_model="head-test-model", reader_model="reader-test-model")
 
     head_model = ScriptedChatModel(
         model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
@@ -84,7 +84,14 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
     )
     # Verification runs on the "verifier" role (Phase 1 Step 4); this scenario's verify_reply
     # is scripted on `head_model` itself, so it is routed there too rather than a third model.
-    patch_models_by_role({"head": head_model, "subagent": reader_model, "verifier": head_model})
+    patch_models_by_role(
+        {
+            "head": head_model,
+            "researcher": head_model,
+            "reader": reader_model,
+            "verifier": head_model,
+        }
+    )
 
     install_crawler(
         [
