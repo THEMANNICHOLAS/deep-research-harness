@@ -55,7 +55,8 @@
 | Config models | @harness/config.py | TOML-backed `HarnessConfig` and settings, secrets by env var |
 | Model clients | @harness/models.py | `build_chat_model` / `preflight` — role → chat client, fail-fast and bounded retry |
 | Lead agent | @harness/agent.py | `build_agent` — the deepagents lead, its backend, middleware and interrupts |
-| Source registry | @harness/sources.py | Per-run registry assigning `[Sn]` citation IDs to fetched pages |
+| Source registry | @harness/sources.py | Per-run registry assigning `[Sn]` citation IDs to fetched pages; also the capture-file policy (`sources_dir`, `is_failed_capture`) shared by report/verify/tests |
+| Run log | @harness/runlog.py | `RunLog`/`Incident` — per-run degraded-coverage incidents, echoed live to the terminal and disclosed in the report's gaps section |
 | Paragraph unit | @harness/paragraphs.py | `Paragraph` / `split_paragraphs` / `strip_markers` — the one definition of a paragraph, shared by verification and rendering (D1) |
 | Claim verification | @harness/verify.py | `verify_paragraphs` — one pooled model call per paragraph, judging it against all its cited sources together |
 | Report assembly | @harness/report.py | `RunOutcome` + `write_report` — per-paragraph `Sources:`/`Verdict:` rendering, disclosure sections |

@@ -8,34 +8,36 @@ The agent may ask clarifying questions via `ask_user` before researching (R2, D5
 interrupts, `main` prints each question, reads an answer, and resumes the same thread with
 it as the tool's result.
 
-Two ceilings bound the run (R7): a round cap carried as `recursion_limit` on the run config
-(`AgentSettings.max_rounds`, in LangGraph supersteps — see the comment at `run_config`), and
-a wall clock (`AgentSettings.wall_clock_seconds`) armed at the first `search_web`/
-`fetch_pages` call and running continuously after that, including through a later
-clarification wait. Hitting either bound, or any other mid-run failure, still writes a
-report disclosing what happened (`RunOutcome.cut_short`).
+Two ceilings bound the run (R7): a round cap counted by the stream loop itself in MODEL
+TURNS (`AgentSettings.max_rounds` — see `_note_model_turns` inside `main`; `recursion_limit`
+survives only as a runaway backstop), and a wall clock (`AgentSettings.wall_clock_seconds`)
+armed at the first `search_web`/`fetch_pages` call and running continuously after that,
+including through a later clarification wait. A run that lands on the round cap mid-research
+gets one bounded synthesis pass to write a final answer from what it already read
+(`_SYNTHESIZE_NOW`) before the report is written; hitting either bound, or any other mid-run
+failure, still writes a report disclosing what happened (`RunOutcome.cut_short`).
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
 import sys
 import threading
+from contextlib import aclosing
 from datetime import datetime
 from functools import reduce
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.messages.ai import UsageMetadata, add_usage
-from langchain_core.runnables import RunnableConfig
-from langgraph.errors import GraphRecursionError
-from langgraph.types import Command, Interrupt
 
-from harness.agent import build_agent
 from harness.config import ConfigError, load_config
 from harness.display import (
     Activity,
+    Alert,
     Question,
     Renderer,
     RunFinished,
@@ -44,12 +46,21 @@ from harness.display import (
     TodosUpdated,
     build_renderer,
 )
-from harness.models import ModelError, preflight
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
+from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from harness.tools.search import SearchPreflightError, preflight_search
 from harness.verify import VerificationResult, verify_paragraphs
+
+if TYPE_CHECKING:
+    # Annotation-only: the runtime imports of langgraph and the agent/model stack are
+    # deferred into `main` — they cost several seconds, and `--help` or a config error
+    # should not pay them (see the deferred-import block there).
+    from collections.abc import AsyncGenerator
+
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.types import Interrupt
 
 _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -60,6 +71,21 @@ _NO_ANSWER_GIVEN = "(The developer gave no answer to this question.)"
 # Neither search nor fetch exports a tool-name constant, so these are the names from their
 # own `@tool(...)` decorators.
 _RESEARCH_TOOLS = frozenset({"search_web", "fetch_pages"})
+
+# What the lead is told when the round cap lands mid-research (R7): one bounded pass to turn
+# what was already read into a final answer, instead of dying by exception mid-tool-call and
+# leaving `## Answer` to whatever prose happened to come last.
+_SYNTHESIZE_NOW = (
+    "The research round cap has been reached. Stop researching now: do not call any more "
+    "tools. Using only the sources you have already read, write your complete final answer, "
+    "citing each claim with its [Sn] marker, and note explicitly which planned work the cap "
+    "cut off."
+)
+
+# Supersteps allowed for the synthesis pass: room for a couple of model turns plus the
+# per-turn middleware overhead, so a lead that keeps calling tools despite `_SYNTHESIZE_NOW`
+# is stopped quickly by `GraphRecursionError` (reported as the same `round_cap`).
+_SYNTHESIS_RECURSION_LIMIT = 10
 
 
 def _sum_usage(messages: list[BaseMessage]) -> UsageMetadata:
@@ -211,20 +237,39 @@ async def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    # The renderer starts BEFORE the heavy imports and the preflight call: together they are
+    # several silent seconds, and a terminal that shows nothing through them reads as hung.
+    renderer = build_renderer()
+    tracker = StageTracker(renderer)
+
+    renderer.emit(Activity("loading the agent stack"))
+    # Deferred on purpose: deepagents (via harness.agent) and openai (via harness.models)
+    # cost ~5s of import time between them — `--help`, a config error, and the first painted
+    # frame must not wait on them. Tests patch `harness.models.preflight` and
+    # `harness.models.build_chat_model`; binding at call time picks those patches up.
+    from langgraph.errors import GraphRecursionError
+    from langgraph.types import Command
+
+    from harness.agent import build_agent
+    from harness.models import ModelError, preflight
+
+    renderer.emit(Activity("preflight: checking the head model endpoint"))
     try:
         await preflight(config, "head")
     except ModelError as exc:
+        renderer.close()
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    renderer.emit(Activity("preflight: checking the search backend"))
     try:
         await preflight_search(config)
     except SearchPreflightError as exc:
+        # `renderer.close()` first, matching the model-preflight path above: the TUI owns the
+        # alternate screen, so an error printed under it would vanish when the screen exits.
+        renderer.close()
         print(f"error: {exc}", file=sys.stderr)
         return 1
-
-    renderer = build_renderer()
-    tracker = StageTracker(renderer)
 
     # Stamped before the agent can write anything: a cut-short report uses it to tell THIS
     # run's workspace notes from a previous run's leftovers (`report._notes_section`), and it
@@ -233,28 +278,35 @@ async def main(argv: list[str] | None = None) -> int:
     started_at = datetime.now()
 
     registry = SourceRegistry(run_id=started_at.strftime("%Y-%m-%d-%H%M%S"))
-    agent = build_agent(config, registry)
+    run_log = RunLog()
+    agent = build_agent(config, registry, run_log)
+
+    # Live disclosure (best-effort + disclose): every incident a tool records is echoed to
+    # the terminal as soon as the stream yields control back, and `alerts_emitted` keeps a
+    # later poll from re-printing what an earlier one already showed.
+    alerts_emitted = 0
+
+    def _emit_new_alerts() -> None:
+        nonlocal alerts_emitted
+        incidents = run_log.incidents()
+        for incident in incidents[alerts_emitted:]:
+            renderer.emit(Alert(incident.detail))
+        alerts_emitted = len(incidents)
 
     # One stable thread for the whole run: the checkpointer requires an id, and the
     # interrupt/resume loop below must keep resuming the SAME thread.
     thread_id = str(uuid4())
     run_config: RunnableConfig = {
         "configurable": {"thread_id": thread_id},
-        # `recursion_limit` is a `RunnableConfig` key, not a `create_deep_agent` kwarg, and
-        # counts LangGraph supersteps, not research rounds: a round is a model call plus a
-        # tool execution, plus the final tool-free answer turn — hence `* 2 + 1`.
-        #
-        # Deliberately approximate, and conservative: the compiled graph adds a fixed ~7-9
-        # superstep middleware overhead, so the cap buys somewhat FEWER rounds than its name
-        # suggests (default 20 → limit 41 → roughly 16). A tighter fit would hard-code one
-        # deepagents version's node layout.
-        #
-        # It is also a PER-PASS bound. This config is reused on every `Command(resume=...)`
-        # and langgraph recomputes `stop = resumed_step + recursion_limit + 1` per `astream`,
-        # so each clarification resume grants a fresh allowance. Accepted: the wall clock is
-        # the run-level bound once research starts, and the report says "per pass" rather
-        # than implying a run total.
-        "recursion_limit": config.agent.max_rounds * 2 + 1,
+        # A runaway BACKSTOP, never the round cap. The cap is counted in the stream loop below
+        # (`_note_model_turns`) in the unit it actually means — model turns — because
+        # supersteps-per-round is a topology detail owned by the installed deepagents/langchain
+        # versions: middleware `after_model` nodes sit INSIDE the loop (4 supersteps per round
+        # today), so a `max_rounds`-derived recursion_limit silently halved the advertised
+        # budget and drifts again on any upgrade. Sized ~5x anything the counted cap could
+        # legitimately need, so it only trips if the counting fails or the graph loops without
+        # producing model turns.
+        "recursion_limit": config.agent.max_rounds * 20 + 100,
     }
     stream_input: Any = {"messages": [HumanMessage(content=args.question)]}
 
@@ -263,6 +315,50 @@ async def main(argv: list[str] | None = None) -> int:
     clock_armed = False
     cut_short: CutShortReason | None = None
     cut_short_detail: str | None = None
+
+    # R7's round accounting, run-level (clarification resumes no longer refresh it).
+    max_rounds = config.agent.max_rounds
+    rounds_used = 0
+    counted_turn_ids: set[str] = set()
+    awaiting_tool_ids: set[str] = set()
+    cap_hit = False  # round `max_rounds` ended proposing tools: a synthesis pass is owed
+    overrun = False  # a turn past the cap arrived anyway: stop with what already exists
+
+    def _note_model_turns(node_update: dict[str, Any]) -> None:
+        """Advance the round count for each model turn in one node update (R7).
+
+        Counted here, in code this module owns, never derived from `recursion_limit`:
+        supersteps-per-round is a graph-topology detail of the installed framework versions,
+        so any user-facing budget derived from it drifts silently on upgrade. Deduplicated by
+        message id because middleware nodes may re-emit an already-counted message; the reader
+        subagent's internal turns never reach this stream, so rounds are the LEAD's turns.
+        """
+        nonlocal rounds_used, cap_hit, overrun
+        for message in node_update.get("messages") or []:
+            if isinstance(message, ToolMessage):
+                awaiting_tool_ids.discard(message.tool_call_id)
+                continue
+            if not isinstance(message, AIMessage):
+                continue
+            if message.id is not None:
+                if message.id in counted_turn_ids:
+                    continue
+                counted_turn_ids.add(message.id)
+            rounds_used += 1
+            if rounds_used > max_rounds:
+                overrun = True
+            elif rounds_used == max_rounds:
+                # The turn AT the cap may already be the tool-free final answer — only a turn
+                # proposing more tool work owes a synthesis pass, and only after those tools
+                # finish, so the thread never ends on dangling tool calls.
+                call_ids = {
+                    call_id
+                    for call in message.tool_calls
+                    if isinstance(call_id := call.get("id"), str)
+                }
+                if call_ids:
+                    awaiting_tool_ids.update(call_ids)
+                    cap_hit = True
 
     try:
         # `asyncio.timeout(None)` starts disarmed, so a clarifying wait before the first
@@ -276,44 +372,92 @@ async def main(argv: list[str] | None = None) -> int:
                 # re-ask the same question forever. `final_state` still holds the newest
                 # state actually seen, so the report is assembled from real data.
                 pass_state: dict[str, Any] | None = None
-                async for mode, chunk in agent.astream(
-                    stream_input, config=run_config, stream_mode=["updates", "values"]
-                ):
-                    if mode == "updates":
-                        for node_update in chunk.values():
-                            # An interrupt arrives as `{"__interrupt__": (Interrupt(...),)}`,
-                            # whose value is a tuple, not a dict — `.get` raises on it.
-                            if not node_update or not isinstance(node_update, dict):
-                                continue
-                            todos = node_update.get("todos")
-                            if todos is not None and todos != last_todos:
-                                renderer.emit(
-                                    TodosUpdated(
-                                        tuple(
-                                            TodoItem(content=todo["content"], status=todo["status"])
-                                            for todo in todos
+                # `aclosing`, because the round cap leaves this loop by `break`: a bare break
+                # abandons the generator to garbage collection with langgraph tasks in flight.
+                async with aclosing(
+                    # `cast`: `astream` is typed as a bare AsyncIterator, but it is an async
+                    # generator at runtime, which is what `aclosing` needs.
+                    cast(
+                        "AsyncGenerator[Any, None]",
+                        agent.astream(
+                            stream_input, config=run_config, stream_mode=["updates", "values"]
+                        ),
+                    )
+                ) as stream:
+                    async for mode, chunk in stream:
+                        if mode == "updates":
+                            for node_update in chunk.values():
+                                # An interrupt arrives as `{"__interrupt__": (Interrupt(...),)}`,
+                                # whose value is a tuple, not a dict — `.get` raises on it.
+                                if not node_update or not isinstance(node_update, dict):
+                                    continue
+                                todos = node_update.get("todos")
+                                if todos is not None and todos != last_todos:
+                                    renderer.emit(
+                                        TodosUpdated(
+                                            tuple(
+                                                TodoItem(
+                                                    content=todo["content"], status=todo["status"]
+                                                )
+                                                for todo in todos
+                                            )
                                         )
                                     )
-                                )
-                                last_todos = todos
-                            calls = _research_tool_calls(node_update)
-                            if calls:
-                                tracker.advance("researching")
-                                for call in calls:
-                                    renderer.emit(Activity(_describe_tool_call(call)))
-                                if not clock_armed:
-                                    clock.reschedule(
-                                        asyncio.get_running_loop().time()
-                                        + config.agent.wall_clock_seconds
-                                    )
-                                    clock_armed = True
-                    else:  # mode == "values"
-                        pass_state = chunk
-                        # Assigned HERE, inside the iteration: every cut-short path leaves
-                        # this loop by exception, so an assignment after the `async for` never
-                        # runs and the report would lose both the answer and the token usage
-                        # on exactly the runs that need disclosing.
-                        final_state = chunk
+                                    last_todos = todos
+                                calls = _research_tool_calls(node_update)
+                                if calls:
+                                    tracker.advance("researching")
+                                    for call in calls:
+                                        renderer.emit(Activity(_describe_tool_call(call)))
+                                    if not clock_armed:
+                                        clock.reschedule(
+                                            asyncio.get_running_loop().time()
+                                            + config.agent.wall_clock_seconds
+                                        )
+                                        clock_armed = True
+                                _note_model_turns(node_update)
+                            _emit_new_alerts()
+                            if overrun or (cap_hit and not awaiting_tool_ids):
+                                break
+                        else:  # mode == "values"
+                            pass_state = chunk
+                            # Assigned HERE, inside the iteration: every cut-short path leaves
+                            # this loop by exception, so an assignment after the `async for`
+                            # never runs and the report would lose both the answer and the
+                            # token usage on exactly the runs that need disclosing.
+                            final_state = chunk
+
+                if cap_hit or overrun:
+                    cut_short = "round_cap"
+                    # `overrun` means a turn PAST the cap already started new work, so its tool
+                    # calls may be dangling — appending a synthesis request there would hand
+                    # the model an invalid sequence. Otherwise the capped round's tools have
+                    # all answered (`awaiting_tool_ids` drained), and one bounded pass turns
+                    # what was read into a real final answer instead of mid-run chatter.
+                    if not overrun:
+                        renderer.emit(
+                            Activity(f"round cap ({max_rounds}) reached — asking for a synthesis")
+                        )
+                        synthesis_config: RunnableConfig = {
+                            **run_config,
+                            "recursion_limit": _SYNTHESIS_RECURSION_LIMIT,
+                        }
+                        async with aclosing(
+                            cast(
+                                "AsyncGenerator[Any, None]",
+                                agent.astream(
+                                    {"messages": [HumanMessage(content=_SYNTHESIZE_NOW)]},
+                                    config=synthesis_config,
+                                    stream_mode=["updates", "values"],
+                                ),
+                            )
+                        ) as synthesis:
+                            async for mode, chunk in synthesis:
+                                if mode == "values":
+                                    final_state = chunk
+                                else:
+                                    _emit_new_alerts()
+                    break
 
                 interrupts = (pass_state or {}).get("__interrupt__")
                 if not interrupts:
@@ -335,6 +479,9 @@ async def main(argv: list[str] | None = None) -> int:
             cut_short = "error"
             cut_short_detail = f"{type(exc).__name__}: {exc}"
     except GraphRecursionError:  # must precede `Exception` — it subclasses RuntimeError
+        # Two sources, one meaning: the synthesis pass's small limit (a lead that kept calling
+        # tools despite `_SYNTHESIZE_NOW`) or the runaway backstop on `run_config`. Either way
+        # the run ended on a rounds-related bound.
         cut_short = "round_cap"
     except Exception as exc:  # noqa: BLE001 — never `BaseException`; KeyboardInterrupt has its own clause below
         cut_short = "error"
@@ -344,6 +491,10 @@ async def main(argv: list[str] | None = None) -> int:
         # own clause because `KeyboardInterrupt` is a `BaseException`, not caught by `Exception`.
         cut_short = "error"
         cut_short_detail = "user abort (Ctrl+C)"
+
+    # One last poll: the final tool executions (or a cut-short pass) may have recorded
+    # incidents after the last updates chunk was handled.
+    _emit_new_alerts()
 
     messages: list[BaseMessage] = final_state["messages"] if final_state else []
     usage = _sum_usage(messages)
@@ -368,7 +519,14 @@ async def main(argv: list[str] | None = None) -> int:
             Activity(f"checking {len(paragraphs)} paragraph(s) against their cited sources")
         )
         try:
-            verification = await verify_paragraphs(paragraphs, config, registry)
+            verification = await verify_paragraphs(
+                paragraphs,
+                config,
+                registry,
+                # Per-paragraph progress: each pooled check is one model call that can take
+                # minutes, so without this the verifying stage shows nothing until it ends.
+                on_paragraph=lambda i, n: renderer.emit(Activity(f"checking paragraph {i}/{n}")),
+            )
         except Exception as exc:  # noqa: BLE001
             # Best-effort + disclose: a pass that fails wholesale is reported IN the report.
             # Per-paragraph failures are handled inside the pass itself.
@@ -387,6 +545,7 @@ async def main(argv: list[str] | None = None) -> int:
         started_at=started_at,
         paragraphs=paragraphs,
         verification=verification,
+        incidents=run_log.incidents(),
     )
     # D2's gate: a hard error, a user abort (mapped onto `cut_short == "error"` above), and a
     # wall-clock expiry with no final answer all write NO report — stderr error, exit 1. Round
@@ -413,6 +572,7 @@ async def main(argv: list[str] | None = None) -> int:
                 unusable_sources=len(unusable),
                 cut_short=cut_short,
                 verification_failures=len(verification.check_failures) if verification else 0,
+                incidents=len(run_log.incidents()),
             )
         )
     finally:

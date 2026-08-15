@@ -26,7 +26,7 @@ from harness.config import (
     SearchSettings,
     run_workspace_dir,
 )
-from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
+from harness.sources import FETCH_FAILED_PREFIX, sources_dir
 
 
 class _FakeMarkdown:
@@ -87,16 +87,18 @@ def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
 
 @pytest.fixture
 def install_crawler(monkeypatch):
-    """Patch `harness.tools.fetch.AsyncWebCrawler` with a fake serving canned results.
+    """Patch `harness.tools.fetch._crawler_class` to return a fake serving canned results.
 
-    Patches fetch.py's namespace regardless of caller: `fallback.py` reuses fetch.py's
-    `_fetch`, and that is where the crawler is actually constructed, so both fetch and
-    fallback tests share this one fixture.
+    `_crawler_class` (not a module-level `AsyncWebCrawler` name) because fetch.py imports
+    crawl4ai lazily inside `_fetch` — the function is the deliberate patch seam. Patches
+    fetch.py's namespace regardless of caller: `fallback.py` reuses fetch.py's `_fetch`,
+    and that is where the crawler is actually constructed, so both fetch and fallback
+    tests share this one fixture.
     """
 
     def _install(results: list[_FakeResult]) -> type:
         fake_cls = _make_fake_crawler_class(results)
-        monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+        monkeypatch.setattr("harness.tools.fetch._crawler_class", lambda: fake_cls)
         return fake_cls
 
     return _install
@@ -168,7 +170,13 @@ class ScriptedChatModel(ChatOpenAI):
         **kwargs: Any,
     ) -> ChatResult:
         self._received_messages.append(list(messages))
-        response = self._script[self._call_count]
+        # A fresh copy with a per-call id, like a real model: scripts commonly repeat one
+        # AIMessage object (`[keep_going] * 20`), and reusing it verbatim gives every turn the
+        # SAME message id — which `__main__`'s round counter deduplicates by, so the run would
+        # count one round no matter how many turns actually happened.
+        response = self._script[self._call_count].model_copy(deep=True)
+        if response.id is None:
+            response.id = f"scripted-{self._call_count}"
         self._call_count += 1
         return ChatResult(generations=[ChatGeneration(message=response)])
 
@@ -184,20 +192,14 @@ class ScriptedChatModel(ChatOpenAI):
 
 
 def patch_model(monkeypatch: pytest.MonkeyPatch, model: Any) -> None:
-    """Point EVERY module-local `build_chat_model` binding at `model`.
+    """Point `build_chat_model` at `model` for every caller.
 
-    Three modules do `from harness.models import build_chat_model`, so each holds its own binding
-    that patching the others does not touch: `harness.agent`, `harness.models`, and
-    `harness.verify`. Missing one leaves a `main()`-driven test either avoiding the state that
-    reaches it or dialing `https://example.test/v1` for real. One home for the list, so a fourth
-    importer cannot reopen that hole silently.
+    One target: `harness.agent` and `harness.verify` call it as a module attribute
+    (`models.build_chat_model(...)`, resolved at call time) rather than importing it by
+    value, so patching the definition covers them all — including any future caller,
+    which a hand-maintained target list silently missed.
     """
-    for target in (
-        "harness.agent.build_chat_model",
-        "harness.models.build_chat_model",
-        "harness.verify.build_chat_model",
-    ):
-        monkeypatch.setattr(target, lambda cfg, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
 
 
 @pytest.fixture
@@ -208,12 +210,7 @@ def patch_models_by_role(monkeypatch: pytest.MonkeyPatch):
         def _by_role(cfg: Any, role: str) -> Any:
             return models[role]
 
-        for target in (
-            "harness.agent.build_chat_model",
-            "harness.models.build_chat_model",
-            "harness.verify.build_chat_model",
-        ):
-            monkeypatch.setattr(target, _by_role)
+        monkeypatch.setattr("harness.models.build_chat_model", _by_role)
 
     return _patch
 
@@ -246,12 +243,17 @@ def patch_run(
         async def _noop_preflight(cfg: HarnessConfig, role: str) -> None:
             return None
 
-        monkeypatch.setattr(main_module, "preflight", _noop_preflight)
+        # At the source module, not `main_module`: `main` imports `preflight` at call time
+        # (the heavy-import deferral), so the patched attribute is what that import binds.
+        monkeypatch.setattr("harness.models.preflight", _noop_preflight)
     if not run_search_preflight:
 
         async def _noop_search_preflight(cfg: HarnessConfig) -> None:
             return None
 
+        # On `main_module`, NOT the source module — unlike `preflight`, this one is imported
+        # by value at module import time (it is cheap, so it stays out of the deferred block),
+        # so `harness.tools.search.preflight_search` is not the name `main` calls.
         monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
     patch_model(monkeypatch, model)
 
@@ -317,9 +319,9 @@ def write_source_capture(
     and `harness/verify.py` (can it settle a claim?) both read. Takes `registry` so the file
     lands under this run's directory rather than a flat `sources/`.
     """
-    sources_dir = _sources_dir(config, registry)
-    sources_dir.mkdir(parents=True, exist_ok=True)
-    (sources_dir / f"{source_id}.md").write_text(
+    captures_dir = sources_dir(config, registry)
+    captures_dir.mkdir(parents=True, exist_ok=True)
+    (captures_dir / f"{source_id}.md").write_text(
         f"# {source_id}: captured page\n\n- Outcome: fetched\n\n{body}", encoding="utf-8"
     )
 
@@ -343,9 +345,9 @@ def write_failed_capture(
     config: HarnessConfig, registry: Any, source_id: str, outcome: str = "error"
 ) -> None:
     """Write a failure stub — the shape `harness/tools/fetch.py` writes for a bad fetch."""
-    sources_dir = _sources_dir(config, registry)
-    sources_dir.mkdir(parents=True, exist_ok=True)
-    (sources_dir / f"{source_id}.md").write_text(
+    captures_dir = sources_dir(config, registry)
+    captures_dir.mkdir(parents=True, exist_ok=True)
+    (captures_dir / f"{source_id}.md").write_text(
         f"{FETCH_FAILED_PREFIX}{outcome}\n", encoding="utf-8"
     )
 

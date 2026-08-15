@@ -17,8 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig, run_workspace_dir
 from harness.paragraphs import LIST_ITEM_RE, Paragraph, strip_markers
-from harness.sources import Source, SourceRegistry
-from harness.tools.fetch import _sources_dir, is_failed_capture
+from harness.runlog import Incident
+from harness.sources import Source, SourceRegistry, is_failed_capture, sources_dir
 from harness.verify import MODEL_VERDICTS, ParagraphVerdict, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
@@ -47,6 +47,8 @@ _UNREAD_HEADING = "Not read at all (fetch never succeeded):"
 # Mirrors `harness/tools/fetch.py`'s `FetchOutcome`: a typed value, not an exception, for why
 # a run ended early.
 CutShortReason = Literal["round_cap", "wall_clock", "error"]
+
+_INCIDENTS_HEADING = "Tool failures during the run:"
 
 _CUT_SHORT_HEADING = "## Run cut short"
 _NOTES_HEADING = "## Working notes"
@@ -103,6 +105,9 @@ class RunOutcome(BaseModel):
     # `Verdict: not verified - ...` line then; only a non-citing paragraph and the two
     # disclosure sections are unaffected by this being unset.
     verification: VerificationResult | None = None
+    # The run's degraded-coverage incidents (`harness.runlog.RunLog.incidents()`), disclosed
+    # under `## Gaps and disclosures` even when verification never ran.
+    incidents: list[Incident] = Field(default_factory=list)
 
 
 def format_todos(todos: list[dict[str, Any]]) -> str:
@@ -152,7 +157,7 @@ def _is_usable(config: HarnessConfig, registry: SourceRegistry, source: Source) 
     `ValueError`, so catching `OSError` alone let it escape `write_report` and lose the whole
     report of an otherwise finished run.
     """
-    path = _sources_dir(config, registry) / f"{source.id}.md"
+    path = sources_dir(config, registry) / f"{source.id}.md"
     if not path.exists():
         return False
     try:
@@ -235,12 +240,11 @@ def _read_modes_section(registry: SourceRegistry) -> str:
 def _cut_short_section(outcome: RunOutcome, config: HarnessConfig) -> str:
     """One sentence naming the bound that ended the run, then the unfinished todos."""
     if outcome.cut_short == "round_cap":
-        # "per pass", not a flat run total: langgraph recomputes the budget from the resumed
-        # step on every `astream` call, so each clarification resume grants a fresh allowance.
-        # A run-level phrasing overstates a number the reader cannot reconcile.
+        # A run-level total: `__main__` counts model turns itself across every pass, so the
+        # configured number is exactly what the run was allowed.
         bound_line = (
             f"The run was cut short by {_ROUND_CAP_TEXT} "
-            f"(configured at {config.agent.max_rounds} rounds per pass)."
+            f"(configured at {config.agent.max_rounds} rounds)."
         )
     elif outcome.cut_short == "wall_clock":
         bound_line = (
@@ -416,14 +420,17 @@ def _conflicts_section(outcome: RunOutcome, verification: VerificationResult) ->
     return "\n\n".join(blocks)
 
 
-def _gaps_section(outcome: RunOutcome, verification: VerificationResult) -> str:
-    """Unresolved citation markers, per-check failures, and — on a run that was NOT cut short
-    — its dead branches.
+def _gaps_section(outcome: RunOutcome, verification: VerificationResult | None) -> str:
+    """Unresolved citation markers, run incidents, per-check failures, and — on a run that was
+    NOT cut short — its dead branches.
 
     R4 requires dead branches on every run, not only a cut-short one. `_cut_short_section`
     already lists unfinished todos when a bound ended the run, so this renders them only when
     it did not: an agent that simply stops with steps still `pending` has abandoned those
     branches just as surely.
+
+    `verification` may be `None` (the pass never ran): incidents and unresolved markers must
+    still be disclosed on exactly those runs.
     """
     lines: list[str] = []
 
@@ -440,11 +447,33 @@ def _gaps_section(outcome: RunOutcome, verification: VerificationResult) -> str:
         lines.append("Unresolved citation markers (no matching source was registered):")
         lines.extend(f"- {source_id}" for source_id in unresolved)
 
-    if verification.check_failures:
+    if outcome.incidents:
+        if lines:
+            lines.append("")
+        lines.append(_INCIDENTS_HEADING)
+        lines.extend(f"- {incident.detail}" for incident in outcome.incidents)
+
+    if verification is not None and verification.check_failures:
         if lines:
             lines.append("")
         lines.append("Verification checks that failed to run:")
         lines.extend(f"- {failure}" for failure in verification.check_failures)
+
+    # A count mismatch means `## Answer` silently rendered the overflow paragraphs as
+    # "not verified" — say so rather than letting that read as a deliberate verdict. Zero
+    # verdicts is "the pass did not run", which the sections above already cover.
+    if (
+        verification is not None
+        and verification.verdicts
+        and len(verification.verdicts) != len(outcome.paragraphs)
+    ):
+        if lines:
+            lines.append("")
+        lines.append(
+            f"Verification returned {len(verification.verdicts)} verdict(s) for "
+            f"{len(outcome.paragraphs)} paragraph(s); paragraphs without a matching verdict "
+            "are shown as not verified."
+        )
 
     return "\n".join(lines)
 
@@ -489,9 +518,11 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
         if conflicts_text:
             lines += [_CONFLICTS_HEADING, "", conflicts_text, ""]
 
-        gaps_text = _gaps_section(outcome, outcome.verification)
-        if gaps_text:
-            lines += [_GAPS_HEADING, "", gaps_text, ""]
+    # NOT gated on verification: incidents and unresolved markers belong to the run itself,
+    # and the runs that skip verification are exactly the ones with the most to disclose.
+    gaps_text = _gaps_section(outcome, outcome.verification)
+    if gaps_text:
+        lines += [_GAPS_HEADING, "", gaps_text, ""]
 
     lines += [
         "## Sources",

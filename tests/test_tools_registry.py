@@ -13,9 +13,9 @@ def test_build_tools_returns_the_frozen_tool_set(make_config, monkeypatch):
     calls = []
     real_build_fetch_tool = harness.tools.build_fetch_tool
 
-    def _spy(cfg, reg):
-        calls.append((cfg, reg))
-        return real_build_fetch_tool(cfg, reg)
+    def _spy(cfg, reg, log):
+        calls.append((cfg, reg, log))
+        return real_build_fetch_tool(cfg, reg, log)
 
     monkeypatch.setattr("harness.tools.build_fetch_tool", _spy)
 
@@ -63,7 +63,7 @@ async def test_build_tools_wires_the_callers_registry_into_the_fetch_tool(make_c
     registry = SourceRegistry()
     seen = []
 
-    async def _spy(urls, cfg, reg):
+    async def _spy(urls, cfg, reg, log):
         seen.append(reg)
         return "", []
 

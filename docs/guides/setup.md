@@ -51,17 +51,11 @@
 
 ## Running with `.env`
 
-Nothing in the harness reads `.env` — `harness/config.py` resolves `api_key_env` from
-the **process environment**, and `uv run` does not load `.env` on its own. Either pass
-it explicitly:
-
-```
-uv run --env-file .env python -c "from harness.config import load_config; print(load_config())"
-```
-
-or set `UV_ENV_FILE=.env` once in your shell profile. Without one of these,
-`load_config()` fails with `ConfigError: providers.opencode: Value error, environment
-variable 'OPENCODE_API_KEY' is not set` even though `.env` is filled in correctly.
+`harness/config.py`'s `load_config()` auto-loads a `.env` file next to `harness.toml` before
+resolving any `api_key_env`, filling in only variables not already set in the process
+environment — a real environment variable still wins over `.env`. `uv run --env-file .env`
+or `UV_ENV_FILE=.env` still work and take precedence (the process environment already has the
+value by the time `.env` is read), but neither is required anymore.
 
 ## `harness.toml`
 

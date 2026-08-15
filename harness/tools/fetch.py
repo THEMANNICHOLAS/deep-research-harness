@@ -3,28 +3,29 @@
 Each URL is classified into `FetchOutcome` rather than raising. The model sees compact,
 `[Sn]`-headed, boilerplate-stripped markdown capped per page; the artifact carries the
 full untruncated outcomes for downstream use (e.g. `harness.sources.SourceRegistry`).
+
+crawl4ai is imported lazily, inside `_fetch`/`_crawler_class`: its import alone costs ~1.2s,
+which every CLI invocation paid before doing anything. The first fetch pays it instead,
+overlapped with the model's first research turn.
 """
 
 import re
-import sys
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from crawl4ai import (  # type: ignore[import-untyped]
-    AsyncWebCrawler,
-    BrowserConfig,
-    CacheMode,
-    CrawlerRunConfig,
-    DefaultMarkdownGenerator,
-    MemoryAdaptiveDispatcher,
-    PruningContentFilter,
-    RateLimiter,
-)
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.config import HarnessConfig, run_workspace_dir
-from harness.sources import SourceRegistry, normalize_url, note_digest_candidate
+from harness.config import HarnessConfig
+from harness.runlog import RunLog
+from harness.sources import (
+    FETCH_FAILED_PREFIX,
+    SourceRegistry,
+    is_failed_capture,
+    normalize_url,
+    note_digest_candidate,
+    sources_dir,
+)
 
 FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
 
@@ -35,25 +36,16 @@ _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form",
 # box also hosts SearXNG and Chromium.
 _MEMORY_THRESHOLD_PERCENT = 75.0
 
-# The single home for this policy string: `_write_source_file` writes it as the first line of
-# any non-`fetched` capture, and `harness/report.py` reads it to judge whether a registered
-# source is usable evidence.
-FETCH_FAILED_PREFIX = "FETCH FAILED: "
 
+def _crawler_class() -> Any:
+    """The crawler class `_fetch` constructs — the one seam tests patch to avoid a browser.
 
-def is_failed_capture(source_text: str) -> bool:
-    """Whether a captured source file's text is a failure stub rather than real content.
-
-    The single home for READING what `FETCH_FAILED_PREFIX` writes. `report.py` (is this usable
-    evidence?) and `verify.py` (can this settle a claim?) ask the same question, and two copies
-    of "split the first line, test the prefix" could disagree about which sources count.
+    A function rather than a module-level name so crawl4ai stays unimported until a fetch
+    actually happens.
     """
-    return source_text.split("\n", 1)[0].startswith(FETCH_FAILED_PREFIX)
+    from crawl4ai import AsyncWebCrawler  # type: ignore[import-untyped]
 
-
-def _sources_dir(config: HarnessConfig, registry: SourceRegistry) -> Path:
-    """The one place the `<workspace_dir>/<run_id>/sources` layout is built."""
-    return run_workspace_dir(config, registry.run_id) / "sources"
+    return AsyncWebCrawler
 
 
 # Despite the name, crawl4ai 0.9.2 re-fetches nothing — this caps how many times a domain's
@@ -158,8 +150,8 @@ def _holds_successful_capture(path: Path) -> bool:
         return False
 
 
-def _write_source_file(sources_dir: Path, page: FetchedPage) -> None:
-    """Write `page`'s full-text capture to `<sources_dir>/<source_id>.md`.
+def _write_source_file(captures_dir: Path, page: FetchedPage, run_log: RunLog) -> None:
+    """Write `page`'s full-text capture to `<captures_dir>/<source_id>.md`.
 
     A `fetched` page gets its full untruncated markdown; any other outcome gets a stub whose
     first line names the outcome, so a reader can treat it as unusable without parsing further.
@@ -168,10 +160,11 @@ def _write_source_file(sources_dir: Path, page: FetchedPage) -> None:
     both attempts share one `[Sn]` and downgrading the file would make a claim cited from the
     good capture report as unverifiable.
 
-    A write failure degrades to a skipped file, never an exception into the model; a missing
-    capture is treated exactly like a stub.
+    A write failure degrades to a skipped file, never an exception into the model — but it is
+    RECORDED on `run_log` (best-effort + disclose): the source will show as unusable evidence,
+    and without the incident the report mis-attributes a local disk problem as a fetch failure.
     """
-    path = sources_dir / f"{page.source_id}.md"
+    path = captures_dir / f"{page.source_id}.md"
     if page.outcome != "fetched" and _holds_successful_capture(path):
         return
 
@@ -199,10 +192,10 @@ def _write_source_file(sources_dir: Path, page: FetchedPage) -> None:
     try:
         path.write_text(text, encoding="utf-8")
     except OSError as exc:
-        print(
-            f"warning: failed to write source file for {page.source_id} ({page.url}) "
-            f"to {path}: {exc}",
-            file=sys.stderr,
+        run_log.record(
+            "capture_write_failed",
+            f"[{page.source_id}] {page.url}: the fetched page could not be saved to {path} "
+            f"({exc}); the source will be reported as unusable evidence",
         )
 
 
@@ -233,10 +226,30 @@ def _render(page: FetchedPage, cap: int) -> str:
     return "\n\n".join(lines)
 
 
+def _failure_detail(page: FetchedPage) -> str:
+    """One incident line for a page that did not come back `fetched`."""
+    bits: list[str] = [page.outcome]
+    if page.status_code is not None:
+        bits.append(f"status {page.status_code}")
+    if page.error:
+        bits.append(page.error)
+    return f"[{page.source_id}] {page.url}: {' — '.join(bits)}"
+
+
 async def _fetch(
-    urls: list[str], config: HarnessConfig, registry: SourceRegistry
+    urls: list[str], config: HarnessConfig, registry: SourceRegistry, run_log: RunLog
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL, returning model-facing markdown and the full per-URL artifact."""
+    from crawl4ai import (
+        BrowserConfig,
+        CacheMode,
+        CrawlerRunConfig,
+        DefaultMarkdownGenerator,
+        MemoryAdaptiveDispatcher,
+        PruningContentFilter,
+        RateLimiter,
+    )
+
     # Crawl each canonical URL once: the registry dedups by normalized URL, so two spellings
     # would otherwise render duplicate [Sn] headings over different bodies.
     seen: set[str] = set()
@@ -265,7 +278,7 @@ async def _fetch(
     )
 
     # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
-    async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as crawler:
+    async with _crawler_class()(config=BrowserConfig(verbose=False)) as crawler:
         raw_results = await crawler.arun_many(urls, config=run_config, dispatcher=dispatcher)
         results = list(raw_results)
 
@@ -304,22 +317,31 @@ async def _fetch(
             )
         )
 
-    sources_dir = _sources_dir(config, registry)
+    # Recorded here, in the shared path, so `fetch_pages` and `fetch_raw` disclose alike.
+    # The model already sees each failure in its rendered block; this is the operator's copy.
     for page in pages:
-        _write_source_file(sources_dir, page)
+        if page.outcome != "fetched":
+            run_log.record("fetch_failed", _failure_detail(page))
+
+    captures_dir = sources_dir(config, registry)
+    for page in pages:
+        _write_source_file(captures_dir, page, run_log)
 
     content = "\n\n".join(_render(page, config.fetch.per_page_char_cap) for page in pages)
     return content, pages
 
 
-def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseTool:
-    """Build the `fetch_pages` tool, closing over `config` and the shared `registry`.
+def build_fetch_tool(
+    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+) -> BaseTool:
+    """Build the `fetch_pages` tool, closing over `config`, the shared `registry` and `run_log`.
 
     Creates `<workspace_dir>/<run_id>/sources` up front, so an unwritable workspace fails at
     startup rather than silently losing captures mid-run.
     """
-    _sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
+    sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
+    log = run_log if run_log is not None else RunLog()
     max_urls = config.fetch.max_urls_per_call
 
     class FetchPagesInput(BaseModel):
@@ -343,7 +365,7 @@ def build_fetch_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseToo
         their outcome rather than raising, so one bad URL never fails the batch. Equivalent
         spellings of the same page (trailing slash, fragment, case) are fetched once.
         """
-        content, pages = await _fetch(urls, config, registry)
+        content, pages = await _fetch(urls, config, registry, log)
         # Only a real capture is even a digest CANDIDATE (R5) — a failed fetch stays "unread".
         # The mark itself is deferred to the delegation boundary: agent.py's
         # `_ReaderDigestMiddleware` promotes these to "digested" only when the reader's digest

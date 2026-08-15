@@ -891,10 +891,11 @@ async def test_read_answer_returns_what_was_typed(monkeypatch):
 async def test_main_cuts_the_run_short_at_the_round_cap(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """`max_rounds=1` with a model that never stops proposing tool calls forces `recursion_limit`
-    to end the run rather than the graph terminating on its own. `ScriptedChatModel` raises
-    `IndexError` when its script runs out, so far more responses are scripted than the cap can
-    consume — proving the cap, not an exhausted script, is what ended it.
+    """`max_rounds=1` with a model that never stops proposing tool calls forces the stream
+    loop's own turn counter to end the run rather than the graph terminating on its own.
+    `ScriptedChatModel` raises `IndexError` when its script runs out, so far more responses are
+    scripted than the cap (plus its bounded synthesis pass) can consume — proving the cap, not
+    an exhausted script, is what ended it.
     """
     agent = AgentSettings(
         max_rounds=1, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
@@ -921,8 +922,9 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
     assert lines, "main() printed no report path"
     report_path = Path(lines[-1].strip())
     assert report_path.exists()
-    # A run that consumed the whole 20-item script would have driven far more model calls.
-    assert len(model._received_messages) < 5
+    # A run that consumed the whole 20-item script would have driven far more model calls:
+    # this allows the capped round plus the bounded synthesis pass, nothing like 21.
+    assert len(model._received_messages) < 8
     body = report_path.read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING in body
     # Names the ROUND CAP specifically: without this, swapping the `GraphRecursionError` and
@@ -931,17 +933,18 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
     assert _WALL_CLOCK_TEXT not in body
 
 
-@pytest.mark.parametrize(("max_rounds", "expect_cut_short"), [(3, True), (4, False)])
-async def test_max_rounds_scales_the_recursion_limit(
+@pytest.mark.parametrize(("max_rounds", "expect_cut_short"), [(1, True), (2, False)])
+async def test_max_rounds_counts_model_turns_not_supersteps(
     make_config, monkeypatch, scripted_model, tmp_path, capsys, max_rounds, expect_cut_short
 ):
-    """Pins the `max_rounds * 2 + 1` mapping at its measured boundary, which the round-cap test
-    above cannot — that one passes under ANY mapping small enough to trip.
+    """Pins the cap's unit at its exact boundary: a run of one tool round plus the final answer
+    turn is two MODEL TURNS, so it is capped at `max_rounds=1` and completes clean at
+    `max_rounds=2`. Any supersteps-derived mapping (middleware `after_model` nodes cost ~4
+    supersteps per round) would move this boundary and fail one side of the pair.
 
-    A run doing exactly one tool round is cut short at `max_rounds=3` (limit 7) and completes at
-    `max_rounds=4` (limit 9). Measured, not derived: the graph adds a fixed ~7-9 superstep
-    middleware overhead on top of the ~2 a round costs. Passing `max_rounds` straight through as
-    `recursion_limit` would cut BOTH short, so this pair is what separates the two mappings.
+    The capped side also proves the graceful stop: the lead gets one bounded synthesis pass
+    (`_SYNTHESIZE_NOW`) after the capped round's tools finish, so the report still carries a
+    real final answer alongside the round-cap disclosure.
     """
     agent = AgentSettings(
         max_rounds=max_rounds,
@@ -973,8 +976,18 @@ async def test_max_rounds_scales_the_recursion_limit(
     assert exit_code == 0
     body = Path(lines[-1].strip()).read_text(encoding="utf-8")
     assert (_CUT_SHORT_HEADING in body) is expect_cut_short
-    if not expect_cut_short:
-        assert "Answered after exactly one tool round." in body
+    # BOTH sides keep the answer: uncapped by finishing normally, capped via the synthesis
+    # pass — the cap must no longer destroy a run's output.
+    assert "Answered after exactly one tool round." in body
+    if expect_cut_short:
+        assert _ROUND_CAP_TEXT in body
+        # The synthesis instruction actually reached the model as the resumed thread's last
+        # human message, rather than the answer arriving by script-order coincidence.
+        last_call = model._received_messages[-1]
+        assert any(
+            main_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
+            for message in last_call
+        )
 
 
 async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
@@ -1250,10 +1263,14 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
     model = scripted_model([ping])
     patch_run(monkeypatch, config, model)
 
-    real_build_agent = main_module.build_agent
+    import harness.agent as agent_module
 
-    def _build_agent_that_interrupts(config: HarnessConfig, registry: Any) -> Any:
-        real_agent = real_build_agent(config, registry)
+    real_build_agent = agent_module.build_agent
+
+    def _build_agent_that_interrupts(
+        config: HarnessConfig, registry: Any, run_log: Any = None
+    ) -> Any:
+        real_agent = real_build_agent(config, registry, run_log)
 
         class _InterruptingAgent:
             def astream(self, *args: Any, **kwargs: Any) -> Any:
@@ -1266,7 +1283,9 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
 
         return _InterruptingAgent()
 
-    monkeypatch.setattr(main_module, "build_agent", _build_agent_that_interrupts)
+    # At the source module: `main` imports `build_agent` at call time (the heavy-import
+    # deferral), so the patched attribute is what that import binds.
+    monkeypatch.setattr(agent_module, "build_agent", _build_agent_that_interrupts)
 
     exit_code, files, out, err = await _run_main(["a question"], config, capsys)
 
@@ -1392,7 +1411,17 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     patch_run(monkeypatch, config, model)
 
     verify_model = scripted_model([verify_reply("not_supported", "The capture reads $5.10.")])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda cfg, role: verify_model)
+
+    # One patch target serves every caller now, so the verify client is told apart by call
+    # order: main() resolves models in a fixed sequence — preflight, lead, reader, then the
+    # verification pass — making the fourth resolution the verify client.
+    resolutions = {"count": 0}
+
+    def _dispatch(cfg, role):
+        resolutions["count"] += 1
+        return verify_model if resolutions["count"] >= 4 else model
+
+    monkeypatch.setattr("harness.models.build_chat_model", _dispatch)
 
     await main_module.main(["what does Acme charge?"])
 

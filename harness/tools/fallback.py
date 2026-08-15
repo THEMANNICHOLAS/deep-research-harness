@@ -11,18 +11,18 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
-from harness.sources import SourceRegistry
+from harness.runlog import RunLog
+from harness.sources import SourceRegistry, sources_dir
 from harness.tools.fetch import (
     FetchedPage,
     _fetch,
     _install_url_limit_contract,
     _render,
-    _sources_dir,
 )
 
 
 async def _fetch_raw(
-    urls: list[str], reason: str, config: HarnessConfig, registry: SourceRegistry
+    urls: list[str], reason: str, config: HarnessConfig, registry: SourceRegistry, run_log: RunLog
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL via the shared `_fetch`, wrapping each successful page in the marker.
 
@@ -30,7 +30,7 @@ async def _fetch_raw(
     stub is rendered exactly like `fetch_pages` renders it and stays `"unread"`, since nothing
     was actually captured for the lead to read raw.
     """
-    _, pages = await _fetch(urls, config, registry)
+    _, pages = await _fetch(urls, config, registry, run_log)
 
     # `"` is escaped rather than stripped: the reason is model-supplied prose that may
     # legitimately quote something, and dropping the quote marks would lose that context.
@@ -57,15 +57,18 @@ async def _fetch_raw(
     return "\n\n".join(blocks), pages
 
 
-def build_fallback_tool(config: HarnessConfig, registry: SourceRegistry) -> BaseTool:
-    """Build the `fetch_raw` tool, closing over `config` and the shared `registry`.
+def build_fallback_tool(
+    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+) -> BaseTool:
+    """Build the `fetch_raw` tool, closing over `config`, the shared `registry` and `run_log`.
 
     Mirrors `build_fetch_tool`'s own `mkdir`: `fetch_raw` can be exercised (and, in a live
     run, called) before `fetch_pages` ever has been, so it cannot rely on the reader's tool
     having already created `<workspace_dir>/<run_id>/sources`.
     """
-    _sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
+    sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
+    log = run_log if run_log is not None else RunLog()
     max_urls = config.fetch.max_urls_per_call
 
     class FetchRawInput(BaseModel):
@@ -90,6 +93,6 @@ def build_fallback_tool(config: HarnessConfig, registry: SourceRegistry) -> Base
         or returned an empty digest. Each successfully fetched page is wrapped in an
         `<undigested>` marker so the run's report can disclose it as raw, undigested content.
         """
-        return await _fetch_raw(urls, reason, config, registry)
+        return await _fetch_raw(urls, reason, config, registry, log)
 
     return _install_url_limit_contract(fetch_raw, max_urls)

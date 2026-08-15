@@ -35,8 +35,8 @@ from harness.report import (
     RunOutcome,
     write_report,
 )
-from harness.sources import SourceRegistry
-from harness.tools.fetch import _sources_dir
+from harness.runlog import Incident
+from harness.sources import SourceRegistry, sources_dir
 from harness.verify import CHECK_FAILED_DETAIL, ParagraphVerdict, VerificationResult
 from tests.conftest import write_failed_capture, write_source_capture, write_workspace_note
 
@@ -217,7 +217,7 @@ def test_write_report_survives_a_capture_file_that_is_not_valid_utf8(make_config
     good_id = registry.add("https://example.test/good", title=None)
     torn_id = registry.add("https://example.test/torn", title=None)
     write_source_capture(config, registry, good_id)
-    torn_path = _sources_dir(config, registry) / f"{torn_id}.md"
+    torn_path = sources_dir(config, registry) / f"{torn_id}.md"
     # A valid UTF-8 prefix cut mid-character, as an aborted flush would leave it.
     torn_path.write_bytes(b"# S2: torn page\n\n- Outcome: fetched\n\ncaf\xc3")
     outcome = RunOutcome(
@@ -1762,3 +1762,89 @@ def test_write_report_omits_the_read_modes_section_with_no_registered_sources(ma
     body = write_report(outcome, config).read_text(encoding="utf-8")
 
     assert _READ_MODES_HEADING not in body
+
+
+def test_incidents_render_under_gaps_even_when_verification_never_ran(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="What failed?",
+        answer="An answer with no citations.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=None,
+        incidents=[
+            Incident(kind="search_failed", detail='search for "solar" failed: unreachable'),
+            Incident(kind="fetch_failed", detail="[S1] https://a.test: blocked - status 403"),
+        ],
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "## Gaps and disclosures" in body
+    assert "Tool failures during the run:" in body
+    assert '- search for "solar" failed: unreachable' in body
+    assert "- [S1] https://a.test: blocked - status 403" in body
+
+
+def test_no_incidents_renders_no_tool_failures_heading(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="Anything?",
+        answer="An answer with no citations.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Tool failures during the run:" not in body
+
+
+def test_a_verdict_paragraph_count_mismatch_is_disclosed(make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id)
+    answer = f"First claim [{source_id}].\n\nSecond claim [{source_id}]."
+    paragraphs = split_paragraphs(answer)
+    # One verdict for two paragraphs: the overflow paragraph silently renders "not verified",
+    # which the report must say out loud rather than let read as a deliberate verdict.
+    verification = VerificationResult(
+        verdicts=[ParagraphVerdict(verdict="supported", detail="ok", source_ids=[source_id])]
+    )
+    outcome = RunOutcome(
+        question="Mismatch?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Verification returned 1 verdict(s) for 2 paragraph(s)" in body
+
+
+def test_matching_verdict_and_paragraph_counts_are_not_flagged(make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id)
+    answer = f"Only claim [{source_id}]."
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[ParagraphVerdict(verdict="supported", detail="ok", source_ids=[source_id])]
+    )
+    outcome = RunOutcome(
+        question="Match?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Verification returned" not in body

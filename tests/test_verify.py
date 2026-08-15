@@ -16,8 +16,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import PrivateAttr, SecretStr
 
 from harness.paragraphs import Paragraph
-from harness.sources import SourceRegistry
-from harness.tools.fetch import _sources_dir
+from harness.sources import SourceRegistry, sources_dir
 from harness.verify import CHECK_FAILED_DETAIL, Verdict, verify_paragraphs
 from tests.conftest import (
     ScriptedChatModel,
@@ -53,7 +52,7 @@ async def test_one_call_per_paragraph_and_prompt_contains_every_pooled_source(
     paragraph = _paragraph(f"The pump failed under load [{id1}] [{id2}] [{id3}].", [id1, id2, id3])
 
     model = scripted_model([verify_reply("supported", "All three sources agree.")])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -100,13 +99,39 @@ async def test_paragraphs_are_checked_strictly_sequentially(make_config, monkeyp
     model = _ConcurrencyTrackingModel(
         model="test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script([verify_reply("supported", "ok")] * len(ids))
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs(paragraphs, config, registry)
 
     assert model._peak_in_flight == 1
     assert model._call_count == len(paragraphs)
     assert len(result.verdicts) == len(paragraphs)
+
+
+async def test_on_paragraph_fires_once_per_paragraph_including_no_call_ones(
+    make_config, scripted_model, monkeypatch
+):
+    """The progress callback must tick for EVERY paragraph — the deterministic-verdict ones
+    that skip the model call included — so the i/n sequence at the terminal stays monotone.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/one")
+    write_source_capture(config, registry, source_id, "Body text.")
+    paragraphs = [
+        _paragraph("No citations in this block at all.", []),
+        _paragraph(f"A checked claim [{source_id}].", [source_id]),
+    ]
+
+    model = scripted_model([verify_reply("supported", "ok")])
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
+
+    seen: list[tuple[int, int]] = []
+    await verify_paragraphs(
+        paragraphs, config, registry, on_paragraph=lambda i, n: seen.append((i, n))
+    )
+
+    assert seen == [(1, 2), (2, 2)]
 
 
 # --- item 2: deterministic verdicts bypass the model entirely --------------------------
@@ -121,7 +146,7 @@ async def test_no_markers_or_all_unregistered_sources_returns_no_sources_cited_w
     all_unregistered = _paragraph("Refers to an unregistered source [S99].", ["S99"])
 
     model = scripted_model([])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([no_markers, all_unregistered], config, registry)
 
@@ -148,7 +173,7 @@ async def test_a_failed_capture_or_missing_file_is_excluded_from_the_pooled_prom
     )
 
     model = scripted_model([verify_reply("supported", "Confirmed by the one usable source.")])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -173,7 +198,7 @@ async def test_a_paragraph_left_with_no_usable_source_returns_not_verified_namin
     )
 
     model = scripted_model([])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -199,11 +224,11 @@ async def test_a_capture_that_is_not_valid_utf8_is_skipped_not_raised(
     source_id = registry.add("https://example.test/truncated")
     write_source_capture(config, registry, source_id, "placeholder")
     # A lone continuation byte — valid on disk, undecodable as UTF-8.
-    (_sources_dir(config, registry) / f"{source_id}.md").write_bytes(b"Tungsten melts at \xff\xfe")
+    (sources_dir(config, registry) / f"{source_id}.md").write_bytes(b"Tungsten melts at \xff\xfe")
 
     paragraph = _paragraph(f"Tungsten melts at 3422 C [{source_id}].", [source_id])
     model = scripted_model([])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -252,7 +277,7 @@ async def test_a_malformed_reply_unknown_verdict_and_raised_exception_all_contin
     model = _RaisesOnThirdCallModel(
         model="test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script(script)
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs(paragraphs, config, registry)
 
@@ -278,7 +303,7 @@ async def test_a_failed_check_keeps_its_diagnostic_out_of_the_readers_verdict_de
     paragraph = _paragraph(f"A claim [{source_id}].", [source_id])
 
     model = scripted_model([AIMessage(content="this is not json at all")])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -320,7 +345,7 @@ async def test_sources_conflict_and_unsupported_items_round_trip_and_verdicts_ar
             verify_reply("supported", "Confirmed by both sources.", sources_conflict=False),
         ]
     )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([list_paragraph, prose_paragraph], config, registry)
 
@@ -348,7 +373,7 @@ async def test_a_single_pooled_source_can_still_carry_a_conflict(
     model = scripted_model(
         [verify_reply("not_supported", "Contradicts itself.", sources_conflict=True)]
     )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -395,7 +420,7 @@ async def test_every_verdict_in_the_frozen_vocabulary_is_reachable(
             verify_reply("not_supported", "The kiln specs contradict this."),
         ]
     )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs(
         [
@@ -425,10 +450,10 @@ async def test_a_check_never_fetches(make_config, scripted_model, monkeypatch):
         def __init__(self, *args, **kwargs) -> None:
             raise AssertionError("verification must never fetch — D10/R8")
 
-    monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", _ExplodingCrawler)
+    monkeypatch.setattr("harness.tools.fetch._crawler_class", lambda: _ExplodingCrawler)
 
     model = scripted_model([verify_reply("supported", "matches")])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -455,7 +480,7 @@ async def test_the_input_paragraphs_list_is_exactly_what_gets_checked(
     second = _paragraph(f"UNIQUE_PARAGRAPH_TWO [{id2}].", [id2])
 
     model = scripted_model([verify_reply("supported", "ok"), verify_reply("supported", "ok")])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([first, second], config, registry)
 
@@ -495,7 +520,7 @@ async def test_a_reply_wrapped_in_prose_is_still_parsed(make_config, scripted_mo
             )
         ]
     )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -530,7 +555,7 @@ async def test_a_reply_wrapped_on_either_side_is_still_parsed(
     paragraph = _paragraph(f"The vendor quoted $4.20 [{source_id}].", [source_id])
 
     model = scripted_model([AIMessage(content=content)])
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -556,7 +581,7 @@ async def test_a_reply_omitting_unsupported_items_defaults_to_empty(
     model = scripted_model(
         [AIMessage(content='{"verdict": "not_supported", "detail": "The source disagrees."}')]
     )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -597,7 +622,7 @@ async def test_non_integer_bullet_indices_are_dropped_not_carried_through(
             )
         ]
     )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 
@@ -629,7 +654,7 @@ async def test_a_quoted_conflict_flag_reads_as_no_conflict(
             )
         ]
     )
-    monkeypatch.setattr("harness.verify.build_chat_model", lambda config, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
 

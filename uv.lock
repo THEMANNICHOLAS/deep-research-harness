@@ -8,6 +8,9 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[manifest]
+overrides = [{ name = "langchain-google-genai", marker = "sys_platform == 'never'" }]
+
 [[package]]
 name = "aiofiles"
 version = "25.1.0"
@@ -859,7 +862,7 @@ dependencies = [
     { name = "langchain" },
     { name = "langchain-anthropic" },
     { name = "langchain-core" },
-    { name = "langchain-google-genai" },
+    { name = "langchain-google-genai", marker = "sys_platform == 'never'" },
     { name = "langsmith" },
     { name = "packaging" },
     { name = "wcmatch" },

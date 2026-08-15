@@ -1,7 +1,11 @@
 """Assign stable per-run source IDs and resolve `[Sn]` markers into markdown links.
 
 The mechanical half of the citation scheme: minting IDs, deduplicating equivalent URLs, and
-rewriting markers into links. No model involvement, no fetching (D6).
+rewriting markers into links. No model involvement, no fetching (D6). Also the home of the
+captured-file policy (`sources_dir`, `FETCH_FAILED_PREFIX`, `is_failed_capture`): it used to
+live in `harness/tools/fetch.py`, but `report.py`, `verify.py` and the test fixtures all need
+it, and importing it from there dragged all of crawl4ai (~1.2s) into every pure-rendering
+module and every test session.
 """
 
 import re
@@ -10,12 +14,35 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict
 
+from harness.config import HarnessConfig, run_workspace_dir
+
 MARKER_RE = re.compile(r"\[S(\d+)\]")
+
+# The single home for this policy string: fetch.py's `_write_source_file` writes it as the
+# first line of any non-`fetched` capture, and `is_failed_capture` below reads it.
+FETCH_FAILED_PREFIX = "FETCH FAILED: "
+
+
+def is_failed_capture(source_text: str) -> bool:
+    """Whether a captured source file's text is a failure stub rather than real content.
+
+    The single home for READING what `FETCH_FAILED_PREFIX` writes. `report.py` (is this usable
+    evidence?) and `verify.py` (can this settle a claim?) ask the same question, and two copies
+    of "split the first line, test the prefix" could disagree about which sources count.
+    """
+    return source_text.split("\n", 1)[0].startswith(FETCH_FAILED_PREFIX)
+
+
+def sources_dir(config: HarnessConfig, registry: "SourceRegistry") -> Path:
+    """The one place the `<workspace_dir>/<run_id>/sources` layout is built."""
+    return run_workspace_dir(config, registry.run_id) / "sources"
+
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 

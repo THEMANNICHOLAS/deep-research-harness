@@ -15,6 +15,25 @@ class ConfigError(Exception):
     """Raised for any failure loading or validating the harness config."""
 
 
+def _load_dotenv(path: Path) -> None:
+    """Populate `os.environ` from a `.env` file next to `harness.toml`, if present.
+
+    A real environment variable always wins over `.env` — this only fills gaps, matching
+    standard dotenv precedence. Hand-rolled rather than a `python-dotenv` dependency: the file
+    is just `KEY=VALUE` lines, comments, and blanks (see `.env.example`).
+    """
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value.strip()
+
+
 class _StrictModel(BaseModel):
     """Shared strictness for every config model: an unknown key is a typo, not data."""
 
@@ -114,6 +133,8 @@ def load_config(path: Path | None = None) -> HarnessConfig:
     """Load and validate `harness.toml`, raising `ConfigError` on any failure."""
     if path is None:
         path = Path(__file__).resolve().parent.parent / "harness.toml"
+
+    _load_dotenv(path.parent / ".env")
 
     try:
         with open(path, "rb") as f:

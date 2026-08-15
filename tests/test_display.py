@@ -1,5 +1,6 @@
 """Behavioral tests for harness.display: events, renderers, and StageTracker."""
 
+import pathlib
 import re
 import sys
 from contextlib import AbstractContextManager
@@ -15,6 +16,7 @@ import harness.__main__ as main_module
 from harness.config import AgentSettings
 from harness.display import (
     Activity,
+    Alert,
     DisplayEvent,
     PlainRenderer,
     Question,
@@ -608,6 +610,7 @@ def test_run_finished_renders_the_full_summary(kind, capsys):
         unusable_sources=1,
         cut_short="wall_clock",
         verification_failures=2,
+        incidents=3,
     )
 
     lines = _render_lines(kind, event, capsys)
@@ -619,6 +622,7 @@ def test_run_finished_renders_the_full_summary(kind, capsys):
     assert "  sources: 3 usable, 1 unusable" in lines
     assert "  cut short: wall clock" in lines
     assert "  verification failures: 2" in lines
+    assert "  tool failures: 3" in lines
 
 
 @pytest.mark.parametrize("kind", ["plain", "rich"])
@@ -637,6 +641,7 @@ def test_run_finished_omits_empty_sections(kind, capsys):
     assert not any(line.startswith("  sources: 4 usable,") for line in lines)
     assert not any("cut short:" in line for line in lines)
     assert not any("verification failures:" in line for line in lines)
+    assert not any("tool failures:" in line for line in lines)
 
 
 def test_rich_renderer_run_finished_summary_prints_on_the_normal_screen_after_the_tui():
@@ -823,3 +828,50 @@ async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
     out, lines = drain_stdout(capsys)
     assert "cut short: round cap" in out
     assert lines[-1].strip().endswith(".md")
+
+
+@pytest.mark.parametrize("kind", ["plain", "rich"])
+def test_alert_renders_as_a_persistent_warning_line(kind, capsys):
+    event = Alert('search for "solar" failed: unreachable')
+
+    lines = _render_lines(kind, event, capsys)
+
+    assert any('warning: search for "solar" failed: unreachable' in line for line in lines)
+
+
+async def test_a_dead_search_backend_is_disclosed_on_the_terminal_and_in_the_report(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    """The invariant-pinning path (best-effort + disclose): a SearchFailure must reach the
+    developer through the CLI as a warning line AND through the report's gaps section — not
+    only through model-facing tool output the model may never repeat."""
+    config = make_config()
+    ping = AIMessage(content="pong")
+    search_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_web", "args": {"query": "the answer"}, "id": "call_search"}],
+    )
+    final = AIMessage(
+        content="Best-effort answer without sources.",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    model = scripted_model([ping, search_call, final])
+    patch_run(monkeypatch, config, model)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    install_search_transport(monkeypatch, handler)
+
+    await main_module.main(["a question needing research"])
+
+    out, lines = drain_stdout(capsys)
+    warning_lines = [line for line in lines if line.startswith("warning:")]
+    assert any("unreachable" in line and "the answer" in line for line in warning_lines)
+    assert "  tool failures: 1" in out
+
+    report_path = lines[-1].strip()
+    body = pathlib.Path(report_path).read_text(encoding="utf-8")
+    assert "## Gaps and disclosures" in body
+    assert "Tool failures during the run:" in body
+    assert "unreachable" in body

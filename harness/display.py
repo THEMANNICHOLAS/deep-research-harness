@@ -41,12 +41,21 @@ class Question:
 
 
 @dataclass(frozen=True)
+class Alert:
+    """A degraded-coverage warning (a `RunLog` incident): rendered as a PERSISTENT line, not
+    part of the scrolling activity tail — a failed search must not vanish off the feed."""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class RunFinished:
     stage_timings: tuple[tuple[Stage, float], ...]
     usable_sources: int
     unusable_sources: int
     cut_short: str | None
     verification_failures: int
+    incidents: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,7 +71,9 @@ class TodosUpdated:
     todos: tuple[TodoItem, ...]
 
 
-DisplayEvent = StageStarted | StageCompleted | Activity | Question | RunFinished | TodosUpdated
+DisplayEvent = (
+    StageStarted | StageCompleted | Activity | Question | Alert | RunFinished | TodosUpdated
+)
 
 
 def _summary_lines(event: RunFinished) -> list[str]:
@@ -78,6 +89,8 @@ def _summary_lines(event: RunFinished) -> list[str]:
         lines.append(f"  cut short: {event.cut_short.replace('_', ' ')}")
     if event.verification_failures > 0:
         lines.append(f"  verification failures: {event.verification_failures}")
+    if event.incidents > 0:
+        lines.append(f"  tool failures: {event.incidents}")
     return lines
 
 
@@ -104,6 +117,8 @@ class PlainRenderer:
             print(f"{event.stage} done ({event.elapsed_seconds:.1f}s)", file=stream)
         elif isinstance(event, Question):
             print(event.text, file=stream)
+        elif isinstance(event, Alert):
+            print(f"warning: {event.text}", file=stream)
         elif isinstance(event, RunFinished):
             for line in _summary_lines(event):
                 print(line, file=stream)
@@ -186,6 +201,7 @@ class RichRenderer:
         self._stage: Stage | None = None
         self._activities: list[str] = []
         self._timeline: list[Text] = []
+        self._alerts: list[Text] = []
         self._todos: tuple[TodoItem, ...] = ()
         self._pending_question: str | None = None
         self._closed = False
@@ -207,7 +223,7 @@ class RichRenderer:
     def _build_activity_group(self) -> Group:
         header = Spinner("dots", text=f"[bold]{self._stage or self._PRE_STAGE_LABEL}[/bold]")
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
-        return Group(*self._timeline, header, *activity_lines)
+        return Group(*self._timeline, *self._alerts, header, *activity_lines)
 
     def _build_renderable(self) -> Group:
         return Group(
@@ -259,6 +275,23 @@ class RichRenderer:
             # there and be discarded when `suspend()` exits it — the question must appear on
             # the NORMAL screen, so `_suspend()` prints it after stopping the Live.
             self._pending_question = event.text
+        elif isinstance(event, Alert):
+            # Appended to a PERSISTENT list rendered inside the frame, not `console.print`ed
+            # and not part of the scrolling `_activities` tail: under `screen=True` a print
+            # while the Live runs is overwritten and then discarded on exit, and a failed
+            # search must not scroll away. `Text(...)` for the same markup-safety reason as
+            # `Question` — the detail can carry model- or URL-derived brackets. The run's
+            # full incident list still reaches the normal screen via `RunFinished` and the
+            # report's `## Gaps and disclosures`.
+            warning = Text(f"warning: {event.text}", style="yellow")
+            self._alerts.append(warning)
+            if self._live is not None:
+                self._live.update(self._build_renderable(), refresh=True)
+            else:
+                # No Live owns the screen yet (an incident before the first stage, or a run
+                # whose feed never started): print it straight to the normal terminal, where
+                # it stays. Once the Live starts, `_alerts` replays it inside the frame.
+                self._console.print(warning)
         elif isinstance(event, TodosUpdated):
             self._todos = event.todos
             if self._live is None:
