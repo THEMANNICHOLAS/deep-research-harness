@@ -11,11 +11,13 @@ it as the tool's result.
 Two ceilings bound the run (R7): a round cap counted by the stream loop itself in MODEL
 TURNS (`AgentSettings.max_rounds` — see `_note_model_turns` inside `main`; `recursion_limit`
 survives only as a runaway backstop), and a wall clock (`AgentSettings.wall_clock_seconds`)
-armed at the first `search_web`/`fetch_pages` call and running continuously after that,
-including through a later clarification wait. A run that lands on the round cap mid-research
-gets one bounded synthesis pass to write a final answer from what it already read
-(`_SYNTHESIZE_NOW`) before the report is written; hitting either bound, or any other mid-run
-failure, still writes a report disclosing what happened (`RunOutcome.cut_short`).
+armed at the first top-level `task(subagent_type="researcher")` dispatch (Step 3 Drift C — the
+lead's own `search_web`/`fetch_pages` calls moved onto the nested researcher/reader tiers,
+which this top-level stream never sees) and running continuously after that, including through
+a later clarification wait. A run that lands on the round cap mid-research gets one bounded
+synthesis pass to write a final answer from what it already read (`_SYNTHESIZE_NOW`) before the
+report is written; hitting either bound, or any other mid-run failure, still writes a report
+disclosing what happened (`RunOutcome.cut_short`).
 """
 
 from __future__ import annotations
@@ -67,10 +69,11 @@ _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tok
 # What the model is told when the developer answers a clarifying question with nothing.
 _NO_ANSWER_GIVEN = "(The developer gave no answer to this question.)"
 
-# R2's pre-research window: the wall clock arms the first time one of these is proposed.
-# Neither search nor fetch exports a tool-name constant, so these are the names from their
-# own `@tool(...)` decorators.
-_RESEARCH_TOOLS = frozenset({"search_web", "fetch_pages"})
+# R2's pre-research window / Step 3 Drift C: the wall clock arms the first time the lead
+# proposes a `task` dispatch to this subagent type — that IS "research started" in the 3-tier
+# design (the nested `search_web`/`fetch_pages` calls inside a researcher's own subgraph never
+# reach this top-level stream at all).
+_RESEARCHER_SUBAGENT_TYPE = "researcher"
 
 # What the lead is told when the round cap lands mid-research (R7): one bounded pass to turn
 # what was already read into a final answer, instead of dying by exception mid-tool-call and
@@ -182,26 +185,27 @@ async def _read_answer(prompt: str = "> ") -> str:
 
 
 def _research_tool_calls(node_update: dict[str, Any]) -> list[dict[str, Any]]:
-    """The research tool calls (`_RESEARCH_TOOLS`) proposed in one node update, if any.
+    """The top-level `task(subagent_type="researcher")` calls proposed in one node update.
 
     Also drives the wall clock, which arms exactly once, at the first such call seen in the
-    stream.
+    stream (Step 3 Drift C — see `_RESEARCHER_SUBAGENT_TYPE`).
     """
     calls: list[dict[str, Any]] = []
     for message in node_update.get("messages") or []:
         if isinstance(message, AIMessage):
             calls.extend(
-                dict(call) for call in message.tool_calls if call["name"] in _RESEARCH_TOOLS
+                dict(call)
+                for call in message.tool_calls
+                if call["name"] == "task"
+                and (call.get("args") or {}).get("subagent_type") == _RESEARCHER_SUBAGENT_TYPE
             )
     return calls
 
 
 def _describe_tool_call(call: dict[str, Any]) -> str:
-    """One activity line describing a research tool call proposal."""
+    """One activity line describing a researcher-dispatch proposal."""
     args = call.get("args") or {}
-    if call["name"] == "search_web":
-        return f'search_web: "{args.get("query", "")}"'
-    return f"fetch_pages: {len(args.get('urls') or [])} url(s)"
+    return f'task(researcher): "{args.get("description", "")}"'
 
 
 async def _answer_questions(interrupt: Interrupt, renderer: Renderer) -> list[dict[str, Any]]:

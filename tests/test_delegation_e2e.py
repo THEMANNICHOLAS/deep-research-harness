@@ -1,7 +1,8 @@
-"""End-to-end regression: the full reader-delegation loop through a real deepagents graph.
+"""End-to-end regression: the full lead -> researcher -> reader delegation loop through a real
+deepagents graph.
 
 New file, not folded into `tests/test_agent.py`: the scripted scenario composes DISTINCT
-head/reader models, the fake crawler, `main()`'s own config/preflight patching, and a
+head/researcher/reader models, the fake crawler, `main()`'s own config/preflight patching, and a
 `write_report` spy all at once -- `test_agent.py`'s `noop_agent` fixture scripts one shared
 model over every role, which this scenario cannot reuse. Implementor's call, per the plan.
 """
@@ -17,23 +18,29 @@ from tests.test_verify import _flatten
 _URL = "https://example.test/page"
 _CAPTURE_MARKER = "CAPTURE-UNIQUE-MARKER-55d10e"
 _DIGEST_MARKER = "DIGEST-UNIQUE-MARKER-91c44d"
+_RESEARCHER_MARKER = "RESEARCHER-UNIQUE-MARKER-2b6c19"
 _HEAD_MARKER = "HEAD-UNIQUE-MARKER-7f3ab2"
 
-_DESCRIPTION = (
+_RESEARCHER_DESCRIPTION = (
     "Objective: determine whether the widget line's early crash reports show a defect "
-    f"pattern, reading {_URL}. Output format: prose findings with [Sn] markers. "
-    "Tools: fetch_pages only, no search. Boundaries: technical specs only, not marketing "
-    "claims."
+    "pattern. Output format: prose findings with [Sn] markers. Tools: search and reader "
+    "delegation. Boundaries: technical specs only, not marketing claims."
+)
+
+_READER_DESCRIPTION = (
+    f"Objective: read {_URL} for the widget defect pattern. Output format: prose findings "
+    "with [Sn] markers. Tools: fetch_pages only, no search. Boundaries: technical specs "
+    "only, not marketing claims."
 )
 
 
-def _task_call(call_id: str = "call_task") -> AIMessage:
+def _task_call(description: str, subagent_type: str, call_id: str = "call_task") -> AIMessage:
     return AIMessage(
         content="",
         tool_calls=[
             {
                 "name": "task",
-                "args": {"description": _DESCRIPTION, "subagent_type": "reader"},
+                "args": {"description": description, "subagent_type": subagent_type},
                 "id": call_id,
             }
         ],
@@ -48,25 +55,43 @@ def _fetch_call(call_id: str = "call_fetch") -> AIMessage:
 
 
 async def _run_delegation(make_config, patch_models_by_role, monkeypatch, install_crawler):
-    """Drive one full `main()` run through the real graph: lead delegates, reader fetches via
-    the fake crawler, the digest returns, verification runs, and the report is written.
+    """Drive one full `main()` run through the real graph: the lead delegates to a researcher,
+    the researcher delegates to a reader, the reader fetches via the fake crawler, the digest
+    returns up through both tiers, verification runs, and the report is written.
 
     Hand-rolls what `patch_run` does (`load_config` + preflight skip) rather than reusing it:
     `patch_run` binds ONE model to every role, and this scenario needs role-distinct models.
     """
-    config = make_config(head_model="head-test-model", reader_model="reader-test-model")
+    config = make_config(
+        head_model="head-test-model",
+        researcher_model="researcher-test-model",
+        reader_model="reader-test-model",
+    )
 
     head_model = ScriptedChatModel(
         model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script(
         [
-            _task_call(),
+            _task_call(_RESEARCHER_DESCRIPTION, "researcher"),
             AIMessage(
                 content=(
                     f"Widget defect reports are documented on the source page [S1]. {_HEAD_MARKER}"
                 )
             ),
             verify_reply("supported", "The capture confirms the digest's claim."),
+        ]
+    )
+    researcher_model = ScriptedChatModel(
+        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script(
+        [
+            _task_call(_READER_DESCRIPTION, "reader"),
+            AIMessage(
+                content=(
+                    "The reader's digest confirms a widget defect pattern [S1]. "
+                    f"{_RESEARCHER_MARKER}"
+                )
+            ),
         ]
     )
     reader_model = ScriptedChatModel(
@@ -83,11 +108,11 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
         ]
     )
     # Verification runs on the "verifier" role (Phase 1 Step 4); this scenario's verify_reply
-    # is scripted on `head_model` itself, so it is routed there too rather than a third model.
+    # is scripted on `head_model` itself, so it is routed there too rather than a fourth model.
     patch_models_by_role(
         {
             "head": head_model,
-            "researcher": head_model,
+            "researcher": researcher_model,
             "reader": reader_model,
             "verifier": head_model,
         }
@@ -136,6 +161,7 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
     return {
         "config": config,
         "head_model": head_model,
+        "researcher_model": researcher_model,
         "reader_model": reader_model,
         "captured": captured,
         "exit_code": exit_code,
@@ -145,9 +171,10 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
 async def test_end_to_end_delegation_loop_digests_and_resolves_citations(
     make_config, patch_models_by_role, monkeypatch, install_crawler
 ):
-    """R1/R4/R5: the lead delegates through `task`, the reader fetches via the shared
-    `fetch_pages` instance against the fake crawler, the digest comes back, the lead
-    synthesizes from it, and the written report resolves `[S1]` and discloses it as digested.
+    """R1/R4/R5: the lead delegates through `task` to a researcher, which delegates through its
+    OWN `task` to a reader; the reader fetches via the shared `fetch_pages` instance against the
+    fake crawler, the digest comes back up through both tiers, the lead synthesizes from the
+    researcher's report, and the written report resolves `[S1]` and discloses it as digested.
     """
     result = await _run_delegation(make_config, patch_models_by_role, monkeypatch, install_crawler)
 
@@ -192,7 +219,8 @@ async def test_verification_reads_the_capture_file_not_the_reader_digest(
     make_config, patch_models_by_role, monkeypatch, install_crawler
 ):
     """R3: `verify_paragraphs` judges the claim against the CAPTURED page text, never the
-    reader's digest -- even though the digest is all the lead itself ever saw.
+    reader's digest or the researcher's report -- even though the researcher's report is all
+    the lead itself ever saw.
     """
     result = await _run_delegation(make_config, patch_models_by_role, monkeypatch, install_crawler)
 
@@ -204,3 +232,4 @@ async def test_verification_reads_the_capture_file_not_the_reader_digest(
 
     assert _CAPTURE_MARKER in verify_text
     assert _DIGEST_MARKER not in verify_text
+    assert _RESEARCHER_MARKER not in verify_text
