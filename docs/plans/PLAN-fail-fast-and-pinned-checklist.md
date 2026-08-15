@@ -190,7 +190,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 2: Startup search preflight + cap raise
 - [x] Phase 3: Consecutive-search-failure abort
 - [x] Phase 4: Report gating and abort semantics
-- [ ] Phase 5: Docs reconciliation
+- [x] Phase 5: Docs reconciliation
 - [ ] Final verification
 
 ## Phases
@@ -409,7 +409,7 @@ wall-clock expiry; keep disclosed reports for round cap and post-answer wall-clo
 - No new guide documents.
 
 **Manual verification:**
-- [ ] `grep -n "best-effort" CLAUDE.md docs/INDEX.md` — reworded text present, old absolute
+- [x] `grep -n "best-effort" CLAUDE.md docs/INDEX.md` — reworded text present, old absolute
       phrasing gone.
 
 **Steps:**
@@ -417,7 +417,7 @@ wall-clock expiry; keep disclosed reports for round cap and post-answer wall-clo
 2. Run the manual verification.
 
 **Acceptance criteria:**
-- [ ] A reader of CLAUDE.md alone would correctly predict that a SearXNG-down run writes
+- [x] A reader of CLAUDE.md alone would correctly predict that a SearXNG-down run writes
       no report.
 
 ## Verification
@@ -528,6 +528,16 @@ Disposition: defer (blanket-approval session; developer to confirm).
 - Drift: none.
 - Watch-next: Phase 5 is docs-only; the two live checks (Phase 1 TUI smoke, mid-run
   container stop) remain for final verification.
+
+### 2026-08-15 — Phase 5: Docs reconciliation
+- Done: CLAUDE.md invariant scoped to runs that finish; INDEX.md status covers
+  fail-fast + TUI; D1-D4 entries in docs/decisions.md; PLAN-rich-cli-output.md marked
+  Complete/superseded.
+- Learned: nothing new — docs matched shipped code on reviewer cross-check.
+- Drift: none.
+- Watch-next: final verification — quality gates offline, plus the LIVE checks only the
+  developer can run (TUI smoke in a real terminal, container stopped at startup, and
+  container stopped mid-run).
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so

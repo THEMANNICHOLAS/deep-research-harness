@@ -7,7 +7,12 @@
 - **Status:** research loop runs end to end — `python -m harness "<question>"` drives a
   single deepagents lead agent over the substrate's tools, may ask clarifying questions
   before researching, stops at a round cap or wall clock, checks each claim against its own
-  cited source, and writes a timestamped cited report. All seven phases of
+  cited source, and writes a timestamped cited report. Runs are fail-fast: SearXNG is
+  health-checked before any agent work, three consecutive mid-run search connection
+  failures abort the run, and a failed run (hard error, user abort, answer-less wall-clock
+  expiry) writes no report and exits nonzero (PLAN-fail-fast-and-pinned-checklist). On a
+  TTY the run renders as a full-screen TUI: pinned todo checklist over a scrolling event
+  log, post-run summary on the normal terminal. All seven phases of
   docs/plans/PLAN-research-loop.md are built. The researcher and reader tiers exist only as
   frozen prompt contracts — nothing delegates to them yet; wiring them is the next round.
 - **Integrations:** SearXNG (local Docker instance checked in at

@@ -130,3 +130,29 @@ sentences each, append-only, newest last.
   belongs to. The 25-word cap lives in @harness/prompts/verify.md alone: rejected a code-level
   trim in @harness/report.py because clipping mid-sentence is worse to read than a long verdict,
   so a model that ignores the instruction still gets its full sentence printed.
+
+- **2026-08-14 — the run display is a full-screen Rich TUI on the alternate screen buffer
+  (D1, PLAN-fail-fast-and-pinned-checklist).** Pinned todo checklist over a gray rule over a
+  fixed event-log panel, `Live(screen=True)`, no Textual dependency; rejected a Textual app
+  (new pinned dep, ~2x diff) and a non-fullscreen Live block. Prints made while the Live runs
+  are discarded with the alt buffer, so questions and stage-timeline lines render via the
+  frame or after suspend — see @harness/display.py.
+
+- **2026-08-14 — failed runs write no report (D2, PLAN-fail-fast-and-pinned-checklist).**
+  Hard errors, user abort (Ctrl+C), and wall-clock expiry with no final answer produce stderr
+  error + exit 1 and nothing in reports/; round cap and post-answer wall-clock expiry stay
+  disclosed reports. This narrows the best-effort + disclose invariant to runs that finish
+  (CLAUDE.md reworded to match).
+
+- **2026-08-14 — mid-run SearXNG outage aborts via a counter inside the search tool closure
+  (D3, PLAN-fail-fast-and-pinned-checklist).** Three consecutive connection-level failures
+  (`unreachable`/`bad_status`; `malformed` neither counts nor resets) raise
+  `SearchUnavailableError`, which propagates through deepagents to the loop's generic handler
+  — verified empirically; no agent-loop changes, preserving the tools-don't-touch-the-loop
+  invariant. Limit: `[search] max_consecutive_failures`.
+
+- **2026-08-14 — the startup health check probes the SearXNG JSON API, not the container
+  (D4, PLAN-fail-fast-and-pinned-checklist).** One GET of `{base_url}/search?q=ping&format=json`
+  asserting 200 + parseable JSON catches both container-down and the HTML-only
+  stock-container misconfiguration; rejected docker inspection (hardcodes a deployment
+  detail). See `preflight_search` in @harness/tools/search.py.

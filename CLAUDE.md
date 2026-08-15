@@ -40,8 +40,13 @@ not the ceiling).
   standing exception is a tool that must STOP the loop to work — `ask_user`
   is registered in `harness/agent.py`'s `interrupt_on`, because an interrupt
   is a property of the loop, not of the tool. Everything else stays additive.
-- Best-effort + disclose: degraded coverage (rate limits, fetch failures)
-  is answered and disclosed, never silently thinned or hidden.
+- Best-effort + disclose, scoped to runs that finish: degraded coverage
+  (rate limits, fetch failures, the round cap, a wall clock that fires
+  after a final answer exists) is answered and disclosed, never silently
+  thinned or hidden. A FAILED run — hard error, SearXNG down at startup
+  or mid-run, user abort, or wall-clock expiry with no final answer —
+  writes no report at all: error to stderr, nonzero exit, nothing in
+  reports/.
 
 ## Stack
 
