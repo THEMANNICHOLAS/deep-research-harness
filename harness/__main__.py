@@ -33,7 +33,16 @@ from langgraph.types import Command, Interrupt
 
 from harness.agent import build_agent
 from harness.config import ConfigError, load_config
-from harness.display import Activity, Question, Renderer, RunFinished, StageTracker, build_renderer
+from harness.display import (
+    Activity,
+    Question,
+    Renderer,
+    RunFinished,
+    StageTracker,
+    TodoItem,
+    TodosUpdated,
+    build_renderer,
+)
 from harness.models import ModelError, preflight
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
@@ -270,12 +279,14 @@ async def main(argv: list[str] | None = None) -> int:
                                 continue
                             todos = node_update.get("todos")
                             if todos is not None and todos != last_todos:
-                                previous = {t["content"]: t["status"] for t in (last_todos or [])}
-                                for todo in todos:
-                                    if previous.get(todo["content"]) != todo["status"]:
-                                        renderer.emit(
-                                            Activity(f"[{todo['status']}] {todo['content']}")
+                                renderer.emit(
+                                    TodosUpdated(
+                                        tuple(
+                                            TodoItem(content=todo["content"], status=todo["status"])
+                                            for todo in todos
                                         )
+                                    )
+                                )
                                 last_todos = todos
                             calls = _research_tool_calls(node_update)
                             if calls:

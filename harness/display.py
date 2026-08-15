@@ -12,6 +12,7 @@ from typing import Literal, Protocol
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.text import Text
 
@@ -48,7 +49,20 @@ class RunFinished:
     verification_failures: int
 
 
-DisplayEvent = StageStarted | StageCompleted | Activity | Question | RunFinished
+@dataclass(frozen=True)
+class TodoItem:
+    content: str
+    status: str
+
+
+@dataclass(frozen=True)
+class TodosUpdated:
+    """The agent's full, ordered todo list — a replacement, not a delta (Contracts)."""
+
+    todos: tuple[TodoItem, ...]
+
+
+DisplayEvent = StageStarted | StageCompleted | Activity | Question | RunFinished | TodosUpdated
 
 
 def _summary_lines(event: RunFinished) -> list[str]:
@@ -93,6 +107,9 @@ class PlainRenderer:
         elif isinstance(event, RunFinished):
             for line in _summary_lines(event):
                 print(line, file=stream)
+        elif isinstance(event, TodosUpdated):
+            for item in event.todos:
+                print(f"  [{item.status}] {item.content}", file=stream)
         else:  # Activity
             print(f"  {event.text}", file=stream)
 
@@ -145,10 +162,13 @@ class StageTracker:
 
 
 class RichRenderer:
-    """Live-updating stage header + activity feed (R1), collapsing to a timeline line (R2).
+    """Full-screen TUI (D1/R5): a pinned checklist over a gray rule over the activity feed
+    (R1), collapsing stage completions to a timeline line (R2), with a one-line exit-hint
+    footer.
 
-    One `Live` region for the whole run, low refresh rate, every print routed through the
-    same `Console` — the risk #2 mitigations from the parent plan.
+    One `Live` region for the whole run, on the alternate screen buffer, low refresh rate,
+    every print routed through the same `Console` — the risk #2 mitigations from the parent
+    plan.
     """
 
     _ACTIVITY_TAIL = 8
@@ -157,25 +177,52 @@ class RichRenderer:
     # first model turn and its initial todo plan, which precede the first `search_web` call.
     _PRE_STAGE_LABEL = "starting"
 
+    _FOOTER_HINT = "Ctrl+C to exit"
+
     def __init__(self, console: Console | None = None, *, auto_refresh: bool = True) -> None:
         self._console = console or Console()
         self._auto_refresh = auto_refresh
         self._live: Live | None = None
         self._stage: Stage | None = None
         self._activities: list[str] = []
+        self._timeline: list[Text] = []
+        self._todos: tuple[TodoItem, ...] = ()
+        self._pending_question: str | None = None
         self._closed = False
 
-    def _build_renderable(self) -> Group:
+    def _build_checklist(self) -> Group:
+        heading = Text("Tasks", style="bold blue")
+        if not self._todos:
+            return Group(heading, Text("  (none yet)", style="dim"))
+        lines: list[Text] = []
+        for item in self._todos:
+            if item.status == "completed":
+                lines.append(Text(f"  [x] {item.content}", style="green"))
+            elif item.status == "in_progress":
+                lines.append(Text(f"  > {item.content}", style="bold bright_blue"))
+            else:  # pending
+                lines.append(Text(f"  [ ] {item.content}", style="#207d99"))
+        return Group(heading, *lines)
+
+    def _build_activity_group(self) -> Group:
         header = Spinner("dots", text=f"[bold]{self._stage or self._PRE_STAGE_LABEL}[/bold]")
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
-        return Group(header, *activity_lines)
+        return Group(*self._timeline, header, *activity_lines)
+
+    def _build_renderable(self) -> Group:
+        return Group(
+            self._build_checklist(),
+            Rule(style="grey50"),
+            Panel(self._build_activity_group(), border_style="blue"),
+            Text(self._FOOTER_HINT, style="dim"),
+        )
 
     def _start_live(self) -> None:
         self._live = Live(
             self._build_renderable(),
             console=self._console,
             refresh_per_second=4,
-            transient=True,
+            screen=True,
             auto_refresh=self._auto_refresh,
         )
         # refresh=True paints the first frame immediately — without it the header
@@ -195,18 +242,35 @@ class RichRenderer:
         elif isinstance(event, StageCompleted):
             self._stage = None
             self._activities = []
-            if self._live is not None:
-                self._live.update("", refresh=True)
-            self._console.print(
-                f"[green]ok[/green] {event.stage} [dim]({event.elapsed_seconds:.1f}s)[/dim]"
+            # Collapsed timeline lines live INSIDE the frame: under `screen=True` a
+            # `console.print` while the Live runs paints onto the alternate screen at the
+            # home position and is overwritten by the next refresh, then discarded on exit.
+            self._timeline.append(
+                Text.assemble(
+                    ("ok", "green"),
+                    f" {event.stage} ",
+                    (f"({event.elapsed_seconds:.1f}s)", "dim"),
+                )
             )
+            if self._live is not None:
+                self._live.update(self._build_renderable(), refresh=True)
         elif isinstance(event, Question):
-            # `Text(...)`, not the raw string: `Panel` renders console markup, and the question
-            # is model-authored. A bracketed path (`[/var/log]`) would raise `MarkupError` and
-            # end the run instead of asking, and a `[a]`-style option label would be parsed as
-            # an unknown style and silently dropped from the question the developer answers.
-            self._console.print(Panel(Text(event.text), border_style="cyan"))
+            # Held, not printed: while the Live owns the alternate screen a print would land
+            # there and be discarded when `suspend()` exits it — the question must appear on
+            # the NORMAL screen, so `_suspend()` prints it after stopping the Live.
+            self._pending_question = event.text
+        elif isinstance(event, TodosUpdated):
+            self._todos = event.todos
+            if self._live is None:
+                self._start_live()
+            else:
+                self._live.update(self._build_renderable(), refresh=True)
         elif isinstance(event, RunFinished):
+            # Leave the alternate screen FIRST: the summary belongs on the normal terminal
+            # (R5), and a later `close()` must then be a safe no-op (idempotent).
+            if self._live is not None:
+                self._live.stop()
+                self._live = None
             lines = _summary_lines(event)
             self._console.print(lines[0], style="bold")
             for line in lines[1:]:
@@ -231,6 +295,13 @@ class RichRenderer:
         if self._live is not None:
             self._live.stop()
             self._live = None
+        if self._pending_question is not None:
+            # `Text(...)`, not the raw string: `Panel` renders console markup, and the question
+            # is model-authored. A bracketed path (`[/var/log]`) would raise `MarkupError` and
+            # end the run instead of asking, and a `[a]`-style option label would be parsed as
+            # an unknown style and silently dropped from the question the developer answers.
+            self._console.print(Panel(Text(self._pending_question), border_style="cyan"))
+            self._pending_question = None
         try:
             yield
         finally:
@@ -240,7 +311,6 @@ class RichRenderer:
     def close(self) -> None:
         self._closed = True
         if self._live is not None:
-            self._live.update("", refresh=True)
             self._live.stop()
             self._live = None
 
