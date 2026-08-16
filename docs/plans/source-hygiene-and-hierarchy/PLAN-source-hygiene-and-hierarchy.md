@@ -309,6 +309,13 @@ Append-only, empty at plan creation. -->
 - Step 3's diff landed at 769+/246- across 13 files vs the planned ~200–350/4 — fully
   accounted for by reconciliations Drift A/B/C; recorded so the budget miss is visible.
 
+### 2026-08-16 — Phase 2 Step 4 (deferred, 3F simplify)
+- tests/test_delegation_e2e.py's new mixed-disclosure test re-copies the `_run_delegation`
+  scaffolding (~50 lines, second occurrence). Parametrize the helper when a THIRD scripted
+  e2e appears, per CLAUDE.md's factor-on-third rule.
+- Pre-existing wording quirk (not this phase): `_UNREAD_HEADING`'s "fetch never succeeded"
+  parenthetical in @harness/report.py is inaccurate for a crash-after-successful-fetch path.
+
 ### 2026-08-15 — Phase 1 Step 1 (deferred)
 - Query re-encode asymmetry in `normalize_url` (@harness/sources.py): the query is
   re-encoded only when a tracking key was dropped, so `?q=a%20b&utm_source=1` → `q=a+b`

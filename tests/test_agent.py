@@ -268,6 +268,30 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
     assert "interrupt_on" not in spec
 
 
+def test_researcher_spec_has_no_interrupt_on(make_config, scripted_model, tmp_path):
+    """Regression pin (D6; deferred from Step 3, developer-approved to land in Step 4): the
+    researcher `SubAgent` spec omits `interrupt_on`, the same as the reader above — a nested
+    researcher has no checkpointer forwarded and cannot interrupt either.
+    """
+    from deepagents.backends.filesystem import FilesystemBackend
+
+    from harness.agent import _reader_spec, _researcher_spec
+    from harness.tools import build_tools
+
+    config = make_config()
+    reader_model = scripted_model([AIMessage(content="done")])
+    researcher_model = scripted_model([AIMessage(content="done")])
+    tool_sets = build_tools(config, SourceRegistry())
+    backend = FilesystemBackend(root_dir=tmp_path / "workspace")
+    reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
+
+    spec = _researcher_spec(
+        config, researcher_model, tool_sets.researcher, reader_spec, backend, SourceRegistry()
+    )
+
+    assert "interrupt_on" not in spec
+
+
 async def test_build_agent_resolves_each_role_from_its_own_key(
     make_config, monkeypatch, scripted_model
 ):
