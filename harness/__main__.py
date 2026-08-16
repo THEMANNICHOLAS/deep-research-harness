@@ -87,6 +87,15 @@ _SYNTHESIZE_NOW = (
 # is stopped quickly by `GraphRecursionError` (reported as the same `round_cap`).
 _SYNTHESIS_RECURSION_LIMIT = 10
 
+# Roles preflighted before any agent work, in the order they are checked. Adding a role to
+# the config means adding it here — nothing else in `main` knows the list.
+_PREFLIGHT_ROLES = ("head", "verifier")
+
+# The runaway backstop's sizing, named alongside `_SYNTHESIS_RECURSION_LIMIT` rather than left
+# inline: both are recursion-limit safety margins and a tuning pass should find them together.
+_BACKSTOP_SUPERSTEPS_PER_ROUND = 20
+_BACKSTOP_FLOOR = 100
+
 
 def _sum_usage(messages: list[BaseMessage]) -> UsageMetadata:
     """Sum `usage_metadata` across every `AIMessage` in the final state."""
@@ -253,21 +262,17 @@ async def main(argv: list[str] | None = None) -> int:
     from harness.agent import build_agent
     from harness.models import ModelError, preflight
 
-    renderer.emit(Activity("preflight: checking the head model endpoint"))
-    try:
-        await preflight(config, "head")
-    except ModelError as exc:
-        renderer.close()
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    renderer.emit(Activity("preflight: checking the verifier model endpoint"))
-    try:
-        await preflight(config, "verifier")
-    except ModelError as exc:
-        renderer.close()
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    # Every role the run will actually call, checked before any agent work. A loop, not a
+    # block per role: Phase 2 adds more, and each pasted copy is another place the close/print
+    # /exit-1 shape can drift.
+    for role in _PREFLIGHT_ROLES:
+        renderer.emit(Activity(f"preflight: checking the {role} model endpoint"))
+        try:
+            await preflight(config, role)
+        except ModelError as exc:
+            renderer.close()
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
     renderer.emit(Activity("preflight: checking the search backend"))
     try:
@@ -314,7 +319,9 @@ async def main(argv: list[str] | None = None) -> int:
         # budget and drifts again on any upgrade. Sized ~5x anything the counted cap could
         # legitimately need, so it only trips if the counting fails or the graph loops without
         # producing model turns.
-        "recursion_limit": config.agent.max_rounds * 20 + 100,
+        "recursion_limit": (
+            config.agent.max_rounds * _BACKSTOP_SUPERSTEPS_PER_ROUND + _BACKSTOP_FLOOR
+        ),
     }
     stream_input: Any = {"messages": [HumanMessage(content=args.question)]}
 
@@ -435,6 +442,22 @@ async def main(argv: list[str] | None = None) -> int:
                             # token usage on exactly the runs that need disclosing.
                             final_state = chunk
 
+                # Interrupts first, BEFORE the cap: `ask_user` counts as a tool call on the
+                # capped round and so sets `cap_hit`, but it pauses the graph instead of
+                # returning a `ToolMessage`, so `awaiting_tool_ids` never drains. Handling the
+                # cap here dropped the question and then resumed a paused thread — the run
+                # died and wrote nothing. The cap still applies once the answer is delivered.
+                interrupts = (pass_state or {}).get("__interrupt__")
+                if interrupts:
+                    tracker.advance("clarifying")
+                    # `interrupts[0]`, not all of them: the lead is a single agent node, so at
+                    # most one is ever pending, and `Command(resume=...)` delivers ONE value —
+                    # fanning several into one decisions list would mis-pair them.
+                    stream_input = Command(
+                        resume={"decisions": await _answer_questions(interrupts[0], renderer)}
+                    )
+                    continue
+
                 if cap_hit or overrun:
                     cut_short = "round_cap"
                     # `overrun` means a turn PAST the cap already started new work, so its tool
@@ -465,18 +488,7 @@ async def main(argv: list[str] | None = None) -> int:
                                     final_state = chunk
                                 else:
                                     _emit_new_alerts()
-                    break
-
-                interrupts = (pass_state or {}).get("__interrupt__")
-                if not interrupts:
-                    break
-                tracker.advance("clarifying")
-                # `interrupts[0]`, not all of them: the lead is a single agent node, so at
-                # most one is ever pending, and `Command(resume=...)` delivers ONE value —
-                # fanning several into one decisions list would mis-pair them.
-                stream_input = Command(
-                    resume={"decisions": await _answer_questions(interrupts[0], renderer)}
-                )
+                break
     except TimeoutError as exc:
         # `clock.expired()`, not a bare `except TimeoutError`: a timeout raised INSIDE the
         # run (an `asyncio.wait_for` in a tool, say) would otherwise be reported as "the wall
