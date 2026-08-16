@@ -3,6 +3,7 @@
 from langchain_core.tools import BaseTool
 
 import harness.tools
+from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from harness.tools import build_tools
 
@@ -85,3 +86,28 @@ def test_tools_are_langchain_base_tools_with_content_and_artifact(make_config):
     for tool in [*tool_sets.lead, *tool_sets.reader]:
         assert isinstance(tool, BaseTool)
         assert tool.response_format == "content_and_artifact"
+
+
+def test_one_run_log_instance_reaches_every_tool_builder(make_config, monkeypatch):
+    """The docstring's "ONE `run_log` is shared" claim, asserted rather than trusted.
+
+    A second `RunLog()` built for any one builder would fragment the incidents the report
+    and terminal disclose, and every existing test would still pass.
+    """
+    config = make_config()
+    run_log = RunLog()
+    seen: dict[str, object] = {}
+
+    for name in ("build_search_tool", "build_fallback_tool", "build_fetch_tool"):
+        real = getattr(harness.tools, name)
+
+        def _spy(*args, _name=name, _real=real, **kwargs):
+            seen[_name] = args[-1]
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(f"harness.tools.{name}", _spy)
+
+    build_tools(config, SourceRegistry(), run_log)
+
+    assert set(seen) == {"build_search_tool", "build_fallback_tool", "build_fetch_tool"}
+    assert all(log is run_log for log in seen.values())
