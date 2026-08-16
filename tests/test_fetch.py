@@ -119,6 +119,66 @@ async def test_equivalent_url_spellings_are_fetched_once_with_one_source_id(
     assert content.count(f"## [{pages[0].source_id}]") == 1
 
 
+async def test_merging_a_differently_shaped_url_records_a_disclosed_incident(
+    install_crawler, make_config
+):
+    """A dropped spelling that names a different document form must not vanish silently.
+
+    arxiv's abs and pdf paths canonicalize to one key, so asking for both fetches only the
+    first — the abstract when it is listed first. That is a real coverage loss and the
+    best-effort-plus-disclose invariant requires it reach the report, not just the log.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    run_log = RunLog()
+    results = [
+        _FakeResult(
+            "https://arxiv.org/abs/2405.11111",
+            markdown=_FakeMarkdown(raw_markdown="abstract", fit_markdown="abstract"),
+        ),
+    ]
+    fake_cls = install_crawler(results)
+
+    _, pages = await fetch._fetch(
+        ["https://arxiv.org/abs/2405.11111", "https://arxiv.org/pdf/2405.11111.pdf"],
+        config,
+        registry,
+        run_log,
+    )
+
+    assert fake_cls.calls[0].urls == ["https://arxiv.org/abs/2405.11111"]
+    assert len(pages) == 1
+    merged = [incident for incident in run_log.incidents() if incident.kind == "urls_merged"]
+    assert len(merged) == 1
+    assert "https://arxiv.org/pdf/2405.11111.pdf" in merged[0].detail
+    assert "https://arxiv.org/abs/2405.11111" in merged[0].detail
+
+
+async def test_merging_an_equivalent_spelling_records_no_incident(install_crawler, make_config):
+    """Trailing slash, fragment and tracking params name the same document — nothing is lost.
+
+    Recording those would bury the arxiv case above in noise on every ordinary run.
+    """
+    config = make_config()
+    run_log = RunLog()
+    results = [
+        _FakeResult(
+            "https://dup.test/a",
+            markdown=_FakeMarkdown(raw_markdown="one", fit_markdown="one"),
+        ),
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(
+        ["https://dup.test/a", "https://dup.test/a/#frag", "https://dup.test/a?utm_source=x"],
+        config,
+        SourceRegistry(),
+        run_log,
+    )
+
+    assert [incident for incident in run_log.incidents() if incident.kind == "urls_merged"] == []
+
+
 async def test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text(
     install_crawler, make_config
 ):
@@ -300,6 +360,30 @@ async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(install_cr
 
     recorded = fake_cls.calls[0].config
     assert set(recorded.excluded_tags) >= {"nav", "header", "footer", "aside", "script"}
+    assert isinstance(recorded.markdown_generator, DefaultMarkdownGenerator)
+    assert isinstance(recorded.markdown_generator.content_filter, PruningContentFilter)
+
+
+async def test_pdf_batch_gets_the_same_boilerplate_stripping_as_the_html_batch(
+    install_crawler, make_config
+):
+    """Without an explicit generator crawl4ai falls back to an unfiltered default.
+
+    That left running headers, footers and page numbers in every PDF source, against this
+    module's own "boilerplate-stripped markdown" contract.
+    """
+    config = make_config()
+    results = [
+        _FakeResult(
+            "https://a.test/paper.pdf",
+            markdown=_FakeMarkdown(raw_markdown="text", fit_markdown="text"),
+        )
+    ]
+    fake_cls = install_crawler(results)
+
+    await fetch._fetch(["https://a.test/paper.pdf"], config, SourceRegistry(), RunLog())
+
+    recorded = fake_cls.calls[0].config
     assert isinstance(recorded.markdown_generator, DefaultMarkdownGenerator)
     assert isinstance(recorded.markdown_generator.content_filter, PruningContentFilter)
 
@@ -965,7 +1049,9 @@ async def test_empty_pdf_extraction_writes_a_stub_and_never_fetched_or_non_html(
     )
 
     page = message.artifact[0]
-    assert page.outcome not in ("fetched", "non_html")
+    # Exactly "error": `classify` is deterministic for an empty extraction, so accepting
+    # "blocked" or "timeout" too would let a real reclassification pass unnoticed.
+    assert page.outcome == "error"
     text = (sources_dir(config, registry) / f"{page.source_id}.md").read_text(encoding="utf-8")
     assert text.splitlines()[0] == f"FETCH FAILED: {page.outcome}"
 

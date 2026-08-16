@@ -18,11 +18,12 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
-from harness.runlog import RunLog
+from harness.runlog import RunLog, or_default
 from harness.sources import (
     FETCH_FAILED_PREFIX,
     SourceRegistry,
     is_failed_capture,
+    names_a_different_document,
     normalize_url,
     note_digest_candidate,
     sources_dir,
@@ -268,6 +269,23 @@ def _failure_detail(page: FetchedPage) -> str:
     return f"[{page.source_id}] {page.url}: {' — '.join(bits)}"
 
 
+def _no_result_page(url: str, registry: SourceRegistry) -> FetchedPage:
+    """The page recorded when a batch comes back short one result.
+
+    Both batches pair their results positionally, and both must answer a missing slot the
+    same way — a URL the caller asked for always gets a `FetchedPage`, never a hole.
+    """
+    return FetchedPage(
+        source_id=registry.add(url),
+        url=url,
+        outcome="error",
+        status_code=None,
+        title=None,
+        markdown="",
+        error="no result returned for this URL",
+    )
+
+
 async def _fetch(
     urls: list[str], config: HarnessConfig, registry: SourceRegistry, run_log: RunLog
 ) -> tuple[str, list[FetchedPage]]:
@@ -284,13 +302,20 @@ async def _fetch(
 
     # Crawl each canonical URL once: the registry dedups by normalized URL, so two spellings
     # would otherwise render duplicate [Sn] headings over different bodies.
-    seen: set[str] = set()
+    survivor_by_key: dict[str, str] = {}
     unique_urls: list[str] = []
     for url in urls:
         normalized = normalize_url(url)
-        if normalized not in seen:
-            seen.add(normalized)
+        survivor = survivor_by_key.get(normalized)
+        if survivor is None:
+            survivor_by_key[normalized] = url
             unique_urls.append(url)
+        elif names_a_different_document(url, survivor):
+            # A merge that costs coverage: arxiv's abs/html/pdf paths share one canonical key,
+            # so asking for the abstract and the PDF together fetches only whichever came
+            # first. The caller gets one block where it asked for two, and without this the
+            # drop reaches no disclosure surface at all.
+            run_log.record("urls_merged", f"{url} merged into {survivor}; only the latter was read")
     urls = unique_urls
     if not urls:
         return "", []
@@ -329,15 +354,7 @@ async def _fetch(
 
         for url, result in _pair(playwright_urls, results):
             if result is None:
-                pages_by_url[url] = FetchedPage(
-                    source_id=registry.add(url),
-                    url=url,
-                    outcome="error",
-                    status_code=None,
-                    title=None,
-                    markdown="",
-                    error="no result returned for this URL",
-                )
+                pages_by_url[url] = _no_result_page(url, registry)
                 continue
 
             markdown = _markdown_of(result)
@@ -368,6 +385,10 @@ async def _fetch(
         pdf_run_config = CrawlerRunConfig(
             page_timeout=config.fetch.page_timeout_ms,
             scraping_strategy=pdf_scraping_strategy_cls(),
+            # Same generator as the HTML batch: crawl4ai's fallback is an unfiltered
+            # `DefaultMarkdownGenerator`, which left every PDF's running headers, footers and
+            # page numbers in the text this module promises is boilerplate-stripped.
+            markdown_generator=DefaultMarkdownGenerator(content_filter=PruningContentFilter()),
             cache_mode=CacheMode.BYPASS,
             stream=False,
             verbose=False,
@@ -382,15 +403,7 @@ async def _fetch(
 
         for url, result in _pair(pdf_batch_urls, pdf_results):
             if result is None:
-                pages_by_url[url] = FetchedPage(
-                    source_id=registry.add(url),
-                    url=url,
-                    outcome="error",
-                    status_code=None,
-                    title=None,
-                    markdown="",
-                    error="no result returned for this URL",
-                )
+                pages_by_url[url] = _no_result_page(url, registry)
                 continue
 
             markdown = _markdown_of(result)
@@ -442,7 +455,7 @@ def build_fetch_tool(
     """
     sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
-    log = run_log if run_log is not None else RunLog()
+    log = or_default(run_log)
     max_urls = config.fetch.max_urls_per_call
 
     class FetchPagesInput(BaseModel):

@@ -27,7 +27,7 @@ model = "gpt-5.6-luna"
 [fetch]
 page_timeout_ms = 15000
 max_concurrency = 5
-per_page_char_cap = 12000
+per_page_char_cap = 120000  # ~30k tokens per source at ~4 chars/token
 max_urls_per_call = 5  # bounds one fetch_pages call, not the run (R9/D11)
 
 [search]

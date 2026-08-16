@@ -79,8 +79,12 @@ class FetchSettings(_StrictModel):
     # where 0 or a negative is nonsense.
     page_timeout_ms: int = Field(default=15000, gt=0)
     max_concurrency: int = Field(default=5, gt=0)
-    per_page_char_cap: int = Field(default=12000, gt=0)
-    # Judgment, not a measured optimum (D1): bounds one call to ~15k tokens at the current
+    # ~30k tokens of one page at roughly 4 chars per token. A character cap, not a token
+    # cap: exact token counting would need a tokenizer and a choice of whose, and four model
+    # roles are declared. Raised from 12000 now that page reading is delegated, so a long
+    # source reaches the reader whole instead of truncated mid-argument.
+    per_page_char_cap: int = Field(default=120000, gt=0)
+    # Judgment, not a measured optimum (D1): bounds one call to ~150k tokens at the current
     # per-page cap. Bounds one `fetch_pages` call, never the run (R9/D11).
     max_urls_per_call: int = Field(default=5, gt=0)
 
