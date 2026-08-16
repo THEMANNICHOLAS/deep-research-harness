@@ -13,12 +13,13 @@
   expiry) writes no report and exits nonzero (PLAN-fail-fast-and-pinned-checklist). On a
   TTY the run renders as a full-screen TUI: pinned todo checklist over a scrolling event
   log, post-run summary on the normal terminal. All seven phases of
-  docs/plans/PLAN-research-loop.md are built. The reader tier is now wired
-  (docs/plans/PLAN-reader-delegation.md): the lead delegates page reading to a declared
-  `reader` subagent rather than fetching directly, a bounded-retry `fetch_raw` fallback
-  recovers a failed or empty digest, and the report discloses which sources were digested,
-  fell back raw, or went unread. The researcher tier remains only a frozen prompt contract —
-  nothing delegates to it yet.
+  docs/plans/PLAN-research-loop.md are built. The hierarchy is now three tiers deep
+  (docs/plans/source-hygiene-and-hierarchy/PLAN-Phase2-agent-hierarchy.md): the lead plans
+  research angles and dispatches parallel `researcher` subagents, each of which searches the
+  web and delegates page reading to its own nested `reader` subagent, with a bounded-retry
+  `fetch_raw` fallback recovering a failed or empty digest. The report discloses which sources
+  were digested, fell back raw, or went unread, read strictly from the registry's own state
+  regardless of which tier fetched them.
 - **Integrations:** SearXNG (local Docker instance checked in at
   @searxng/docker-compose.yml, JSON API enabled — a stock container is HTML-only
   and will not work), crawl4ai over
@@ -62,6 +63,7 @@
 | Claim verification | @harness/verify.py | `verify_paragraphs` — one pooled model call per paragraph, judging it against all its cited sources together |
 | Report assembly | @harness/report.py | `RunOutcome` + `write_report` — per-paragraph `Sources:`/`Verdict:` rendering, disclosure sections |
 | Prompt loader | @harness/prompts.py | Loads/renders `harness/prompts/*.md` `$variable` templates |
-| Reader wiring | @harness/agent.py | Declares the `reader` `SubAgent` spec and routes the shared `fetch_pages` instance to it — the lead's only route to page content |
-| Researcher contract | @harness/prompts/subagent.md | Frozen researcher delegation contract — still unwired |
+| Reader wiring | @harness/agent.py | `_reader_spec` — declares the `reader` `SubAgent`, nested one level under the researcher, never dispatched by the lead directly |
+| Researcher wiring | @harness/agent.py | `_researcher_spec` — declares the `researcher` `SubAgent`, the lead's only `subagents` entry; nests `_reader_spec` via `SubAgentMiddleware` and owns `search_web`/`fetch_raw` |
+| Researcher contract | @harness/prompts/subagent.md | The researcher's rendered system prompt (angle research + delegated reading) |
 | Tool registry | @harness/tools/ | `build_tools` and the per-tool `build_<name>_tool` factories |

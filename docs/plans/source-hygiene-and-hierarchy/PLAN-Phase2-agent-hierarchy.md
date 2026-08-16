@@ -15,7 +15,7 @@ Codebase Map (deepagents nesting facts), and Design Decisions D5–D7.
 - [x] Step 1: Live model & rate-limit checks
 - [x] Step 2: Role keys and routing
 - [x] Step 3: Researcher tier wiring
-- [ ] Step 4: Disclosures end-to-end
+- [x] Step 4: Disclosures end-to-end
 - [ ] Step 5: Consolidated verification verdict
 - [ ] Phase verification
 
@@ -183,7 +183,7 @@ exists, including the task-tool config; see Reconciliations.)
   structure, not reader-facing).
 
 **Tests (write first, confirm red):**
-- [ ] A scripted 3-tier run's report discloses digested / fallback / unread counts that
+- [x] A scripted 3-tier run's report discloses digested / fallback / unread counts that
   match the registry state (the wiring test `test_report.py` alone cannot prove).
 
 **Details:**
@@ -318,3 +318,16 @@ never add a section below it. -->
 - Watch-next: Step 4 proves R7 disclosures at the report boundary end-to-end and reconciles
   docs/INDEX.md + CLAUDE.md to the 3-tier reality; add the researcher interrupt_on test pin
   while in there. Then Step 5 (consolidated verdict) before the live run.
+
+### 2026-08-16 — Step 4: Disclosures end-to-end
+- Done: End-to-end mixed digested/unread disclosure proven against the WRITTEN report text
+  (test_delegation_e2e.py); report.py needed no change (the plan's predicted outcome — both
+  new tests were immediate-green regression pins, disclosed). Researcher interrupt_on pin
+  added; docs/INDEX.md + CLAUDE.md reconciled to the 3-tier, four-role reality. 424 green,
+  gates clean after one orchestrator lint wrap.
+- Learned: Step 4's live-run acceptance box and the phase's ## Verification live run are the
+  same event — sequenced after Step 5 so it exercises the finished phase.
+- Drift: none.
+- Watch-next: Step 5 (consolidated verification verdict) — verify.py gains ONE pooled
+  consolidation call on the verifier role; report.py drops per-paragraph Sources:/Verdict:
+  from ## Answer and renders the reviewer paragraph under ## Sources. Then the live run.
