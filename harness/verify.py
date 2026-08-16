@@ -17,7 +17,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
-from harness.paragraphs import Paragraph
+from harness.paragraphs import Paragraph, renders_content
 from harness.prompts import render
 from harness.sources import SourceRegistry, is_failed_capture, sources_dir
 
@@ -55,6 +55,10 @@ class VerificationResult(BaseModel):
 
     verdicts: list[ParagraphVerdict] = Field(default_factory=list)
     check_failures: list[str] = Field(default_factory=list)
+    # A consolidated, prose reviewer-analysis paragraph over ALL per-paragraph verdicts
+    # (Phase 2 Step 5). Additive: `None` means the consolidation pass never ran, was skipped
+    # (zero verdicts), or failed — the per-paragraph verdicts above are unaffected either way.
+    reviewer_summary: str | None = None
 
 
 class VerifyError(Exception):
@@ -89,6 +93,31 @@ def _parse_reply(content: str) -> tuple[Verdict, str, bool, list[int]]:
         item for item in raw_items if isinstance(item, int) and not isinstance(item, bool)
     ]
     return verdict, detail, sources_conflict, unsupported_items
+
+
+def _format_verdicts_block(paragraphs: list[Paragraph], verdicts: list[ParagraphVerdict]) -> str:
+    """One line per verdict, naming its paragraph number, verdict, detail, and cited sources.
+
+    The consolidator must be able to NAME each not-fully-supported claim (the whole point of
+    this step), so every field it would need to do that is here — not just the verdict value.
+
+    Numbered by `renders_content` (D1), NOT by raw list position: `report.py`'s `_answer_section`
+    drops an empty-rendering paragraph's block entirely (a citation-only paragraph strips to no
+    visible text), so counting it here would misattribute the reviewer's number to whatever
+    paragraph follows it — the reader's only pointer to a claim now that no per-paragraph
+    `Verdict:` line survives in `## Answer`.
+    """
+    lines = []
+    number = 0
+    for paragraph, verdict in zip(paragraphs, verdicts, strict=True):
+        if not renders_content(paragraph):
+            continue
+        number += 1
+        sources = ", ".join(verdict.source_ids) if verdict.source_ids else "none"
+        lines.append(
+            f"Paragraph {number}: {verdict.verdict} - {verdict.detail} (sources: {sources})"
+        )
+    return "\n".join(lines)
 
 
 async def verify_paragraphs(
@@ -202,4 +231,21 @@ async def verify_paragraphs(
             )
             check_failures.append(f"{type(exc).__name__}: {exc}")
 
-    return VerificationResult(verdicts=verdicts, check_failures=check_failures)
+    reviewer_summary: str | None = None
+    if verdicts:  # D-E: zero verdicts makes no consolidation call at all
+        try:
+            block = _format_verdicts_block(paragraphs, verdicts)
+            rendered = render("verify_summary", verdicts=block)
+            reply = await model.ainvoke([HumanMessage(content=rendered)])
+            summary = str(reply.content).strip()
+            if summary:  # D-C: empty/whitespace-only reads as "no summary"
+                reviewer_summary = summary
+        except Exception as exc:  # noqa: BLE001 — consolidation is best-effort (D-D)
+            # Prefixed, unlike a per-paragraph failure's bare message: both land in the same
+            # `check_failures` list (`## Gaps and disclosures` prints them identically), and an
+            # unprefixed one here would read as a paragraph that went unchecked when none did.
+            check_failures.append(f"consolidated summary: {type(exc).__name__}: {exc}")
+
+    return VerificationResult(
+        verdicts=verdicts, check_failures=check_failures, reviewer_summary=reviewer_summary
+    )

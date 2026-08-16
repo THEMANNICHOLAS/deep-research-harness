@@ -28,7 +28,6 @@ from harness.report import (
     _NO_ANSWER_TEXT,
     _ROUND_CAP_TEXT,
     _WALL_CLOCK_TEXT,
-    VERDICT_LABEL,
 )
 from harness.sources import SourceRegistry
 from tests.conftest import (
@@ -1424,7 +1423,11 @@ async def test_max_rounds_counts_model_turns_not_supersteps(
         content="Answered after exactly one tool round.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([one_round, final])
+    # A third reply for verification's Phase 2 Step 5 consolidation call: the answer cites
+    # nothing, so it is the pass's only model call (`patch_run` binds every role to this one
+    # model), made right after these two agent-loop turns.
+    consolidation = AIMessage(content="Nothing was cited, so nothing was checked.")
+    model = scripted_model([one_round, final, consolidation])
     patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["a question needing one round"])
@@ -1439,8 +1442,10 @@ async def test_max_rounds_counts_model_turns_not_supersteps(
     if expect_cut_short:
         assert _ROUND_CAP_TEXT in body
         # The synthesis instruction actually reached the model as the resumed thread's last
-        # human message, rather than the answer arriving by script-order coincidence.
-        last_call = model._received_messages[-1]
+        # human message, rather than the answer arriving by script-order coincidence. It is
+        # the SECOND of exactly two agent-loop model calls (the docstring's own pinned count):
+        # the third, scripted separately above, is verification's consolidation call.
+        last_call = model._received_messages[1]
         assert any(
             main_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
             for message in last_call
@@ -1901,7 +1906,13 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     model = scripted_model([partial, *([keep_going] * 20)])
     patch_run(monkeypatch, config, model)
 
-    verify_model = scripted_model([verify_reply("not_supported", "The capture reads $5.10.")])
+    verify_model = scripted_model(
+        [
+            verify_reply("not_supported", "The capture reads $5.10."),
+            # The consolidation call (Phase 2 Step 5), made after the per-paragraph loop.
+            AIMessage(content="One paragraph was not supported: the capture reads $5.10."),
+        ]
+    )
 
     # One patch target serves every caller now, so the verify client is told apart by ROLE
     # (Phase 1 Step 4 moved verification onto its own "verifier" role) rather than call order,
@@ -1917,9 +1928,10 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     body = Path(lines[-1].strip()).read_text(encoding="utf-8")
 
     assert _CUT_SHORT_HEADING in body, "this run was supposed to hit the round cap"
-    # The check actually ran on the cut-short path — not skipped, not defaulted.
-    assert verify_model._call_count == 1
-    assert f"{VERDICT_LABEL} not supported - The capture reads $5.10." in body
+    # The check actually ran on the cut-short path — not skipped, not defaulted — including
+    # its consolidation call (Phase 2 Step 5).
+    assert verify_model._call_count == 2
+    assert "One paragraph was not supported: the capture reads $5.10." in body
     # And R1's citation resolution still happened on the same partial answer.
     assert "https://example.test/pricing" in body
 

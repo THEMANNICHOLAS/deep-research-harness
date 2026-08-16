@@ -16,7 +16,7 @@ Codebase Map (deepagents nesting facts), and Design Decisions D5–D7.
 - [x] Step 2: Role keys and routing
 - [x] Step 3: Researcher tier wiring
 - [x] Step 4: Disclosures end-to-end
-- [ ] Step 5: Consolidated verification verdict
+- [x] Step 5: Consolidated verification verdict
 - [ ] Phase verification
 
 ## Steps
@@ -223,9 +223,9 @@ Step 3 moved the machinery, and to reconcile the docs.
   per-source verdicts.
 
 **Tests (write first, confirm red):**
-- [ ] The consolidation call runs on the `verifier` role and receives every per-paragraph
+- [x] The consolidation call runs on the `verifier` role and receives every per-paragraph
   verdict.
-- [ ] The rendered report has no `Sources:`/`Verdict:` lines inside `## Answer`, and the
+- [x] The rendered report has no `Sources:`/`Verdict:` lines inside `## Answer`, and the
   reviewer paragraph appears under `## Sources` naming each non-supported claim.
 
 **Details:**
@@ -331,3 +331,22 @@ never add a section below it. -->
 - Watch-next: Step 5 (consolidated verification verdict) — verify.py gains ONE pooled
   consolidation call on the verifier role; report.py drops per-paragraph Sources:/Verdict:
   from ## Answer and renders the reviewer paragraph under ## Sources. Then the live run.
+
+### 2026-08-16 — Step 5: Consolidated verification verdict
+- Done: ONE pooled consolidation call on the verifier role (reusing the client already built
+  for per-paragraph work) produces a prose reviewer paragraph carried as
+  `VerificationResult.reviewer_summary` and rendered under `## Sources`; per-paragraph
+  `Sources:`/`Verdict:` blocks are gone from `## Answer`. Per-paragraph verdicts still
+  computed and returned unchanged (frozen contract). 423 green, all gates clean.
+- Learned: the consolidator's "Paragraph N" numbering must match what a reader can COUNT in
+  the rendered `## Answer`, not raw list position — citation-only paragraphs render nothing,
+  so raw numbering pointed at the wrong claim (caught by 3F, fixed via the new shared
+  `renders_content` predicate in @harness/paragraphs.py). With per-claim verdicts gone from
+  `## Answer`, that prose anchor is the reader's ONLY pointer — it is load-bearing. Also:
+  consolidation is best-effort, its failure disclosed as `consolidated summary: ...` in
+  check_failures so it never reads as an unchecked paragraph.
+- Drift: none (D-A..D-E were orchestrator design decisions inside plan scope).
+- Watch-next: ALL implementation steps are done — only the phase's live end-to-end run
+  remains (needs SearXNG up and real model calls): researcher fan-out visible, disclosure
+  section plausible, and a run with a `partially supported` paragraph naming that claim in
+  the `## Sources` reviewer paragraph. Four items sit in the parent plan's Discoveries.
