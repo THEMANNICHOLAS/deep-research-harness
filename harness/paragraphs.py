@@ -62,6 +62,20 @@ def split_paragraphs(answer: str) -> list[Paragraph]:
     return paragraphs
 
 
+def renders_content(paragraph: Paragraph) -> bool:
+    """Whether `paragraph` renders any visible text in the report's `## Answer`.
+
+    Shared by `report.py` (which drops an empty block from the answer entirely) and
+    `verify.py` (whose consolidator numbers paragraphs by what a reader can actually count
+    there, not by raw list position) so the two agree (D1). A fenced code block always
+    renders; a prose/list block does not if `strip_markers` leaves nothing — a paragraph that
+    is nothing but a citation marker.
+    """
+    if paragraph.is_code:
+        return True
+    return bool(strip_markers(paragraph.text).strip())
+
+
 def strip_markers(text: str) -> str:
     """Remove every `[Sn]` marker from `text` and repair the whitespace it leaves.
 

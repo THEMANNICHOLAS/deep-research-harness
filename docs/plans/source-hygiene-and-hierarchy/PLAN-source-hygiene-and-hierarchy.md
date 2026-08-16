@@ -316,6 +316,18 @@ Append-only, empty at plan creation. -->
 - Pre-existing wording quirk (not this phase): `_UNREAD_HEADING`'s "fetch never succeeded"
   parenthetical in @harness/report.py is inaccurate for a crash-after-successful-fetch path.
 
+### 2026-08-16 — Phase 2 Step 5 (recorded)
+- Diff budget: 309+/426- across 6 files vs the planned ~80–150/4 (3F Major). Mostly the 8
+  superseded per-paragraph-verdict tests being removed plus two e2e files the extra model
+  call forced; recorded so the miss is visible rather than absorbed.
+- 3F simplify (deferred): `_paragraph_block` in @harness/report.py is now a two-line
+  is_code guard over `_paragraph_prose` — inlineable, but it touches the `_answer_section`
+  call site and the docstring recording the Step 5 change. Do it when that area is next open.
+- Orchestrator observation (deferred): `renders_content` in @harness/paragraphs.py documents
+  itself as shared by report.py and verify.py, but only verify.py calls it — report.py
+  filters falsy blocks on its own. Two mechanisms that must agree is how the off-by-N
+  consolidator anchor returns; point report.py's filter at the predicate when next open.
+
 ### 2026-08-15 — Phase 1 Step 1 (deferred)
 - Query re-encode asymmetry in `normalize_url` (@harness/sources.py): the query is
   re-encoded only when a tracking key was dropped, so `?q=a%20b&utm_source=1` → `q=a+b`

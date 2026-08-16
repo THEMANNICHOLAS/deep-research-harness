@@ -19,23 +19,13 @@ from harness.config import HarnessConfig, run_workspace_dir
 from harness.paragraphs import LIST_ITEM_RE, Paragraph, strip_markers
 from harness.runlog import Incident
 from harness.sources import Source, SourceRegistry, is_failed_capture, sources_dir
-from harness.verify import MODEL_VERDICTS, ParagraphVerdict, VerificationResult
+from harness.verify import ParagraphVerdict, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
 # Matches a markdown heading marker at the start of any line (per-line, not per-paragraph).
 _HEADING_RE = re.compile(r"^(#{1,6}) ", re.MULTILINE)
 
-# The one spelling of each per-paragraph label. Bold, and preceded by a blank line, because
-# an unstyled `Sources:` on the line right after the prose read as another sentence of the
-# paragraph rather than as machinery about it. Public so tests assert the rendered label
-# rather than re-spelling it.
-SOURCES_LABEL = "**Sources:**"
-VERDICT_LABEL = "**Verdict:**"
-# Two trailing spaces: markdown's hard line break. Without it `Sources:` and `Verdict:`
-# are one paragraph and a renderer joins them onto a single line; a blank line between
-# them instead would space the pair further apart than the paragraph it belongs to.
-_HARD_BREAK = "  "
 _NO_SOURCES_TEXT = "No usable sources were found for this run."
 _UNUSABLE_HEADING = "Not usable as evidence (fetch failed or capture missing):"
 
@@ -185,7 +175,9 @@ def partition_sources(
     return usable, unusable
 
 
-def _sources_section(config: HarnessConfig, registry: SourceRegistry) -> str:
+def _sources_section(
+    config: HarnessConfig, registry: SourceRegistry, reviewer_summary: str | None
+) -> str:
     usable, unusable = partition_sources(config, registry)
 
     lines: list[str] = []
@@ -199,6 +191,11 @@ def _sources_section(config: HarnessConfig, registry: SourceRegistry) -> str:
             lines.append("")
         lines.append(_UNUSABLE_HEADING)
         lines.extend(f"- [{source.id}] {registry.link(source.id)}" for source in unusable)
+
+    if reviewer_summary:
+        if lines:
+            lines.append("")
+        lines.append(reviewer_summary)
 
     return "\n".join(lines)
 
@@ -319,11 +316,6 @@ def _demote_headings(text: str) -> str:
     return _HEADING_RE.sub(_bump, text)
 
 
-def _verdict_label(verdict: str) -> str:
-    """The reader-facing spelling of a verdict."""
-    return verdict.replace("_", " ")
-
-
 def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> list[str]:
     """Marker-stripped, heading-demoted prose lines for `paragraph`, with a trailing ` *` on
     each bullet whose zero-based index is in `verdict.unsupported_items` (an out-of-range
@@ -355,62 +347,33 @@ def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> 
     return lines
 
 
-def _paragraph_block(
-    paragraph: Paragraph, verdict: ParagraphVerdict | None, registry: SourceRegistry
-) -> str:
-    """Render one paragraph: marker-stripped prose, a blank line, then the bold
-    `**Sources:**`/`**Verdict:**` pair when the paragraph cites at least one REGISTERED
-    source. Gated on citation alone, never on the verdict value, so a `supported`
-    paragraph gets a line like any other.
+def _paragraph_block(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> str:
+    """Render one paragraph: marker-stripped prose, with a trailing `*` on any bullet the
+    verdict named as unsupported. A fenced block is emitted verbatim — stripping markers
+    would corrupt the code.
 
-    A fenced block is emitted verbatim — stripping markers would corrupt the code — and it
-    cites nothing, so it carries no pair anyway.
+    Per-paragraph `Sources:`/`Verdict:` lines are no longer rendered here (Phase 2 Step 5):
+    that information now lives in the consolidated reviewer paragraph under `## Sources`.
     """
     if paragraph.is_code:
         return paragraph.text
-
-    lines = _paragraph_prose(paragraph, verdict)
-    registered = [sid for sid in paragraph.source_ids if registry.get(sid) is not None]
-    if not registered:
-        return "\n".join(lines)
-
-    links = " ".join(registry.link(sid) for sid in registered)
-    # Guarded, not unconditional: a paragraph that is nothing but a citation marker
-    # (`[S1]`) strips to no prose at all, and a separator with nothing above it opens the
-    # block with a blank line the joined answer does not need.
-    if lines:
-        lines.append("")
-    lines.append(f"{SOURCES_LABEL} {links}{_HARD_BREAK}")
-
-    if verdict is None:
-        label = "not verified"
-        detail = "verification did not run for this paragraph."
-    else:
-        label = _verdict_label(verdict.verdict)
-        detail = verdict.detail
-        # Only a MODEL verdict can carry a rollup: `not_verified` means no check ran, so
-        # "n/m bullets verified" would assert a count nothing measured. Counted over the
-        # bullets the reader can SEE — a citation-only bullet renders no line, so counting it
-        # would inflate the denominator past the list.
-        counted = [i for i, item in enumerate(paragraph.items) if strip_markers(item)]
-        if counted and verdict.verdict in MODEL_VERDICTS:
-            unsupported_count = len(set(verdict.unsupported_items) & set(counted))
-            detail = f"{len(counted) - unsupported_count}/{len(counted)} bullets verified. {detail}"
-    lines.append(f"{VERDICT_LABEL} {label} - {detail}")
-    return "\n".join(lines)
+    return "\n".join(_paragraph_prose(paragraph, verdict))
 
 
 def _answer_section(outcome: RunOutcome) -> str:
     """Render every paragraph in `outcome.paragraphs`, in order.
 
     Never re-splits `outcome.answer` (D2): `__main__.py` splits once and hands the list here.
+    An empty block (a citation-only paragraph strips to no visible text) is dropped from the
+    join entirely, not just left blank — joining it in would leave a stray blank paragraph
+    between its neighbors (3F review issue 2).
     """
     verdicts = outcome.verification.verdicts if outcome.verification is not None else []
     blocks = [
-        _paragraph_block(paragraph, verdicts[i] if i < len(verdicts) else None, outcome.registry)
+        _paragraph_block(paragraph, verdicts[i] if i < len(verdicts) else None)
         for i, paragraph in enumerate(outcome.paragraphs)
     ]
-    return "\n\n".join(blocks)
+    return "\n\n".join(block for block in blocks if block)
 
 
 def _conflicts_section(outcome: RunOutcome, verification: VerificationResult) -> str:
@@ -547,10 +510,13 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
     if gaps_text:
         lines += [_GAPS_HEADING, "", gaps_text, ""]
 
+    reviewer_summary = (
+        outcome.verification.reviewer_summary if outcome.verification is not None else None
+    )
     lines += [
         "## Sources",
         "",
-        _sources_section(config, outcome.registry),
+        _sources_section(config, outcome.registry, reviewer_summary),
         "",
     ]
 
@@ -565,10 +531,9 @@ def write_report(outcome: RunOutcome, config: HarnessConfig) -> Path:
     """Render `outcome` and write it to `<reports_dir>/YYYY-MM-DD-HHMMSS-<slug>.md`.
 
     Marker stripping is UNCONDITIONAL: every `[Sn]` leaves the prose on every run, registered
-    or not, so no bare marker survives into `## Answer` (R1). A registered source's link moves
-    onto its paragraph's `Sources:` line; an unregistered one is disclosed under `## Gaps and
-    disclosures`. `outcome.verification` gates only the `Verdict:` line's content — a real
-    verdict, or the deterministic "not verified".
+    or not, so no bare marker survives into `## Answer` (R1). An unregistered marker is
+    disclosed under `## Gaps and disclosures`. `outcome.verification`'s consolidated
+    `reviewer_summary`, when present, renders under `## Sources` (Phase 2 Step 5).
     """
     config.agent.reports_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now()

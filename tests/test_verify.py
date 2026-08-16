@@ -296,6 +296,8 @@ async def test_a_malformed_reply_unknown_verdict_and_raised_exception_all_contin
         verify_reply("bogus_verdict_value", "irrelevant"),
         verify_reply("supported", "unreachable placeholder"),
         verify_reply("supported", "The final paragraph checked out."),
+        # The consolidation call, made after the per-paragraph loop (Phase 2 Step 5).
+        AIMessage(content="Reviewer analysis prose."),
     ]
     model = _RaisesOnThirdCallModel(
         model="test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
@@ -304,7 +306,7 @@ async def test_a_malformed_reply_unknown_verdict_and_raised_exception_all_contin
 
     result = await verify_paragraphs(paragraphs, config, registry)
 
-    assert model._call_count == 4
+    assert model._call_count == 5
     verdicts = [v.verdict for v in result.verdicts]
     assert verdicts == ["not_verified", "not_verified", "not_verified", "supported"]
     assert result.verdicts[3].detail == "The final paragraph checked out."
@@ -325,7 +327,14 @@ async def test_a_failed_check_keeps_its_diagnostic_out_of_the_readers_verdict_de
     write_source_capture(config, registry, source_id, "Body text.")
     paragraph = _paragraph(f"A claim [{source_id}].", [source_id])
 
-    model = scripted_model([AIMessage(content="this is not json at all")])
+    model = scripted_model(
+        [
+            AIMessage(content="this is not json at all"),
+            # The consolidation call (Phase 2 Step 5), scripted to succeed so it adds no
+            # further entry to `check_failures`.
+            AIMessage(content="Reviewer analysis prose."),
+        ]
+    )
     monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
@@ -540,7 +549,8 @@ async def test_a_reply_wrapped_in_prose_is_still_parsed(make_config, scripted_mo
                     '"sources_conflict": false, "unsupported_items": []}\n'
                     "Let me know if you would like another pass."
                 )
-            )
+            ),
+            AIMessage(content="Reviewer analysis prose."),
         ]
     )
     monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
@@ -577,7 +587,7 @@ async def test_a_reply_wrapped_on_either_side_is_still_parsed(
     write_source_capture(config, registry, source_id, "The vendor quoted $4.20.")
     paragraph = _paragraph(f"The vendor quoted $4.20 [{source_id}].", [source_id])
 
-    model = scripted_model([AIMessage(content=content)])
+    model = scripted_model([AIMessage(content=content), AIMessage(content="Reviewer prose.")])
     monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
     result = await verify_paragraphs([paragraph], config, registry)
@@ -602,7 +612,10 @@ async def test_a_reply_omitting_unsupported_items_defaults_to_empty(
     paragraph = _paragraph(f"A claim [{source_id}].", [source_id])
 
     model = scripted_model(
-        [AIMessage(content='{"verdict": "not_supported", "detail": "The source disagrees."}')]
+        [
+            AIMessage(content='{"verdict": "not_supported", "detail": "The source disagrees."}'),
+            AIMessage(content="Reviewer prose."),
+        ]
     )
     monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
 
@@ -674,7 +687,8 @@ async def test_a_quoted_conflict_flag_reads_as_no_conflict(
                     '{"verdict": "supported", "detail": "The capture agrees.", '
                     '"sources_conflict": "false"}'
                 )
-            )
+            ),
+            AIMessage(content="Reviewer prose."),
         ]
     )
     monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
@@ -683,3 +697,142 @@ async def test_a_quoted_conflict_flag_reads_as_no_conflict(
 
     assert result.verdicts[0].sources_conflict is False
     assert result.check_failures == []
+
+
+# --- Phase 2 Step 5: consolidated reviewer summary --------------------------------------
+
+
+async def test_the_consolidation_call_runs_on_the_verifier_role_and_sees_every_verdict(
+    make_config, patch_models_by_role
+):
+    """One extra call after the per-paragraph loop, on the SAME verifier client, carrying
+    every verdict's literal and detail so the consolidator can name each unsupported claim.
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Body one.")
+    write_source_capture(config, registry, id2, "Body two.")
+    paragraphs = [
+        _paragraph(f"First claim [{id1}].", [id1]),
+        _paragraph(f"Second claim [{id2}].", [id2]),
+    ]
+
+    head_model = ScriptedChatModel(
+        model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([])
+    verifier_model = ScriptedChatModel(
+        model="verifier-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script(
+        [
+            verify_reply("supported", "UNIQUE_DETAIL_ONE"),
+            verify_reply("not_supported", "UNIQUE_DETAIL_TWO"),
+            AIMessage(content="Reviewer analysis prose."),
+        ]
+    )
+    patch_models_by_role({"head": head_model, "verifier": verifier_model})
+
+    result = await verify_paragraphs(paragraphs, config, registry)
+
+    assert head_model._call_count == 0
+    assert verifier_model._call_count == 3
+    last_prompt = _flatten(verifier_model._received_messages[-1])
+    assert "supported" in last_prompt
+    assert "UNIQUE_DETAIL_ONE" in last_prompt
+    assert "not_supported" in last_prompt
+    assert "UNIQUE_DETAIL_TWO" in last_prompt
+    assert result.reviewer_summary == "Reviewer analysis prose."
+
+
+async def test_the_consolidation_numbering_skips_paragraphs_that_render_no_text(
+    make_config, scripted_model, monkeypatch
+):
+    """A citation-only paragraph renders nothing in `## Answer` (report.py drops its empty
+    block entirely), so it must not consume a number the reviewer paragraph then
+    misattributes to the paragraph that follows it — the reader's only pointer to a claim
+    once the per-paragraph `Verdict:` line is gone (3F review issue 1).
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    id1 = registry.add("https://example.test/one")
+    id2 = registry.add("https://example.test/two")
+    write_source_capture(config, registry, id1, "Body one.")
+    write_source_capture(config, registry, id2, "Body two.")
+    # Cites a REGISTERED source, so it still gets a real model call and verdict, but strips to
+    # no visible text at all — `report.py`'s `_answer_section` drops its block entirely.
+    citation_only = _paragraph(f"[{id1}]", [id1])
+    later = _paragraph(f"The gauge read 42 psi [{id2}].", [id2])
+
+    model = scripted_model(
+        [
+            verify_reply("supported", "The citation-only paragraph checks out."),
+            verify_reply("partially_supported", "The gauge reading is only partly confirmed."),
+            AIMessage(content="Reviewer prose."),
+        ]
+    )
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
+
+    await verify_paragraphs([citation_only, later], config, registry)
+
+    consolidation_prompt = _flatten(model._received_messages[-1])
+    # The reader can only count ONE paragraph in `## Answer` — the citation-only one renders
+    # nothing — so the partially-supported one must be named "Paragraph 1", not "Paragraph 2".
+    assert "Paragraph 1: partially_supported" in consolidation_prompt
+    assert "Paragraph 2" not in consolidation_prompt
+
+
+async def test_zero_paragraph_run_makes_no_consolidation_call(
+    make_config, scripted_model, monkeypatch
+):
+    config = make_config()
+    registry = SourceRegistry()
+
+    model = scripted_model([])
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([], config, registry)
+
+    assert model._call_count == 0
+    assert result.reviewer_summary is None
+    assert result.verdicts == []
+
+
+async def test_a_raising_consolidation_call_leaves_verdicts_intact_and_records_a_check_failure(
+    make_config, monkeypatch
+):
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "Body text.")
+    paragraph = _paragraph(f"A claim [{source_id}].", [source_id])
+
+    class _RaisesOnSecondCallModel(ScriptedChatModel):
+        async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+            if self._call_count == 1:
+                self._received_messages.append(list(messages))
+                self._call_count += 1
+                raise RuntimeError("consolidation outage")
+            return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    model = _RaisesOnSecondCallModel(
+        model="test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([verify_reply("supported", "Confirmed.")])
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert len(result.verdicts) == 1
+    assert result.verdicts[0].verdict == "supported"
+    assert result.verdicts[0].detail == "Confirmed."
+    assert result.reviewer_summary is None
+    assert len(result.check_failures) == 1
+    # Prefixed (3F review issue 3): an unprefixed message here reads identically to a
+    # per-paragraph failure under "## Gaps and disclosures", telling a reader a paragraph went
+    # unchecked when none did.
+    assert result.check_failures[0].startswith("consolidated summary: ")
+    assert "RuntimeError" in result.check_failures[0]

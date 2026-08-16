@@ -79,6 +79,9 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
                 )
             ),
             verify_reply("supported", "The capture confirms the digest's claim."),
+            # Verification's Phase 2 Step 5 consolidation call, made right after the one
+            # per-paragraph verify call above (this scenario's answer is a single paragraph).
+            AIMessage(content="One paragraph was checked and fully supported."),
         ]
     )
     researcher_model = ScriptedChatModel(
@@ -373,9 +376,9 @@ async def test_verification_reads_the_capture_file_not_the_reader_digest(
     result = await _run_delegation(make_config, patch_models_by_role, monkeypatch, install_crawler)
 
     head_model = result["head_model"]
-    # Script order: task call, final synthesis, verify reply -- the verify call is the model's
-    # LAST invocation.
-    verify_messages = head_model._received_messages[-1]
+    # Script order: task call, final synthesis, verify reply, consolidation reply -- the
+    # per-paragraph verify call is the model's third invocation (index 2).
+    verify_messages = head_model._received_messages[2]
     verify_text = _flatten(verify_messages)
 
     assert _CAPTURE_MARKER in verify_text
