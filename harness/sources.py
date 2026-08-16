@@ -16,7 +16,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict
 
@@ -157,10 +157,12 @@ def normalize_url(url: str) -> str:
             for key, value in pairs
             if key not in _TRACKING_PARAMS and not key.startswith("utm_")
         ]
-        if len(kept) != len(pairs):
-            # Only re-encode a query we actually changed — re-encoding an untouched query
-            # risks a gratuitous formatting difference from the original.
-            query = urlencode(kept)
+        # Re-encode unconditionally, not just when a param was dropped: a conditional
+        # rebuild makes the canonical form depend on which branch ran, so the same page
+        # with and without a tracking param normalized to `q=hello%20world` vs
+        # `q=hello+world` and minted two IDs. `quote_via=quote` (not the `quote_plus`
+        # default) keeps a space as `%20`, matching how an untouched query already reads.
+        query = urlencode(kept, quote_via=quote)
 
     if hostname in _ARXIV_HOSTS:
         match = _ARXIV_PATH_RE.match(path)
@@ -170,6 +172,23 @@ def normalize_url(url: str) -> str:
             path = f"/abs/{match['work']}"
 
     return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def names_a_different_document(url: str, other: str) -> bool:
+    """Whether two URLs that share a canonical form still name different documents.
+
+    Trailing slash, fragment, case and tracking params rewrite the same page's address, so
+    collapsing them costs nothing. The arxiv rule is the one that merges genuinely different
+    documents — `/abs/<work>` is an abstract, `/pdf/<work>.pdf` the full text — and a caller
+    that asked for both gets only one. Path is the discriminator: everything else this
+    function's callers merge leaves the path alone.
+    """
+    try:
+        path = urlsplit(url).path.rstrip("/").lower()
+        other_path = urlsplit(other).path.rstrip("/").lower()
+    except ValueError:
+        return False
+    return path != other_path
 
 
 class Source(BaseModel):

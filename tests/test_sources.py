@@ -328,6 +328,31 @@ def test_surviving_query_keys_preserve_original_order():
 
 
 @pytest.mark.parametrize(
+    ("bare", "tracked"),
+    [
+        (
+            "https://example.com/a?q=hello%20world",
+            "https://example.com/a?q=hello%20world&utm_source=x",
+        ),
+        ("https://example.com/a?q=hello+world", "https://example.com/a?fbclid=1&q=hello+world"),
+        ("https://example.com/a?path=x%2Fy", "https://example.com/a?path=x%2Fy&gclid=9"),
+    ],
+)
+def test_percent_encoded_query_values_still_dedup_against_the_tracked_spelling(bare, tracked):
+    """Normalization must not depend on whether a tracking param was present to strip.
+
+    Re-encoding only the stripped branch made the canonical form branch-dependent: the bare
+    URL kept `%20` while the tracked one came back `+`, so the two spellings of one page
+    minted two `Sn` IDs — the duplicate-source defect R1 exists to prevent.
+    """
+    registry = SourceRegistry()
+
+    assert normalize_url(bare) == normalize_url(tracked)
+    assert registry.add(bare) == registry.add(tracked)
+    assert len(registry.all()) == 1
+
+
+@pytest.mark.parametrize(
     ("url_a", "url_b"),
     [
         ("https://arxiv.org/abs/2405.11111", "https://arxiv.org/abs/2405.22222"),
