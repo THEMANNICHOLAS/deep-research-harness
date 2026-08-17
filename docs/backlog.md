@@ -124,3 +124,75 @@ to address.
   can only bucket a fallback, not explain it (PR #13 review). To address: an optional
   `read_reason` on @harness/sources.py's `Source`, set alongside `mark_read("fallback")`
   and rendered after the link in @harness/report.py's `_read_modes_section`.
+
+The entries below come from a read-only code audit on 2026-08-17 (everything except
+`harness/tools/fetch.py`, under active work in another session). Code-reading findings,
+not observed failures — none has been reproduced against a live run.
+
+- **A resolved API key sits in a plain `str` field and prints everywhere.** After
+  `_resolve_api_key` runs, `ProviderConfig.api_key` (@harness/config.py) holds the live
+  secret in a field with default repr/dump behavior, so `repr(config)`, `model_dump()`, or
+  a logged `ValidationError` emits it — the file boundary is guarded (a literal `api_key`
+  in TOML is rejected) while the object boundary is not. The same design breaks
+  round-tripping: `model_validate(config.model_dump())` raises, because the dump carries
+  the truthy `api_key` the before-validator rejects. Latent until config reaches a log, a
+  traceback, or a serialized boundary. To address: `SecretStr`, or
+  `Field(repr=False, exclude=True)` — the exclude also fixes the round-trip.
+
+- **`SourceRegistry.link` emits unescaped URLs into markdown.** @harness/sources.py renders
+  `[label](url)` verbatim, so a URL containing an unbalanced `)` (query strings, redirect
+  wrappers) closes the link early and bleeds the remainder into the surrounding prose.
+  This now reaches four report surfaces: per-paragraph `Sources:` lines, `## Sources`,
+  `## Source reading`, and `## Conflicting sources` (@harness/report.py). Balanced parens
+  (Wikipedia's `Python_(programming_language)`) survive CommonMark; the unbalanced case
+  does not, and URLs here are model- and web-supplied. To address: percent-encode `(`, `)`,
+  and space in the href at render time, leaving `Source.url` itself canonical.
+
+- **The search HTTP timeout is httpx's implicit 5s default.** `_fetch_search_json`
+  (@harness/tools/search.py) builds a bare `httpx.AsyncClient()`, so nothing in
+  @harness.toml governs how long a search or the startup `preflight_search` may take —
+  unlike `fetch.page_timeout_ms` and `agent.request_timeout_seconds`, which are both
+  config-driven. A SearXNG fan-out across slow upstream engines can legitimately exceed
+  5s, and the result is `SearchFailure(reason="unreachable")` — which also feeds the
+  `max_consecutive_failures` abort counter, so a merely slow backend can read as a dead
+  one and end the run. To address: a `timeout_ms` (or reuse of a shared timeout key) on
+  `SearchSettings`, passed into the client.
+
+- **The `verifier` role is required in practice but not by config validation.**
+  `_cross_check_roles` (@harness/config.py) requires only `head` and `subagent`, yet
+  `_PREFLIGHT_ROLES` in @harness/__main__.py, `verify_paragraphs` (@harness/verify.py),
+  and the run-metadata lines in @harness/report.py all consume `roles.verifier`
+  unconditionally. A config missing `[roles.verifier]` loads cleanly and then fails at
+  preflight as a `ModelError` — caught and readable, but it is exactly the class of gap R7
+  wants surfaced as a startup `ConfigError` naming the field. To address: add `verifier`
+  to the required-roles tuple (and its absence to a config test).
+
+- **CLAUDE.md's model-routing story has drifted from the code.** The project docs state
+  routing as "orchestrator, fallback, worker" with "GLM 5.2 default orchestrator, DeepSeek
+  V4 Pro fallback", but the implemented roles are `head`/`subagent`/`verifier`
+  (@harness/config.py, @harness.toml) with head = deepseek-v4-pro and no fallback role or
+  retry-to-second-model mechanism anywhere. This bites anyone (or any session) planning
+  against the documented invariant. To address: reconcile CLAUDE.md and @docs/INDEX.md to
+  the roles that exist, and decide separately whether a fallback model is still wanted —
+  if so it is new machinery, not a config key.
+
+- **Report token usage undercounts on runs that trigger summarization.** `_sum_usage`
+  (@harness/__main__.py) sums `usage_metadata` over the FINAL state's messages, but the
+  summarization middleware (trigger: 200k tokens, @harness/agent.py) evicts older messages
+  from state — taking their usage metadata with them — so exactly the long, expensive runs
+  report the smallest numbers under `## Run metadata`. Unverified against a live
+  summarizing run; the arithmetic follows from eviction. To address: accumulate usage
+  incrementally in the stream loop (dedup by message id, as `_note_model_turns` already
+  does) instead of summing the survivors at the end.
+
+- **Small guard gaps, batched.** (1) `_load` in @harness/prompts.py rejects `/`, `\`, and
+  `..` but not a Windows drive-relative name (`C:x`), which `Path.__truediv__` treats as
+  a new root — Linux deployment and internal-literal names make this completeness, not
+  exposure. (2) `SearchWebInput.max_results` (@harness/tools/search.py) has `ge=1` and no
+  ceiling, unlike every bounded field in `FetchSettings`. (3) `_load_dotenv`
+  (@harness/config.py) does not strip quotes, so a conventionally written
+  `KEY="value"` line yields a key with literal quote characters that fails auth at
+  preflight with a misleading "credentials rejected". (4) Report filenames
+  (@harness/report.py `_filename`) are second-resolution with no random suffix — the same
+  collision `SourceRegistry.run_id` already guards against — so two same-question runs
+  finishing in the same second silently overwrite one report.
