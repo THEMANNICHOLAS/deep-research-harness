@@ -18,7 +18,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
-from harness.guard import scan, strip_invisibles
+from harness.guard import fence, guard_blocked_detail, scan, strip_invisibles
 from harness.runlog import RunLog, or_default
 from harness.sources import (
     SourceRegistry,
@@ -208,6 +208,10 @@ def _render(page: FetchedPage, cap: int) -> str:
 
     A failure has no `source_id` (R5), so it renders by URL alone rather than a `[Sn]` heading
     that would imply it was ever registered as evidence.
+
+    The page's own markdown is untrusted content (Phase 5, D1 spotlighting): it is fenced with
+    `harness.guard.fence` AFTER truncation, never before (risk #4 — truncating a fenced block
+    could cut its closing boundary). Heading and status line stay outside the fence.
     """
     if page.source_id is not None:
         heading = f"## [{page.source_id}] {page.url}"
@@ -233,7 +237,7 @@ def _render(page: FetchedPage, cap: int) -> str:
             window[:cut].rstrip()
             + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
         )
-    lines.append(text)
+    lines.append(fence(text))
 
     return "\n\n".join(lines)
 
@@ -251,15 +255,10 @@ def _failure_detail(page: FetchedPage) -> str:
     return f"{page.url}: {' — '.join(bits)}"
 
 
-def _guard_blocked_detail(url: str, signals: list[str]) -> str:
-    """One incident line for a page dropped by the guard (D4): URL plus fired families."""
-    return f"{url}: blocked by guard ({', '.join(signals)})"
-
-
 def _provenance_rejected_detail(url: str) -> str:
     """One incident line for a URL rejected by strict provenance (Phase 4, D2/R2).
 
-    URL only, no signal families (unlike `_guard_blocked_detail`): rejection here has nothing
+    URL only, no signal families (unlike `guard_blocked_detail`): rejection here has nothing
     to do with content, only with where the URL came from.
     """
     return f"{url}: rejected — not from search results or explicit user approval"
@@ -376,7 +375,7 @@ async def _fetch(
             if config.guard.enabled:
                 scan_result = scan(markdown)
                 if scan_result.blocked:
-                    run_log.record("guard_blocked", _guard_blocked_detail(url, scan_result.signals))
+                    run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
                     continue
 
             title = _title_of(result)
@@ -439,7 +438,7 @@ async def _fetch(
             if config.guard.enabled:
                 scan_result = scan(markdown)
                 if scan_result.blocked:
-                    run_log.record("guard_blocked", _guard_blocked_detail(url, scan_result.signals))
+                    run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
                     continue
 
             title = _title_of(result)

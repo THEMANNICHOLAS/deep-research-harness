@@ -1,5 +1,6 @@
 """Behavioral tests for harness.tools.search."""
 
+import re
 from pathlib import Path
 
 import httpx
@@ -258,6 +259,38 @@ async def test_success_content_lists_each_result_with_title_url_and_snippet(
 
     for expected in ("A Title", "https://a.test", "A snippet", "B Title", "https://b.test"):
         assert expected in content
+
+
+async def test_rendered_results_listing_is_fenced_titles_and_snippets_inside(  # R4
+    monkeypatch, make_config
+):
+    payload = {
+        "query": "solar panels",
+        "results": [
+            {
+                "url": "https://a.test",
+                "title": "A Title",
+                "content": "A snippet",
+                "engine": "duckduckgo",
+            },
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+
+    content, _ = await search._search("solar panels", 10, config, SourceRegistry(), RunLog())
+
+    header_line = content.splitlines()[0]
+    assert "<<<UNTRUSTED" not in header_line
+    fence_open = content.index("<<<UNTRUSTED")
+    fence_close = content.index("<<<END UNTRUSTED")
+    assert fence_open < content.index("A Title") < fence_close
+    assert fence_open < content.index("A snippet") < fence_close
+    assert re.search(r"<<<END UNTRUSTED [0-9a-f]+>>>\s*$", content)
 
 
 async def test_zero_results_content_says_so_without_claiming_failure(monkeypatch, make_config):

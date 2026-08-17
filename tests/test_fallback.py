@@ -143,6 +143,33 @@ async def test_fetch_raw_marks_successful_pages_fallback_and_mints_nothing_for_f
     assert bad_page.source_id is None
 
 
+async def test_fetch_raw_fences_the_body_nested_inside_the_undigested_wrapper(  # R4
+    install_crawler, make_config
+):
+    """The wrapper stays outermost; the fence's boundary lines sit inside it."""
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
+    results = [
+        _FakeResult(
+            "https://a.test", markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body")
+        )
+    ]
+    install_crawler(results)
+    fetch_raw = fallback.build_fallback_tool(config, registry)
+
+    message = await fetch_raw.ainvoke(_tool_call(["https://a.test"], "some reason", "call-1"))
+
+    content = message.content
+    wrapper_start = content.index('<undigested source="S1"')
+    wrapper_end = content.index("</undigested>")
+    fence_open = content.index("<<<UNTRUSTED")
+    fence_close = content.index("<<<END UNTRUSTED")
+
+    assert wrapper_start < fence_open < fence_close < wrapper_end
+    assert wrapper_start < content.index("A body") < wrapper_end
+
+
 async def test_fetch_raw_never_downgrades_a_digested_source(install_crawler, make_config):
     """A source an earlier delegation already digested keeps its "digested" mode even when the
     lead re-fetches it raw (e.g. for a second facet): `mark_read` is last-write-wins, so an

@@ -164,7 +164,7 @@ async def test_build_agent_exposes_the_harness_tools(noop_agent):
     assert "fetch_pages" not in _tools_by_name(graph)
 
 
-async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):
+async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):  # R4
     _, graph = noop_agent
 
     # `task` now exists (backing the declared `researcher` subagent), so the general-purpose
@@ -172,16 +172,31 @@ async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):
     assert _declared_subagent_names(graph) == {"researcher"}
 
 
-async def test_the_researchers_own_task_tool_declares_only_the_reader(noop_agent):
+async def test_the_researchers_own_task_tool_declares_only_the_reader(noop_agent):  # R4
     """TEST-FIRST item 3 (lead tool surface): the 3-tier hierarchy is nested, not flattened —
     the lead's own declared subagent is exactly `{"researcher"}` (previous test), and the
     researcher's OWN `task` tool, one level deeper, declares exactly `{"reader"}`.
+
+    R4 regression (PLAN-prompt-injection-defense.md Phase 5): pins the containment structure
+    a fenced/sanitized run still relies on — the researcher can dispatch only to the reader,
+    never fan out to another tier of its own choosing.
     """
     _, graph = noop_agent
 
     researcher_runnable = _declared_subagents(graph)["researcher"]
 
     assert _declared_subagent_names(researcher_runnable) == {"reader"}
+
+
+def test_lead_interrupt_on_contains_exactly_ask_user():  # R4
+    """R4 regression (Phase 5, D7): the lead's whole interrupt surface is `ask_user` — pinning
+    `_INTERRUPT_ON`'s key set directly, since that dict is what `build_agent` passes through to
+    `interrupt_on` unmodified.
+    """
+    from harness.agent import _INTERRUPT_ON
+    from harness.tools.ask_user import ASK_USER_TOOL_NAME
+
+    assert set(_INTERRUPT_ON) == {ASK_USER_TOOL_NAME}
 
 
 async def test_the_nested_readers_tool_surface_includes_its_filesystem_workspace(noop_agent):
@@ -264,6 +279,7 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
     assert any(isinstance(m, FilesystemMiddleware) for m in spec["middleware"])
     # The reader has no checkpointer forwarded and cannot interrupt — inheriting the lead's
     # `ask_user` interrupt entry would register an interrupt that can never fire.
+    # R4 regression (Phase 5): `interrupt_on` stays confined to the lead alone.
     assert "interrupt_on" not in spec
 
 
@@ -271,6 +287,8 @@ def test_researcher_spec_has_no_interrupt_on(make_config, scripted_model, tmp_pa
     """Regression pin (D6; deferred from Step 3, developer-approved to land in Step 4): the
     researcher `SubAgent` spec omits `interrupt_on`, the same as the reader above — a nested
     researcher has no checkpointer forwarded and cannot interrupt either.
+
+    R4 regression (Phase 5): `interrupt_on` stays confined to the lead alone.
     """
     from deepagents.backends.filesystem import FilesystemBackend
 

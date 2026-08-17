@@ -9,6 +9,7 @@ bare, complete JSON — every tolerance must have a test that fails if the toler
 """
 
 import asyncio
+import re
 from typing import get_args
 
 import pytest
@@ -62,6 +63,28 @@ async def test_one_call_per_paragraph_and_prompt_contains_every_pooled_source(
     assert "UNIQUE_MARKER_THREE" in prompt_text
     assert len(result.verdicts) == 1
     assert result.verdicts[0].verdict == "supported"
+
+
+async def test_pooled_sources_block_is_fenced_in_the_verifier_prompt(  # R4
+    make_config, scripted_model, monkeypatch
+):
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/one")
+    write_source_capture(config, registry, source_id, "UNIQUE_MARKER body text.")
+    paragraph = _paragraph(f"The pump failed under load [{source_id}].", [source_id])
+
+    model = scripted_model([verify_reply("supported", "ok")])
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
+
+    await verify_paragraphs([paragraph], config, registry)
+
+    prompt_text = _flatten(model._received_messages[0])
+    fence_open_match = re.search(r"<<<UNTRUSTED [0-9a-f]+>>>", prompt_text)
+    fence_close_match = re.search(r"<<<END UNTRUSTED [0-9a-f]+>>>", prompt_text)
+    assert fence_open_match is not None
+    assert fence_close_match is not None
+    assert fence_open_match.start() < prompt_text.index("UNIQUE_MARKER") < fence_close_match.start()
 
 
 class _ConcurrencyTrackingModel(ScriptedChatModel):

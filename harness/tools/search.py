@@ -13,7 +13,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.config import HarnessConfig
-from harness.guard import scan
+from harness.guard import fence, guard_blocked_detail, scan
 from harness.runlog import RunLog, or_default
 from harness.sources import SourceRegistry
 
@@ -81,11 +81,6 @@ def _parse_results(
     return results[:max_results], dropped
 
 
-def _guard_blocked_detail(url: str, signals: list[str]) -> str:
-    """One incident line for a search result dropped by the guard (D4/D5, mirrors fetch.py)."""
-    return f"{url}: blocked by guard ({', '.join(signals)})"
-
-
 def _drop_guarded(
     results: list[SearchResult], config: HarnessConfig, run_log: RunLog
 ) -> list[SearchResult]:
@@ -101,7 +96,7 @@ def _drop_guarded(
     for result in results:
         scan_result = scan(f"{result.title}\n{result.snippet}")
         if scan_result.blocked:
-            run_log.record("guard_blocked", _guard_blocked_detail(result.url, scan_result.signals))
+            run_log.record("guard_blocked", guard_blocked_detail(result.url, scan_result.signals))
         else:
             survivors.append(result)
     return survivors
@@ -118,16 +113,22 @@ def _approve_survivors(results: list[SearchResult], registry: SourceRegistry) ->
 
 
 def _render(query: str, outcome: list[SearchResult] | SearchFailure) -> str:
-    """Render the model-facing content: a numbered list, a no-results line, or a failure."""
+    """Render the model-facing content: a numbered list, a no-results line, or a failure.
+
+    Titles/snippets are untrusted content (Phase 5, D1 spotlighting): the whole results listing
+    is fenced with `harness.guard.fence` as one block, with the header line kept outside it.
+    """
     if isinstance(outcome, SearchFailure):
         return f'Search for "{query}" failed: {outcome.reason} — {outcome.detail}'
     if not outcome:
         return f'Search for "{query}" returned no results.'
 
-    lines = [f'Results for "{query}":']
-    for index, result in enumerate(outcome, start=1):
-        lines.append(f"{index}. {result.title} — {result.url}\n   {result.snippet}")
-    return "\n".join(lines)
+    result_lines = [
+        f"{index}. {result.title} — {result.url}\n   {result.snippet}"
+        for index, result in enumerate(outcome, start=1)
+    ]
+    listing = "\n".join(result_lines)
+    return f'Results for "{query}":\n\n{fence(listing)}'
 
 
 def _search_url(config: HarnessConfig) -> str:

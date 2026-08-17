@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
+from harness.guard import fence
 from harness.paragraphs import Paragraph, renders_content
 from harness.prompts import render
 from harness.sources import SourceRegistry, sources_dir
@@ -205,7 +206,10 @@ async def verify_paragraphs(
         pooled_ids = [sid for sid, _, _ in pooled]
         try:
             sources_block = "\n\n".join(f"[{sid}] {url}\n{text}" for sid, url, text in pooled)
-            rendered = render("verify", paragraph=paragraph.text, sources=sources_block)
+            # D5's capture gating already guarantees this text is scan-passed; fencing (Phase 5,
+            # D1) is the second layer, so a page whose provenance was clean still cannot steer
+            # the verifier model via untrusted content read straight off disk.
+            rendered = render("verify", paragraph=paragraph.text, sources=fence(sources_block))
             reply = await model.ainvoke([HumanMessage(content=rendered)])
             verdict, detail, sources_conflict, unsupported_items = _parse_reply(str(reply.content))
             verdicts.append(

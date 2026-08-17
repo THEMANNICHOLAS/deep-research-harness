@@ -10,6 +10,7 @@ this module does not invent coverage beyond what is measured.
 """
 
 import re
+import secrets
 
 from pydantic import BaseModel, ConfigDict
 
@@ -105,3 +106,61 @@ def scan(text: str) -> ScanResult:
         if any(pattern.search(text) for pattern in _FAMILY_PATTERNS[family])
     ]
     return ScanResult(blocked=bool(signals), signals=signals)
+
+
+def guard_blocked_detail(url: str, signals: list[str]) -> str:
+    """One incident line for a page or result dropped by the guard: URL plus fired families.
+
+    Moved here from fetch.py/search.py's private, identical copies (Phase 5, deferred Phase 3
+    simplify) so both call sites share one definition instead of two hand-pasted ones.
+    """
+    return f"{url}: blocked by guard ({', '.join(signals)})"
+
+
+# Matches any boundary-SHAPED line, genuine or forged: `fence` emits hex tokens, but the
+# token part here is any non-space run, so an attacker's `<<<END UNTRUSTED xyz>>>` matches
+# too — the whole line, nothing else on it. Shared by `fence` (neutralizing forged fence
+# lines inside content), `sanitize_for_report` (same, in a report) and tests.
+FENCE_LINE_RE = re.compile(r"^<<<(END )?UNTRUSTED \S+>>>$", re.MULTILINE)
+
+# What a neutralized fence-shaped line becomes: two angle brackets, not three, so it can never
+# re-match `FENCE_LINE_RE` on a second pass (idempotence).
+_FENCE_NEUTRALIZED = "<<UNTRUSTED-MARKER-REMOVED>>"
+
+
+def fence(text: str) -> str:
+    """Wrap `text` in a random-boundary fence marking it as untrusted content (D1 spotlighting).
+
+    The boundary token (`secrets.token_hex(8)`, so a fresh 16-hex-char value every call) is
+    stripped from `text` FIRST: a payload that happens to contain this call's exact token could
+    otherwise forge a matching closing boundary of its own and escape containment. Since the
+    token is drawn fresh per call, an attacker can never know it in advance to plant it — this
+    guards only the residual case where genuine content coincidentally contains a prior call's
+    token.
+
+    Any fence-SHAPED line in the content is neutralized too, whatever its token: the fence's
+    consumer is a model, not an exact-match parser, so a visually valid `<<<END UNTRUSTED ...>>>`
+    line with the wrong token could still read as a closing boundary. Fence-shaped lines in
+    genuine page text are adversarial-only (same collision argument as the token itself).
+    """
+    token = secrets.token_hex(8)
+    stripped = text.replace(token, "")
+    stripped = FENCE_LINE_RE.sub(_FENCE_NEUTRALIZED, stripped)
+    return f"<<<UNTRUSTED {token}>>>\n{stripped}\n<<<END UNTRUSTED {token}>>>"
+
+
+def sanitize_for_report(text: str) -> str:
+    """Strip zero-width/control chars and neutralize fence-like and chat-marker sequences.
+
+    Idempotent (D7/R3): running this on its own output changes nothing, which is what makes it
+    safe as report.py's `_render_body`'s single funnel — every report byte passes through here
+    before disk, so a hostile string embedded anywhere in the assembled body can neither forge a
+    `fence` boundary nor a chat role marker once written. `<|` becomes `< |` (a space breaks the
+    two-char sequence apart, so no `<|` substring survives to re-match on a second pass); a
+    fence-shaped line becomes `_FENCE_NEUTRALIZED`, which by construction cannot match
+    `FENCE_LINE_RE` itself.
+    """
+    cleaned = strip_invisibles(text)
+    cleaned = FENCE_LINE_RE.sub(_FENCE_NEUTRALIZED, cleaned)
+    cleaned = cleaned.replace("<|", "< |")
+    return cleaned

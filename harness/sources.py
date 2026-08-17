@@ -25,6 +25,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict
 
 from harness.config import HarnessConfig, run_workspace_dir
+from harness.guard import strip_invisibles
 
 MARKER_RE = re.compile(r"\[S(\d+)\]")
 
@@ -239,7 +240,9 @@ class SourceRegistry:
     def add(self, url: str, title: str | None = None) -> str:
         """Register `url` and return its ID; the same normalized URL is never added twice.
 
-        First write wins — an already-registered URL keeps its existing title.
+        First write wins — an already-registered URL keeps its existing title. `title` is run
+        through `strip_invisibles` (Phase 5, R3 hygiene) before storage: a page's own title is
+        untrusted content like anything else it carries.
         """
         normalized = normalize_url(url)
         existing = self._by_url.get(normalized)
@@ -247,7 +250,8 @@ class SourceRegistry:
             return existing.id
 
         source_id = f"S{len(self._by_id) + 1}"
-        source = Source(id=source_id, url=normalized, title=title)
+        clean_title = strip_invisibles(title) if title is not None else None
+        source = Source(id=source_id, url=normalized, title=clean_title)
         self._by_url[normalized] = source
         self._by_id[source_id] = source
         return source_id
@@ -268,17 +272,28 @@ class SourceRegistry:
         return list(self._by_id.values())
 
     def link(self, source_id: str) -> str:
-        """Render `source_id` as a `[domain](url)` link; `KeyError` if unregistered."""
+        """Render `source_id` as a `[domain](url)` link; `KeyError` if unregistered.
+
+        Emits a markdown link ONLY when the URL's scheme is http/https (Phase 5, R3): any other
+        scheme (`javascript:`, `data:`, ...) renders as plain text instead, so a hostile title or
+        URL can never become a clickable non-http(s) action in the report. A URL `normalize_url`
+        itself could not parse (`ValueError` from `urlsplit`) has no scheme to check either way
+        and still renders as a link with itself as the label, matching `add`'s own tolerance for
+        unparseable input.
+        """
         source = self._by_id.get(source_id)
         if source is None:
             raise KeyError(f"unknown source id {source_id!r}")
 
         try:
-            label = urlsplit(source.url).hostname or source.url
+            parts = urlsplit(source.url)
         except ValueError:
-            # `add` stored a URL `normalize_url` could not parse, so it fails here too;
-            # the raw URL is the only label available.
-            label = source.url
+            return f"[{source.url}]({source.url})"
+
+        if parts.scheme.lower() not in ("http", "https"):
+            return source.url
+
+        label = parts.hostname or source.url
         return f"[{label}]({source.url})"
 
     def resolve(self, text: str) -> str:

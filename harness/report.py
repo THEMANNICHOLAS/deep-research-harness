@@ -16,6 +16,7 @@ from langchain_core.messages import UsageMetadata
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig, run_workspace_dir
+from harness.guard import sanitize_for_report
 from harness.paragraphs import LIST_ITEM_RE, Paragraph, strip_markers
 from harness.runlog import Incident
 from harness.sources import Source, SourceRegistry, sources_dir
@@ -524,7 +525,10 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
     if read_modes_text:
         lines += [_READ_MODES_HEADING, "", read_modes_text, ""]
 
-    return "\n".join(lines)
+    # The single funnel (Phase 5, D7/R3): every report byte passes through here before disk, so
+    # a hostile string reaching any section above (answer text, a workspace note, an incident
+    # detail, ...) cannot forge a fence boundary or a chat role marker in the written file.
+    return sanitize_for_report("\n".join(lines))
 
 
 def write_report(outcome: RunOutcome, config: HarnessConfig) -> Path:

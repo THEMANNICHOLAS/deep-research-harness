@@ -180,6 +180,49 @@ def test_urls_differing_only_by_password_stay_distinct_sources():
     assert len(registry.all()) == 2
 
 
+# --- Phase 5: registry/link hygiene (R3) ------------------------------------------------
+
+
+def test_add_sanitizes_a_hostile_title_stripping_zero_width_chars():
+    registry = SourceRegistry()
+
+    source_id = registry.add("https://example.com/a", title="wo​rd title")
+
+    source = registry.get(source_id)
+    assert source is not None
+    assert source.title == "word title"
+    assert "​" not in (source.title or "")
+
+
+def test_link_on_a_javascript_url_emits_plain_text_never_a_markdown_link():
+    registry = SourceRegistry()
+    source_id = registry.add("javascript:alert(1)")
+
+    link = registry.link(source_id)
+
+    assert link == "javascript:alert(1)"
+    assert not link.startswith("[")
+
+
+def test_resolve_on_a_javascript_url_emits_plain_text_never_a_markdown_link():
+    registry = SourceRegistry()
+    source_id = registry.add("javascript:alert(1)")
+
+    result = registry.resolve(f"See [{source_id}] for details.")
+
+    assert result == "See javascript:alert(1) for details."
+    assert "](" not in result
+
+
+def test_link_on_http_and_https_urls_still_emits_a_markdown_link():
+    registry = SourceRegistry()
+    http_id = registry.add("http://example.com/a")
+    https_id = registry.add("https://example.org/b")
+
+    assert registry.link(http_id) == "[example.com](http://example.com/a)"
+    assert registry.link(https_id) == "[example.org](https://example.org/b)"
+
+
 # --- Phase 6: per-run `run_id`, so source captures never collide across runs -----------
 
 

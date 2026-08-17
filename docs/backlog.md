@@ -196,3 +196,16 @@ not observed failures — none has been reproduced against a live run.
   (@harness/report.py `_filename`) are second-resolution with no random suffix — the same
   collision `SourceRegistry.run_id` already guards against — so two same-question runs
   finishing in the same second silently overwrite one report.
+
+- **Worker-model LLM-judge detection layer (config-gated).** The guard's heuristic scanner
+  (harness/guard.py) is syntactic-only by design — semantic steering passes it and is stopped
+  only by containment (R2/R4). A per-page LLM-judge pass was rejected in
+  @docs/plans/PLAN-prompt-injection-defense.md D1 for its config-role and offline-mock cost,
+  parked here as a later layer. To address: a new config-routed role, a judge prompt, and
+  fixture-based offline tests; gate it behind `[guard]` config so heuristics stay the default.
+
+- **Strict-provenance escape hatch if research reach suffers.** Phase 4 of
+  @docs/plans/PLAN-prompt-injection-defense.md makes non-search, non-user URLs unfetchable with
+  no config override (D2, deliberate). Every rejection is disclosed as a `provenance_rejected`
+  incident, so starvation is observable in reports. If reach measurably suffers, the remedy is
+  a config-gated link-following mode (sanitized or approval-based) — never a silent widening.

@@ -1,6 +1,6 @@
 # PLAN: Prompt Injection Defense
 
-**Status:** In Progress
+**Status:** Complete
 **Created:** 2026-08-15
 **Reconciled:** 2026-08-17 — rewritten against the post-loop tree (the PR #16 original was
 scoped before harness/agent.py, report.py, verify.py, runlog.py existed; see D5-D7).
@@ -239,8 +239,8 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 2: Guard scanner core
 - [x] Phase 3: Firewall wiring in fetch and search
 - [x] Phase 4: Strict URL provenance
-- [ ] Phase 5: Spotlighting, report hygiene, containment tests
-- [ ] Final verification
+- [x] Phase 5: Spotlighting, report hygiene, containment tests
+- [x] Final verification
 
 ## Phases
 
@@ -510,16 +510,18 @@ structural containment is pinned by regression tests.
 5. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full suite green + all four quality gates (see `## Verification`)
+- [x] Full suite green + all four quality gates (see `## Verification`)
 
 ## Verification
-- [ ] `uv run pytest` — full suite green
-- [ ] `uv run ruff check .`
-- [ ] `uv run ruff format --check .`
-- [ ] `uv run mypy .`
-- [ ] Manual: run the fetch tool against a local fixture page containing a known attack
+- [x] `uv run pytest` — full suite green (495, 2026-08-17)
+- [x] `uv run ruff check .`
+- [x] `uv run ruff format --check .`
+- [x] `uv run mypy .`
+- [x] Manual: run the fetch tool against a local fixture page containing a known attack
   string (offline fake) and observe drop + disclosure end to end — no Sn, no capture
   file, a `guard_blocked` line in the gaps section of the written report
+  (run 2026-08-17 via a throwaway offline test: report gaps carried
+  `- https://evil.example/attack: blocked by guard (instruction_override)`)
 
 ## Notes
 - Backlog items to record in docs/backlog.md during implementation (directed by the
@@ -568,6 +570,21 @@ Append-only, empty at plan creation. -->
   benign content (compound emoji, Indic/Persian scripts), so it will false-positive once
   Phase 3 wires the scan. Fix: delete the character or add a justifying fixture. MUST be
   resolved before/with Phase 3.
+### 2026-08-17 — Phase 5 findings
+- **[Major, fixed in-phase]** `fence()` initially stripped only its own random token, so an
+  attacker-planted fence-SHAPED line with a different token survived into the model prompt
+  and could visually "close" the fence for the LLM reader. Fixed (developer: fix now):
+  `fence()` neutralizes any `FENCE_LINE_RE`-shaped line in content before wrapping, and the
+  regex's token class widened from hex-only to `\S+` so non-hex forgeries match too.
+- **[Note]** The plan's Phase 5 e2e report test listed a registry-title vector, but no
+  report section renders `Source.title` (link() emits hostname labels) — testing it there
+  would be tautological. Title sanitization is proven at `add` in test_sources instead, and
+  the `sanitize_for_report` funnel would catch any future title-rendering section
+  (reviewer-verified).
+- **[Process]** The Phase 5 worker implemented before writing tests (red-first not honored).
+  Compensated with direct evidence: with the wiring files reverted, all 9 new integration
+  tests fail on genuine behavioral assertions.
+
 ### 2026-08-17 — Phase 4 gap decided (developer, this session)
 - No user-URL input path existed in `harness/__main__.py` (CLI takes one question string).
   Developer decision: the prompt stays a plain question — no `--url` flag; http(s) URLs
@@ -610,6 +627,12 @@ Append-only, empty at plan creation. -->
 - Learned: the provenance check has NO config off-switch (deliberate — the no-escape-hatch non-goal); `[guard] enabled=false` still approves all parsed results since `_drop_guarded` returns everything. Existing tests that fetch without a search needed `approve_all` (new conftest helper) or URL-in-question arranges — the same will apply to any future test driving `_fetch` directly.
 - Drift: none.
 - Watch-next: Phase 5 (flagged !#4) — `fence`/`sanitize_for_report` in guard.py, wire into both `_render`s + verify's pooled block + report's `_render_body`, registry title/link hygiene, prompt rule blocks, R4 regression tests. Also fold in the deferred Phase 3 simplify: move `_guard_blocked_detail` into guard.py.
+
+### 2026-08-17 — Phase 5: Spotlighting, report hygiene, containment tests (FINAL)
+- Done: `fence` (random-boundary spotlighting, forged fence-shaped lines neutralized) wired into fetch/search `_render`s and verify's pooled block; `sanitize_for_report` as `_render_body`'s single-funnel final statement; registry titles sanitized at `add`, `link`/`resolve` emit markdown links only for http(s); fenced-data rule block in four prompt files; R4 regression pins in test_agent/test_tools_registry; `guard_blocked_detail` consolidated into guard.py (deferred Phase 3 simplify). Plan's two Notes backlog items filed in docs/backlog.md. Full suite 495 green, gates clean, manual e2e verification observed (see `## Verification`). Flagged-risk (!#4) review: one Major (fence forgery) found and fixed in-phase; all risk-#4 mitigations confirmed.
+- Learned: `Source.title` never renders into reports today — R3's title vector is covered at ingestion plus the funnel, not by a report-section test. Worker skipped red-first; orchestrator compensated with a revert-and-rerun red check (see `## Discoveries`).
+- Drift: none.
+- Watch-next: plan COMPLETE. Next step is /pr-review across the whole feature branch (phases were reviewed in isolation); watch the `guard_blocked` false-positive rate in real runs (the [Minor] "System: ..." role_spoofing breadth is still open in `## Discoveries`).
 
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:

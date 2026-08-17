@@ -1,5 +1,6 @@
 """Behavioral tests for harness.tools.fetch."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -279,6 +280,27 @@ def test_a_heading_at_the_very_start_does_not_empty_the_block():
     assert "# Title" in rendered
     assert "A" * 92 in rendered
     assert "truncated" in rendered
+
+
+def test_render_wraps_page_markdown_in_a_fence_with_heading_and_status_outside():  # R4
+    cap = 1000
+    rendered = _rendered("clean body text", cap)
+
+    heading, status, remainder = rendered.split("\n\n", 2)
+    assert "<<<UNTRUSTED" not in heading
+    assert "<<<UNTRUSTED" not in status
+    assert re.search(r"^<<<UNTRUSTED [0-9a-f]+>>>\nclean body text\n<<<END UNTRUSTED", remainder)
+
+
+def test_render_truncation_never_cuts_the_fences_closing_boundary():  # R4
+    cap = 50
+    rendered = _rendered("A" * 500, cap)
+
+    assert "truncated" in rendered
+    lines = rendered.splitlines()
+    assert re.match(r"^<<<END UNTRUSTED [0-9a-f]+>>>$", lines[-1])
+    # The truncation notice sits INSIDE the fence, before the closing boundary.
+    assert rendered.index("truncated") < rendered.rindex("<<<END UNTRUSTED")
 
 
 async def test_content_has_a_heading_for_every_url_including_failures(install_crawler, make_config):
