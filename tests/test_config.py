@@ -25,7 +25,9 @@ model = "gemma-4-31b"
 
 [fetch]
 page_timeout_ms = 20000
-max_concurrency = 8
+http_concurrency = 8
+http_deadline_ms = 4000
+max_retries = 3
 per_page_char_cap = 9000
 max_urls_per_call = 3
 
@@ -81,7 +83,9 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
     assert config.roles["subagent"].model == "gemma-4-31b"
 
     assert config.fetch.page_timeout_ms == 20000
-    assert config.fetch.max_concurrency == 8
+    assert config.fetch.http_concurrency == 8
+    assert config.fetch.http_deadline_ms == 4000
+    assert config.fetch.max_retries == 3
     assert config.fetch.per_page_char_cap == 9000
     assert config.fetch.max_urls_per_call == 3
 
@@ -97,7 +101,9 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
     config = load_config(path)
 
     assert config.fetch.page_timeout_ms == 15000
-    assert config.fetch.max_concurrency == 5
+    assert config.fetch.http_concurrency == 10
+    assert config.fetch.http_deadline_ms == 3000
+    assert config.fetch.max_retries == 2
     assert config.fetch.per_page_char_cap == 12000
     assert config.fetch.max_urls_per_call == 5
     assert config.search.default_max_results == 10
@@ -180,7 +186,9 @@ def test_typo_in_key_error_names_the_offending_key(tmp_path, monkeypatch):
     ("setting", "bad_value"),
     [
         ("page_timeout_ms", 0),
-        ("max_concurrency", -1),
+        ("http_concurrency", -1),
+        ("http_deadline_ms", 0),
+        ("max_retries", 0),
         ("per_page_char_cap", 0),
         ("max_urls_per_call", 0),
     ],
@@ -190,7 +198,9 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
     original = {
         "page_timeout_ms": 20000,
-        "max_concurrency": 8,
+        "http_concurrency": 8,
+        "http_deadline_ms": 4000,
+        "max_retries": 3,
         "per_page_char_cap": 9000,
         "max_urls_per_call": 3,
     }

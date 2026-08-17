@@ -8,18 +8,20 @@ full, untruncated per-URL outcomes for anything downstream that needs them (e.g.
 resolution via `harness.sources.SourceRegistry`).
 """
 
+import asyncio
 import re
 from typing import Literal
 
 from crawl4ai import (  # type: ignore[import-untyped]
     AsyncWebCrawler,
-    BrowserConfig,
     CacheMode,
     CrawlerRunConfig,
     DefaultMarkdownGenerator,
-    MemoryAdaptiveDispatcher,
     PruningContentFilter,
-    RateLimiter,
+)
+from crawl4ai.async_crawler_strategy import (  # type: ignore[import-untyped]
+    AsyncHTTPCrawlerStrategy,
+    HTTPCrawlerConfig,
 )
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,17 +34,13 @@ FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
 _BLOCKED_STATUSES = frozenset({403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
 
-# 75%, not crawl4ai's default 90%: each concurrent crawl is a real browser page, and this
-# box also hosts SearXNG and Chromium.
-_MEMORY_THRESHOLD_PERCENT = 75.0
-
-# Despite the name, crawl4ai 0.9.2 re-fetches nothing — this caps how many times a domain's
-# backoff delay may double. See @docs/plans/PLAN-crawler-refinement.md Reconciliation #1.
-_RATE_LIMIT_MAX_RETRIES = 1
-
 # A markdown heading line. crawl4ai hands us flat strings with no heading tree, so a cut
 # boundary has to be found in the text itself.
 _HEADING_LINE = re.compile(r"^#{1,6} ", re.MULTILINE)
+
+# Matches the "HTTP <code>: ..." shape crawl4ai 0.9.2's HTTP strategy raises internally on
+# a non-2xx response (see _status_from_error).
+_HTTP_STATUS = re.compile(r"HTTP (\d{3})")
 
 
 def classify(
@@ -111,23 +109,112 @@ def _title_of(result: object) -> str | None:
     return metadata.get("title")
 
 
-def _pair(urls: list[str], results: list[object]) -> list[tuple[str, object | None]]:
-    """Pair each input URL with the result crawl4ai keyed to that exact URL.
+def _status_from_error(error: str | None) -> int | None:
+    """Recover the numeric HTTP status crawl4ai's HTTP strategy encodes only in its error
+    message on a non-2xx (`CrawlResult.status_code` itself is `None` there).
 
-    An input URL with no exact match pairs with `None` and reports `error` rather than
-    consuming an unclaimed result positionally, which could attribute one page's body to
-    another page's `[Sn]` marker. One URL can yield two results under memory pressure; the
-    first is taken. See @docs/plans/PLAN-crawler-refinement.md Phase 1.
+    Risk !#1: this is a string-format dependency on crawl4ai 0.9.2 — re-verify the parse
+    against the installed package on any upgrade.
     """
-    by_url: dict[str | None, list[object]] = {}
-    for result in results:
-        by_url.setdefault(getattr(result, "url", None), []).append(result)
+    if not error:
+        return None
+    match = _HTTP_STATUS.search(error)
+    return int(match.group(1)) if match else None
 
-    pairs: list[tuple[str, object | None]] = []
-    for url in urls:
-        bucket = by_url.get(url)
-        pairs.append((url, bucket.pop(0) if bucket else None))
-    return pairs
+
+async def _fetch_one(
+    crawler: object, url: str, run_config: object, deadline_ms: int
+) -> FetchedPage:
+    """One deadlined `arun` attempt for `url`; never raises.
+
+    `source_id` is left blank — the caller assigns it in input order once every URL's
+    attempts are done, since registering from inside a concurrent task would number
+    `[Sn]` citations by completion order instead.
+    """
+    try:
+        result = await asyncio.wait_for(crawler.arun(url, config=run_config), deadline_ms / 1000)  # type: ignore[attr-defined]
+    except TimeoutError:
+        return FetchedPage(
+            source_id="",
+            url=url,
+            outcome="timeout",
+            status_code=None,
+            title=None,
+            markdown="",
+            error=f"exceeded the {deadline_ms}ms fetch deadline",
+        )
+    except Exception as exc:
+        return FetchedPage(
+            source_id="",
+            url=url,
+            outcome="error",
+            status_code=None,
+            title=None,
+            markdown="",
+            error=str(exc),
+        )
+
+    if result is None:
+        return FetchedPage(
+            source_id="",
+            url=url,
+            outcome="error",
+            status_code=None,
+            title=None,
+            markdown="",
+            error="no result returned for this URL",
+        )
+
+    markdown = _markdown_of(result)
+    title = _title_of(result)
+    error_message = getattr(result, "error_message", None)
+    status_code = getattr(result, "status_code", None)
+    if status_code is None:
+        status_code = _status_from_error(error_message)
+    outcome = classify(status_code, error_message, _content_type(result), markdown)
+    return FetchedPage(
+        source_id="",
+        url=url,
+        outcome=outcome,
+        status_code=status_code,
+        title=title,
+        markdown=markdown,
+        error=error_message,
+    )
+
+
+def _is_retryable(page: FetchedPage) -> bool:
+    """Retryable: timeouts, 5xx (503 is also classified `blocked` — that overlap is
+    intended), and network errors (an `error` outcome with no status). Not retryable: any
+    other 4xx, including 429, and every successful outcome.
+    """
+    if page.outcome == "timeout":
+        return True
+    if page.status_code is not None and page.status_code >= 500:
+        return True
+    return page.outcome == "error" and page.status_code is None
+
+
+async def _fetch_with_retries(
+    crawler: object,
+    url: str,
+    run_config: object,
+    deadline_ms: int,
+    max_retries: int,
+    semaphore: asyncio.Semaphore,
+) -> FetchedPage:
+    """Attempt `url` up to `max_retries + 1` times, returning the first non-retryable page
+    or the last attempt once the budget is exhausted. No backoff between attempts — none
+    is specified, and the per-attempt deadline already bounds each one.
+    """
+    page: FetchedPage | None = None
+    for _ in range(max_retries + 1):
+        async with semaphore:
+            page = await _fetch_one(crawler, url, run_config, deadline_ms)
+        if not _is_retryable(page):
+            return page
+    assert page is not None  # max_retries is gt=0, so the loop always runs
+    return page
 
 
 def _render(page: FetchedPage, cap: int) -> str:
@@ -183,51 +270,32 @@ async def _fetch(
         stream=False,
         verbose=False,
     )
-    dispatcher = MemoryAdaptiveDispatcher(
-        max_session_permit=config.fetch.max_concurrency,
-        memory_threshold_percent=_MEMORY_THRESHOLD_PERCENT,
-        rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
-    )
+    semaphore = asyncio.Semaphore(config.fetch.http_concurrency)
 
-    # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
-    async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as crawler:
-        raw_results = await crawler.arun_many(urls, config=run_config, dispatcher=dispatcher)
-        results = list(raw_results)
-
-    pages: list[FetchedPage] = []
-    for url, result in _pair(urls, results):
-        if result is None:
-            source_id = registry.add(url)
-            pages.append(
-                FetchedPage(
-                    source_id=source_id,
-                    url=url,
-                    outcome="error",
-                    status_code=None,
-                    title=None,
-                    markdown="",
-                    error="no result returned for this URL",
+    # verbose=False above is deliberate: crawl4ai defaults it True and prints into our
+    # process. The HTTP strategy/config below exposes no separate verbose flag to silence
+    # (unlike the browser backend this replaces), so there is nothing else to configure here.
+    async with AsyncWebCrawler(
+        crawler_strategy=AsyncHTTPCrawlerStrategy(browser_config=HTTPCrawlerConfig())
+    ) as crawler:
+        fetched_pages = await asyncio.gather(
+            *(
+                _fetch_with_retries(
+                    crawler,
+                    url,
+                    run_config,
+                    config.fetch.http_deadline_ms,
+                    config.fetch.max_retries,
+                    semaphore,
                 )
-            )
-            continue
-
-        markdown = _markdown_of(result)
-        title = _title_of(result)
-        status_code = getattr(result, "status_code", None)
-        error_message = getattr(result, "error_message", None)
-        outcome = classify(status_code, error_message, _content_type(result), markdown)
-        source_id = registry.add(url, title=title)
-        pages.append(
-            FetchedPage(
-                source_id=source_id,
-                url=url,
-                outcome=outcome,
-                status_code=status_code,
-                title=title,
-                markdown=markdown,
-                error=error_message,
+                for url in urls
             )
         )
+
+    pages: list[FetchedPage] = []
+    for url, page in zip(urls, fetched_pages, strict=True):
+        source_id = registry.add(url, title=page.title)
+        pages.append(page.model_copy(update={"source_id": source_id}))
 
     content = "\n\n".join(_render(page, config.fetch.per_page_char_cap) for page in pages)
     return content, pages

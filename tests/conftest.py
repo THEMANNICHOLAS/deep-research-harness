@@ -18,7 +18,9 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
     def _make(
         *,
         page_timeout_ms: int = 15000,
-        max_concurrency: int = 5,
+        http_concurrency: int = 5,
+        http_deadline_ms: int = 3000,
+        max_retries: int = 2,
         per_page_char_cap: int = 12000,
         max_urls_per_call: int = 5,
         base_url: str = "http://searx.test",
@@ -37,7 +39,9 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
             },
             fetch=FetchSettings(
                 page_timeout_ms=page_timeout_ms,
-                max_concurrency=max_concurrency,
+                http_concurrency=http_concurrency,
+                http_deadline_ms=http_deadline_ms,
+                max_retries=max_retries,
                 per_page_char_cap=per_page_char_cap,
                 max_urls_per_call=max_urls_per_call,
             ),

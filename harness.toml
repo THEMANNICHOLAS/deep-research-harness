@@ -24,7 +24,9 @@ model = "TODO"                       # TODO: Cerebras worker-model ID, e.g. gemm
 
 [fetch]
 page_timeout_ms = 15000
-max_concurrency = 5
+http_concurrency = 10
+http_deadline_ms = 3000
+max_retries = 2
 per_page_char_cap = 12000
 max_urls_per_call = 5
 

@@ -1,6 +1,6 @@
 # PLAN: HTTP-First Fetch Pipeline
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-17
 **Type:** Single plan
 
@@ -190,7 +190,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R6 | Bounded concurrent subagents | Phase 5 |
 
 ## Progress
-- [ ] Phase 1: HTTP-first fetch with hard deadline and retry budget
+- [x] Phase 1: HTTP-first fetch with hard deadline and retry budget
 - [ ] Phase 2: Chromium escalation for JS shells
 - [ ] Phase 3: PDF precheck and download containment
 - [ ] Phase 4: Persistent domain blocklist
@@ -216,7 +216,10 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 **Reuse:**
 - Extend `FetchSettings` in `harness/config.py` — do NOT create a new settings model
-- Keep `classify()`, `FetchedPage`, `_render()`, `_pair`/dedup in `harness/tools/fetch.py`
+- ~~Keep `classify()`, `FetchedPage`, `_render()`, `_pair`/dedup in `harness/tools/fetch.py`
+  unchanged in shape — only the fetch mechanism below them changes~~
+  (amended 2026-08-17 — see `## Reconciliations` #1: `_pair` is deleted; the rest stand)
+- Keep `classify()`, `FetchedPage`, `_render()`, and the URL dedup at the top of `_fetch()`
   unchanged in shape — only the fetch mechanism below them changes
 - Pattern to mirror: `tests/test_fetch.py`'s `install_crawler` monkeypatch — fake at the
   `AsyncWebCrawler` boundary, never hit the network
@@ -236,11 +239,11 @@ Inherits every `## Intent` non-goal — not re-listed.
 - Touching `_render()` truncation or `max_urls_per_call`
 
 **Tests (write first, confirm red):**
-- [ ] A URL exceeding the deadline yields a `timeout` outcome and never blocks siblings
-- [ ] Retryable failures are attempted exactly 3 times total; non-retryable 4xx exactly once
-- [ ] A non-2xx recovers its numeric status through `_status_from_error` into `classify()`
-- [ ] A successful fetch produces the same `FetchedPage`/markdown shape as before the swap
-- [ ] Concurrency never exceeds `http_concurrency` simultaneous in-flight fetches
+- [x] A URL exceeding the deadline yields a `timeout` outcome and never blocks siblings
+- [x] Retryable failures are attempted exactly 3 times total; non-retryable 4xx exactly once
+- [x] A non-2xx recovers its numeric status through `_status_from_error` into `classify()`
+- [x] A successful fetch produces the same `FetchedPage`/markdown shape as before the swap
+- [x] Concurrency never exceeds `http_concurrency` simultaneous in-flight fetches
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -249,9 +252,10 @@ Inherits every `## Intent` non-goal — not re-listed.
 4. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `grep -rn "BrowserConfig\|arun_many\|MemoryAdaptiveDispatcher" harness/` returns nothing
+- [x] `grep -rn "BrowserConfig\|arun_many\|MemoryAdaptiveDispatcher" harness/` returns nothing
 - [ ] A live fetch of a static page per docs/guides/setup.md returns markdown, and no
-  Chromium process appears in `ps` during the run
+  Chromium process appears in `ps` during the run — **not run**: needs the homelab box;
+  deferred to the plan's final live verification
 
 ### Phase 2: Chromium escalation for JS shells
 **Risk:** flagged (!#2, !#5)
@@ -489,10 +493,55 @@ future agent loop must honor.
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+#1. 2026-08-17 — Phase 1: the Reuse line requires keeping `_pair()` unchanged, but D1's
+    per-URL design makes it unreachable — `asyncio.gather` preserves input order, so each
+    result is already bound to its own URL and there is nothing left to pair. The hazard
+    `_pair` was written for (crawl4ai's `arun_many` returning results in arbitrary order,
+    or two results for one URL under memory pressure) is structurally impossible once each
+    URL gets its own `arun()` call. → **Amendment:** delete `_pair()` and the two
+    `arun_many`-specific tests that pin it (`tests/test_fetch.py` ~lines 505-540), and add
+    a test asserting output order matches input order — the property `_pair` used to buy,
+    now guaranteed by `gather`. Every other name in the struck bullet (`classify`,
+    `FetchedPage`, `_render`, the URL dedup) is kept unchanged as written. No requirement
+    is affected: R1/R2/R4/R5 say nothing about the pairing mechanism.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+#1. 2026-08-17 — Phase 1, **deferred**: dropping `BrowserConfig(verbose=False)` lets one
+    `Crawl4AI <version>` banner per `_fetch()` call reach stdout. `AsyncWebCrawler.__init__`
+    falls back to `BrowserConfig()` (whose `verbose` defaults `True`) to build its logger, and
+    `start()` prints the banner before any `CrawlerRunConfig` is read. Per-`arun` logging is
+    still silenced (`arun` sets `self.logger.verbose` from the run config), so this is cosmetic
+    noise, not leaked crawl detail. Suppressing it would mean importing `BrowserConfig`, which
+    Phase 1's Out-of-scope forbids. Revisit in Phase 2, which legitimately constructs a browser
+    crawler and can set the flag there.
+
 ## Phase Handoff Log
+
+### 2026-08-17 — Phase 1: HTTP-first fetch with hard deadline and retry budget
+- Done: `_fetch()` now runs one `arun()` per URL over `AsyncHTTPCrawlerStrategy`, each attempt
+  under `asyncio.wait_for` and an `asyncio.Semaphore(http_concurrency)`, with an explicit
+  `_fetch_with_retries` budget. `_status_from_error`, `_fetch_one`, `_is_retryable` added;
+  `_pair`, `_MEMORY_THRESHOLD_PERCENT`, `_RATE_LIMIT_MAX_RETRIES` deleted. `FetchSettings`
+  gained `http_deadline_ms`/`max_retries` and renamed `max_concurrency` to `http_concurrency`
+  (propagated to `harness.toml`, `conftest.py`, `test_config.py`). 121 tests green; ruff,
+  format, mypy clean.
+- Learned: `AsyncHTTPCrawlerStrategy`/`HTTPCrawlerConfig` are NOT exported from top-level
+  `crawl4ai` — import from `crawl4ai.async_crawler_strategy`. `HTTPCrawlerConfig` has no
+  `verbose` field. Production never sees a bare `"HTTP 403: ..."`: `AsyncWebCrawler.arun`
+  catches the internal `HTTPStatusError` and stores it wrapped in a traceback blob with
+  trailing code context, so the !#1 parse survives only because `Error:` precedes
+  `Code context:` and the regex takes the first match — now pinned by a test.
+  `_fetch_one` deliberately leaves `source_id=""`; the caller assigns `[Sn]` in input order
+  after `gather`, because `SourceRegistry.add()` numbers by insertion and registering from
+  concurrent tasks would number by completion order.
+- Drift: Reconciliation #1 — `_pair()` deleted as unreachable under per-URL fetching
+  (approved); replaced by an input-order test. Discovery #1 logged and deferred (stdout
+  banner from the dropped `BrowserConfig(verbose=False)`).
+- Watch-next: Phase 2 constructs a browser crawler — set `BrowserConfig(verbose=False)` there
+  to close Discovery #1. Reuse `_fetch_one` for the browser attempt (do not write a second
+  fetch path) and remember escalation must NOT consume the R4 retry budget.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
