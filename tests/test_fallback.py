@@ -104,7 +104,7 @@ async def test_fetch_raw_mints_ids_via_the_shared_registry_continuing_the_sequen
     assert registry.get("S3") is not None
 
 
-async def test_fetch_raw_marks_successful_pages_fallback_and_leaves_failures_unread(
+async def test_fetch_raw_marks_successful_pages_fallback_and_mints_nothing_for_failures(  # R5
     install_crawler, make_config
 ):
     config = make_config()
@@ -126,7 +126,8 @@ async def test_fetch_raw_marks_successful_pages_fallback_and_leaves_failures_unr
 
     ok_page, bad_page = message.artifact
     assert registry.get(ok_page.source_id).read_mode == "fallback"
-    assert registry.get(bad_page.source_id).read_mode == "unread"
+    # A failure mints no id at all (R5) — there is no registry entry to leave "unread".
+    assert bad_page.source_id is None
 
 
 async def test_fetch_raw_never_downgrades_a_digested_source(install_crawler, make_config):

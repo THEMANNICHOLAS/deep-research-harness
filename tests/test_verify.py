@@ -21,7 +21,6 @@ from harness.verify import CHECK_FAILED_DETAIL, Verdict, verify_paragraphs
 from tests.conftest import (
     ScriptedChatModel,
     verify_reply,
-    write_failed_capture,
     write_source_capture,
 )
 
@@ -182,15 +181,19 @@ async def test_no_markers_or_all_unregistered_sources_returns_no_sources_cited_w
 # --- item 3: failed/missing captures are excluded; empty pool is not_verified ----------
 
 
-async def test_a_failed_capture_or_missing_file_is_excluded_from_the_pooled_prompt(
+async def test_a_missing_capture_is_excluded_from_the_pooled_prompt(  # R5
     make_config, scripted_model, monkeypatch
 ):
+    """New convention: a failed fetch mints no source id and writes no file at all, so the
+    only "unusable evidence" shape verification has to exclude is a registered source with no
+    capture file — never a `FETCH FAILED:` stub's content.
+    """
     config = make_config()
     registry = SourceRegistry()
     healthy_id = registry.add("https://example.test/healthy")
     failed_id = registry.add("https://example.test/failed")
     write_source_capture(config, registry, healthy_id, "UNIQUE_HEALTHY_BODY text.")
-    write_failed_capture(config, registry, failed_id, outcome="blocked")
+    # `failed_id` is registered but never captured: no file exists under `sources_dir`.
     paragraph = _paragraph(
         f"The pump failed under load [{healthy_id}] [{failed_id}].", [healthy_id, failed_id]
     )
@@ -207,17 +210,17 @@ async def test_a_failed_capture_or_missing_file_is_excluded_from_the_pooled_prom
     assert result.verdicts[0].source_ids == [healthy_id]
 
 
-async def test_a_paragraph_left_with_no_usable_source_returns_not_verified_naming_the_reason(
+async def test_a_paragraph_with_only_missing_captures_returns_not_verified_naming_the_reason(  # R5
     make_config, scripted_model, monkeypatch
 ):
     config = make_config()
     registry = SourceRegistry()
     missing_id = registry.add("https://example.test/missing")
-    failed_id = registry.add("https://example.test/failed")
-    write_failed_capture(config, registry, failed_id, outcome="error")
-    # `missing_id` is registered but never captured: no file exists under `sources_dir`.
+    also_missing_id = registry.add("https://example.test/also-missing")
+    # Neither source was ever captured: under the new convention a failed fetch writes no file.
     paragraph = _paragraph(
-        f"The pump failed under load [{missing_id}] [{failed_id}].", [missing_id, failed_id]
+        f"The pump failed under load [{missing_id}] [{also_missing_id}].",
+        [missing_id, also_missing_id],
     )
 
     model = scripted_model([])
@@ -231,7 +234,7 @@ async def test_a_paragraph_left_with_no_usable_source_returns_not_verified_namin
     # "readable", not just "exists": the catch covers a `UnicodeDecodeError` from a capture whose
     # write died mid-character, not only a missing file.
     assert "no readable captured content exists" in verdict.detail
-    assert "FETCH FAILED: error" in verdict.detail
+    assert "FETCH FAILED" not in verdict.detail
     assert verdict.source_ids == []
 
 

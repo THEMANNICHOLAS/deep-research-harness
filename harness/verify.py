@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from harness.config import HarnessConfig
 from harness.paragraphs import Paragraph, renders_content
 from harness.prompts import render
-from harness.sources import SourceRegistry, is_failed_capture, sources_dir
+from harness.sources import SourceRegistry, sources_dir
 
 Verdict = Literal[
     "supported", "partially_supported", "not_supported", "no_sources_cited", "not_verified"
@@ -185,9 +185,6 @@ async def verify_paragraphs(
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 skipped.append(f"{sid}: no readable captured content exists")
-                continue
-            if is_failed_capture(text):
-                skipped.append(f"{sid}: {text.split(chr(10), 1)[0]}")
                 continue
             pooled.append((sid, source.url, text))
 

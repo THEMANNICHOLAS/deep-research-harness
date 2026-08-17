@@ -35,7 +35,6 @@ from tests.conftest import (
     install_search_transport,
     patch_run,
     verify_reply,
-    write_failed_capture,
     write_source_capture,
 )
 
@@ -730,9 +729,10 @@ async def test_the_summary_counts_real_usable_and_unusable_sources(
     # back, one that did not.
     registry = SourceRegistry(run_id="2020-01-01-000000")
     fetched = registry.add("https://example.test/pricing", title="Pricing")
-    blocked = registry.add("https://example.test/blocked", title="Blocked")
+    registry.add("https://example.test/blocked", title="Blocked")
     write_source_capture(config, registry, fetched, "Acme lists $5.10 per unit.")
-    write_failed_capture(config, registry, blocked)
+    # The "blocked" source is registered but never captured: the new convention writes no file
+    # at all for a failed fetch, so "no file" is the only unusable shape left to simulate.
     monkeypatch.setattr(main_module, "SourceRegistry", lambda run_id: registry)
 
     final = AIMessage(

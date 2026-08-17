@@ -26,7 +26,7 @@ from harness.config import (
     SearchSettings,
     run_workspace_dir,
 )
-from harness.sources import FETCH_FAILED_PREFIX, sources_dir
+from harness.sources import sources_dir
 
 
 class _FakeMarkdown:
@@ -377,17 +377,6 @@ def write_workspace_note(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
-
-
-def write_failed_capture(
-    config: HarnessConfig, registry: Any, source_id: str, outcome: str = "error"
-) -> None:
-    """Write a failure stub — the shape `harness/tools/fetch.py` writes for a bad fetch."""
-    captures_dir = sources_dir(config, registry)
-    captures_dir.mkdir(parents=True, exist_ok=True)
-    (captures_dir / f"{source_id}.md").write_text(
-        f"{FETCH_FAILED_PREFIX}{outcome}\n", encoding="utf-8"
-    )
 
 
 @pytest.fixture

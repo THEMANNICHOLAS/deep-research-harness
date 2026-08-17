@@ -2,10 +2,14 @@
 
 The mechanical half of the citation scheme: minting IDs, deduplicating equivalent URLs, and
 rewriting markers into links. No model involvement, no fetching (D6). Also the home of the
-captured-file policy (`sources_dir`, `FETCH_FAILED_PREFIX`, `is_failed_capture`): it used to
-live in `harness/tools/fetch.py`, but `report.py`, `verify.py` and the test fixtures all need
-it, and importing it from there dragged all of crawl4ai (~1.2s) into every pure-rendering
-module and every test session.
+captured-file policy (`sources_dir`): it used to live in `harness/tools/fetch.py`, but
+`report.py`, `verify.py` and the test fixtures all need it, and importing it from there dragged
+all of crawl4ai (~1.2s) into every pure-rendering module and every test session.
+
+R5's identity model: a `source_id` is minted only for a successful (`fetched`) page, and only
+a `fetched` page ever gets a captures-dir file (`harness/tools/fetch.py`'s `_write_source_file`).
+So "a capture file exists" is now equivalent to "content is real page text" with no further
+convention needed — there is no more failure-stub shape for `report.py`/`verify.py` to detect.
 """
 
 import re
@@ -23,20 +27,6 @@ from pydantic import BaseModel, ConfigDict
 from harness.config import HarnessConfig, run_workspace_dir
 
 MARKER_RE = re.compile(r"\[S(\d+)\]")
-
-# The single home for this policy string: fetch.py's `_write_source_file` writes it as the
-# first line of any non-`fetched` capture, and `is_failed_capture` below reads it.
-FETCH_FAILED_PREFIX = "FETCH FAILED: "
-
-
-def is_failed_capture(source_text: str) -> bool:
-    """Whether a captured source file's text is a failure stub rather than real content.
-
-    The single home for READING what `FETCH_FAILED_PREFIX` writes. `report.py` (is this usable
-    evidence?) and `verify.py` (can this settle a claim?) ask the same question, and two copies
-    of "split the first line, test the prefix" could disagree about which sources count.
-    """
-    return source_text.split("\n", 1)[0].startswith(FETCH_FAILED_PREFIX)
 
 
 def sources_dir(config: HarnessConfig, registry: "SourceRegistry") -> Path:

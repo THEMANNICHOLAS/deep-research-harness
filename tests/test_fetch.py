@@ -291,7 +291,9 @@ async def test_content_has_a_heading_for_every_url_including_failures(install_cr
     )
 
     for page in pages:
-        assert f"## [{page.source_id}] {page.url}" in content
+        # A failure has no `source_id` (R5) and renders by URL alone.
+        heading = f"## [{page.source_id}] {page.url}" if page.source_id else f"## {page.url}"
+        assert heading in content
         assert page.outcome in content
 
 
@@ -767,54 +769,7 @@ async def test_source_file_text_is_untruncated_even_when_the_render_is_capped(
     assert long_markdown in text
 
 
-@pytest.mark.parametrize(
-    ("outcome", "result_kwargs"),
-    [
-        ("blocked", {"status_code": 403}),
-        ("timeout", {"error_message": "Timeout after 15000ms", "status_code": 200}),
-        ("non_html", {"response_headers": {"Content-Type": "application/octet-stream"}}),
-        ("error", {"status_code": 500, "error_message": "internal server error"}),
-    ],
-)
-async def test_failed_fetch_writes_a_stub_naming_its_outcome(
-    install_crawler, make_config, tmp_path, outcome, result_kwargs
-):
-    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
-    registry = SourceRegistry()
-    page_text = "should never reach the stub"
-    results = [
-        _FakeResult(
-            "https://fail.test",
-            markdown=_FakeMarkdown(raw_markdown=page_text, fit_markdown=page_text),
-            **result_kwargs,
-        )
-    ]
-    install_crawler(results)
-    fetch_pages = fetch.build_fetch_tool(config, registry)
-
-    message = await fetch_pages.ainvoke(_tool_call(["https://fail.test"], f"call-stub-{outcome}"))
-
-    page = message.artifact[0]
-    assert page.outcome == outcome
-    text = (sources_dir(config, registry) / f"{page.source_id}.md").read_text(encoding="utf-8")
-    lines = text.splitlines()
-    assert lines[0] == f"FETCH FAILED: {outcome}"
-    assert "https://fail.test" in text
-    assert page_text not in text
-
-    # The stub keeps the artifact's status code and error text, omitting a bullet whose value is
-    # absent rather than printing `None`.
-    if page.status_code is not None:
-        assert f"- Status: {page.status_code}" in text
-    else:
-        assert "- Status:" not in text
-    if page.error:
-        assert f"- Error: {page.error}" in text
-    else:
-        assert "- Error:" not in text
-
-
-async def test_a_mixed_batch_writes_content_for_successes_and_stubs_for_failures(
+async def test_a_mixed_batch_writes_content_for_successes_and_nothing_for_failures(
     install_crawler, make_config, tmp_path
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
@@ -839,17 +794,13 @@ async def test_a_mixed_batch_writes_content_for_successes_and_stubs_for_failures
     )
 
     ok_page, bad_page = message.artifact
-    ok_text = (sources_dir(config, registry) / f"{ok_page.source_id}.md").read_text(
-        encoding="utf-8"
-    )
-    bad_text = (sources_dir(config, registry) / f"{bad_page.source_id}.md").read_text(
-        encoding="utf-8"
-    )
+    captures_dir = sources_dir(config, registry)
+    ok_text = (captures_dir / f"{ok_page.source_id}.md").read_text(encoding="utf-8")
 
     assert ok_text.splitlines()[0] == f"# {ok_page.source_id}: https://ok.test"
     assert "ok body" in ok_text
-    assert bad_text.splitlines()[0] == f"FETCH FAILED: {bad_page.outcome}"
-    assert "ok body" not in bad_text
+    assert bad_page.source_id is None
+    assert list(captures_dir.glob("*.md")) == [captures_dir / f"{ok_page.source_id}.md"]
 
 
 async def test_one_source_write_failure_does_not_poison_the_batch_or_go_silent(
@@ -939,12 +890,12 @@ async def test_refetching_the_same_url_overwrites_the_same_source_file(
     assert "first" not in text
 
 
-async def test_a_failed_refetch_does_not_overwrite_a_successful_capture(
-    install_crawler, make_config, tmp_path
+async def test_a_failed_refetch_does_not_overwrite_a_successful_capture(  # R5
+    install_crawler, make_config, tmp_path, monkeypatch
 ):
-    """A transient failure on a URL already captured must not destroy the evidence: both attempts
-    share one `[Sn]` and one file, and `harness/verify.py` reads only that file, so a stub written
-    over real content would report a genuinely sourced claim as unverifiable.
+    """A transient failure on a URL already captured must not destroy the evidence. Under the
+    new convention a failed fetch writes no file at all, so the guard is now that no write is
+    even attempted against the existing capture — not merely that its content survives.
     """
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
@@ -960,28 +911,39 @@ async def test_a_failed_refetch_does_not_overwrite_a_successful_capture(
     )
     first = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-good"))
     source_id = first.artifact[0].source_id
+    captures_dir = sources_dir(config, registry)
+    captured_path = captures_dir / f"{source_id}.md"
+
+    real_write_text = Path.write_text
+
+    def guarded_write_text(self: Path, *args: object, **kwargs: object) -> int:
+        assert self != captured_path, "a failed refetch must never write the existing capture"
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", guarded_write_text)
 
     install_crawler([_FakeResult("https://flaky.test", status_code=429, markdown=None)])
     second = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-blocked"))
 
     # The model still learns the refetch was blocked: only the captured file is spared.
     assert second.artifact[0].outcome == "blocked"
-    text = (sources_dir(config, registry) / f"{source_id}.md").read_text(encoding="utf-8")
-    assert not fetch.is_failed_capture(text)
-    assert "real body" in text
+    assert second.artifact[0].source_id is None
+    assert "real body" in captured_path.read_text(encoding="utf-8")
 
 
-async def test_a_successful_refetch_still_replaces_a_failure_stub(
+async def test_a_successful_refetch_after_an_earlier_failure_writes_a_normal_capture(  # R5
     install_crawler, make_config, tmp_path
 ):
-    """The no-downgrade guard is one-way: a later success must still win."""
+    """A failure leaves nothing to replace: the first (failed) call wrote no file at all, so
+    the later success just mints a fresh id and writes a normal capture.
+    """
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
     fetch_pages = fetch.build_fetch_tool(config, registry)
 
     install_crawler([_FakeResult("https://flaky.test", status_code=429, markdown=None)])
     first = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-blocked"))
-    source_id = first.artifact[0].source_id
+    assert first.artifact[0].source_id is None
 
     install_crawler(
         [
@@ -991,11 +953,130 @@ async def test_a_successful_refetch_still_replaces_a_failure_stub(
             )
         ]
     )
-    await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-good"))
+    second = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-good"))
+    source_id = second.artifact[0].source_id
 
-    text = (sources_dir(config, registry) / f"{source_id}.md").read_text(encoding="utf-8")
-    assert not fetch.is_failed_capture(text)
+    assert source_id is not None
+    captures_dir = sources_dir(config, registry)
+    text = (captures_dir / f"{source_id}.md").read_text(encoding="utf-8")
     assert "real body" in text
+    assert list(captures_dir.glob("*.md")) == [captures_dir / f"{source_id}.md"]
+
+
+# --- R5: identity-model migration — a failed fetch mints no id and writes no file ------
+
+
+@pytest.mark.parametrize(
+    ("outcome", "result_kwargs", "no_result"),
+    [
+        ("blocked", {"status_code": 403}, False),
+        ("timeout", {"error_message": "Timeout after 15000ms", "status_code": 200}, False),
+        ("non_html", {"response_headers": {"Content-Type": "application/octet-stream"}}, False),
+        ("error", {"status_code": 500, "error_message": "internal server error"}, False),
+        ("error", {}, True),
+    ],
+)
+async def test_a_failed_fetch_mints_no_source_id_writes_no_file_and_renders_by_url(  # R5
+    install_crawler, make_config, tmp_path, outcome, result_kwargs, no_result
+):
+    """A failed fetch (blocked/timeout/non_html/error, or a missing result) is never evidence:
+    it gets no `[Sn]` id, no capture file, and renders by URL alone — the report/verify surfaces
+    must be able to say "content is real" from "a capture file exists" with no exceptions.
+    """
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    run_log = RunLog()
+    url = "https://fail.test"
+    if no_result:
+        install_crawler([])
+    else:
+        page_text = "should never reach a capture file"
+        install_crawler(
+            [
+                _FakeResult(
+                    url,
+                    markdown=_FakeMarkdown(raw_markdown=page_text, fit_markdown=page_text),
+                    **result_kwargs,
+                )
+            ]
+        )
+    fetch_pages = fetch.build_fetch_tool(config, registry, run_log)
+
+    message = await fetch_pages.ainvoke(_tool_call([url], f"call-nomint-{outcome}-{no_result}"))
+
+    page = message.artifact[0]
+    assert page.outcome == outcome
+    assert page.source_id is None
+    assert registry.all() == []
+    captures_dir = sources_dir(config, registry)
+    assert list(captures_dir.glob("*.md")) == []
+    assert url in message.content
+    assert outcome in message.content
+    assert "[S" not in message.content
+
+    fetch_incidents = [i for i in run_log.incidents() if i.kind == "fetch_failed"]
+    assert len(fetch_incidents) == 1
+    assert url in fetch_incidents[0].detail
+    assert "[S" not in fetch_incidents[0].detail
+
+
+async def test_a_successful_fetch_mints_sn_writes_capture_and_renders_sn_heading(  # R5
+    install_crawler, make_config, tmp_path
+):
+    """Unchanged today-behavior pin: a `fetched` page still gets a normal `[Sn]` id, a full-text
+    capture file, and an `## [Sn] url` heading.
+    """
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    url = "https://ok.test"
+    install_crawler(
+        [_FakeResult(url, markdown=_FakeMarkdown(raw_markdown="ok body", fit_markdown="ok body"))]
+    )
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(_tool_call([url], "call-success"))
+
+    page = message.artifact[0]
+    assert page.outcome == "fetched"
+    assert page.source_id is not None
+    assert registry.get(page.source_id) is not None
+    assert f"## [{page.source_id}] {url}" in message.content
+    captures_dir = sources_dir(config, registry)
+    text = (captures_dir / f"{page.source_id}.md").read_text(encoding="utf-8")
+    assert text.splitlines()[0] == f"# {page.source_id}: {url}"
+    assert "ok body" in text
+
+
+async def test_a_url_that_fails_then_succeeds_later_mints_a_fresh_sn_normally(  # R5
+    install_crawler, make_config, tmp_path
+):
+    """A URL that fails on one call and succeeds on a later one is treated as if it had never
+    been attempted: the failure minted nothing, so the later success gets a normal, fresh `Sn`.
+    """
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    run_log = RunLog()
+    url = "https://retry.test"
+    fetch_pages = fetch.build_fetch_tool(config, registry, run_log)
+
+    install_crawler([_FakeResult(url, status_code=500, error_message="boom", markdown=None)])
+    first = await fetch_pages.ainvoke(_tool_call([url], "call-retry-1"))
+
+    assert first.artifact[0].source_id is None
+    assert registry.all() == []
+
+    install_crawler(
+        [_FakeResult(url, markdown=_FakeMarkdown(raw_markdown="finally", fit_markdown="finally"))]
+    )
+    second = await fetch_pages.ainvoke(_tool_call([url], "call-retry-2"))
+
+    page = second.artifact[0]
+    assert page.outcome == "fetched"
+    assert page.source_id == "S1"
+    captures_dir = sources_dir(config, registry)
+    text = (captures_dir / "S1.md").read_text(encoding="utf-8")
+    assert "finally" in text
+    assert list(captures_dir.glob("*.md")) == [captures_dir / "S1.md"]
 
 
 async def test_pdf_extension_url_is_routed_to_the_pdf_crawler_and_lands_fetched(
@@ -1031,7 +1112,7 @@ async def test_pdf_extension_url_is_routed_to_the_pdf_crawler_and_lands_fetched(
     assert "Extracted PDF text" in text
 
 
-async def test_empty_pdf_extraction_writes_a_stub_and_never_fetched_or_non_html(
+async def test_empty_pdf_extraction_mints_no_id_and_never_fetched_or_non_html(  # R5
     install_crawler, make_config, tmp_path
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
@@ -1052,8 +1133,8 @@ async def test_empty_pdf_extraction_writes_a_stub_and_never_fetched_or_non_html(
     # Exactly "error": `classify` is deterministic for an empty extraction, so accepting
     # "blocked" or "timeout" too would let a real reclassification pass unnoticed.
     assert page.outcome == "error"
-    text = (sources_dir(config, registry) / f"{page.source_id}.md").read_text(encoding="utf-8")
-    assert text.splitlines()[0] == f"FETCH FAILED: {page.outcome}"
+    assert page.source_id is None
+    assert list(sources_dir(config, registry).glob("*.md")) == []
 
 
 @pytest.mark.parametrize(
@@ -1063,7 +1144,7 @@ async def test_empty_pdf_extraction_writes_a_stub_and_never_fetched_or_non_html(
         ({"status_code": 403}, "blocked"),
     ],
 )
-async def test_pdf_batch_failure_writes_a_stub_naming_its_outcome(
+async def test_pdf_batch_failure_mints_no_id_and_writes_no_file(  # R5
     install_crawler, make_config, tmp_path, result_kwargs, expected_outcome
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
@@ -1078,8 +1159,8 @@ async def test_pdf_batch_failure_writes_a_stub_naming_its_outcome(
 
     page = message.artifact[0]
     assert page.outcome == expected_outcome
-    text = (sources_dir(config, registry) / f"{page.source_id}.md").read_text(encoding="utf-8")
-    assert text.splitlines()[0] == f"FETCH FAILED: {expected_outcome}"
+    assert page.source_id is None
+    assert list(sources_dir(config, registry).glob("*.md")) == []
 
 
 async def test_a_mixed_html_and_pdf_batch_writes_both_captures_with_existing_shapes(

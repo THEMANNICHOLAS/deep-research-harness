@@ -36,7 +36,7 @@ from harness.report import (
 from harness.runlog import Incident
 from harness.sources import SourceRegistry, sources_dir
 from harness.verify import ParagraphVerdict, VerificationResult
-from tests.conftest import write_failed_capture, write_source_capture, write_workspace_note
+from tests.conftest import write_source_capture, write_workspace_note
 
 _FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-[a-z0-9-]+\.md$")
 
@@ -176,16 +176,18 @@ def test_write_report_with_usable_sources_does_not_claim_it_has_none(make_config
     assert "example.test" in body
 
 
-def test_write_report_treats_registered_stub_sources_as_not_usable(make_config):
-    """A registered source whose captured file is a `FETCH FAILED:` stub is not evidence.
+def test_write_report_treats_a_registered_source_with_no_capture_file_as_not_usable(  # R5
+    make_config,
+):
+    """A registered source with no captured file at all is not evidence.
 
-    `fetch.py` registers every attempted URL, including 404s and blocked pages, so a registry of
-    nothing but stubs must still say plainly that no usable sources were found.
+    New convention: `fetch.py` no longer mints an id or writes anything for a failed fetch, so
+    the only "not usable" shape left to handle is a registered source whose file is simply
+    missing — never a `FETCH FAILED:` stub's content.
     """
     config = make_config()
     registry = SourceRegistry()
     dead_id = registry.add("https://example.test/dead-link", title=None)
-    write_failed_capture(config, registry, dead_id, outcome="blocked")
     outcome = RunOutcome(
         question="What killed the link?",
         answer="Unable to determine — the only lead was unreachable.",
@@ -236,14 +238,18 @@ def test_write_report_survives_a_capture_file_that_is_not_valid_utf8(make_config
     assert unusable_pos < body.index(f"[{torn_id}]")
 
 
-def test_write_report_lists_usable_sources_and_marks_stubs_separately(make_config):
-    """Mixed case: one real capture, one stub. Each must be judged on its own file."""
+def test_write_report_lists_usable_sources_and_marks_missing_captures_separately(  # R5
+    make_config,
+):
+    """Mixed case: one real capture, one registered source with no file at all — the shape a
+    failed fetch now leaves behind. Each must be judged on its own file's presence.
+    """
     config = make_config()
     registry = SourceRegistry()
     good_id = registry.add("https://good.example.test/page", title="Good page")
     bad_id = registry.add("https://bad.example.test/page", title=None)
     write_source_capture(config, registry, good_id)
-    write_failed_capture(config, registry, bad_id, outcome="timeout")
+    # `bad_id` is registered but never captured: no file exists under `sources_dir`.
     outcome = RunOutcome(
         question="Mixed source usability",
         answer="Partial answer [S1].",
@@ -1526,7 +1532,8 @@ def test_write_report_mixed_read_modes_bucket_each_source_correctly(make_config)
     failed_id = registry.add("https://example.test/failed")
     write_source_capture(config, registry, digested_id)
     write_source_capture(config, registry, fallback_id)
-    write_failed_capture(config, registry, failed_id, outcome="blocked")
+    # `failed_id` is registered but never captured: the new convention writes no file at all
+    # for a failed fetch.
     registry.mark_read(digested_id, "digested")
     registry.mark_read(fallback_id, "fallback")
     # failed_id is left at its default "unread" — fetch.py never marks a failed capture read.

@@ -40,6 +40,7 @@ async def _fetch_raw(
     for page in pages:
         rendered = _render(page, config.fetch.per_page_char_cap)
         if page.outcome == "fetched":
+            assert page.source_id is not None  # every `fetched` page was minted an id
             # Never downgrade: a source an earlier delegation already digested keeps its
             # "digested" mode even if the lead re-fetches it raw (e.g. for a second facet).
             # The <undigested> wrapper still applies — it describes THIS payload being raw —
