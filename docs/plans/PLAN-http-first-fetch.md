@@ -1,6 +1,6 @@
 # PLAN: HTTP-First Fetch Pipeline
 
-**Status:** In Progress
+**Status:** Complete (pending the live verification check)
 **Created:** 2026-08-17
 **Type:** Single plan
 
@@ -194,8 +194,8 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 2: Chromium escalation for JS shells
 - [x] Phase 3: PDF precheck and download containment
 - [x] Phase 4: Persistent domain blocklist
-- [ ] Phase 5: Subagent cap config contract
-- [ ] Final verification
+- [x] Phase 5: Subagent cap config contract
+- [x] Final verification (offline gates; the live mixed-URL check remains outstanding)
 
 ## Phases
 
@@ -442,7 +442,7 @@ future agent loop must honor.
 - Building or wiring the agent loop
 
 **Tests (write first, confirm red):**
-- [ ] The key loads with its default and rejects non-positive values
+- [x] The key loads with its default and rejects non-positive values
 
 **Steps:**
 1. Write the test above; run it; confirm it FAILS (red).
@@ -450,17 +450,21 @@ future agent loop must honor.
 3. Run the test; confirm it PASSES (green).
 
 **Acceptance criteria:**
-- [ ] `docs/architecture.md` states the cap and the `max_subagents * http_concurrency`
+- [x] `docs/architecture.md` states the cap and the `max_subagents * http_concurrency`
   worst-case fetch load
 
 ## Verification
-- [ ] `uv run pytest`
-- [ ] `uv run ruff check .`
-- [ ] `uv run ruff format --check .`
-- [ ] `uv run mypy .`
-- [ ] Coverage stays at or above the CI 90% floor
+- [x] `uv run pytest` — 157 passed
+- [x] `uv run ruff check .`
+- [x] `uv run ruff format --check .`
+- [x] `uv run mypy .`
+- [x] Coverage stays at or above the CI 90% floor — 99% total (`blocklist.py` 98%,
+  `fetch.py` 99%)
 - [ ] Live check per docs/guides/setup.md: a mixed URL set (static page, JS-rendered page,
-  PDF, 403ing domain) returns one disclosed outcome each and no run hangs
+  PDF, 403ing domain) returns one disclosed outcome each and no run hangs — **not run**:
+  needs the homelab box. This single check also settles Reconciliation #3
+  (`wait_until="networkidle"` really renders an SPA), risk !#5's escalation rate at 50 words,
+  and each phase's deferred live acceptance criterion.
 
 ## Notes
 - `docs/decisions.md` currently records "Chromium via crawl4ai-managed Playwright is the only
@@ -655,5 +659,22 @@ Append-only, empty at plan creation. -->
 - Pattern worth carrying: three phases running, the defect was an exception type missing from
   an `except` clause on a path contracted never to fail the batch. At a batch boundary, guard
   broadly by default; narrow only where a specific type is genuinely handled differently.
+
+### 2026-08-17 — Phase 5: Subagent cap config contract
+- Done: `HarnessConfig.max_subagents` (default 3, `gt=0`) plus the `harness.toml` key, a
+  `## Concurrency Bounds` section in `docs/architecture.md`, and config tests for the default
+  and non-positive rejection. No runtime enforcement, per D6. Also closed the plan's
+  `## Notes` item: three entries appended to `docs/decisions.md` recording that this work
+  reverses the earlier "Chromium is the only path, no config key selects a browser" decision,
+  the blocklist design, and the declared-not-enforced subagent cap. 157 tests green; ruff,
+  format, mypy clean; coverage 99% against the 90% floor.
+- Learned: `HarnessConfig` is `extra="forbid"`, so a rejection test for a not-yet-existing key
+  passes for the WRONG reason (unknown key) — the `gt=0` bound had to be mutation-checked
+  after the field landed to prove the test actually binds.
+- Drift: none. Review verdict clean; one Minor applied (the `3 * 10 = 30` arithmetic now lives
+  only in `docs/architecture.md`, not restated in `config.py`).
+- Watch-next: nothing blocks further phases — the plan is done offline. The one outstanding
+  item is the live mixed-URL run on the homelab box, which settles Reconciliation #3, risk
+  !#5's 50-word threshold, and the four deferred per-phase live criteria in one pass.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->

@@ -110,7 +110,25 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
     assert config.fetch.browser_deadline_ms == 20000
     assert config.fetch.browser_concurrency == 2
     assert config.fetch.downloads_dir == "workspace/downloads"
+    assert config.fetch.blocklist_path == "workspace/blocklist.json"
+    assert config.fetch.blocklist_ttl_days == 30
+    assert config.max_subagents == 3
     assert config.search.default_max_results == 10
+
+
+@pytest.mark.parametrize("bad_value", [0, -1])
+def test_non_positive_max_subagents_is_rejected(tmp_path, monkeypatch, bad_value):
+    # R6/D6: the cap is a declared contract the future agent loop must honor, so an
+    # operator setting it to 0 (or negative) must fail at startup rather than silently
+    # meaning "no subagents" or "unbounded" once the loop exists to read it.
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, f"max_subagents = {bad_value}\n{MINIMAL_TOML}")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "max_subagents" in str(excinfo.value)
 
 
 def test_missing_env_var_raises_config_error_naming_variable(tmp_path, monkeypatch):

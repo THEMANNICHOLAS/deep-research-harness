@@ -6,6 +6,10 @@
 # Secrets are never stored here — each provider names an environment variable
 # (see `.env.example`), resolved at load time.
 
+# The bound the agent loop must honor once it exists (R6/D6). Nothing enforces it today —
+# see docs/architecture.md for the worst-case fetch load it implies.
+max_subagents = 3
+
 [providers.opencode]
 base_url = "TODO"                    # TODO: OpenCode API base URL, e.g. https://<host>/v1
 api_key_env = "OPENCODE_API_KEY"

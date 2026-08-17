@@ -106,6 +106,11 @@ class HarnessConfig(_StrictModel):
     roles: dict[str, RoleConfig]
     fetch: FetchSettings = Field(default_factory=FetchSettings)
     search: SearchSettings
+    # D6/R6: a declared contract, not runtime enforcement — no agent loop exists yet to
+    # honor it, so nothing here schedules or counts subagents. It multiplies with
+    # `fetch.http_concurrency` to set the worst-case fetch load; the arithmetic lives in
+    # docs/architecture.md `## Concurrency Bounds` rather than being restated here.
+    max_subagents: int = Field(default=3, gt=0)
 
     @model_validator(mode="after")
     def _cross_check_roles(self) -> "HarnessConfig":
