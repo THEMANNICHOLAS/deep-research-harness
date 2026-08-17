@@ -100,7 +100,7 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
 
     assert config.fetch.page_timeout_ms == 15000
     assert config.fetch.max_concurrency == 5
-    assert config.fetch.per_page_char_cap == 12000
+    assert config.fetch.per_page_char_cap == 120000
     assert config.fetch.max_urls_per_call == 5
     assert config.search.default_max_results == 10
     assert config.search.max_consecutive_failures == 3
@@ -382,3 +382,45 @@ typo_key = "oops"
         load_config(path)
 
     assert "typo_key" in str(excinfo.value)
+
+
+def test_dotenv_beside_the_toml_supplies_a_missing_api_key(tmp_path, monkeypatch):
+    """Keys live in `.env`, never in `harness.toml` — so loading it is part of loading config."""
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+    (tmp_path / ".env").write_text(
+        "# a comment\n\nOPENCODE_API_KEY=from-dotenv\nMALFORMED_NO_EQUALS\n", encoding="utf-8"
+    )
+
+    config = load_config(path)
+
+    assert config.providers["opencode"].api_key == "from-dotenv"
+
+
+def test_a_real_env_var_wins_over_the_same_key_in_dotenv(tmp_path, monkeypatch):
+    """Standard dotenv precedence: the file fills gaps, it never overrides the environment.
+
+    Flipping this would let a stale checked-out `.env` silently outrank the key an operator
+    exported for one run.
+    """
+    monkeypatch.setenv("OPENCODE_API_KEY", "from-environment")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+    (tmp_path / ".env").write_text("OPENCODE_API_KEY=from-dotenv\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.providers["opencode"].api_key == "from-environment"
+
+
+def test_dotenv_value_containing_an_equals_sign_survives_intact(tmp_path, monkeypatch):
+    """Split on the FIRST `=` only — base64 and URL-shaped secrets routinely contain more."""
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+    (tmp_path / ".env").write_text("OPENCODE_API_KEY=abc==def=\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.providers["opencode"].api_key == "abc==def="

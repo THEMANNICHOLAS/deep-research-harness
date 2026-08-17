@@ -11,7 +11,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
-from harness.runlog import RunLog
+from harness.runlog import RunLog, or_default
 from harness.sources import SourceRegistry, sources_dir
 from harness.tools.fetch import (
     FetchedPage,
@@ -68,7 +68,7 @@ def build_fallback_tool(
     """
     sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
-    log = run_log if run_log is not None else RunLog()
+    log = or_default(run_log)
     max_urls = config.fetch.max_urls_per_call
 
     class FetchRawInput(BaseModel):

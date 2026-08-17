@@ -1346,6 +1346,50 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
     assert _WALL_CLOCK_TEXT not in body
 
 
+async def test_a_clarification_on_the_capped_round_is_still_asked(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """An `ask_user` landing exactly on `max_rounds` must reach the developer, not be skipped.
+
+    `_note_model_turns` sets `cap_hit` for ANY tool call on the capped round, `ask_user`
+    included, but that tool pauses the graph on an interrupt instead of returning a
+    `ToolMessage`. Handling the cap first `break`s past the interrupt check, so the question
+    was dropped and the synthesis pass then resumed a paused thread — which failed the run and
+    wrote no report at all, for what should have been an ordinary clarifying question.
+    """
+    agent = AgentSettings(
+        max_rounds=1, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
+    )
+    config = make_config(agent=agent)
+    ask = AIMessage(
+        content="",
+        tool_calls=[{"name": "ask_user", "args": {"question": "Which region?"}, "id": "call_1"}],
+    )
+    final = AIMessage(
+        content="Final answer after the clarification.",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    model = scripted_model([ask, *([final] * 5)])
+    patch_run(monkeypatch, config, model)
+
+    asked = {"value": False}
+
+    async def _answer(prompt: str = "> ") -> str:
+        asked["value"] = True
+        return "The EU."
+
+    monkeypatch.setattr(main_module, "_read_answer", _answer)
+
+    exit_code = await main_module.main(["Should we expand?"])
+
+    out, lines = drain_stdout(capsys)
+    assert asked["value"], "_read_answer was never awaited — the capped-round ask_user was dropped"
+    assert exit_code == 0
+    assert lines, "main() printed no report path"
+    body = Path(lines[-1].strip()).read_text(encoding="utf-8")
+    assert "Final answer after the clarification." in body
+
+
 @pytest.mark.parametrize(("max_rounds", "expect_cut_short"), [(1, True), (2, False)])
 async def test_max_rounds_counts_model_turns_not_supersteps(
     make_config, monkeypatch, scripted_model, tmp_path, capsys, max_rounds, expect_cut_short

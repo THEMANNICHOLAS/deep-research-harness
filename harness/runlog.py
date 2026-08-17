@@ -37,3 +37,13 @@ class RunLog:
     def incidents(self) -> list[Incident]:
         """Every incident so far, oldest first. A copy — callers may not mutate the log."""
         return list(self._incidents)
+
+
+def or_default(run_log: "RunLog | None") -> RunLog:
+    """The shared log if one was passed, otherwise a throwaway one.
+
+    Every `build_*_tool` factory and `build_tools` itself takes an optional log for the
+    tests' sake, and each was resolving it the same way inline. One home, so a change to
+    the policy — warn on a missing log, say — is one edit, not four that can drift apart.
+    """
+    return run_log if run_log is not None else RunLog()

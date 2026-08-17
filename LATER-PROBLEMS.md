@@ -173,3 +173,25 @@ missing `unsupported_items`, 1-based bullet indices) now each have a test that f
 tolerance is removed, but a scripted test only proves the parser survives what we IMAGINED
 the model does. The first live run is still the real check — watch for `check_failures`
 entries and for `Verdict: not verified` lines in the first real report.
+
+## A non-ASCII character in an incident detail aborts the whole run on Windows
+
+**What is wrong:** `harness/display.py`'s `emit` writes incidents with a bare
+`print(..., file=stream)`. When stdout is redirected on Windows the stream encoding is
+cp1252, so the first incident detail carrying a non-ASCII character raises
+`UnicodeEncodeError` out of `_emit_new_alerts` (@harness/__main__.py) and kills `main()`.
+The characters are not ours -- they arrive inside crawl4ai/site error text -- so no
+ASCII-only rule on our own source prevents it.
+
+**What it costs:** by the fail-fast invariant a crashed run writes NO report, so a research
+run that had already fetched and digested ~70 sources is discarded for a display-encoding
+detail. Interactive TTY runs are unaffected (the TUI stream is UTF-8 capable), which is why
+it went unseen; it reproduces whenever output is piped or redirected, including any
+scripted or CI-driven run. Observed 2026-08-16 during the Phase 2 live verification;
+`PYTHONIOENCODING=utf-8` is a working stopgap.
+
+**What fixing it takes:** give the incident/alert stream an explicit UTF-8 encoding with a
+replacement error handler (reconfigure the stream once at renderer construction, or encode
+per write), plus a regression test that emits a non-ASCII incident detail through a cp1252
+stream. Small and self-contained -- it was left out of Phase 2 only because
+`harness/display.py` is outside that phase's scope and the bug predates it.

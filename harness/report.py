@@ -296,7 +296,9 @@ def _notes_section(
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        sections.append(f"### {relative.as_posix()}\n\n{text}")
+        # Demoted like answer prose: a note is model-authored too, and embedding it verbatim
+        # put its `# `/`## ` headings at the report's own title and section depths.
+        sections.append(f"### {relative.as_posix()}\n\n{_demote_headings(text)}")
 
     return "\n\n".join(sections) if sections else _NO_NOTES_TEXT
 

@@ -13,7 +13,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.config import HarnessConfig
-from harness.runlog import RunLog
+from harness.runlog import RunLog, or_default
 
 
 class SearchResult(BaseModel):
@@ -201,7 +201,7 @@ class SearchUnavailableError(Exception):
 def build_search_tool(config: HarnessConfig, run_log: RunLog | None = None) -> BaseTool:
     """Build the `search_web` tool, closing over `config` and the shared `run_log`."""
 
-    log = run_log if run_log is not None else RunLog()
+    log = or_default(run_log)
 
     class SearchWebInput(BaseModel):
         """Model-facing input schema for the `search_web` tool."""

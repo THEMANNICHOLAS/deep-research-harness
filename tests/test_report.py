@@ -458,6 +458,38 @@ def test_write_report_includes_workspace_notes_when_cut_short(make_config):
     assert _NO_NOTES_TEXT not in body
 
 
+def test_headings_inside_working_notes_are_demoted_like_answer_prose(make_config):
+    """R3's one-H1 rule covers the whole report, not just `## Answer`.
+
+    Notes were embedded verbatim, so a cut-short run whose note opened with `# Pricing`
+    put a second H1 under the report title and broke the section ordering.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    write_workspace_note(
+        config, registry, "notes.md", "# Pricing findings\n\n## Vendors\n\nAcme quoted $4.20/unit."
+    )
+    outcome = RunOutcome(
+        question="What pricing was found before the cutoff?",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert "### Pricing findings" in body
+    assert "#### Vendors" in body
+    assert "\n# Pricing findings" not in body
+    assert "\n## Vendors" not in body
+    # The report's own title is the only H1 in the whole document.
+    assert [line for line in body.split("\n") if line.startswith("# ")] == [
+        "# What pricing was found before the cutoff?"
+    ]
+
+
 def test_write_report_says_so_when_no_notes_were_written(make_config):
     config = make_config()
     config.agent.workspace_dir.mkdir(parents=True, exist_ok=True)

@@ -5,7 +5,7 @@ from typing import NamedTuple
 from langchain_core.tools import BaseTool
 
 from harness.config import HarnessConfig
-from harness.runlog import RunLog
+from harness.runlog import RunLog, or_default
 from harness.sources import SourceRegistry
 from harness.tools.ask_user import build_ask_user_tool
 from harness.tools.fallback import build_fallback_tool
@@ -36,7 +36,7 @@ def build_tools(
     the report and terminal disclose. Defaulted only for callers that assert nothing about
     incidents; the real entrypoint always passes the run's shared instance.
     """
-    log = run_log if run_log is not None else RunLog()
+    log = or_default(run_log)
     return ToolSets(
         lead=[build_ask_user_tool(config)],
         researcher=[
