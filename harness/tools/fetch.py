@@ -14,6 +14,7 @@ from typing import Literal
 
 from crawl4ai import (  # type: ignore[import-untyped]
     AsyncWebCrawler,
+    BrowserConfig,
     CacheMode,
     CrawlerRunConfig,
     DefaultMarkdownGenerator,
@@ -80,6 +81,7 @@ class FetchedPage(BaseModel):
     title: str | None
     markdown: str
     error: str | None
+    content_type: str | None = None
 
 
 def _content_type(result: object) -> str | None:
@@ -142,6 +144,7 @@ async def _fetch_one(
             title=None,
             markdown="",
             error=f"exceeded the {deadline_ms}ms fetch deadline",
+            content_type=None,
         )
     except Exception as exc:
         return FetchedPage(
@@ -152,6 +155,7 @@ async def _fetch_one(
             title=None,
             markdown="",
             error=str(exc),
+            content_type=None,
         )
 
     if result is None:
@@ -163,6 +167,7 @@ async def _fetch_one(
             title=None,
             markdown="",
             error="no result returned for this URL",
+            content_type=None,
         )
 
     markdown = _markdown_of(result)
@@ -171,7 +176,8 @@ async def _fetch_one(
     status_code = getattr(result, "status_code", None)
     if status_code is None:
         status_code = _status_from_error(error_message)
-    outcome = classify(status_code, error_message, _content_type(result), markdown)
+    content_type = _content_type(result)
+    outcome = classify(status_code, error_message, content_type, markdown)
     return FetchedPage(
         source_id="",
         url=url,
@@ -180,6 +186,7 @@ async def _fetch_one(
         title=title,
         markdown=markdown,
         error=error_message,
+        content_type=content_type,
     )
 
 
@@ -215,6 +222,45 @@ async def _fetch_with_retries(
             return page
     assert page is not None  # max_retries is gt=0, so the loop always runs
     return page
+
+
+def _is_thin(page: FetchedPage, min_words: int) -> bool:
+    """True when the HTTP attempt reads like a JS shell rather than real content (D3):
+    word count of the generated markdown is the signal, chosen over raw-HTML shell markers
+    (`<div id="root">`, noscript patterns) because it measures what the agent actually
+    consumes, not the page's raw structure.
+
+    Escalates on `outcome == "fetched"`, and also on `outcome == "non_html"` when the page
+    looks like an empty HTML page rather than a genuine non-HTML resource (Reconciliation
+    #2): `classify()` maps a 200 `text/html` response with empty generated markdown — the
+    canonical `<div id="root"></div>` SPA shell — to `non_html`, not `fetched`, so excluding
+    that outcome would leave the strongest JS-shell signal unable to ever escalate. A missing
+    `content_type` is treated as HTML-shaped too, since crawl4ai only omits the header, it
+    never fabricates a non-HTML one. `timeout`, `error`, and `blocked` outcomes never
+    escalate — those are genuine failures, not thin-but-successful content.
+    """
+    if len(page.markdown.split()) >= min_words:
+        return False
+    if page.outcome == "fetched":
+        return True
+    if page.outcome == "non_html":
+        return page.content_type is None or "html" in page.content_type.lower()
+    return False
+
+
+async def _escalate_one(
+    browser: object,
+    url: str,
+    run_config: object,
+    deadline_ms: int,
+    semaphore: asyncio.Semaphore,
+) -> FetchedPage:
+    """One deadlined browser attempt for `url`, reusing `_fetch_one` rather than a second
+    fetch path. This is deliberately not `_fetch_with_retries`: escalation is contractually
+    at most one attempt and must not consume the R4 retry budget.
+    """
+    async with semaphore:
+        return await _fetch_one(browser, url, run_config, deadline_ms)
 
 
 def _render(page: FetchedPage, cap: int) -> str:
@@ -262,19 +308,27 @@ async def _fetch(
     if not urls:
         return "", []
 
+    # Shared by the HTTP and (lazily built, below) browser run configs — built once so the
+    # policy list lives in exactly one place rather than as two parallel literals.
+    _shared_run_config_kwargs: dict[str, object] = {
+        "excluded_tags": _EXCLUDED_TAGS,
+        "markdown_generator": DefaultMarkdownGenerator(content_filter=PruningContentFilter()),
+        "cache_mode": CacheMode.BYPASS,
+        "stream": False,
+        "verbose": False,
+    }
     run_config = CrawlerRunConfig(
         page_timeout=config.fetch.page_timeout_ms,
-        excluded_tags=_EXCLUDED_TAGS,
-        markdown_generator=DefaultMarkdownGenerator(content_filter=PruningContentFilter()),
-        cache_mode=CacheMode.BYPASS,
-        stream=False,
-        verbose=False,
+        **_shared_run_config_kwargs,
     )
     semaphore = asyncio.Semaphore(config.fetch.http_concurrency)
 
     # verbose=False above is deliberate: crawl4ai defaults it True and prints into our
-    # process. The HTTP strategy/config below exposes no separate verbose flag to silence
-    # (unlike the browser backend this replaces), so there is nothing else to configure here.
+    # process. The HTTP strategy/config below exposes no separate verbose flag to silence,
+    # and AsyncWebCrawler.__init__ falls back to BrowserConfig() (verbose defaults True) to
+    # build its logger regardless of strategy, so this crawler still prints one startup
+    # banner (Discovery #1, deferred — the HTTP path's banner remains). The browser crawler
+    # below passes BrowserConfig(verbose=False) explicitly, closing the gap for that path.
     async with AsyncWebCrawler(
         crawler_strategy=AsyncHTTPCrawlerStrategy(browser_config=HTTPCrawlerConfig())
     ) as crawler:
@@ -292,8 +346,47 @@ async def _fetch(
             )
         )
 
+    pages_list = list(fetched_pages)
+    thin = [
+        i for i, page in enumerate(pages_list) if _is_thin(page, config.fetch.min_markdown_words)
+    ]
+    if thin:
+        # The browser attempt gets its own CrawlerRunConfig (Reconciliation #3): reusing the
+        # HTTP one's wait_until="domcontentloaded" fires before client-side render, so
+        # Chromium could return the same near-empty markdown the HTTP path already produced.
+        # page_timeout is aligned to browser_deadline_ms rather than the HTTP page_timeout_ms
+        # (15000 < 20000) so crawl4ai's own page timeout no longer preempts the escalation
+        # budget — asyncio.wait_for(browser_deadline_ms) in _escalate_one remains the hard
+        # no-hang bound (R2); this page_timeout is the cooperative one, deliberately the same
+        # number. Built only here, inside `if thin:`, so a run with no thin results does no
+        # extra work and never launches Chromium.
+        browser_run_config = CrawlerRunConfig(
+            page_timeout=config.fetch.browser_deadline_ms,
+            wait_until="networkidle",
+            **_shared_run_config_kwargs,
+        )
+        browser_semaphore = asyncio.Semaphore(config.fetch.browser_concurrency)
+        async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as browser:
+            escalated = await asyncio.gather(
+                *(
+                    _escalate_one(
+                        browser,
+                        urls[i],
+                        browser_run_config,
+                        config.fetch.browser_deadline_ms,
+                        browser_semaphore,
+                    )
+                    for i in thin
+                )
+            )
+        # The escalation's outcome wins unconditionally, even a timeout with empty markdown
+        # over an HTTP attempt that had returned a few words — no "keep the better result"
+        # fallback (decision carried in from the phase gate).
+        for i, page in zip(thin, escalated, strict=True):
+            pages_list[i] = page
+
     pages: list[FetchedPage] = []
-    for url, page in zip(urls, fetched_pages, strict=True):
+    for url, page in zip(urls, pages_list, strict=True):
         source_id = registry.add(url, title=page.title)
         pages.append(page.model_copy(update={"source_id": source_id}))
 

@@ -72,6 +72,15 @@ class FetchSettings(_StrictModel):
     # 5 is engineering judgment, not a measured optimum (D1): it bounds one call to ~15k
     # tokens at the current per-page cap. Operators change it here, not in code.
     max_urls_per_call: int = Field(default=5, gt=0)
+    # 50 is a starting guess (risk !#5), not a measured threshold: check the escalation
+    # rate on a real run before treating it as settled — too high sends ordinary short
+    # pages to Chromium needlessly, too low lets real JS shells through as "fetched".
+    min_markdown_words: int = Field(default=50, gt=0)
+    browser_deadline_ms: int = Field(default=20000, gt=0)
+    # 2 is deliberately low (risk !#2): dropping arun_many also dropped crawl4ai's
+    # MemoryAdaptiveDispatcher backpressure, so this is now the only thing bounding browser
+    # memory use. Raising it requires a memory measurement on the box, not just an edit here.
+    browser_concurrency: int = Field(default=2, gt=0)
 
 
 class SearchSettings(_StrictModel):

@@ -106,6 +106,9 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
     assert config.fetch.max_retries == 2
     assert config.fetch.per_page_char_cap == 12000
     assert config.fetch.max_urls_per_call == 5
+    assert config.fetch.min_markdown_words == 50
+    assert config.fetch.browser_deadline_ms == 20000
+    assert config.fetch.browser_concurrency == 2
     assert config.search.default_max_results == 10
 
 

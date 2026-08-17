@@ -191,7 +191,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: HTTP-first fetch with hard deadline and retry budget
-- [ ] Phase 2: Chromium escalation for JS shells
+- [x] Phase 2: Chromium escalation for JS shells
 - [ ] Phase 3: PDF precheck and download containment
 - [ ] Phase 4: Persistent domain blocklist
 - [ ] Phase 5: Subagent cap config contract
@@ -276,7 +276,8 @@ Chromium, under its own hard deadline and a low concurrency cap.
 **Reuse:**
 - Reuse Phase 1's `_fetch_one` for the browser attempt — do NOT write a second fetch path;
   it differs only by crawler instance and deadline
-- Keep the existing `page_timeout_ms` as the browser `CrawlerRunConfig` page timeout
+- ~~Keep the existing `page_timeout_ms` as the browser `CrawlerRunConfig` page timeout~~
+  (amended 2026-08-17 — see `## Reconciliations` #3: the browser gets its own run config)
 
 **Contracts:**
 - `FetchSettings.min_markdown_words: int` (default 50), `browser_deadline_ms: int`
@@ -286,16 +287,18 @@ Chromium, under its own hard deadline and a low concurrency cap.
 - Escalation is at most one attempt per URL and does NOT consume the R4 retry budget
 
 **Out of scope:**
-- Escalating on failure outcomes (only thin-but-successful results escalate)
+- ~~Escalating on failure outcomes (only thin-but-successful results escalate)~~
+  (amended 2026-08-17 — see `## Reconciliations` #2: an empty-but-HTML `non_html` result
+  escalates too; genuine failure outcomes still never escalate)
 - `text_mode` (it disables JavaScript, defeating escalation); `light_mode` is optional
 - Blocklist and PDF handling
 
 **Tests (write first, confirm red):**
-- [ ] A thin-markdown success escalates exactly once and returns the browser's richer result
-- [ ] A rich HTTP result never escalates, and no browser crawler is constructed
-- [ ] A failed/timed-out HTTP fetch does not escalate
-- [ ] An escalation exceeding `browser_deadline_ms` yields `timeout`, not a hang
-- [ ] Escalations in flight never exceed `browser_concurrency`
+- [x] A thin-markdown success escalates exactly once and returns the browser's richer result
+- [x] A rich HTTP result never escalates, and no browser crawler is constructed
+- [x] A failed/timed-out HTTP fetch does not escalate
+- [x] An escalation exceeding `browser_deadline_ms` yields `timeout`, not a hang
+- [x] Escalations in flight never exceed `browser_concurrency`
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -305,7 +308,9 @@ Chromium, under its own hard deadline and a low concurrency cap.
 
 **Acceptance criteria:**
 - [ ] A live fetch of a static page launches no Chromium; a live fetch of a known
-  JS-rendered page returns non-empty markdown
+  JS-rendered page returns non-empty markdown — **not run**: needs the homelab box. This is
+  now the check that settles Reconciliation #3 (`wait_until="networkidle"` actually renders)
+  and risk !#5's escalation rate; deferred to the plan's final live verification.
 
 ### Phase 3: PDF precheck and download containment
 **Risk:** flagged (!#3)
@@ -505,6 +510,30 @@ correction. Empty at plan creation. -->
     `FetchedPage`, `_render`, the URL dedup) is kept unchanged as written. No requirement
     is affected: R1/R2/R4/R5 say nothing about the pairing mechanism.
 
+#2. 2026-08-17 — Phase 2: restricting escalation to `outcome == "fetched"` excludes the
+    canonical JS shell and so fails R1. A page serving `<div id="root"></div>` returns 200
+    `text/html` with empty generated markdown, and `classify()` maps "no error + empty
+    markdown" to `non_html` — so the zero-word case, the strongest shell signal R1 names,
+    was the one case that could never escalate. → **Amendment:** `_is_thin` escalates a
+    `non_html` result too, but only when it looks like an empty HTML page rather than a real
+    non-HTML resource: no error, and a content type that is HTML or absent. To make that
+    decidable, `FetchedPage` gains `content_type: str | None` (already read by `_content_type`
+    for `classify()`, previously discarded). Genuine failure outcomes — `timeout`, `error`,
+    `blocked` — still never escalate, so the struck line's intent is preserved. Side benefit:
+    a PDF's `application/pdf` fails the HTML check, so it does not escalate even before
+    Phase 3's HEAD precheck lands.
+
+#3. 2026-08-17 — Phase 2: reusing the HTTP `CrawlerRunConfig` for the browser attempt
+    defeats the escalation. crawl4ai 0.9.2 defaults `wait_until="domcontentloaded"` and
+    `delay_before_return_html=0.1`, and DOMContentLoaded fires before client-side render —
+    so Chromium can return the same near-empty markdown the HTTP path already produced, at
+    the cost of a full browser launch. The shared `page_timeout=page_timeout_ms` (15000) also
+    binds 5s before `browser_deadline_ms` (20000), leaving that key mostly inert. →
+    **Amendment:** the browser gets its own `CrawlerRunConfig` with a render-aware wait and
+    `page_timeout` aligned to `browser_deadline_ms`; `asyncio.wait_for` remains the hard
+    no-hang bound. The HTTP run config is unchanged. Risk !#5's live escalation-rate check
+    should now also confirm escalated pages come back non-empty.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
@@ -517,6 +546,15 @@ Append-only, empty at plan creation. -->
     noise, not leaked crawl detail. Suppressing it would mean importing `BrowserConfig`, which
     Phase 1's Out-of-scope forbids. Revisit in Phase 2, which legitimately constructs a browser
     crawler and can set the flag there.
+
+#2. 2026-08-17 — Phase 2, **acted on**: `min_markdown_words=50` is correct for production but
+    retroactively makes 11 pre-existing Phase 1 fixtures ("fine", "A content", `"x"*500` with
+    no spaces) count as JS shells and escalate, since none were written with a word budget in
+    mind. → `make_config` in `tests/conftest.py` defaults `min_markdown_words` to 1, so
+    escalation is opt-in per test and every pre-Phase-2 test keeps the semantics it was
+    written with; the Phase 2 tests pass 50 explicitly. `FetchSettings`/`harness.toml` keep
+    the real default of 50, now pinned by a test asserting the model default directly so the
+    divergence between test factory and production cannot drift unnoticed.
 
 ## Phase Handoff Log
 
@@ -543,5 +581,29 @@ Append-only, empty at plan creation. -->
 - Watch-next: Phase 2 constructs a browser crawler — set `BrowserConfig(verbose=False)` there
   to close Discovery #1. Reuse `_fetch_one` for the browser attempt (do not write a second
   fetch path) and remember escalation must NOT consume the R4 retry budget.
+
+### 2026-08-17 — Phase 2: Chromium escalation for JS shells
+- Done: `_is_thin` + `_escalate_one` added; `_fetch()` lazily builds a browser
+  `AsyncWebCrawler(config=BrowserConfig(verbose=False))` only when thin results exist and
+  re-fetches each once under `browser_deadline_ms` and `Semaphore(browser_concurrency)`,
+  reusing `_fetch_one`. `FetchSettings` gained `min_markdown_words` (50),
+  `browser_deadline_ms` (20000), `browser_concurrency` (2). `FetchedPage` gained
+  `content_type: str | None = None`. 131 tests green; ruff, format, mypy clean.
+- Learned: `classify()` maps a 200 `text/html` page with empty markdown to `non_html`, NOT
+  `fetched` — so the canonical SPA shell needed an explicit escalation branch (Recon #2);
+  `_is_thin` now also escalates `non_html` when `content_type` is absent or HTML-like, which
+  incidentally keeps PDFs out. crawl4ai 0.9.2's `CrawlerRunConfig` defaults
+  `wait_until="domcontentloaded"` and `delay_before_return_html=0.1`, passed straight to
+  Playwright's `page.goto`, so the browser needed its own run config with
+  `wait_until="networkidle"` (Recon #3). Test fixtures now use per-instance
+  `in_flight`/`max_in_flight` via `fake_cls.instances[N]`, since two crawlers share the class.
+- Drift: Reconciliations #2 and #3 (both approved, both from the 3F review's Major findings).
+  Discovery #2 logged and acted on: `make_config` defaults `min_markdown_words` to 1 so
+  pre-Phase-2 tests keep their semantics; production's 50 is pinned in `tests/test_config.py`.
+  Discovery #1 closed for the browser path only; the HTTP crawler still prints one banner.
+- Watch-next: two escalation behaviors rest on unrun live checks — that `networkidle` really
+  renders an SPA, and risk !#5's escalation rate at 50 words. Phase 3's HEAD precheck is the
+  next thing to touch `_fetch()`'s per-URL path; it must land ahead of the fetch, and its
+  `downloads_path` goes on `HTTPCrawlerConfig`, not the strategy.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->

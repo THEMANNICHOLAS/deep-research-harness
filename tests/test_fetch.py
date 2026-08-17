@@ -4,7 +4,11 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter  # type: ignore[import-untyped]
+from crawl4ai import (  # type: ignore[import-untyped]
+    BrowserConfig,
+    DefaultMarkdownGenerator,
+    PruningContentFilter,
+)
 from crawl4ai.async_crawler_strategy import (  # type: ignore[import-untyped]
     AsyncHTTPCrawlerStrategy,
 )
@@ -64,11 +68,16 @@ def _make_fake_crawler_class(
     class _FakeCrawler:
         constructed_with: list[dict[str, object]] = []
         calls: list[SimpleNamespace] = []
-        in_flight = 0
-        max_in_flight = 0
+        # Phase 2 constructs a second (browser) AsyncWebCrawler from this same patched
+        # class, so per-instance in_flight/max_in_flight keep the HTTP and browser
+        # concurrency caps from conflating; instances is order-preserving construction order.
+        instances: list["_FakeCrawler"] = []
 
         def __init__(self, **kwargs: object) -> None:
             _FakeCrawler.constructed_with.append(kwargs)
+            self.in_flight = 0
+            self.max_in_flight = 0
+            _FakeCrawler.instances.append(self)
 
         async def __aenter__(self) -> "_FakeCrawler":
             return self
@@ -78,8 +87,8 @@ def _make_fake_crawler_class(
 
         async def arun(self, url: str, config: object = None) -> _FakeResult | None:
             _FakeCrawler.calls.append(SimpleNamespace(url=url, config=config))
-            _FakeCrawler.in_flight += 1
-            _FakeCrawler.max_in_flight = max(_FakeCrawler.max_in_flight, _FakeCrawler.in_flight)
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
             try:
                 # Yields control at least once so overlapping arun calls actually interleave
                 # under the semaphore, rather than each running to completion synchronously.
@@ -96,7 +105,7 @@ def _make_fake_crawler_class(
                 bucket = by_url.get(url)
                 return bucket.pop(0) if bucket else None
             finally:
-                _FakeCrawler.in_flight -= 1
+                self.in_flight -= 1
 
     return _FakeCrawler
 
@@ -673,7 +682,7 @@ async def test_concurrency_never_exceeds_the_configured_cap(install_crawler, mak
 
     await fetch._fetch(urls, config, registry)
 
-    assert fake_cls.max_in_flight == 2
+    assert fake_cls.instances[0].max_in_flight == 2
 
 
 async def test_output_order_follows_input_order_not_completion_order(install_crawler, make_config):
@@ -847,3 +856,297 @@ async def test_a_call_at_exactly_the_limit_fetches_every_url(install_crawler, ma
     ]
     assert "## [S1] https://limit1.test" in message.content
     assert "## [S2] https://limit2.test" in message.content
+
+
+async def test_a_thin_result_escalates_once_and_the_browser_result_wins(
+    install_crawler, make_config
+):
+    config = make_config(min_markdown_words=5)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://shell.test": [
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
+            ),
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(
+                    raw_markdown="a rich rendered body with plenty of real words",
+                    fit_markdown="a rich rendered body with plenty of real words",
+                ),
+            ),
+        ],
+    }
+    fake_cls = install_crawler([], behaviors=behaviors)
+
+    _, pages = await fetch._fetch(["https://shell.test"], config, registry)
+
+    assert pages[0].markdown == "a rich rendered body with plenty of real words"
+    assert len([c for c in fake_cls.calls if c.url == "https://shell.test"]) == 2
+    assert len(fake_cls.constructed_with) == 2
+    assert isinstance(fake_cls.constructed_with[1]["config"], BrowserConfig)
+
+
+async def test_a_rich_result_never_escalates_and_constructs_no_browser(
+    install_crawler, make_config
+):
+    config = make_config(min_markdown_words=5)
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://rich.test",
+            markdown=_FakeMarkdown(
+                raw_markdown="plenty of real words here already",
+                fit_markdown="plenty of real words here already",
+            ),
+        ),
+    ]
+    fake_cls = install_crawler(results)
+
+    await fetch._fetch(["https://rich.test"], config, registry)
+
+    assert len([c for c in fake_cls.calls if c.url == "https://rich.test"]) == 1
+    assert len(fake_cls.constructed_with) == 1
+
+
+async def test_failure_outcomes_do_not_escalate(install_crawler, make_config):
+    config = make_config(min_markdown_words=5, http_deadline_ms=20, max_retries=1)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://hang.test": ["hang", "hang"],
+        "https://notfound.test": [
+            _FakeResult(
+                "https://notfound.test", error_message="HTTP 404: Not Found", status_code=None
+            ),
+        ],
+        "https://blocked.test": [
+            _FakeResult(
+                "https://blocked.test", error_message="HTTP 403: Forbidden", status_code=None
+            ),
+        ],
+    }
+    fake_cls = install_crawler([], behaviors=behaviors)
+
+    _, pages = await fetch._fetch(
+        ["https://hang.test", "https://notfound.test", "https://blocked.test"], config, registry
+    )
+
+    by_url = {page.url: page for page in pages}
+    assert by_url["https://hang.test"].outcome == "timeout"
+    assert by_url["https://notfound.test"].outcome == "error"
+    assert by_url["https://blocked.test"].outcome == "blocked"
+    # Neither a timeout, a 404, nor a blocked outcome is escalatable, so thinness alone never
+    # triggers escalation — only one (HTTP) crawler is ever constructed.
+    assert len(fake_cls.constructed_with) == 1
+
+
+async def test_empty_but_html_non_html_result_escalates(install_crawler, make_config):
+    # Reconciliation #2: a 200 text/html page with empty generated markdown classifies as
+    # `non_html` (classify()'s existing behavior), not `fetched` — but it is the canonical
+    # JS-shell case (`<div id="root"></div>`) and must still escalate.
+    config = make_config(min_markdown_words=5)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://shell.test": [
+            _FakeResult(
+                "https://shell.test",
+                response_headers={"Content-Type": "text/html"},
+                markdown=_FakeMarkdown(raw_markdown="", fit_markdown=""),
+            ),
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(
+                    raw_markdown="a rich rendered body with plenty of real words",
+                    fit_markdown="a rich rendered body with plenty of real words",
+                ),
+            ),
+        ],
+    }
+    fake_cls = install_crawler([], behaviors=behaviors)
+
+    _, pages = await fetch._fetch(["https://shell.test"], config, registry)
+
+    assert pages[0].markdown == "a rich rendered body with plenty of real words"
+    assert len([c for c in fake_cls.calls if c.url == "https://shell.test"]) == 2
+    assert len(fake_cls.constructed_with) == 2
+
+
+async def test_empty_pdf_non_html_result_does_not_escalate(install_crawler, make_config):
+    # A genuine non-HTML resource (PDF) with empty markdown must stay `non_html` and never
+    # trigger a browser launch, even though it is also "thin".
+    config = make_config(min_markdown_words=5)
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://pdf.test/doc",
+            response_headers={"Content-Type": "application/pdf"},
+            markdown=_FakeMarkdown(raw_markdown="", fit_markdown=""),
+        )
+    ]
+    fake_cls = install_crawler(results)
+
+    _, pages = await fetch._fetch(["https://pdf.test/doc"], config, registry)
+
+    assert pages[0].outcome == "non_html"
+    assert len([c for c in fake_cls.calls if c.url == "https://pdf.test/doc"]) == 1
+    assert len(fake_cls.constructed_with) == 1
+
+
+async def test_empty_result_with_no_content_type_header_escalates(install_crawler, make_config):
+    # No `content-type` header at all still reads as "looks like HTML" — `content_type` is
+    # `None`, not a non-HTML type — so it escalates too.
+    config = make_config(min_markdown_words=5)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://noheader.test": [
+            _FakeResult(
+                "https://noheader.test",
+                response_headers=None,
+                markdown=_FakeMarkdown(raw_markdown="", fit_markdown=""),
+            ),
+            _FakeResult(
+                "https://noheader.test",
+                markdown=_FakeMarkdown(
+                    raw_markdown="a rich rendered body with plenty of real words",
+                    fit_markdown="a rich rendered body with plenty of real words",
+                ),
+            ),
+        ],
+    }
+    fake_cls = install_crawler([], behaviors=behaviors)
+
+    _, pages = await fetch._fetch(["https://noheader.test"], config, registry)
+
+    assert pages[0].markdown == "a rich rendered body with plenty of real words"
+    assert len([c for c in fake_cls.calls if c.url == "https://noheader.test"]) == 2
+    assert len(fake_cls.constructed_with) == 2
+
+
+async def test_escalation_run_config_uses_browser_deadline_and_render_aware_wait(
+    install_crawler, make_config
+):
+    # Reconciliation #3: the browser attempt must get its own CrawlerRunConfig — its
+    # page_timeout aligned to browser_deadline_ms (not the HTTP page_timeout_ms) and a
+    # render-aware wait, while the HTTP attempt's config is untouched.
+    config = make_config(min_markdown_words=5, page_timeout_ms=1234, browser_deadline_ms=20000)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://shell.test": [
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
+            ),
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(
+                    raw_markdown="a rich rendered body with plenty of real words",
+                    fit_markdown="a rich rendered body with plenty of real words",
+                ),
+            ),
+        ],
+    }
+    fake_cls = install_crawler([], behaviors=behaviors)
+
+    await fetch._fetch(["https://shell.test"], config, registry)
+
+    calls = [c for c in fake_cls.calls if c.url == "https://shell.test"]
+    assert len(calls) == 2
+    http_config, browser_config = calls[0].config, calls[1].config
+    assert http_config.page_timeout == 1234
+    assert browser_config.page_timeout == 20000
+    assert browser_config.wait_until == "networkidle"
+    assert http_config.wait_until != "networkidle"
+
+
+async def test_an_escalation_exceeding_its_deadline_yields_timeout_not_a_hang(
+    install_crawler, make_config
+):
+    config = make_config(min_markdown_words=5, browser_deadline_ms=20)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://shell.test": [
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
+            ),
+            "hang",
+        ],
+    }
+    install_crawler([], behaviors=behaviors)
+
+    _, pages = await asyncio.wait_for(
+        fetch._fetch(["https://shell.test"], config, registry), timeout=5
+    )
+
+    assert pages[0].outcome == "timeout"
+    assert pages[0].markdown == ""
+
+
+async def test_escalation_does_not_consume_the_retry_budget(install_crawler, make_config):
+    config = make_config(min_markdown_words=5, max_retries=2)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://flaky.test": [
+            _FakeResult(
+                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
+            ),
+            _FakeResult(
+                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
+            ),
+            _FakeResult(
+                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
+            ),
+        ],
+        "https://shell.test": [
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
+            ),
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(
+                    raw_markdown="a rich rendered body with plenty of words",
+                    fit_markdown="a rich rendered body with plenty of words",
+                ),
+            ),
+        ],
+    }
+    fake_cls = install_crawler([], behaviors=behaviors)
+
+    _, pages = await fetch._fetch(["https://flaky.test", "https://shell.test"], config, registry)
+
+    assert (
+        len([c for c in fake_cls.calls if c.url == "https://flaky.test"])
+        == config.fetch.max_retries + 1
+    )
+    assert len([c for c in fake_cls.calls if c.url == "https://shell.test"]) == 2
+
+    by_url = {page.url: page for page in pages}
+    assert by_url["https://flaky.test"].outcome == "error"
+    assert by_url["https://shell.test"].markdown == "a rich rendered body with plenty of words"
+
+
+async def test_browser_concurrency_never_exceeds_its_configured_cap(install_crawler, make_config):
+    config = make_config(min_markdown_words=5, browser_concurrency=2, http_concurrency=10)
+    registry = SourceRegistry()
+    urls = [f"https://shell{n}.test" for n in range(5)]
+    behaviors: dict[str, list[object]] = {
+        url: [
+            _FakeResult(url, markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin")),
+            _FakeResult(
+                url,
+                markdown=_FakeMarkdown(
+                    raw_markdown="a rich rendered body with plenty of words",
+                    fit_markdown="a rich rendered body with plenty of words",
+                ),
+            ),
+        ]
+        for url in urls
+    }
+    fake_cls = install_crawler([], behaviors=behaviors)
+
+    await fetch._fetch(urls, config, registry)
+
+    assert fake_cls.instances[1].max_in_flight == 2
+    assert fake_cls.instances[0].max_in_flight == 5
