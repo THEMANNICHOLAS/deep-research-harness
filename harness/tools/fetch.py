@@ -256,6 +256,15 @@ def _guard_blocked_detail(url: str, signals: list[str]) -> str:
     return f"{url}: blocked by guard ({', '.join(signals)})"
 
 
+def _provenance_rejected_detail(url: str) -> str:
+    """One incident line for a URL rejected by strict provenance (Phase 4, D2/R2).
+
+    URL only, no signal families (unlike `_guard_blocked_detail`): rejection here has nothing
+    to do with content, only with where the URL came from.
+    """
+    return f"{url}: rejected — not from search results or explicit user approval"
+
+
 def _no_result_page(url: str) -> FetchedPage:
     """The page recorded when a batch comes back short one result.
 
@@ -305,6 +314,20 @@ async def _fetch(
             # drop reaches no disclosure surface at all.
             run_log.record("urls_merged", f"{url} merged into {survivor}; only the latter was read")
     urls = unique_urls
+    if not urls:
+        return "", []
+
+    # Phase 4 strict provenance (D2/R2): a URL is fetchable only if it arrived from a
+    # `search_web` result or explicit user approval (`__main__` at run start) — never from a
+    # page's own in-body links. Rejection is per-URL: one unapproved URL never fails the rest
+    # of the batch, and a rejected URL never reaches the crawler at all.
+    approved_urls: list[str] = []
+    for url in urls:
+        if registry.is_approved(url):
+            approved_urls.append(url)
+        else:
+            run_log.record("provenance_rejected", _provenance_rejected_detail(url))
+    urls = approved_urls
     if not urls:
         return "", []
 
@@ -473,6 +496,10 @@ def build_fetch_tool(
     inside the shared `_fetch`, before classification, minting, or capture. A blocked page
     vanishes from the pipeline entirely and is disclosed only via a `guard_blocked`
     `RunLog` incident — see harness/guard.py and PLAN-prompt-injection-defense.md Phase 3.
+
+    Strict URL provenance (Phase 4, R2) is enforced the same way, one step earlier: an
+    unapproved URL never reaches the crawler at all, disclosed via a `provenance_rejected`
+    incident instead.
     """
     sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 

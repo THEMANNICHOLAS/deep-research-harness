@@ -560,7 +560,11 @@ async def test_a_reader_crash_after_a_successful_fetch_leaves_the_source_unread(
         ]
     )
 
-    researcher, registry = build_researcher(researcher_model, reader_model)
+    # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
+    # directly-fetched URL must arrive pre-approved.
+    registry = SourceRegistry()
+    registry.approve("https://a.test")
+    researcher, registry = build_researcher(researcher_model, reader_model, registry=registry)
     result = await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
     task_messages = [
@@ -599,7 +603,11 @@ async def test_an_empty_digest_leaves_the_fetched_source_unread(
         ]
     )
 
-    researcher, registry = build_researcher(researcher_model, reader_model)
+    # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
+    # directly-fetched URL must arrive pre-approved.
+    registry = SourceRegistry()
+    registry.approve("https://a.test")
+    researcher, registry = build_researcher(researcher_model, reader_model, registry=registry)
     await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
     source = registry.get("S1")
@@ -683,7 +691,10 @@ async def test_lead_to_researcher_to_reader_digest_reaches_the_lead(
         ]
     )
 
+    # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
+    # directly-fetched URL must arrive pre-approved.
     registry = SourceRegistry()
+    registry.approve("https://a.test")
     graph = build_agent(make_config(), registry)
     result = await graph.ainvoke(
         {"messages": [HumanMessage(content="research this")]},

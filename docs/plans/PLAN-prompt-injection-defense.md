@@ -238,7 +238,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Identity-model migration
 - [x] Phase 2: Guard scanner core
 - [x] Phase 3: Firewall wiring in fetch and search
-- [ ] Phase 4: Strict URL provenance
+- [x] Phase 4: Strict URL provenance
 - [ ] Phase 5: Spotlighting, report hygiene, containment tests
 - [ ] Final verification
 
@@ -441,7 +441,7 @@ user approval, pre-crawl, as a disclosed outcome (R2 closed structurally for bot
 4. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full suite green: `uv run pytest`
+- [x] Full suite green: `uv run pytest`
 
 ### Phase 5: Spotlighting, report hygiene, containment tests
 **Risk:** flagged (!#4)
@@ -568,6 +568,14 @@ Append-only, empty at plan creation. -->
   benign content (compound emoji, Indic/Persian scripts), so it will false-positive once
   Phase 3 wires the scan. Fix: delete the character or add a justifying fixture. MUST be
   resolved before/with Phase 3.
+### 2026-08-17 — Phase 4 gap decided (developer, this session)
+- No user-URL input path existed in `harness/__main__.py` (CLI takes one question string).
+  Developer decision: the prompt stays a plain question — no `--url` flag; http(s) URLs
+  found INSIDE the question text are extracted and `approve`d at run start, so a pasted
+  "read this page" URL stays fetchable under strict provenance. Guard-blocked search
+  results are NOT approved (only survivors of `_drop_guarded` are) — the plan's "every
+  parsed result URL approved on ingestion" predates Phase 3's drop.
+
 ### 2026-08-17 — Phase 3 review finding (deferred)
 - **[Simplify, deferred]** `_guard_blocked_detail` is byte-identical in
   harness/tools/fetch.py and harness/tools/search.py; per D3 the formatter belongs in
@@ -596,6 +604,12 @@ Append-only, empty at plan creation. -->
 - Learned: scan-before-classify means a failed crawl whose error page fires a signal discloses as `guard_blocked`, not `fetch_failed` — by design (D5), noted for operator expectations. Blocked URLs have no `pages_by_url` entry, so the final pages assembly filters membership.
 - Drift: none. One deferred simplify — `_guard_blocked_detail` duplicated in fetch.py/search.py, move to guard.py in Phase 5 (see `## Discoveries`).
 - Watch-next: Phase 4 (strict provenance, flagged !#2) adds `approve`/`is_approved` to `SourceRegistry` keyed by `normalize_url`, approves on search ingestion and user URLs at run start (`harness/__main__.py`), enforces pre-crawl inside `_fetch` — rejection must be per-URL, never failing the approved batch.
+
+### 2026-08-17 — Phase 4: Strict URL provenance
+- Done: `SourceRegistry.approve`/`is_approved` (keyed by `normalize_url`) + `extract_urls`; `_fetch` rejects unapproved URLs pre-crawl per-URL (`provenance_rejected` incident each, batch survives); search approves guard-SURVIVOR result URLs only; `__main__` extracts and approves http(s) URLs from the question text (developer decision — no `--url` flag). Full suite 475 green, gates clean after one mechanical ruff-format fix in test_search.py; flagged-risk (!#2) judgment review clean (never-silent, per-URL, no widening all confirmed).
+- Learned: the provenance check has NO config off-switch (deliberate — the no-escape-hatch non-goal); `[guard] enabled=false` still approves all parsed results since `_drop_guarded` returns everything. Existing tests that fetch without a search needed `approve_all` (new conftest helper) or URL-in-question arranges — the same will apply to any future test driving `_fetch` directly.
+- Drift: none.
+- Watch-next: Phase 5 (flagged !#4) — `fence`/`sanitize_for_report` in guard.py, wire into both `_render`s + verify's pooled block + report's `_render_body`, registry title/link hygiene, prompt rule blocks, R4 regression tests. Also fold in the deferred Phase 3 simplify: move `_guard_blocked_detail` into guard.py.
 
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:

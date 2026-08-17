@@ -164,6 +164,22 @@ def normalize_url(url: str) -> str:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+_URL_RE = re.compile(r"https?://\S+")
+_TRAILING_PUNCTUATION = ".,;:!?)]}>\"'"
+
+
+def extract_urls(text: str) -> list[str]:
+    """Return every http(s) URL found in `text`, trailing punctuation stripped.
+
+    Phase 4's strict-provenance seam (D2/R2): a question's pasted "read this page" URL is the
+    only other sanctioned way (besides a search result) a URL becomes fetchable, so `__main__`
+    extracts here and `registry.approve`s each one at run start. Non-http(s) schemes
+    (`javascript:`, `ftp:`) are never matched — approving one would widen fetchability beyond
+    what `_fetch`'s crawler even attempts.
+    """
+    return [match.group(0).rstrip(_TRAILING_PUNCTUATION) for match in _URL_RE.finditer(text)]
+
+
 def names_a_different_document(url: str, other: str) -> bool:
     """Whether two URLs that share a canonical form still name different documents.
 
@@ -207,6 +223,18 @@ class SourceRegistry:
         )
         self._by_url: dict[str, Source] = {}
         self._by_id: dict[str, Source] = {}
+        # Phase 4 strict provenance (R2): a URL is fetchable only once it lands here — from a
+        # `search_web` result surviving Phase 3's guard, or a user-supplied URL `__main__`
+        # approves at run start. Never from a page's own in-body links (D2).
+        self._approved: set[str] = set()
+
+    def approve(self, url: str) -> None:
+        """Mark `url` fetchable (Phase 4, R2) -- the only sanctioned way to widen fetchability."""
+        self._approved.add(normalize_url(url))
+
+    def is_approved(self, url: str) -> bool:
+        """Whether `url` (any `normalize_url`-equivalent spelling) has been approved."""
+        return normalize_url(url) in self._approved
 
     def add(self, url: str, title: str | None = None) -> str:
         """Register `url` and return its ID; the same normalized URL is never added twice.

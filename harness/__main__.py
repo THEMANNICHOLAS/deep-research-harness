@@ -51,7 +51,7 @@ from harness.display import (
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
 from harness.runlog import RunLog
-from harness.sources import SourceRegistry
+from harness.sources import SourceRegistry, extract_urls
 from harness.tools.search import SearchPreflightError, preflight_search
 from harness.verify import VerificationResult, verify_paragraphs
 
@@ -295,6 +295,11 @@ async def main(argv: list[str] | None = None) -> int:
     started_at = datetime.now()
 
     registry = SourceRegistry(run_id=started_at.strftime("%Y-%m-%d-%H%M%S"))
+    # Phase 4 strict provenance (D2/R2): a pasted "read this page" URL is the only other
+    # sanctioned way a URL becomes fetchable (no `--url` flag) — approved here, before the
+    # agent runs, so it is fetchable from the run's very first tool call.
+    for url in extract_urls(args.question):
+        registry.approve(url)
     run_log = RunLog()
     agent = build_agent(config, registry, run_log)
 

@@ -10,7 +10,7 @@ from harness.config import AgentSettings, GuardSettings
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
 from harness.tools import fetch
-from tests.conftest import _FakeMarkdown, _FakeResult
+from tests.conftest import _FakeMarkdown, _FakeResult, approve_all
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
 
@@ -49,6 +49,7 @@ async def test_mixed_batch_returns_one_entry_per_url_with_successes_intact(
 ):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test", "https://b.test", "https://c.test"])
     results = [
         _FakeResult(
             "https://a.test",
@@ -102,6 +103,7 @@ async def test_equivalent_url_spellings_are_fetched_once_with_one_source_id(
 ):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://dup.test/a"])
     results = [
         _FakeResult(
             "https://dup.test/a",
@@ -136,6 +138,7 @@ async def test_merging_a_differently_shaped_url_records_a_disclosed_incident(
     """
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://arxiv.org/abs/2405.11111"])
     run_log = RunLog()
     results = [
         _FakeResult(
@@ -167,6 +170,8 @@ async def test_merging_an_equivalent_spelling_records_no_incident(install_crawle
     """
     config = make_config()
     run_log = RunLog()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://dup.test/a"])
     results = [
         _FakeResult(
             "https://dup.test/a",
@@ -178,7 +183,7 @@ async def test_merging_an_equivalent_spelling_records_no_incident(install_crawle
     await fetch._fetch(
         ["https://dup.test/a", "https://dup.test/a/#frag", "https://dup.test/a?utm_source=x"],
         config,
-        SourceRegistry(),
+        registry,
         run_log,
     )
 
@@ -191,6 +196,7 @@ async def test_content_is_truncated_at_the_cap_but_artifact_keeps_full_text(
     cap = 50
     config = make_config(per_page_char_cap=cap)
     registry = SourceRegistry()
+    approve_all(registry, ["https://long.test"])
     long_markdown = "x" * 500
     results = [
         _FakeResult(
@@ -278,6 +284,7 @@ def test_a_heading_at_the_very_start_does_not_empty_the_block():
 async def test_content_has_a_heading_for_every_url_including_failures(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://ok.test", "https://fail.test"])
     results = [
         _FakeResult(
             "https://ok.test",
@@ -306,6 +313,7 @@ async def test_content_has_a_heading_for_every_url_including_failures(install_cr
 async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_config):
     config = make_config(page_timeout_ms=1234, max_concurrency=3)
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     results = [
         _FakeResult(
             "https://a.test",
@@ -325,6 +333,7 @@ async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_confi
 async def test_dispatcher_is_memory_bounded_and_rate_limited(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     results = [
         _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"))
     ]
@@ -344,6 +353,7 @@ async def test_dispatcher_is_memory_bounded_and_rate_limited(install_crawler, ma
 async def test_crawl4ai_logging_is_silenced_on_both_configs(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     results = [
         _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"))
     ]
@@ -359,6 +369,7 @@ async def test_crawl4ai_logging_is_silenced_on_both_configs(install_crawler, mak
 async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     results = [
         _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"))
     ]
@@ -381,6 +392,8 @@ async def test_pdf_batch_gets_the_same_boilerplate_stripping_as_the_html_batch(
     module's own "boilerplate-stripped markdown" contract.
     """
     config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test/paper.pdf"])
     results = [
         _FakeResult(
             "https://a.test/paper.pdf",
@@ -389,7 +402,7 @@ async def test_pdf_batch_gets_the_same_boilerplate_stripping_as_the_html_batch(
     ]
     fake_cls = install_crawler(results)
 
-    await fetch._fetch(["https://a.test/paper.pdf"], config, SourceRegistry(), RunLog())
+    await fetch._fetch(["https://a.test/paper.pdf"], config, registry, RunLog())
 
     recorded = fake_cls.calls[0].config
     assert isinstance(recorded.markdown_generator, DefaultMarkdownGenerator)
@@ -401,6 +414,7 @@ async def test_built_tool_exposes_the_pinned_contract_and_returns_content_and_ar
 ):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://tool.test"])
     results = [
         _FakeResult(
             "https://tool.test",
@@ -439,6 +453,7 @@ async def test_built_tool_exposes_the_pinned_contract_and_returns_content_and_ar
 async def test_fit_markdown_is_preferred_over_raw_markdown(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://pruned.test"])
     results = [
         _FakeResult(
             "https://pruned.test",
@@ -459,6 +474,7 @@ async def test_fit_markdown_is_preferred_over_raw_markdown(install_crawler, make
 async def test_raw_markdown_is_used_when_fit_markdown_is_empty(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://unpruned.test"])
     results = [
         _FakeResult(
             "https://unpruned.test",
@@ -478,6 +494,7 @@ async def test_title_from_result_metadata_reaches_the_page_and_the_registry(
 ):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://titled.test"])
     results = [
         _FakeResult(
             "https://titled.test",
@@ -504,6 +521,7 @@ async def test_content_type_header_on_the_result_reroutes_through_the_pdf_batch(
     # reroutes it through the PDF batch instead, landing a real fetched capture.
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://pdf.test/doc"])
     playwright_results = [
         _FakeResult(
             "https://pdf.test/doc",
@@ -531,6 +549,7 @@ async def test_input_url_with_no_result_reports_a_single_error_outcome(
 ):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     install_crawler([])
 
     _, pages = await fetch._fetch(["https://a.test"], config, registry, RunLog())
@@ -550,6 +569,7 @@ async def test_the_first_of_two_results_for_one_url_is_the_one_reported(
     # "Requeued" placeholder AND re-queue the crawl, and the first result wins.
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     results = [
         _FakeResult("https://a.test", error_message="Requeued", status_code=None),
         _FakeResult(
@@ -574,6 +594,7 @@ async def test_result_matching_no_input_url_never_supplies_another_urls_body(
     # which would produce a plausible wrong citation.
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://original.test/start"])
     results = [
         _FakeResult(
             "https://redirected.test/final",
@@ -648,7 +669,7 @@ async def test_a_malformed_call_is_reported_as_itself_not_as_an_over_limit_call(
     install_crawler, make_config
 ):
     # The `handle_validation_error` hook swallows EVERY validation failure for this tool, so a
-    # fixed over-limit string would make a wrong type look like a too-long list.
+    # wrong type must not be misreported as an over-limit call (D2).
     config = make_config()
     registry = SourceRegistry()
     fake_cls = install_crawler([])
@@ -699,6 +720,7 @@ async def test_a_call_at_exactly_the_limit_fetches_every_url(install_crawler, ma
     # Survival guard: proves the cap does not break the at-limit case.
     config = make_config(max_urls_per_call=2)
     registry = SourceRegistry()
+    approve_all(registry, ["https://limit1.test", "https://limit2.test"])
     results = [
         _FakeResult(
             "https://limit1.test",
@@ -727,6 +749,7 @@ async def test_a_call_at_exactly_the_limit_fetches_every_url(install_crawler, ma
 async def test_each_fetched_page_writes_its_source_file(install_crawler, make_config, tmp_path):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://article.test"])
     results = [
         _FakeResult(
             "https://article.test",
@@ -756,6 +779,7 @@ async def test_source_file_text_is_untruncated_even_when_the_render_is_capped(
     long_markdown = "y" * 500
     config = make_config(per_page_char_cap=cap, agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://long.test"])
     results = [
         _FakeResult(
             "https://long.test",
@@ -780,6 +804,7 @@ async def test_a_mixed_batch_writes_content_for_successes_and_nothing_for_failur
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://ok.test", "https://bad.test"])
     results = [
         _FakeResult(
             "https://ok.test",
@@ -814,6 +839,7 @@ async def test_one_source_write_failure_does_not_poison_the_batch_or_go_silent(
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test", "https://b.test"])
     run_log = RunLog()
     results = [
         _FakeResult(
@@ -864,6 +890,7 @@ async def test_refetching_the_same_url_overwrites_the_same_source_file(
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://re.test"])
     fetch_pages = fetch.build_fetch_tool(config, registry)
 
     install_crawler(
@@ -905,6 +932,7 @@ async def test_a_failed_refetch_does_not_overwrite_a_successful_capture(  # R5
     """
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://flaky.test"])
     fetch_pages = fetch.build_fetch_tool(config, registry)
 
     install_crawler(
@@ -945,6 +973,7 @@ async def test_a_successful_refetch_after_an_earlier_failure_writes_a_normal_cap
     """
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://flaky.test"])
     fetch_pages = fetch.build_fetch_tool(config, registry)
 
     install_crawler([_FakeResult("https://flaky.test", status_code=429, markdown=None)])
@@ -993,6 +1022,7 @@ async def test_a_failed_fetch_mints_no_source_id_writes_no_file_and_renders_by_u
     registry = SourceRegistry()
     run_log = RunLog()
     url = "https://fail.test"
+    approve_all(registry, [url])
     if no_result:
         install_crawler([])
     else:
@@ -1035,6 +1065,7 @@ async def test_a_successful_fetch_mints_sn_writes_capture_and_renders_sn_heading
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
     url = "https://ok.test"
+    approve_all(registry, [url])
     install_crawler(
         [_FakeResult(url, markdown=_FakeMarkdown(raw_markdown="ok body", fit_markdown="ok body"))]
     )
@@ -1063,6 +1094,7 @@ async def test_a_url_that_fails_then_succeeds_later_mints_a_fresh_sn_normally(  
     registry = SourceRegistry()
     run_log = RunLog()
     url = "https://retry.test"
+    approve_all(registry, [url])
     fetch_pages = fetch.build_fetch_tool(config, registry, run_log)
 
     install_crawler([_FakeResult(url, status_code=500, error_message="boom", markdown=None)])
@@ -1090,6 +1122,7 @@ async def test_pdf_extension_url_is_routed_to_the_pdf_crawler_and_lands_fetched(
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://docs.test/report.pdf"])
     pdf_results = [
         _FakeResult(
             "https://docs.test/report.pdf",
@@ -1123,6 +1156,7 @@ async def test_empty_pdf_extraction_mints_no_id_and_never_fetched_or_non_html(  
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://docs.test/empty.pdf"])
     pdf_results = [
         _FakeResult(
             "https://docs.test/empty.pdf", markdown=_FakeMarkdown(raw_markdown="", fit_markdown="")
@@ -1155,6 +1189,7 @@ async def test_pdf_batch_failure_mints_no_id_and_writes_no_file(  # R5
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://docs.test/broken.pdf"])
     pdf_results = [_FakeResult("https://docs.test/broken.pdf", markdown=None, **result_kwargs)]
     install_crawler([], pdf_results=pdf_results)
     fetch_pages = fetch.build_fetch_tool(config, registry)
@@ -1174,6 +1209,7 @@ async def test_a_mixed_html_and_pdf_batch_writes_both_captures_with_existing_sha
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://article.test/page", "https://docs.test/report.pdf"])
     html_results = [
         _FakeResult(
             "https://article.test/page",
@@ -1216,6 +1252,7 @@ async def test_char_cap_applies_to_extracted_pdf_text_same_as_markdown(
     cap = 50
     config = make_config(per_page_char_cap=cap)
     registry = SourceRegistry()
+    approve_all(registry, ["https://docs.test/long.pdf"])
     long_text = "z" * 500
     pdf_results = [
         _FakeResult(
@@ -1235,6 +1272,7 @@ async def test_char_cap_applies_to_extracted_pdf_text_same_as_markdown(
 async def test_failed_fetch_outcomes_are_recorded_on_the_run_log(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://ok.test", "https://blocked.test"])
     run_log = RunLog()
     # Direct `_fetch` call, so the capture directory the builder normally creates must exist
     # here — otherwise every write fails and pollutes the log with capture_write_failed.
@@ -1271,6 +1309,7 @@ async def test_a_page_carrying_an_attack_string_mints_no_sn_writes_no_file_and_i
     still fetches and renders normally (mixed batch)."""
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://evil.test", "https://clean.test"])
     run_log = RunLog()
     attack_markdown = _attack_markdown()
     results = [
@@ -1313,6 +1352,7 @@ async def test_a_blocked_pdf_page_is_dropped_identically_to_an_html_page(  # R1
 ):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://docs.test/evil.pdf"])
     run_log = RunLog()
     attack_markdown = _attack_markdown()
     pdf_results = [
@@ -1339,6 +1379,7 @@ async def test_guard_disabled_bypasses_scanning_and_the_attack_page_fetches_norm
 ):
     config = make_config(guard=GuardSettings(enabled=False))
     registry = SourceRegistry()
+    approve_all(registry, ["https://evil.test"])
     run_log = RunLog()
     attack_markdown = _attack_markdown()
     results = [
@@ -1368,6 +1409,7 @@ async def test_survivor_markdown_zero_width_chars_stripped_when_guard_disabled( 
         agent=AgentSettings(workspace_dir=tmp_path), guard=GuardSettings(enabled=False)
     )
     registry = SourceRegistry()
+    approve_all(registry, ["https://zerowidth.test"])
     dirty_markdown = "wo​rd"
     results = [
         _FakeResult(
@@ -1393,6 +1435,7 @@ async def test_survivor_markdown_control_chars_stripped_with_guard_enabled(  # D
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://control.test"])
     dirty_markdown = "be\x07ll"
     results = [
         _FakeResult(
@@ -1411,3 +1454,66 @@ async def test_survivor_markdown_control_chars_stripped_with_guard_enabled(  # D
     text = (captures_dir / f"{page.source_id}.md").read_text(encoding="utf-8")
     assert "bell" in text
     assert "\x07" not in text
+
+
+# --- Phase 4: strict URL provenance (R2) -------------------------------------------------
+
+
+async def test_an_unapproved_url_is_rejected_pre_crawl_and_never_reaches_the_crawler(
+    install_crawler, make_config
+):
+    """A URL never seen by search or approved by the user is rejected before any crawl call —
+    no FetchedPage, no Sn, no capture, absent from rendered content — with a disclosed
+    `provenance_rejected` incident carrying the URL."""
+    config = make_config()
+    registry = SourceRegistry()  # deliberately nothing approved
+    run_log = RunLog()
+    fake_cls = install_crawler([])
+
+    content, pages = await fetch._fetch(["https://never-approved.test"], config, registry, run_log)
+
+    assert pages == []
+    assert content == ""
+    assert fake_cls.calls == []
+    assert registry.all() == []
+
+    incidents = [i for i in run_log.incidents() if i.kind == "provenance_rejected"]
+    assert len(incidents) == 1
+    assert "https://never-approved.test" in incidents[0].detail
+
+
+async def test_mixed_batch_approved_urls_fetch_while_the_unapproved_one_is_rejected(
+    install_crawler, make_config
+):
+    """Rejection is per-URL: one unapproved URL in a batch never fails the approved ones."""
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://approved-a.test", "https://approved-b.test"])
+    run_log = RunLog()
+    results = [
+        _FakeResult(
+            "https://approved-a.test",
+            markdown=_FakeMarkdown(raw_markdown="a body", fit_markdown="a body"),
+        ),
+        _FakeResult(
+            "https://approved-b.test",
+            markdown=_FakeMarkdown(raw_markdown="b body", fit_markdown="b body"),
+        ),
+    ]
+    fake_cls = install_crawler(results)
+
+    content, pages = await fetch._fetch(
+        ["https://approved-a.test", "https://not-approved.test", "https://approved-b.test"],
+        config,
+        registry,
+        run_log,
+    )
+
+    assert fake_cls.calls[0].urls == ["https://approved-a.test", "https://approved-b.test"]
+    assert [page.url for page in pages] == ["https://approved-a.test", "https://approved-b.test"]
+    assert all(page.outcome == "fetched" for page in pages)
+    assert "https://not-approved.test" not in content
+
+    incidents = [i for i in run_log.incidents() if i.kind == "provenance_rejected"]
+    assert len(incidents) == 1
+    assert "https://not-approved.test" in incidents[0].detail

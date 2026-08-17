@@ -7,6 +7,7 @@ import pytest
 
 from harness.sources import (
     SourceRegistry,
+    extract_urls,
     normalize_url,
     note_digest_candidate,
     pending_digest_scope,
@@ -368,3 +369,58 @@ def test_urls_that_must_not_collapse_stay_distinct(url_a, url_b):
 
     assert id_a != id_b
     assert len(registry.all()) == 2
+
+
+# --- Phase 4: strict URL provenance (R2) -------------------------------------------------
+
+
+def test_approved_url_reports_true_and_an_unapproved_one_reports_false():
+    registry = SourceRegistry()
+
+    registry.approve("https://example.com/a")
+
+    assert registry.is_approved("https://example.com/a") is True
+    assert registry.is_approved("https://example.com/never-approved") is False
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "https://example.com/a/",
+        "HTTPS://EXAMPLE.COM/a",
+        "https://example.com/a?utm_source=x",
+        "https://example.com:443/a",
+    ],
+)
+def test_approval_respects_normalize_url_variants(variant):
+    registry = SourceRegistry()
+
+    registry.approve("https://example.com/a")
+
+    assert registry.is_approved(variant) is True
+
+
+def test_extract_urls_pulls_http_and_https_urls_from_mid_sentence_text():
+    text = "Please read https://example.com/a and also http://example.org/b for context."
+
+    assert extract_urls(text) == ["https://example.com/a", "http://example.org/b"]
+
+
+def test_extract_urls_strips_trailing_punctuation():
+    text = "See (https://example.com/a), or https://example.com/b; or https://example.com/c."
+
+    assert extract_urls(text) == [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+    ]
+
+
+def test_extract_urls_returns_empty_list_for_text_with_no_urls():
+    assert extract_urls("No links in this question at all.") == []
+
+
+def test_extract_urls_ignores_non_http_schemes():
+    text = "Do not fetch javascript:alert(1) or ftp://example.com/file, only prose here."
+
+    assert extract_urls(text) == []

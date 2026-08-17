@@ -346,6 +346,16 @@ def drain_stdout(capsys: pytest.CaptureFixture[str]) -> tuple[str, list[str]]:
     return out, [line for line in out.splitlines() if line.strip()]
 
 
+def approve_all(registry: Any, urls: list[str]) -> None:
+    """Approve every URL in `urls` on `registry` (Phase 4 strict provenance, R2).
+
+    Shared arrange step for fetch/fallback tests that exercise URLs never seen by
+    `search_web` -- without this, `_fetch`'s pre-crawl provenance check rejects them.
+    """
+    for url in urls:
+        registry.approve(url)
+
+
 def write_source_capture(
     config: HarnessConfig,
     registry: Any,
