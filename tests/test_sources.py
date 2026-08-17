@@ -251,3 +251,120 @@ def test_note_digest_candidate_collects_only_inside_a_pending_scope():
         note_digest_candidate("S2")
 
     assert pending == ["S2"]
+
+
+# --- Source hygiene Step 1: canonical-URL dedup (R1) ---
+
+
+@pytest.mark.parametrize(
+    ("url_a", "url_b"),
+    [
+        ("https://arxiv.org/abs/2405.11111", "https://arxiv.org/pdf/2405.11111"),
+        ("https://arxiv.org/abs/2405.11111", "https://arxiv.org/html/2405.11111v2"),
+        ("https://arxiv.org/abs/2405.11111v1", "https://arxiv.org/abs/2405.11111v3"),
+        ("https://arxiv.org/pdf/2405.11111v2.pdf", "https://arxiv.org/abs/2405.11111"),
+        ("https://www.arxiv.org/abs/2405.11111", "https://arxiv.org/abs/2405.11111"),
+    ],
+)
+def test_arxiv_url_variants_share_an_id(url_a, url_b):
+    registry = SourceRegistry()
+
+    id_a = registry.add(url_a)
+    id_b = registry.add(url_b)
+
+    assert id_a == id_b
+    assert len(registry.all()) == 1
+
+
+def test_registering_the_2026_08_15_dup_pair_shapes_yields_4_ids_not_6():
+    """The exact live-run URLs (from a homelab report) were not retrievable locally, so these
+    are the observed shapes that produced duplicate S21/S25 and S23/S26 entries in that
+    report — abs-vs-pdf and abs-vs-html`vN` — not the literal URLs.
+    """
+    registry = SourceRegistry()
+
+    ids = [
+        registry.add("https://arxiv.org/abs/2405.11111"),
+        registry.add("https://arxiv.org/pdf/2405.11111"),
+        registry.add("https://arxiv.org/abs/2405.22222"),
+        registry.add("https://arxiv.org/html/2405.22222v3"),
+        registry.add("https://example.com/paper-a"),
+        registry.add("https://example.org/paper-b"),
+    ]
+
+    assert len(set(ids)) == 4
+    assert len(registry.all()) == 4
+
+
+@pytest.mark.parametrize(
+    "tracking_param",
+    ["utm_source", "utm_campaign", "fbclid", "gclid", "ref"],
+)
+def test_tracking_params_are_stripped_and_share_an_id_with_the_bare_url(tracking_param):
+    registry = SourceRegistry()
+
+    id_bare = registry.add("https://example.com/a")
+    id_tracked = registry.add(f"https://example.com/a?{tracking_param}=xyz")
+
+    assert id_bare == id_tracked
+    assert len(registry.all()) == 1
+
+
+def test_mixed_query_keeps_meaningful_key_and_drops_only_the_tracking_key():
+    registry = SourceRegistry()
+
+    id_bare = registry.add("https://example.com/a?id=7")
+    id_mixed = registry.add("https://example.com/a?id=7&utm_source=x")
+
+    assert id_bare == id_mixed
+    assert normalize_url("https://example.com/a?id=7&utm_source=x") == "https://example.com/a?id=7"
+
+
+def test_surviving_query_keys_preserve_original_order():
+    assert (
+        normalize_url("https://example.com/a?b=2&utm_source=x&a=1")
+        == "https://example.com/a?b=2&a=1"
+    )
+
+
+@pytest.mark.parametrize(
+    ("bare", "tracked"),
+    [
+        (
+            "https://example.com/a?q=hello%20world",
+            "https://example.com/a?q=hello%20world&utm_source=x",
+        ),
+        ("https://example.com/a?q=hello+world", "https://example.com/a?fbclid=1&q=hello+world"),
+        ("https://example.com/a?path=x%2Fy", "https://example.com/a?path=x%2Fy&gclid=9"),
+    ],
+)
+def test_percent_encoded_query_values_still_dedup_against_the_tracked_spelling(bare, tracked):
+    """Normalization must not depend on whether a tracking param was present to strip.
+
+    Re-encoding only the stripped branch made the canonical form branch-dependent: the bare
+    URL kept `%20` while the tracked one came back `+`, so the two spellings of one page
+    minted two `Sn` IDs — the duplicate-source defect R1 exists to prevent.
+    """
+    registry = SourceRegistry()
+
+    assert normalize_url(bare) == normalize_url(tracked)
+    assert registry.add(bare) == registry.add(tracked)
+    assert len(registry.all()) == 1
+
+
+@pytest.mark.parametrize(
+    ("url_a", "url_b"),
+    [
+        ("https://arxiv.org/abs/2405.11111", "https://arxiv.org/abs/2405.22222"),
+        ("https://example.com/abs/123", "https://example.com/pdf/123"),
+        ("https://example.com/a?refid=3", "https://example.com/a"),
+    ],
+)
+def test_urls_that_must_not_collapse_stay_distinct(url_a, url_b):
+    registry = SourceRegistry()
+
+    id_a = registry.add(url_a)
+    id_b = registry.add(url_b)
+
+    assert id_a != id_b
+    assert len(registry.all()) == 2

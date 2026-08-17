@@ -35,8 +35,8 @@ from harness.report import (
     RunOutcome,
     write_report,
 )
-from harness.sources import SourceRegistry
-from harness.tools.fetch import _sources_dir
+from harness.runlog import Incident
+from harness.sources import SourceRegistry, sources_dir
 from harness.verify import CHECK_FAILED_DETAIL, ParagraphVerdict, VerificationResult
 from tests.conftest import write_failed_capture, write_source_capture, write_workspace_note
 
@@ -93,6 +93,7 @@ def test_write_report_run_metadata_names_both_configured_models(make_config):
 
     assert "- Lead Model: test-model" in body
     assert "- Subagent Model: test-model" in body
+    assert "- Verifier Model: test-model" in body
 
 
 def test_write_report_run_metadata_reads_each_role_from_its_own_config_entry(make_config):
@@ -217,7 +218,7 @@ def test_write_report_survives_a_capture_file_that_is_not_valid_utf8(make_config
     good_id = registry.add("https://example.test/good", title=None)
     torn_id = registry.add("https://example.test/torn", title=None)
     write_source_capture(config, registry, good_id)
-    torn_path = _sources_dir(config, registry) / f"{torn_id}.md"
+    torn_path = sources_dir(config, registry) / f"{torn_id}.md"
     # A valid UTF-8 prefix cut mid-character, as an aborted flush would leave it.
     torn_path.write_bytes(b"# S2: torn page\n\n- Outcome: fetched\n\ncaf\xc3")
     outcome = RunOutcome(
@@ -457,6 +458,38 @@ def test_write_report_includes_workspace_notes_when_cut_short(make_config):
     assert "Some captured body text." not in body
     # Guards a stub that always claims "no notes" regardless of what is on disk.
     assert _NO_NOTES_TEXT not in body
+
+
+def test_headings_inside_working_notes_are_demoted_like_answer_prose(make_config):
+    """R3's one-H1 rule covers the whole report, not just `## Answer`.
+
+    Notes were embedded verbatim, so a cut-short run whose note opened with `# Pricing`
+    put a second H1 under the report title and broke the section ordering.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    write_workspace_note(
+        config, registry, "notes.md", "# Pricing findings\n\n## Vendors\n\nAcme quoted $4.20/unit."
+    )
+    outcome = RunOutcome(
+        question="What pricing was found before the cutoff?",
+        answer="",
+        registry=registry,
+        usage=_usage(),
+        cut_short="wall_clock",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+
+    assert "### Pricing findings" in body
+    assert "#### Vendors" in body
+    assert "\n# Pricing findings" not in body
+    assert "\n## Vendors" not in body
+    # The report's own title is the only H1 in the whole document.
+    assert [line for line in body.split("\n") if line.startswith("# ")] == [
+        "# What pricing was found before the cutoff?"
+    ]
 
 
 def test_write_report_says_so_when_no_notes_were_written(make_config):
@@ -1762,3 +1795,177 @@ def test_write_report_omits_the_read_modes_section_with_no_registered_sources(ma
     body = write_report(outcome, config).read_text(encoding="utf-8")
 
     assert _READ_MODES_HEADING not in body
+
+
+def test_incidents_render_under_gaps_even_when_verification_never_ran(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="What failed?",
+        answer="An answer with no citations.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        verification=None,
+        incidents=[
+            Incident(kind="search_failed", detail='search for "solar" failed: unreachable'),
+            Incident(kind="fetch_failed", detail="[S1] https://a.test: blocked - status 403"),
+        ],
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "## Gaps and disclosures" in body
+    assert "Tool failures during the run:" in body
+    assert '- search for "solar" failed: unreachable' in body
+    assert "- [S1] https://a.test: blocked - status 403" in body
+
+
+def test_no_incidents_renders_no_tool_failures_heading(make_config):
+    config = make_config()
+    outcome = RunOutcome(
+        question="Anything?",
+        answer="An answer with no citations.",
+        registry=SourceRegistry(),
+        usage=_usage(),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Tool failures during the run:" not in body
+
+
+def test_a_verdict_paragraph_count_mismatch_is_disclosed(make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id)
+    answer = f"First claim [{source_id}].\n\nSecond claim [{source_id}]."
+    paragraphs = split_paragraphs(answer)
+    # One verdict for two paragraphs: the overflow paragraph silently renders "not verified",
+    # which the report must say out loud rather than let read as a deliberate verdict.
+    verification = VerificationResult(
+        verdicts=[ParagraphVerdict(verdict="supported", detail="ok", source_ids=[source_id])]
+    )
+    outcome = RunOutcome(
+        question="Mismatch?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Verification returned 1 verdict(s) for 2 paragraph(s)" in body
+
+
+def test_matching_verdict_and_paragraph_counts_are_not_flagged(make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id)
+    answer = f"Only claim [{source_id}]."
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[ParagraphVerdict(verdict="supported", detail="ok", source_ids=[source_id])]
+    )
+    outcome = RunOutcome(
+        question="Match?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    assert "Verification returned" not in body
+
+
+# --- Phase 1 Step 3: report structure enforcement (heading demotion) -------------------
+
+
+def test_model_authored_headings_are_demoted_inside_the_answer(make_config):
+    """A model-authored `#`/`##`/`###` heading is demoted by two levels each, so nothing
+    inside `## Answer` can collide with the report's own H1 title or H2 section headings.
+    Relative depth ordering among the three levels is preserved.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    answer = "# Title\n\nSome intro prose.\n\n## Section\n\nBody text.\n\n### Sub\n\nMore text."
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="What headings does a model write?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert "### Title" in answer_section
+    assert "#### Section" in answer_section
+    assert "##### Sub" in answer_section
+    for line in answer_section.splitlines():
+        assert not line.startswith("# "), line
+        assert not line.startswith("## "), line
+
+
+def test_a_heading_inside_a_fenced_code_block_is_not_demoted(make_config):
+    """A `# comment` inside a fence is content, not structure — demotion must not touch it,
+    and the fence must stay byte-identical (mirrors
+    `test_a_fenced_code_block_reaches_the_answer_verbatim`).
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    answer = "Some prose.\n\n```python\n# comment\nprint('hi')\n```"
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="Does a fenced heading-looking comment survive?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert "```python\n# comment\nprint('hi')\n```" in answer_section
+
+
+def test_a_model_authored_title_and_meta_answer_renders_with_exactly_one_h1(make_config):
+    """Representative of the shape observed live on 2026-08-15: the model's answer opened
+    with its own `# <title>`, had body sections, and closed with a model-authored
+    `## Coverage`-style meta section. The literal saved answer text was not retrievable
+    locally (reports live on the homelab); this reproduces the observed shape, not the
+    verbatim text. After demotion the ENTIRE report body must contain exactly one
+    `# `-prefixed line: the harness's own report title.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    answer = (
+        "# Tungsten melting point\n\n"
+        "Tungsten melts at 3422 C.\n\n"
+        "## Background\n\n"
+        "It has the highest melting point of any metal.\n\n"
+        "## Coverage\n\n"
+        "All sources were checked and no gaps were found."
+    )
+    paragraphs = split_paragraphs(answer)
+    outcome = RunOutcome(
+        question="What is the melting point of tungsten?",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+
+    h1_lines = [line for line in body.splitlines() if line.startswith("# ")]
+    assert len(h1_lines) == 1
+    assert h1_lines[0] == "# What is the melting point of tungsten?"

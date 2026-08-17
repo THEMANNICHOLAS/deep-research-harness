@@ -1,5 +1,6 @@
 """Behavioral tests for harness.display: events, renderers, and StageTracker."""
 
+import pathlib
 import re
 import sys
 from contextlib import AbstractContextManager
@@ -15,6 +16,7 @@ import harness.__main__ as main_module
 from harness.config import AgentSettings
 from harness.display import (
     Activity,
+    Alert,
     DisplayEvent,
     PlainRenderer,
     Question,
@@ -207,12 +209,11 @@ async def test_a_direct_answer_skips_the_clarifying_and_researching_lines(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final])
+    model = scripted_model([final])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["a question with no tool calls"])
@@ -234,7 +235,6 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
     have done.
     """
     config = make_config()
-    ping = AIMessage(content="pong")
     plan_search_and_replan: list[Any] = [
         AIMessage(
             content="",
@@ -281,7 +281,7 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, *plan_search_and_replan, final])
+    model = scripted_model([*plan_search_and_replan, final])
     patch_run(monkeypatch, config, model)
     _install_stub_search(monkeypatch)
 
@@ -608,6 +608,7 @@ def test_run_finished_renders_the_full_summary(kind, capsys):
         unusable_sources=1,
         cut_short="wall_clock",
         verification_failures=2,
+        incidents=3,
     )
 
     lines = _render_lines(kind, event, capsys)
@@ -619,6 +620,7 @@ def test_run_finished_renders_the_full_summary(kind, capsys):
     assert "  sources: 3 usable, 1 unusable" in lines
     assert "  cut short: wall clock" in lines
     assert "  verification failures: 2" in lines
+    assert "  tool failures: 3" in lines
 
 
 @pytest.mark.parametrize("kind", ["plain", "rich"])
@@ -637,6 +639,7 @@ def test_run_finished_omits_empty_sections(kind, capsys):
     assert not any(line.startswith("  sources: 4 usable,") for line in lines)
     assert not any("cut short:" in line for line in lines)
     assert not any("verification failures:" in line for line in lines)
+    assert not any("tool failures:" in line for line in lines)
 
 
 def test_rich_renderer_run_finished_summary_prints_on_the_normal_screen_after_the_tui():
@@ -680,12 +683,11 @@ async def test_a_full_run_prints_a_summary_above_the_report_path(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final])
+    model = scripted_model([final])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["a question with no tool calls"])
@@ -713,18 +715,21 @@ async def test_the_summary_counts_real_usable_and_unusable_sources(
     write_failed_capture(config, registry, blocked)
     monkeypatch.setattr(main_module, "SourceRegistry", lambda run_id: registry)
 
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content=f"Acme lists $5.10 per unit [{fetched}].",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final, verify_reply(True, "The page states $5.10.")])
+    model = scripted_model([final, verify_reply(True, "The page states $5.10.")])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["what does acme charge"])
 
     _, lines = drain_stdout(capsys)
     assert "  sources: 1 usable, 1 unusable" in lines
+    # Proves the cited-claim leg actually ran the verify call rather than the run ending on
+    # an unconsumed leading reply (which would leave `model._call_count` at 1 and no verdict
+    # line at all): both the final answer AND the verify reply above were consumed.
+    assert model._call_count == 2
 
 
 async def test_a_failing_report_write_still_closes_the_display(
@@ -742,12 +747,11 @@ async def test_a_failing_report_write_still_closes_the_display(
 
     monkeypatch.setattr(main_module, "write_report", _unwritable)
 
-    ping = AIMessage(content="pong")
     final = AIMessage(
         content="Final answer.",
         usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
     )
-    model = scripted_model([ping, final])
+    model = scripted_model([final])
     patch_run(monkeypatch, config, model)
 
     with pytest.raises(OSError, match="reports dir is not writable"):
@@ -773,7 +777,6 @@ async def test_failed_run_error_prints_only_after_the_renderer_is_closed(
     renderer = _CloseMarkingRenderer()
     monkeypatch.setattr(main_module, "build_renderer", lambda: renderer)
 
-    ping = AIMessage(content="pong")
     plan_call = AIMessage(
         content="",
         tool_calls=[
@@ -784,7 +787,7 @@ async def test_failed_run_error_prints_only_after_the_renderer_is_closed(
             }
         ],
     )
-    model = scripted_model([ping, plan_call])  # no third response — the run dies here
+    model = scripted_model([plan_call])  # no second response — the run dies here
     patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["question whose run dies mid-flight"])
@@ -804,7 +807,6 @@ async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
         max_rounds=1, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
     )
     config = make_config(agent=agent)
-    ping = AIMessage(content="pong")
     keep_going = AIMessage(
         content="",
         tool_calls=[
@@ -815,7 +817,7 @@ async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
             }
         ],
     )
-    model = scripted_model([ping, *([keep_going] * 20)])
+    model = scripted_model([*([keep_going] * 20)])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["question that never settles"])
@@ -823,3 +825,49 @@ async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
     out, lines = drain_stdout(capsys)
     assert "cut short: round cap" in out
     assert lines[-1].strip().endswith(".md")
+
+
+@pytest.mark.parametrize("kind", ["plain", "rich"])
+def test_alert_renders_as_a_persistent_warning_line(kind, capsys):
+    event = Alert('search for "solar" failed: unreachable')
+
+    lines = _render_lines(kind, event, capsys)
+
+    assert any('warning: search for "solar" failed: unreachable' in line for line in lines)
+
+
+async def test_a_dead_search_backend_is_disclosed_on_the_terminal_and_in_the_report(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    """The invariant-pinning path (best-effort + disclose): a SearchFailure must reach the
+    developer through the CLI as a warning line AND through the report's gaps section — not
+    only through model-facing tool output the model may never repeat."""
+    config = make_config()
+    search_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_web", "args": {"query": "the answer"}, "id": "call_search"}],
+    )
+    final = AIMessage(
+        content="Best-effort answer without sources.",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    model = scripted_model([search_call, final])
+    patch_run(monkeypatch, config, model)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    install_search_transport(monkeypatch, handler)
+
+    await main_module.main(["a question needing research"])
+
+    out, lines = drain_stdout(capsys)
+    warning_lines = [line for line in lines if line.startswith("warning:")]
+    assert any("unreachable" in line and "the answer" in line for line in warning_lines)
+    assert "  tool failures: 1" in out
+
+    report_path = lines[-1].strip()
+    body = pathlib.Path(report_path).read_text(encoding="utf-8")
+    assert "## Gaps and disclosures" in body
+    assert "Tool failures during the run:" in body
+    assert "unreachable" in body

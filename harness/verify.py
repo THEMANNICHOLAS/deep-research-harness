@@ -3,24 +3,23 @@
 One model call per PARAGRAPH, with every usable source that paragraph cites pooled into it,
 so the model judges the paragraph as a whole (D3 — contradiction detection needs the sources
 compared against each other, not each one against the paragraph in isolation). Reads only
-captured files under `harness.tools.fetch._sources_dir` and never refetches (D10/R8): the
+captured files under `harness.sources.sources_dir` and never refetches (D10/R8): the
 agent loop is finished and the wall clock stopped (R7) by the time this runs.
 
 Calls are made ONE AT A TIME, in the input list's order — see `verify_paragraphs`.
 """
 
 import json
+from collections.abc import Callable
 from typing import Literal
 
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
-from harness.models import build_chat_model
 from harness.paragraphs import Paragraph
 from harness.prompts import render
-from harness.sources import SourceRegistry
-from harness.tools.fetch import _sources_dir, is_failed_capture
+from harness.sources import SourceRegistry, is_failed_capture, sources_dir
 
 Verdict = Literal[
     "supported", "partially_supported", "not_supported", "no_sources_cited", "not_verified"
@@ -93,7 +92,10 @@ def _parse_reply(content: str) -> tuple[Verdict, str, bool, list[int]]:
 
 
 async def verify_paragraphs(
-    paragraphs: list[Paragraph], config: HarnessConfig, registry: SourceRegistry
+    paragraphs: list[Paragraph],
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    on_paragraph: Callable[[int, int], None] | None = None,
 ) -> VerificationResult:
     """Check every paragraph against its cited source(s), one pooled call at a time.
 
@@ -101,18 +103,31 @@ async def verify_paragraphs(
     One failed check never fails the pass — the loop always continues, the same
     independent-per-item stance as `fetch.py`'s batch handling.
 
+    `on_paragraph(index, total)` (1-based) fires as each paragraph's check begins — a callback
+    rather than a renderer so this module stays display-free; `__main__` maps it to an
+    `Activity` line. Each pooled model call can take minutes, so without this the whole pass
+    is silent and indistinguishable from a hang at the terminal.
+
     A paragraph citing no REGISTERED source is `no_sources_cited` with no model call. One whose
     sources are all unreadable (missing capture or a `FETCH FAILED` stub) is `not_verified`
     with no model call, naming what was skipped. Anything else pools every usable source's
     captured text into one prompt.
     """
-    model = build_chat_model(config, "head")
-    sources_dir = _sources_dir(config, registry)
+    # Deferred, and via the module: importing `harness.models` pulls in `openai` (~2s), which
+    # would land on every CLI startup through `report.py`'s import of this module; the module
+    # attribute lookup also keeps `harness.models.build_chat_model` the single patch target.
+    from harness import models
+
+    model = models.build_chat_model(config, "verifier")
+    captures_dir = sources_dir(config, registry)
 
     verdicts: list[ParagraphVerdict] = []
     check_failures: list[str] = []
 
-    for paragraph in paragraphs:  # strictly sequential
+    total = len(paragraphs)
+    for index, paragraph in enumerate(paragraphs, start=1):  # strictly sequential
+        if on_paragraph is not None:
+            on_paragraph(index, total)
         registered = [sid for sid in paragraph.source_ids if registry.get(sid) is not None]
         if not registered:
             verdicts.append(
@@ -133,7 +148,7 @@ async def verify_paragraphs(
         for sid in registered:
             source = registry.get(sid)
             assert source is not None  # guaranteed by `registered`'s filter above
-            path = sources_dir / f"{sid}.md"
+            path = captures_dir / f"{sid}.md"
             # `UnicodeDecodeError` (a `ValueError`, not an `OSError`) alongside the
             # missing-file case: a capture whose write died mid-flush can end mid-character,
             # and an unreadable source costs one paragraph, not the whole pass.

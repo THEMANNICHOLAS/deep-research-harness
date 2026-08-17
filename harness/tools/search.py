@@ -1,7 +1,9 @@
 """Query the self-hosted SearXNG JSON API and return normalized results.
 
 An unreachable backend, a non-200, or a malformed body all surface as a typed
-`SearchFailure` rather than an exception.
+`SearchFailure` rather than an exception — rendered for the model AND recorded on the
+run's `RunLog`, so a dead search backend reaches the terminal and the report's
+`## Gaps and disclosures` instead of living only in prose the model may not repeat.
 """
 
 from typing import Literal
@@ -11,6 +13,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.config import HarnessConfig
+from harness.runlog import RunLog, or_default
 
 
 class SearchResult(BaseModel):
@@ -33,24 +36,32 @@ class SearchFailure(BaseModel):
     detail: str
 
 
-def _parse_results(payload: dict, max_results: int) -> list[SearchResult] | SearchFailure:
+def _parse_results(
+    payload: dict, max_results: int
+) -> tuple[list[SearchResult] | SearchFailure, int]:
     """Extract and normalize the `results` array, slicing to `max_results` after parsing.
 
     Skips any entry that is not a dict, lacks a truthy `url`, or is wrong-typed: one engine
     emitting a non-string degrades to a skipped entry, not an exception. `raw.get(key) or ""`
     maps `None` and missing keys alike to `""`, matching the frozen `str` fields (SearXNG
     declares `engine` as `str | None`).
+
+    The second element counts the skipped entries: a partially broken engine reads as fewer
+    results, and without the count that thinning is silent (best-effort + disclose).
     """
     raw_results = payload.get("results")
     if not isinstance(raw_results, list):
-        return SearchFailure(reason="malformed", detail="response body has no 'results' list")
+        return SearchFailure(reason="malformed", detail="response body has no 'results' list"), 0
 
     results: list[SearchResult] = []
+    dropped = 0
     for raw in raw_results:
         if not isinstance(raw, dict):
+            dropped += 1
             continue
         url = raw.get("url") or ""
         if not url:
+            dropped += 1
             continue
         try:
             results.append(
@@ -62,9 +73,10 @@ def _parse_results(payload: dict, max_results: int) -> list[SearchResult] | Sear
                 )
             )
         except ValidationError:
+            dropped += 1
             continue
 
-    return results[:max_results]
+    return results[:max_results], dropped
 
 
 def _render(query: str, outcome: list[SearchResult] | SearchFailure) -> str:
@@ -108,19 +120,37 @@ async def _fetch_search_json(query: str, config: HarnessConfig) -> object | Sear
 
 
 async def _search(
-    query: str, max_results: int, config: HarnessConfig
+    query: str, max_results: int, config: HarnessConfig, run_log: RunLog
 ) -> tuple[str, list[SearchResult] | SearchFailure]:
-    """Query SearXNG, returning model-facing content and the typed result/failure."""
+    """Query SearXNG, returning model-facing content and the typed result/failure.
+
+    Every `SearchFailure`, and every batch that silently dropped malformed entries, is also
+    recorded on `run_log` — the model-facing rendering alone leaves disclosure up to whether
+    the model chooses to mention it.
+    """
     payload = await _fetch_search_json(query, config)
+    outcome: list[SearchResult] | SearchFailure
     if isinstance(payload, SearchFailure):
-        return _render(query, payload), payload
+        outcome = payload
+    elif not isinstance(payload, dict):
+        outcome = SearchFailure(
+            reason="malformed",
+            detail=f"response body is not an object (got {type(payload).__name__})",
+        )
+    else:
+        outcome, dropped = _parse_results(payload, max_results)
+        if dropped:
+            noun = "entry" if dropped == 1 else "entries"
+            run_log.record(
+                "search_results_dropped",
+                f'search for "{query}": {dropped} malformed result {noun} '
+                "dropped from the response",
+            )
 
-    if not isinstance(payload, dict):
-        detail = f"response body is not an object (got {type(payload).__name__})"
-        failure = SearchFailure(reason="malformed", detail=detail)
-        return _render(query, failure), failure
-
-    outcome = _parse_results(payload, max_results)
+    if isinstance(outcome, SearchFailure):
+        run_log.record(
+            "search_failed", f'search for "{query}" failed: {outcome.reason} — {outcome.detail}'
+        )
     return _render(query, outcome), outcome
 
 
@@ -168,8 +198,10 @@ class SearchUnavailableError(Exception):
     """
 
 
-def build_search_tool(config: HarnessConfig) -> BaseTool:
-    """Build the `search_web` tool, closing over `config`."""
+def build_search_tool(config: HarnessConfig, run_log: RunLog | None = None) -> BaseTool:
+    """Build the `search_web` tool, closing over `config` and the shared `run_log`."""
+
+    log = or_default(run_log)
 
     class SearchWebInput(BaseModel):
         """Model-facing input schema for the `search_web` tool."""
@@ -200,7 +232,7 @@ def build_search_tool(config: HarnessConfig) -> BaseTool:
         row, which raises `SearchUnavailableError` to abort the run.
         """
         nonlocal consecutive_failures
-        content, outcome = await _search(query, max_results, config)
+        content, outcome = await _search(query, max_results, config, log)
 
         if isinstance(outcome, SearchFailure) and outcome.reason in ("unreachable", "bad_status"):
             consecutive_failures += 1

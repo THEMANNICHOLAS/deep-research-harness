@@ -24,6 +24,9 @@ dependencies = [
     # `ScriptedChatModel` subclasses, so a silent bump moves the request body that
     # `preflight` depends on. See PR #4 review.
     "langchain-openai==1.4.2",
+    # Pinned per project convention: the engine `crawl4ai[pdf]`'s `PDFContentScrapingStrategy`
+    # needs at construction time (harness/tools/fetch.py's PDF fetch path, PLAN-Phase1-source-hygiene.md).
+    "pypdf==6.16.1",
 ]
 
 [dependency-groups]
@@ -69,6 +72,13 @@ show_missing = true
 
 [tool.uv]
 package = false
+# deepagents declares langchain-google-genai as a hard dependency but only imports it inside
+# try/except ImportError (a Google-only file-block allowlist in its filesystem middleware).
+# Nothing here uses Google models, and its google.genai import cost ~2s of CLI startup, so the
+# impossible marker removes it from the resolution entirely. Revisit on ANY deepagents bump:
+# if that import ever becomes unconditional, deepagents crashes at import and this override
+# must be dropped.
+override-dependencies = ["langchain-google-genai ; sys_platform == 'never'"]
 # Pinned exactly, not a `>=` floor: `astral-sh/setup-uv` reads this file to decide
 # which uv to install, and with no constraint it logs "Falling back to latest" — so
 # the action's SHA pin fixes the action, not uv itself. A floor would still float.

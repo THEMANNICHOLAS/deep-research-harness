@@ -71,6 +71,13 @@ attached to the claims they support. If coverage is incomplete (a fetch failed, 
 came back empty, a rate limit was hit), say so plainly in the answer rather than silently
 thinning the response.
 
+Lead with a direct answer or summary paragraph first, then any supporting sections. Do not
+write a title — the harness owns the report title. If you write headings, start at `## `
+depth and go deeper as needed, never `# `. Write no meta, coverage, disclosure,
+methodology, limitations, or self-assessment sections of your own — the harness handles
+all of that disclosure; if a finding itself is a gap, say so plainly in the answer prose
+where it belongs, not in a section about the run.
+
 # Clarification
 
 Before you begin researching, you may use `ask_user` to resolve a genuine ambiguity in the

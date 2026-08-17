@@ -1,7 +1,11 @@
 """Assign stable per-run source IDs and resolve `[Sn]` markers into markdown links.
 
 The mechanical half of the citation scheme: minting IDs, deduplicating equivalent URLs, and
-rewriting markers into links. No model involvement, no fetching (D6).
+rewriting markers into links. No model involvement, no fetching (D6). Also the home of the
+captured-file policy (`sources_dir`, `FETCH_FAILED_PREFIX`, `is_failed_capture`): it used to
+live in `harness/tools/fetch.py`, but `report.py`, `verify.py` and the test fixtures all need
+it, and importing it from there dragged all of crawl4ai (~1.2s) into every pure-rendering
+module and every test session.
 """
 
 import re
@@ -10,14 +14,47 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict
 
+from harness.config import HarnessConfig, run_workspace_dir
+
 MARKER_RE = re.compile(r"\[S(\d+)\]")
 
+# The single home for this policy string: fetch.py's `_write_source_file` writes it as the
+# first line of any non-`fetched` capture, and `is_failed_capture` below reads it.
+FETCH_FAILED_PREFIX = "FETCH FAILED: "
+
+
+def is_failed_capture(source_text: str) -> bool:
+    """Whether a captured source file's text is a failure stub rather than real content.
+
+    The single home for READING what `FETCH_FAILED_PREFIX` writes. `report.py` (is this usable
+    evidence?) and `verify.py` (can this settle a claim?) ask the same question, and two copies
+    of "split the first line, test the prefix" could disagree about which sources count.
+    """
+    return source_text.split("\n", 1)[0].startswith(FETCH_FAILED_PREFIX)
+
+
+def sources_dir(config: HarnessConfig, registry: "SourceRegistry") -> Path:
+    """The one place the `<workspace_dir>/<run_id>/sources` layout is built."""
+    return run_workspace_dir(config, registry.run_id) / "sources"
+
+
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# Tracking keys stripped from every query string in `normalize_url`, regardless of host — a
+# key equal to a member OR starting with `utm_` is dropped; everything else survives verbatim.
+_TRACKING_PARAMS = {"fbclid", "gclid", "ref"}
+
+_ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org"}
+# Canonical form is `/abs/<work>`: the abs/pdf/html variant segment, an optional version
+# suffix, and a trailing `.pdf` all collapse. `<work>` is kept verbatim otherwise — old-style
+# IDs like `cs/0112017` contain a slash, hence the non-greedy `.+?` rather than `[^/]+`.
+_ARXIV_PATH_RE = re.compile(r"^/(?:abs|pdf|html)/(?P<work>.+?)(?:v\d+)?(?:\.pdf)?$")
 
 # R5's recording seam: "unread" until content actually reaches the lead, "digested" when a
 # reader delegation returned a non-empty digest of the page — promoted at the task boundary
@@ -77,8 +114,8 @@ def normalize_url(url: str) -> str:
     """Return a canonical form of `url` so equivalent URLs share one identity.
 
     Collapses what does not change the fetch: scheme/host case, trailing slash, default port,
-    fragment. Everything else is verbatim, including the query — two URLs differing only by
-    query are different sources.
+    fragment, known tracking query params (`utm_*`, `fbclid`, `gclid`, `ref`), and arxiv's
+    abs/pdf/html/version variants. A meaningful query otherwise still distinguishes sources.
 
     Total by design: an unparseable URL is its own canonical form, never an exception, because
     these URLs are model-supplied and R2 forbids one bad URL failing the batch.
@@ -112,7 +149,46 @@ def normalize_url(url: str) -> str:
 
     path = parts.path.rstrip("/")
 
-    return urlunsplit((scheme, netloc, path, parts.query, ""))
+    query = parts.query
+    if query:
+        pairs = parse_qsl(query, keep_blank_values=True)
+        kept = [
+            (key, value)
+            for key, value in pairs
+            if key not in _TRACKING_PARAMS and not key.startswith("utm_")
+        ]
+        # Re-encode unconditionally, not just when a param was dropped: a conditional
+        # rebuild makes the canonical form depend on which branch ran, so the same page
+        # with and without a tracking param normalized to `q=hello%20world` vs
+        # `q=hello+world` and minted two IDs. `quote_via=quote` (not the `quote_plus`
+        # default) keeps a space as `%20`, matching how an untouched query already reads.
+        query = urlencode(kept, quote_via=quote)
+
+    if hostname in _ARXIV_HOSTS:
+        match = _ARXIV_PATH_RE.match(path)
+        if match is not None:
+            hostname = "arxiv.org"
+            netloc = f"{userinfo}{hostname}" + (f":{port}" if port is not None else "")
+            path = f"/abs/{match['work']}"
+
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def names_a_different_document(url: str, other: str) -> bool:
+    """Whether two URLs that share a canonical form still name different documents.
+
+    Trailing slash, fragment, case and tracking params rewrite the same page's address, so
+    collapsing them costs nothing. The arxiv rule is the one that merges genuinely different
+    documents — `/abs/<work>` is an abstract, `/pdf/<work>.pdf` the full text — and a caller
+    that asked for both gets only one. Path is the discriminator: everything else this
+    function's callers merge leaves the path alone.
+    """
+    try:
+        path = urlsplit(url).path.rstrip("/").lower()
+        other_path = urlsplit(other).path.rstrip("/").lower()
+    except ValueError:
+        return False
+    return path != other_path
 
 
 class Source(BaseModel):

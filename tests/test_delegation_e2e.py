@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage
 from pydantic import SecretStr
 
 import harness.__main__ as main_module
-from harness.tools.fetch import _sources_dir
+from harness.sources import sources_dir
 from tests.conftest import ScriptedChatModel, _FakeMarkdown, _FakeResult, verify_reply
 from tests.test_verify import _flatten
 
@@ -82,7 +82,9 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
             ),
         ]
     )
-    patch_models_by_role({"head": head_model, "subagent": reader_model})
+    # Verification runs on the "verifier" role (Phase 1 Step 4); this scenario's verify_reply
+    # is scripted on `head_model` itself, so it is routed there too rather than a third model.
+    patch_models_by_role({"head": head_model, "subagent": reader_model, "verifier": head_model})
 
     install_crawler(
         [
@@ -101,7 +103,8 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
     async def _noop_preflight(cfg, role):
         return None
 
-    monkeypatch.setattr(main_module, "preflight", _noop_preflight)
+    # At the source module: `main` imports `preflight` at call time (heavy-import deferral).
+    monkeypatch.setattr("harness.models.preflight", _noop_preflight)
 
     # Like `patch_run`, the search preflight is neutralized: it is a real HTTP probe against
     # `config.search.base_url`, and this scenario installs no search transport.
@@ -156,7 +159,7 @@ async def test_end_to_end_delegation_loop_digests_and_resolves_citations(
     source = registry.get("S1")
     assert source is not None
     assert source.read_mode == "digested"
-    capture_path = _sources_dir(config, registry) / "S1.md"
+    capture_path = sources_dir(config, registry) / "S1.md"
     assert capture_path.exists()
     assert _CAPTURE_MARKER in capture_path.read_text(encoding="utf-8")
 

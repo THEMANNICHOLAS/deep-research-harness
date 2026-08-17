@@ -26,7 +26,7 @@ from harness.config import (
     SearchSettings,
     run_workspace_dir,
 )
-from harness.tools.fetch import FETCH_FAILED_PREFIX, _sources_dir
+from harness.sources import FETCH_FAILED_PREFIX, sources_dir
 
 
 class _FakeMarkdown:
@@ -58,15 +58,39 @@ class _FakeResult:
         self.markdown = markdown
 
 
-def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
-    """Build a fake AsyncWebCrawler class recording construction and `arun_many` calls."""
+class _FakePDFCrawlerStrategy:
+    """Stand-in for crawl4ai's `PDFCrawlerStrategy` — the PDF-seam construction marker."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+class _FakePDFContentScrapingStrategy:
+    """Stand-in for crawl4ai's `PDFContentScrapingStrategy`."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+def _make_fake_crawler_class(
+    results: list[_FakeResult], pdf_results: list[_FakeResult] | None = None
+) -> type:
+    """Build a fake AsyncWebCrawler class recording construction and `arun_many` calls.
+
+    One fake class serves both the Playwright batch and the PDF batch — `_fetch` gets both
+    from the same `_crawler_class()` seam, distinguished only by the `crawler_strategy` kwarg
+    passed at construction. `pdf_results` (defaulting to `results`, so existing single-arg
+    callers are unaffected) lets a test give the PDF batch its own canned results distinct
+    from the Playwright batch's.
+    """
 
     class _FakeCrawler:
         constructed_with: list[object] = []
         calls: list[SimpleNamespace] = []
 
-        def __init__(self, config: object = None) -> None:
+        def __init__(self, config: object = None, crawler_strategy: object = None) -> None:
             _FakeCrawler.constructed_with.append(config)
+            self._is_pdf = crawler_strategy is not None
 
         async def __aenter__(self) -> "_FakeCrawler":
             return self
@@ -78,8 +102,12 @@ def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
             self, urls: list[str], config: object = None, dispatcher: object = None
         ) -> list[_FakeResult]:
             _FakeCrawler.calls.append(
-                SimpleNamespace(urls=urls, config=config, dispatcher=dispatcher)
+                SimpleNamespace(
+                    urls=urls, config=config, dispatcher=dispatcher, is_pdf=self._is_pdf
+                )
             )
+            if self._is_pdf:
+                return pdf_results if pdf_results is not None else results
             return results
 
     return _FakeCrawler
@@ -87,16 +115,23 @@ def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
 
 @pytest.fixture
 def install_crawler(monkeypatch):
-    """Patch `harness.tools.fetch.AsyncWebCrawler` with a fake serving canned results.
+    """Patch `harness.tools.fetch._crawler_class`/`_pdf_crawler_parts` with fakes.
 
-    Patches fetch.py's namespace regardless of caller: `fallback.py` reuses fetch.py's
-    `_fetch`, and that is where the crawler is actually constructed, so both fetch and
-    fallback tests share this one fixture.
+    `_crawler_class` (not a module-level `AsyncWebCrawler` name) because fetch.py imports
+    crawl4ai lazily inside `_fetch` — the function is the deliberate patch seam. Patches
+    fetch.py's namespace regardless of caller: `fallback.py` reuses fetch.py's `_fetch`,
+    and that is where the crawler is actually constructed, so both fetch and fallback
+    tests share this one fixture. `_pdf_crawler_parts` is the parallel seam for the PDF
+    strategy classes fetch.py's PDF batch constructs.
     """
 
-    def _install(results: list[_FakeResult]) -> type:
-        fake_cls = _make_fake_crawler_class(results)
-        monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
+    def _install(results: list[_FakeResult], pdf_results: list[_FakeResult] | None = None) -> type:
+        fake_cls = _make_fake_crawler_class(results, pdf_results)
+        monkeypatch.setattr("harness.tools.fetch._crawler_class", lambda: fake_cls)
+        monkeypatch.setattr(
+            "harness.tools.fetch._pdf_crawler_parts",
+            lambda: (_FakePDFCrawlerStrategy, _FakePDFContentScrapingStrategy),
+        )
         return fake_cls
 
     return _install
@@ -168,7 +203,13 @@ class ScriptedChatModel(ChatOpenAI):
         **kwargs: Any,
     ) -> ChatResult:
         self._received_messages.append(list(messages))
-        response = self._script[self._call_count]
+        # A fresh copy with a per-call id, like a real model: scripts commonly repeat one
+        # AIMessage object (`[keep_going] * 20`), and reusing it verbatim gives every turn the
+        # SAME message id — which `__main__`'s round counter deduplicates by, so the run would
+        # count one round no matter how many turns actually happened.
+        response = self._script[self._call_count].model_copy(deep=True)
+        if response.id is None:
+            response.id = f"scripted-{self._call_count}"
         self._call_count += 1
         return ChatResult(generations=[ChatGeneration(message=response)])
 
@@ -184,20 +225,14 @@ class ScriptedChatModel(ChatOpenAI):
 
 
 def patch_model(monkeypatch: pytest.MonkeyPatch, model: Any) -> None:
-    """Point EVERY module-local `build_chat_model` binding at `model`.
+    """Point `build_chat_model` at `model` for every caller.
 
-    Three modules do `from harness.models import build_chat_model`, so each holds its own binding
-    that patching the others does not touch: `harness.agent`, `harness.models`, and
-    `harness.verify`. Missing one leaves a `main()`-driven test either avoiding the state that
-    reaches it or dialing `https://example.test/v1` for real. One home for the list, so a fourth
-    importer cannot reopen that hole silently.
+    One target: `harness.agent` and `harness.verify` call it as a module attribute
+    (`models.build_chat_model(...)`, resolved at call time) rather than importing it by
+    value, so patching the definition covers them all — including any future caller,
+    which a hand-maintained target list silently missed.
     """
-    for target in (
-        "harness.agent.build_chat_model",
-        "harness.models.build_chat_model",
-        "harness.verify.build_chat_model",
-    ):
-        monkeypatch.setattr(target, lambda cfg, role: model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
 
 
 @pytest.fixture
@@ -208,12 +243,7 @@ def patch_models_by_role(monkeypatch: pytest.MonkeyPatch):
         def _by_role(cfg: Any, role: str) -> Any:
             return models[role]
 
-        for target in (
-            "harness.agent.build_chat_model",
-            "harness.models.build_chat_model",
-            "harness.verify.build_chat_model",
-        ):
-            monkeypatch.setattr(target, _by_role)
+        monkeypatch.setattr("harness.models.build_chat_model", _by_role)
 
     return _patch
 
@@ -223,14 +253,19 @@ def patch_run(
     config: HarnessConfig,
     model: Any,
     *,
-    skip_preflight: bool = False,
+    skip_preflight: bool = True,
     run_search_preflight: bool = False,
 ) -> None:
     """Patch everything a `main()` test reaches outside the compiled graph.
 
-    `skip_preflight` replaces `preflight` (the model check) with a no-op. `False` by default, so
-    most tests let the REAL `preflight` run against the scripted model and script a leading
-    reply for it — that keeps R6's call site exercised rather than stubbed out everywhere.
+    `skip_preflight` replaces `preflight` (the model check) with a no-op. `True` by default:
+    each preflighted role (`head`, `verifier`, and whatever Phase 2 adds) makes its own real
+    `ainvoke` against the scripted model, consuming one scripted reply per role before the
+    graph ever runs — a test that does not care about preflight itself would otherwise have to
+    keep its script in lockstep with however many roles happen to be preflighted today. Pass
+    `skip_preflight=False` for a test that asserts something about preflight itself (or about a
+    scripted reply preflight is meant to consume) and script a leading reply per preflighted
+    role.
 
     The search preflight (`preflight_search`) is a real HTTP probe against `config.search
     .base_url`, which has no scripted-model equivalent — most `main()` tests never touch
@@ -246,12 +281,17 @@ def patch_run(
         async def _noop_preflight(cfg: HarnessConfig, role: str) -> None:
             return None
 
-        monkeypatch.setattr(main_module, "preflight", _noop_preflight)
+        # At the source module, not `main_module`: `main` imports `preflight` at call time
+        # (the heavy-import deferral), so the patched attribute is what that import binds.
+        monkeypatch.setattr("harness.models.preflight", _noop_preflight)
     if not run_search_preflight:
 
         async def _noop_search_preflight(cfg: HarnessConfig) -> None:
             return None
 
+        # On `main_module`, NOT the source module — unlike `preflight`, this one is imported
+        # by value at module import time (it is cheap, so it stays out of the deferred block),
+        # so `harness.tools.search.preflight_search` is not the name `main` calls.
         monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
     patch_model(monkeypatch, model)
 
@@ -317,9 +357,9 @@ def write_source_capture(
     and `harness/verify.py` (can it settle a claim?) both read. Takes `registry` so the file
     lands under this run's directory rather than a flat `sources/`.
     """
-    sources_dir = _sources_dir(config, registry)
-    sources_dir.mkdir(parents=True, exist_ok=True)
-    (sources_dir / f"{source_id}.md").write_text(
+    captures_dir = sources_dir(config, registry)
+    captures_dir.mkdir(parents=True, exist_ok=True)
+    (captures_dir / f"{source_id}.md").write_text(
         f"# {source_id}: captured page\n\n- Outcome: fetched\n\n{body}", encoding="utf-8"
     )
 
@@ -343,9 +383,9 @@ def write_failed_capture(
     config: HarnessConfig, registry: Any, source_id: str, outcome: str = "error"
 ) -> None:
     """Write a failure stub — the shape `harness/tools/fetch.py` writes for a bad fetch."""
-    sources_dir = _sources_dir(config, registry)
-    sources_dir.mkdir(parents=True, exist_ok=True)
-    (sources_dir / f"{source_id}.md").write_text(
+    captures_dir = sources_dir(config, registry)
+    captures_dir.mkdir(parents=True, exist_ok=True)
+    (captures_dir / f"{source_id}.md").write_text(
         f"{FETCH_FAILED_PREFIX}{outcome}\n", encoding="utf-8"
     )
 
@@ -387,6 +427,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         agent: AgentSettings | None = None,
         head_model: str = "test-model",
         subagent_model: str = "test-model",
+        verifier_model: str = "test-model",
     ) -> HarnessConfig:
         monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
         if agent is None:
@@ -402,6 +443,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
             roles={
                 "head": RoleConfig(provider="opencode", model=head_model),
                 "subagent": RoleConfig(provider="opencode", model=subagent_model),
+                "verifier": RoleConfig(provider="opencode", model=verifier_model),
             },
             fetch=FetchSettings(
                 page_timeout_ms=page_timeout_ms,

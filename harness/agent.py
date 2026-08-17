@@ -37,9 +37,13 @@ from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
+# The MODULE, not `from harness.models import build_chat_model`: a by-value import binds a
+# module-local name each test would have to patch separately. Attribute lookup at call time
+# means patching `harness.models.build_chat_model` covers every caller (see PR #4 review).
+from harness import models
 from harness.config import HarnessConfig, run_workspace_dir
-from harness.models import build_chat_model
 from harness.prompts import render
+from harness.runlog import RunLog
 from harness.sources import SourceRegistry, pending_digest_scope
 from harness.tools import build_tools
 from harness.tools.ask_user import ASK_USER_TOOL_NAME
@@ -171,17 +175,22 @@ def _reader_spec(
     )
 
 
-def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
+def build_agent(
+    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+) -> Runnable:
     """Compile the lead research agent, driven with `ainvoke`/`astream` (substrate D1).
 
     The research question is NOT baked into the system prompt: this signature has no access to
     it. It travels as the initial `HumanMessage` the caller streams in, and the rendered
     orchestrator prompt carries only `$current_date` and `$max_urls_per_call`.
+
+    `run_log` collects the tools' degraded-coverage incidents; the caller shares one instance
+    between this agent and the report so disclosure sees everything (best-effort + disclose).
     """
-    model = build_chat_model(config, "head")
+    model = models.build_chat_model(config, "head")
     _register_no_shell_profile(model)
 
-    reader_model = build_chat_model(config, "subagent")
+    reader_model = models.build_chat_model(config, "subagent")
     _register_no_shell_profile(reader_model)
 
     # Rooted at THIS run's subdirectory, not the shared workspace: the agent can only
@@ -190,7 +199,7 @@ def build_agent(config: HarnessConfig, registry: SourceRegistry) -> Runnable:
     workspace.mkdir(parents=True, exist_ok=True)
     backend = FilesystemBackend(root_dir=workspace)
 
-    tool_sets = build_tools(config, registry)
+    tool_sets = build_tools(config, registry, run_log)
 
     system_prompt = render(
         "orchestrator",

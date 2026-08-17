@@ -3,7 +3,7 @@
 from langchain_core.tools import BaseTool
 
 from harness.config import AgentSettings
-from harness.sources import SourceRegistry
+from harness.sources import SourceRegistry, sources_dir
 from harness.tools import fallback, fetch
 from tests.conftest import _FakeMarkdown, _FakeResult
 
@@ -56,7 +56,7 @@ async def test_fetch_raw_still_writes_the_normal_capture_file(
     message = await fetch_raw.ainvoke(_tool_call(["https://a.test"], "some reason", "call-1"))
 
     source_id = message.artifact[0].source_id
-    source_path = fetch._sources_dir(config, registry) / f"{source_id}.md"
+    source_path = sources_dir(config, registry) / f"{source_id}.md"
     assert source_path.exists()
     assert "A body" in source_path.read_text(encoding="utf-8")
 

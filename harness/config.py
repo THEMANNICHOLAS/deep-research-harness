@@ -15,6 +15,25 @@ class ConfigError(Exception):
     """Raised for any failure loading or validating the harness config."""
 
 
+def _load_dotenv(path: Path) -> None:
+    """Populate `os.environ` from a `.env` file next to `harness.toml`, if present.
+
+    A real environment variable always wins over `.env` — this only fills gaps, matching
+    standard dotenv precedence. Hand-rolled rather than a `python-dotenv` dependency: the file
+    is just `KEY=VALUE` lines, comments, and blanks (see `.env.example`).
+    """
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value.strip()
+
+
 class _StrictModel(BaseModel):
     """Shared strictness for every config model: an unknown key is a typo, not data."""
 
@@ -60,8 +79,12 @@ class FetchSettings(_StrictModel):
     # where 0 or a negative is nonsense.
     page_timeout_ms: int = Field(default=15000, gt=0)
     max_concurrency: int = Field(default=5, gt=0)
-    per_page_char_cap: int = Field(default=12000, gt=0)
-    # Judgment, not a measured optimum (D1): bounds one call to ~15k tokens at the current
+    # ~30k tokens of one page at roughly 4 chars per token. A character cap, not a token
+    # cap: exact token counting would need a tokenizer and a choice of whose, and four model
+    # roles are declared. Raised from 12000 now that page reading is delegated, so a long
+    # source reaches the reader whole instead of truncated mid-argument.
+    per_page_char_cap: int = Field(default=120000, gt=0)
+    # Judgment, not a measured optimum (D1): bounds one call to ~150k tokens at the current
     # per-page cap. Bounds one `fetch_pages` call, never the run (R9/D11).
     max_urls_per_call: int = Field(default=5, gt=0)
 
@@ -114,6 +137,8 @@ def load_config(path: Path | None = None) -> HarnessConfig:
     """Load and validate `harness.toml`, raising `ConfigError` on any failure."""
     if path is None:
         path = Path(__file__).resolve().parent.parent / "harness.toml"
+
+    _load_dotenv(path.parent / ".env")
 
     try:
         with open(path, "rb") as f:

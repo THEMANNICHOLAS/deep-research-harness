@@ -207,3 +207,44 @@ sentences each, append-only, newest last.
   existing `OPENCODE_API_KEY` and no additional region opt-in — the flash-tier's
   documented 403 gotcha did not reproduce for pro. `[roles.subagent]` is unchanged
   (`gpt-5.6-luna`).
+
+- **2026-08-15 — degraded-coverage incidents flow through a dedicated per-run `RunLog`
+  (@harness/runlog.py), not the `SourceRegistry` (developer decision via AskUserQuestion).**
+  Tools record search failures, failed/blocked fetches, dropped malformed results, and
+  capture-write failures; `__main__` echoes each as a terminal `Alert` and the report lists
+  them under `## Gaps and disclosures` even when verification never ran. Chosen over hanging
+  incidents off the registry to keep the citation registry single-purpose and give the future
+  TUI/toolpacks a neutral seam. One shared instance per run — builders default a missing log
+  only so incident-agnostic tests stay unchanged.
+
+- **2026-08-15 — CLI startup cut from ~6s to ~0.5s: lazy imports plus removing
+  `langchain-google-genai` via a uv dependency override (@pyproject.toml `[tool.uv]`).**
+  crawl4ai imports inside `_fetch` (first fetch pays it, overlapped with model latency);
+  `harness.agent`/`harness.models`/langgraph import inside `main()` after the renderer starts;
+  `verify.py` defers `harness.models` into `verify_paragraphs` so report/verify stay light.
+  deepagents only imports langchain-google-genai inside try/except ImportError, so the
+  impossible-marker override (`sys_platform == 'never'`) drops ~2s of google.genai import —
+  MUST be revisited on any deepagents bump (an unconditional import there would crash).
+  Capture-file policy (`FETCH_FAILED_PREFIX`/`is_failed_capture`/`sources_dir`) moved to
+  @harness/sources.py so report/verify/conftest no longer drag crawl4ai.
+
+- **2026-08-15 — `build_chat_model` is called as a module attribute
+  (`models.build_chat_model(...)`) everywhere, never imported by value.** Tests patch the one
+  definition (`harness.models.build_chat_model`); the old three-target patch list in
+  tests/conftest.py let any new by-value importer silently dial the real endpoint. Tests
+  needing DIFFERENT clients for the lead vs the verification pass now dispatch inside the one
+  patched callable (by role, or by main()'s fixed resolution order: preflight, lead, reader,
+  verify).
+
+- **2026-08-15 — the round cap is counted by `__main__`'s stream loop in MODEL TURNS;
+  `recursion_limit` is only a runaway backstop (`max_rounds * 20 + 100`).** The old
+  `max_rounds * 2 + 1` mapping assumed 2 supersteps per round, but middleware `after_model`
+  nodes sit inside the loop (4/round measured), silently halving the advertised budget — a
+  20-round config delivered ~10. Supersteps are framework topology and drift on upgrade;
+  turns are counted in code we own (deduped by message id; the reader subagent's internal
+  turns never reach the outer stream, so rounds are the lead's). The cap is now run-level —
+  clarification resumes no longer refresh it — and a run capped mid-research gets ONE bounded
+  synthesis pass (`_SYNTHESIZE_NOW`, recursion_limit 10) after the capped round's tools
+  finish, so the report carries a real final answer instead of mid-run chatter, with the
+  round cap still disclosed. Reusable rule: reach for recursion_limit as a crash-stop
+  backstop, never as a semantic budget.

@@ -17,12 +17,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig, run_workspace_dir
 from harness.paragraphs import LIST_ITEM_RE, Paragraph, strip_markers
-from harness.sources import Source, SourceRegistry
-from harness.tools.fetch import _sources_dir, is_failed_capture
+from harness.runlog import Incident
+from harness.sources import Source, SourceRegistry, is_failed_capture, sources_dir
 from harness.verify import MODEL_VERDICTS, ParagraphVerdict, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
+# Matches a markdown heading marker at the start of any line (per-line, not per-paragraph).
+_HEADING_RE = re.compile(r"^(#{1,6}) ", re.MULTILINE)
 
 # The one spelling of each per-paragraph label. Bold, and preceded by a blank line, because
 # an unstyled `Sources:` on the line right after the prose read as another sentence of the
@@ -47,6 +49,8 @@ _UNREAD_HEADING = "Not read at all (fetch never succeeded):"
 # Mirrors `harness/tools/fetch.py`'s `FetchOutcome`: a typed value, not an exception, for why
 # a run ended early.
 CutShortReason = Literal["round_cap", "wall_clock", "error"]
+
+_INCIDENTS_HEADING = "Tool failures during the run:"
 
 _CUT_SHORT_HEADING = "## Run cut short"
 _NOTES_HEADING = "## Working notes"
@@ -103,6 +107,9 @@ class RunOutcome(BaseModel):
     # `Verdict: not verified - ...` line then; only a non-citing paragraph and the two
     # disclosure sections are unaffected by this being unset.
     verification: VerificationResult | None = None
+    # The run's degraded-coverage incidents (`harness.runlog.RunLog.incidents()`), disclosed
+    # under `## Gaps and disclosures` even when verification never ran.
+    incidents: list[Incident] = Field(default_factory=list)
 
 
 def format_todos(todos: list[dict[str, Any]]) -> str:
@@ -152,7 +159,7 @@ def _is_usable(config: HarnessConfig, registry: SourceRegistry, source: Source) 
     `ValueError`, so catching `OSError` alone let it escape `write_report` and lose the whole
     report of an otherwise finished run.
     """
-    path = _sources_dir(config, registry) / f"{source.id}.md"
+    path = sources_dir(config, registry) / f"{source.id}.md"
     if not path.exists():
         return False
     try:
@@ -235,12 +242,11 @@ def _read_modes_section(registry: SourceRegistry) -> str:
 def _cut_short_section(outcome: RunOutcome, config: HarnessConfig) -> str:
     """One sentence naming the bound that ended the run, then the unfinished todos."""
     if outcome.cut_short == "round_cap":
-        # "per pass", not a flat run total: langgraph recomputes the budget from the resumed
-        # step on every `astream` call, so each clarification resume grants a fresh allowance.
-        # A run-level phrasing overstates a number the reader cannot reconcile.
+        # A run-level total: `__main__` counts model turns itself across every pass, so the
+        # configured number is exactly what the run was allowed.
         bound_line = (
             f"The run was cut short by {_ROUND_CAP_TEXT} "
-            f"(configured at {config.agent.max_rounds} rounds per pass)."
+            f"(configured at {config.agent.max_rounds} rounds)."
         )
     elif outcome.cut_short == "wall_clock":
         bound_line = (
@@ -293,9 +299,26 @@ def _notes_section(
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        sections.append(f"### {relative.as_posix()}\n\n{text}")
+        # Demoted like answer prose: a note is model-authored too, and embedding it verbatim
+        # put its `# `/`## ` headings at the report's own title and section depths.
+        sections.append(f"### {relative.as_posix()}\n\n{_demote_headings(text)}")
 
     return "\n\n".join(sections) if sections else _NO_NOTES_TEXT
+
+
+def _demote_headings(text: str) -> str:
+    """Demote every markdown heading in `text` by two levels, capped at `######`.
+
+    Model `# ` -> `### `, `## ` -> `#### `, so nothing the model writes can collide with the
+    report's own `# <question>` title or its `## `-depth section headings. `#####`/`######`
+    both land at `######` (the cap), which loses distinction only at those two deepest,
+    unrealistic-for-an-answer levels; relative ordering is preserved everywhere else.
+    """
+
+    def _bump(match: re.Match[str]) -> str:
+        return "#" * min(len(match.group(1)) + 2, 6) + " "
+
+    return _HEADING_RE.sub(_bump, text)
 
 
 def _verdict_label(verdict: str) -> str:
@@ -304,20 +327,25 @@ def _verdict_label(verdict: str) -> str:
 
 
 def _paragraph_prose(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> list[str]:
-    """Marker-stripped prose lines for `paragraph`, with a trailing ` *` on each bullet whose
-    zero-based index is in `verdict.unsupported_items` (an out-of-range index is ignored, D4).
+    """Marker-stripped, heading-demoted prose lines for `paragraph`, with a trailing ` *` on
+    each bullet whose zero-based index is in `verdict.unsupported_items` (an out-of-range
+    index is ignored, D4).
 
     Bullets are identified by `LIST_ITEM_RE`, the same test `split_paragraphs` uses to build
     `items`, so the Nth list line IS `items[N]`. Matching on rendered text instead let a
     lead-in ending in the first bullet's wording consume that bullet's slot, putting the `*`
     on prose and leaving the failing bullet unmarked.
+
+    Only reached for non-code paragraphs (`_paragraph_block` early-returns on `is_code`), so
+    `_demote_headings` here is the one place a model-authored `#`/`##` heading is pushed below
+    the report's own `# `/`## ` depths before `## Answer` is assembled.
     """
     unsupported = set(verdict.unsupported_items) if verdict is not None else set()
     valid = {i for i in unsupported if 0 <= i < len(paragraph.items)}
 
     lines: list[str] = []
     item_index = 0
-    for raw_line in paragraph.text.split("\n"):
+    for raw_line in _demote_headings(paragraph.text).split("\n"):
         rendered = strip_markers(raw_line)
         if LIST_ITEM_RE.match(raw_line):
             # A citation-only bullet renders no line, so a bare ` *` would mark nothing.
@@ -416,14 +444,17 @@ def _conflicts_section(outcome: RunOutcome, verification: VerificationResult) ->
     return "\n\n".join(blocks)
 
 
-def _gaps_section(outcome: RunOutcome, verification: VerificationResult) -> str:
-    """Unresolved citation markers, per-check failures, and — on a run that was NOT cut short
-    — its dead branches.
+def _gaps_section(outcome: RunOutcome, verification: VerificationResult | None) -> str:
+    """Unresolved citation markers, run incidents, per-check failures, and — on a run that was
+    NOT cut short — its dead branches.
 
     R4 requires dead branches on every run, not only a cut-short one. `_cut_short_section`
     already lists unfinished todos when a bound ended the run, so this renders them only when
     it did not: an agent that simply stops with steps still `pending` has abandoned those
     branches just as surely.
+
+    `verification` may be `None` (the pass never ran): incidents and unresolved markers must
+    still be disclosed on exactly those runs.
     """
     lines: list[str] = []
 
@@ -440,11 +471,33 @@ def _gaps_section(outcome: RunOutcome, verification: VerificationResult) -> str:
         lines.append("Unresolved citation markers (no matching source was registered):")
         lines.extend(f"- {source_id}" for source_id in unresolved)
 
-    if verification.check_failures:
+    if outcome.incidents:
+        if lines:
+            lines.append("")
+        lines.append(_INCIDENTS_HEADING)
+        lines.extend(f"- {incident.detail}" for incident in outcome.incidents)
+
+    if verification is not None and verification.check_failures:
         if lines:
             lines.append("")
         lines.append("Verification checks that failed to run:")
         lines.extend(f"- {failure}" for failure in verification.check_failures)
+
+    # A count mismatch means `## Answer` silently rendered the overflow paragraphs as
+    # "not verified" — say so rather than letting that read as a deliberate verdict. Zero
+    # verdicts is "the pass did not run", which the sections above already cover.
+    if (
+        verification is not None
+        and verification.verdicts
+        and len(verification.verdicts) != len(outcome.paragraphs)
+    ):
+        if lines:
+            lines.append("")
+        lines.append(
+            f"Verification returned {len(verification.verdicts)} verdict(s) for "
+            f"{len(outcome.paragraphs)} paragraph(s); paragraphs without a matching verdict "
+            "are shown as not verified."
+        )
 
     return "\n".join(lines)
 
@@ -459,6 +512,7 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
         # tier is wired as the reader (R6).
         f"- Lead Model: {config.roles['head'].model}",
         f"- Subagent Model: {config.roles['subagent'].model}",
+        f"- Verifier Model: {config.roles['verifier'].model}",
         *_usage_lines(outcome.usage),
         "",
     ]
@@ -489,9 +543,11 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
         if conflicts_text:
             lines += [_CONFLICTS_HEADING, "", conflicts_text, ""]
 
-        gaps_text = _gaps_section(outcome, outcome.verification)
-        if gaps_text:
-            lines += [_GAPS_HEADING, "", gaps_text, ""]
+    # NOT gated on verification: incidents and unresolved markers belong to the run itself,
+    # and the runs that skip verification are exactly the ones with the most to disclose.
+    gaps_text = _gaps_section(outcome, outcome.verification)
+    if gaps_text:
+        lines += [_GAPS_HEADING, "", gaps_text, ""]
 
     lines += [
         "## Sources",

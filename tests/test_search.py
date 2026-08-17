@@ -4,6 +4,7 @@ import httpx
 import pytest
 from langchain_core.tools import BaseTool
 
+from harness.runlog import RunLog
 from harness.tools import search
 from tests.conftest import install_search_transport
 
@@ -34,7 +35,7 @@ async def test_well_formed_response_maps_to_search_results(monkeypatch, make_con
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("solar panels", 10, config)
+    content, artifact = await search._search("solar panels", 10, config, RunLog())
 
     assert isinstance(artifact, list)
     assert len(artifact) == 2
@@ -62,7 +63,7 @@ async def test_max_results_bounds_the_number_returned(monkeypatch, make_config):
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 2, config)
+    content, artifact = await search._search("x", 2, config, RunLog())
 
     assert isinstance(artifact, list)
     assert len(artifact) == 2
@@ -87,7 +88,7 @@ async def test_request_targets_the_configured_searxng_json_endpoint(
     install_search_transport(monkeypatch, handler)
     config = make_config(base_url=base_url)
 
-    await search._search("solar panels", 10, config)
+    await search._search("solar panels", 10, config, RunLog())
 
     request = captured_requests[0]
     assert request.url.host == "searx.test"
@@ -112,7 +113,7 @@ async def test_result_without_a_url_is_skipped(monkeypatch, make_config):
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 10, config)
+    content, artifact = await search._search("x", 10, config, RunLog())
 
     assert isinstance(artifact, list)
     assert [r.url for r in artifact] == ["https://ok.test"]
@@ -133,7 +134,7 @@ async def test_result_with_a_wrong_typed_field_is_skipped_not_raised(monkeypatch
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 10, config)
+    content, artifact = await search._search("x", 10, config, RunLog())
 
     assert isinstance(artifact, list)
     assert [r.url for r in artifact] == ["https://ok.test"]
@@ -146,7 +147,7 @@ async def test_non_object_json_body_returns_malformed(monkeypatch, make_config):
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 10, config)
+    content, artifact = await search._search("x", 10, config, RunLog())
 
     assert isinstance(artifact, search.SearchFailure)
     assert artifact.reason == "malformed"
@@ -160,7 +161,7 @@ async def test_connection_error_returns_unreachable_failure(monkeypatch, make_co
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 10, config)
+    content, artifact = await search._search("x", 10, config, RunLog())
 
     assert isinstance(artifact, search.SearchFailure)
     assert artifact.reason == "unreachable"
@@ -175,7 +176,7 @@ async def test_non_200_returns_bad_status_failure_with_the_status_in_detail(
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 10, config)
+    content, artifact = await search._search("x", 10, config, RunLog())
 
     assert isinstance(artifact, search.SearchFailure)
     assert artifact.reason == "bad_status"
@@ -189,7 +190,7 @@ async def test_non_json_body_returns_malformed(monkeypatch, make_config):
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 10, config)
+    content, artifact = await search._search("x", 10, config, RunLog())
 
     assert isinstance(artifact, search.SearchFailure)
     assert artifact.reason == "malformed"
@@ -202,7 +203,7 @@ async def test_missing_results_key_returns_malformed(monkeypatch, make_config):
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 10, config)
+    content, artifact = await search._search("x", 10, config, RunLog())
 
     assert isinstance(artifact, search.SearchFailure)
     assert artifact.reason == "malformed"
@@ -215,7 +216,7 @@ async def test_zero_results_returns_an_empty_list_not_a_failure(monkeypatch, mak
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 10, config)
+    content, artifact = await search._search("x", 10, config, RunLog())
 
     assert artifact == []
     assert not isinstance(artifact, search.SearchFailure)
@@ -243,7 +244,7 @@ async def test_success_content_lists_each_result_with_title_url_and_snippet(
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, _ = await search._search("solar panels", 10, config)
+    content, _ = await search._search("solar panels", 10, config, RunLog())
 
     for expected in ("A Title", "https://a.test", "A snippet", "B Title", "https://b.test"):
         assert expected in content
@@ -256,7 +257,7 @@ async def test_zero_results_content_says_so_without_claiming_failure(monkeypatch
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, _ = await search._search("obscure", 10, config)
+    content, _ = await search._search("obscure", 10, config, RunLog())
 
     assert "no results" in content.lower()
     assert "failed" not in content.lower()
@@ -269,7 +270,7 @@ async def test_failure_content_states_that_the_search_failed_and_why(monkeypatch
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("solar panels", 10, config)
+    content, artifact = await search._search("solar panels", 10, config, RunLog())
 
     assert "solar panels" in content
     assert "failed" in content.lower()
@@ -514,7 +515,7 @@ async def test_result_missing_optional_fields_still_maps(monkeypatch, make_confi
     install_search_transport(monkeypatch, handler)
     config = make_config()
 
-    content, artifact = await search._search("x", 10, config)
+    content, artifact = await search._search("x", 10, config, RunLog())
 
     assert isinstance(artifact, list)
     assert len(artifact) == 1
@@ -522,3 +523,62 @@ async def test_result_missing_optional_fields_still_maps(monkeypatch, make_confi
     assert artifact[0].url == "https://a.test"
     assert artifact[0].snippet == ""
     assert artifact[0].engine == ""
+
+
+async def test_a_search_failure_is_recorded_on_the_run_log(monkeypatch, make_config):
+    def handler(request):
+        raise httpx.ConnectError("refused")
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    run_log = RunLog()
+
+    await search._search("solar panels", 10, config, run_log)
+
+    incidents = run_log.incidents()
+    assert [incident.kind for incident in incidents] == ["search_failed"]
+    assert "solar panels" in incidents[0].detail
+    assert "unreachable" in incidents[0].detail
+
+
+async def test_dropped_malformed_results_are_counted_on_the_run_log(monkeypatch, make_config):
+    payload = {
+        "query": "x",
+        "results": [
+            {"title": "No URL at all", "content": "orphan"},
+            {"url": "https://bad.test", "title": 123, "content": "int title", "engine": "e"},
+            {"url": "https://ok.test", "title": "OK", "content": "good", "engine": "e"},
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    run_log = RunLog()
+
+    content, artifact = await search._search("x", 10, config, run_log)
+
+    assert isinstance(artifact, list)
+    incidents = run_log.incidents()
+    assert [incident.kind for incident in incidents] == ["search_results_dropped"]
+    assert "2 malformed result entries" in incidents[0].detail
+
+
+async def test_a_clean_search_records_no_incident(monkeypatch, make_config):
+    payload = {
+        "query": "x",
+        "results": [{"url": "https://ok.test", "title": "OK", "content": "good", "engine": "e"}],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    run_log = RunLog()
+
+    await search._search("x", 10, config, run_log)
+
+    assert run_log.incidents() == []
