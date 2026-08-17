@@ -1,0 +1,498 @@
+# PLAN: HTTP-First Fetch Pipeline
+
+**Status:** Not started
+**Created:** 2026-08-17
+**Type:** Single plan
+
+## Intent
+
+**True goal:** The fetch pipeline stops hanging research agents and stops burning RAM —
+plain HTTP scraping (still via crawl4ai) becomes the primary extraction strategy; Chromium
+is only an escalation for JS-rendered pages.
+
+**Binding outcomes:**
+- **R1** — Every URL fetch uses HTTP-first extraction; a browser is launched only when the
+  HTTP result is a JS shell / near-empty (auto-detected), retried once via Chromium.
+  - A URL serving `application/pdf` is detected before its body is fetched, reported as the
+    existing `non_html` outcome, and never escalated to Chromium (which cannot extract PDF
+    text). No PDF file is written to disk.
+- **R2** — A fetch attempt never exceeds a hard per-URL, per-strategy deadline, config-driven:
+  ~3s for an HTTP attempt, ~20s ceiling for a Chromium escalation (renders can't finish in 3s).
+  On expiry it counts as a failure — agents can never hang on a URL.
+- **R3** — A 403 or 401 from a domain marks the whole domain skipped; the skip persists
+  across runs with a 30-day TTL (storage format decided in design).
+- **R4** — A failed scrape is retried at most 2 times (2 extra attempts after the first).
+  - Default: retry timeouts/network errors/5xx; other 4xx are not retried; Chromium
+    escalation is not a retry.
+- **R5** — Skipped domains, timeouts, and exhausted retries are disclosed in results, never
+  silently thinned (per the existing best-effort + disclose invariant).
+- **R6** — The number of concurrently callable subagents is bounded by a configured maximum,
+  so total fetch load stays bounded as the agent loop lands.
+  - No agent loop exists yet: this outcome is satisfied by a validated config key that the
+    future loop must honor, not by runtime enforcement in this work.
+
+**Preferences (negotiable — may be trimmed on cost grounds without re-asking):**
+- RAM saving and speed-up are stated goals but qualitative — no measured threshold.
+- Cross-agent fetch dedup via crawl4ai's SQLite cache (`CacheMode`) is deliberately not
+  pursued; `BYPASS` stays, since research URLs are rarely re-fetched within a run.
+
+**Non-goals:**
+- Replacing crawl4ai as the extraction library.
+- Changing search (SearXNG) or the tool registry shape.
+- Tuning extraction quality / markdown output.
+- Extracting text from PDFs (backlog: needs the `crawl4ai[pdf]` extra + `pypdf`).
+- Building the agent loop, or any cross-process coordination machinery for it.
+
+**Constraints & assumptions:**
+- crawl4ai stays pinned at 0.9.2.
+- No new database — blocklist persistence must be file-based.
+- Config (deadlines, retry count, TTL, concurrency, subagent cap) lives in `harness.toml`,
+  never hardcoded.
+- Homelab Linux box, single-user research runs; blocklist is regenerable (no data-loss concern).
+- Fetched pages are untrusted input (already true today).
+- File writes stay confined to the workspace: crawl4ai's `downloads_path` must be pinned
+  inside it rather than defaulting to `~/.crawl4ai/downloads`.
+- No shared Chromium `user_data_dir` may be configured — crawl4ai SIGTERMs the PID holding
+  a shared profile, so one agent would kill a sibling's browser.
+
+**Open questions:**
+- None. (Resolved during design: a 3s deadline is viable only via caller-side
+  `asyncio.wait_for` — crawl4ai's HTTP strategy hardcodes a 10s connect timeout; the
+  blocklist is a JSON `{domain: timestamp}` file; the JS-shell detector measures generated
+  markdown word count.)
+
+## Background
+
+crawl4ai 0.9.2 facts verified against the installed package during planning, which the
+design depends on and no single decision below owns:
+
+- `AsyncHTTPCrawlerStrategy` (`crawl4ai/async_crawler_strategy.py:2466`) uses aiohttp and
+  never imports Playwright; `AsyncWebCrawler.__aenter__` only delegates to the strategy, so
+  an HTTP-only crawler never launches Chromium.
+- Downstream processing (`aprocess_html` — markdown generation, content filtering) runs off
+  `html` identically for both strategies, so extraction output is unchanged.
+- `LXMLWebScrapingStrategy` is already the 0.9.2 default and `PruningContentFilter` is a
+  pure DOM heuristic — the codebase is already on crawl4ai's fast paths, so speed gains must
+  come from our own layer (strategy, deadline, concurrency, skipping).
+- `MemoryAdaptiveDispatcher` applies only to `arun_many`; its `memory_threshold_percent` is
+  measured system-wide via `psutil.virtual_memory()`, not per-process.
+
+## Codebase Map
+
+- Entry point: `harness/tools/fetch.py` — `build_fetch_tool(config, registry)` builds the
+  `fetch_pages` LangChain tool; `_fetch()` (lines 161-195) is the single crawl4ai call site.
+- Module boundaries: flat modules at `harness/` root (`config.py`, `sources.py`,
+  `prompts.py`); tools live in `harness/tools/` with one `build_<name>_tool` factory each,
+  assembled by `build_tools(config, registry)` in `harness/tools/__init__.py:11`.
+- Reuse targets:
+  - `FetchSettings` (`harness/config.py:60-68`) — `page_timeout_ms`, `max_concurrency`,
+    `per_page_char_cap`, `max_urls_per_call`. `HarnessConfig` is a `_StrictModel`
+    (`extra="forbid"`): an unknown `harness.toml` key fails startup loudly.
+  - `classify()` and `FetchOutcome` (`harness/tools/fetch.py:30,48-70`) — the existing
+    typed-failure disclosure seam; `_BLOCKED_STATUSES = frozenset({403, 429, 503})`.
+  - `FetchedPage` (`harness/tools/fetch.py:73-84`) — per-URL record: outcome, status_code,
+    title, markdown, error.
+  - `_render()` (`harness/tools/fetch.py:133-158`) — boundary-aware truncation at
+    `per_page_char_cap`. Not changed by this work.
+  - `normalize_url()` (`harness/sources.py:20-61`) — URL canonicalization; the blocklist's
+    host key derives from the same parsing conventions.
+  - `SourceRegistry.add()` (`harness/sources.py:90-102`) — in-memory `[Sn]` citation IDs.
+- Comparable prior art: `harness/tools/search.py` — same factory shape and typed-failure
+  convention (`SearchFailure`); the pattern the blocklist-aware tool mirrors.
+- No file-write precedent exists anywhere in `harness/` (only `config.py:102` reads
+  `harness.toml`) — the blocklist is genuinely new surface.
+- Tests: `tests/test_fetch.py` (~700 lines) monkeypatches `harness.tools.fetch.AsyncWebCrawler`
+  with a `_FakeCrawler` returning `_FakeResult`/`_FakeMarkdown` stand-ins — fully offline.
+  `tests/conftest.py` supplies `make_config`. pytest + pytest-asyncio, `asyncio_mode = "auto"`.
+  No clock fixture exists.
+- Commands: `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`,
+  `uv run mypy .`.
+
+## Non-Goals
+Inherits every `## Intent` non-goal — not re-listed.
+- Making `SourceRegistry` thread-safe — `add()` has no `await` between its check and write,
+  so it is already safe for in-process asyncio agents; only real threads would break it.
+- Reworking `classify()`'s existing `non_html`/404 gaps (backlog items) beyond what PDF
+  precheck requires.
+- Any change to `_render()` truncation or the five-URL `max_urls_per_call` cap.
+
+## Design Decisions
+
+### D1: Per-URL `arun()` calls replace the `arun_many` batch
+- **Chosen:** One long-lived HTTP-strategy `AsyncWebCrawler`; each URL goes through its own
+  `arun()` wrapped in `asyncio.wait_for(...)`, bounded by our own `asyncio.Semaphore`, with
+  our own retry loop.
+- **Rejected:** Keeping `arun_many` + `MemoryAdaptiveDispatcher` — crawl4ai exposes no
+  per-URL deadline on the batch API, so R2's no-hang guarantee would degrade to a batch-level
+  timeout, and per-URL retry/escalation would have no natural seam.
+- **Consequences:** `MemoryAdaptiveDispatcher`'s memory backpressure is lost (see !#2), so
+  browser concurrency must be capped low and explicitly. `_RATE_LIMIT_MAX_RETRIES` and the
+  dispatcher/`RateLimiter` imports go away.
+
+### D2: HTTP status recovered by parsing `error_message`
+- **Chosen:** On a non-2xx the HTTP strategy raises internally and `CrawlResult.status_code`
+  is `None`; the numeric status survives only inside `error_message` (`"HTTP 403: ..."`).
+  A helper parses it back out and feeds both `classify()` and the blocklist gate.
+- **Rejected:** Setting `CrawlerRunConfig(max_retries>=1)` so crawl4ai surfaces the status
+  itself — it buys the status at the price of hidden extra fetches we cannot deadline,
+  directly fighting R2 and R4's explicit attempt budget.
+- **Consequences:** A string-format dependency on a pinned library version (!#1). Any
+  crawl4ai upgrade must re-verify this parse.
+
+### D3: JS-shell detection by generated-markdown word count
+- **Chosen:** An HTTP fetch that succeeds but yields fewer than `min_markdown_words` words
+  of generated markdown escalates once to Chromium.
+- **Rejected:** Raw-HTML shell markers (`<div id="root">`, noscript patterns) — a pattern
+  list to maintain; word count measures what the agent actually consumes.
+- **Consequences:** One tunable threshold; both mis-tuning directions cost real work (!#5).
+  Escalation is explicitly not a retry, so it composes with R4's budget rather than
+  consuming it.
+
+### D4: Blocklist as an atomically-replaced JSON map
+- **Chosen:** `{"example.com": "2026-08-17T09:30:00Z"}` at a configured path; loaded once per
+  tool call, pruned on load against a 30-day TTL, written via temp-file + `os.replace`.
+  A new `harness/blocklist.py` holds it — no file-persistence precedent exists to extend, and
+  a flat module matches `config.py`/`sources.py`/`prompts.py`.
+- **Rejected:** SQLite (contradicts the no-DB constraint for single-user runs);
+  plain-text lines (hand-rolled parse where `json.load` is free); file locking (machinery
+  built for an agent loop that does not exist).
+- **Consequences:** Concurrent writers are last-write-wins; a lost entry is benign and
+  re-learned on the next 403. Atomic replace means a reader never sees a torn file. TTL logic
+  takes an injectable clock, since no clock seam exists in the test suite.
+
+### D5: PDFs skipped via a HEAD precheck
+- **Chosen:** An `httpx.head()` (already a dependency) before fetching; `application/pdf`
+  short-circuits to the existing `non_html` outcome.
+- **Rejected:** Adding the `crawl4ai[pdf]` extra + `pypdf` — `PDFContentScrapingStrategy`
+  downloads via a synchronous `requests.get()` inside the event loop, reintroducing exactly
+  the blocking class this plan removes. Also rejected: fetch-and-discard, which writes the
+  file to disk anyway.
+- **Consequences:** One extra round trip per URL (!#3); servers rejecting HEAD fall through
+  to a normal fetch. `downloads_path` is still pinned into the workspace as a backstop for
+  any other non-HTML type.
+
+### D6: Subagent cap is a config contract, not runtime enforcement
+- **Chosen:** A validated `max_subagents` key the future agent loop must honor.
+- **Rejected:** Building enforcement now — there is no loop, no caller, and nothing to test
+  against.
+- **Consequences:** Worst-case fetch load is `max_subagents * http_concurrency` (3 * 10 = 30)
+  once the loop lands. The bound is declared, not enforced, until then.
+
+## Requirements Coverage
+
+| ID | Outcome | Covered by |
+|----|---------|------------|
+| R1 | HTTP-first, Chromium only for JS | Phase 1 (HTTP path primary), Phase 2 (escalation), Phase 3 (PDF never escalates) |
+| R2 | Hard per-strategy deadline | Phase 1 (HTTP ~3s), Phase 2 (browser ~20s) |
+| R3 | 403/401 skips whole domain, 30d TTL | Phase 4 |
+| R4 | Max 2 retries | Phase 1 |
+| R5 | Degraded coverage disclosed | Phase 1 (timeout/retry outcomes), Phase 3 (`non_html`), Phase 4 (`skipped`) |
+| R6 | Bounded concurrent subagents | Phase 5 |
+
+## Progress
+- [ ] Phase 1: HTTP-first fetch with hard deadline and retry budget
+- [ ] Phase 2: Chromium escalation for JS shells
+- [ ] Phase 3: PDF precheck and download containment
+- [ ] Phase 4: Persistent domain blocklist
+- [ ] Phase 5: Subagent cap config contract
+- [ ] Final verification
+
+## Phases
+
+### Phase 1: HTTP-first fetch with hard deadline and retry budget
+**Risk:** flagged (!#1, !#2)
+**Test-first:** required
+**Goal:** `fetch_pages` fetches every URL over crawl4ai's HTTP strategy, per-URL, under a hard
+~3s deadline with at most 2 retries — no Chromium is launched at all.
+**Requirements:** R1 (HTTP path), R2 (HTTP half), R4, R5 (timeout/retry disclosure)
+**Files:**
+- `harness/tools/fetch.py` — swap `BrowserConfig` for `AsyncHTTPCrawlerStrategy`; replace
+  `arun_many`/dispatcher with per-URL `arun()` under `asyncio.wait_for` + semaphore + retry loop
+- `harness/config.py` — `FetchSettings`: add `http_deadline_ms`, `max_retries`; rename
+  `max_concurrency` to `http_concurrency`
+- `harness.toml` — matching `[fetch]` keys (strict model: rename must land in both)
+- `tests/test_fetch.py` — extend the `_FakeCrawler` fixture with per-URL `arun`
+**Diff budget:** ~180-260 lines across 4 files
+
+**Reuse:**
+- Extend `FetchSettings` in `harness/config.py` — do NOT create a new settings model
+- Keep `classify()`, `FetchedPage`, `_render()`, `_pair`/dedup in `harness/tools/fetch.py`
+  unchanged in shape — only the fetch mechanism below them changes
+- Pattern to mirror: `tests/test_fetch.py`'s `install_crawler` monkeypatch — fake at the
+  `AsyncWebCrawler` boundary, never hit the network
+
+**Contracts:**
+- `_status_from_error(error: str | None) -> int | None` — parses `"HTTP <code>: ..."`;
+  Phase 4's blocklist gate and `classify()` both consume it
+- `async def _fetch_one(crawler, url: str, run_config, deadline_ms: int) -> FetchedPage` —
+  one deadlined attempt, never raises; Phase 2 wraps it for escalation
+- `FetchSettings.http_deadline_ms: int` (default 3000), `FetchSettings.max_retries: int`
+  (default 2), `FetchSettings.http_concurrency: int` (default 10) — all `gt=0`
+- Retryable set: timeout, network error, 5xx. Not retryable: 4xx other than the 5xx set
+
+**Out of scope:**
+- Any Chromium/browser code path (Phase 2) — this phase must not import `BrowserConfig`
+- Blocklist, PDF precheck, `max_subagents`
+- Touching `_render()` truncation or `max_urls_per_call`
+
+**Tests (write first, confirm red):**
+- [ ] A URL exceeding the deadline yields a `timeout` outcome and never blocks siblings
+- [ ] Retryable failures are attempted exactly 3 times total; non-retryable 4xx exactly once
+- [ ] A non-2xx recovers its numeric status through `_status_from_error` into `classify()`
+- [ ] A successful fetch produces the same `FetchedPage`/markdown shape as before the swap
+- [ ] Concurrency never exceeds `http_concurrency` simultaneous in-flight fetches
+
+**Steps:**
+1. Write the tests above; run them; confirm they FAIL (red).
+2. Add the config fields and the matching `harness.toml` keys (rename `max_concurrency`).
+3. Replace the crawler construction and batch call with the per-URL deadlined loop.
+4. Run the tests; confirm they PASS (green).
+
+**Acceptance criteria:**
+- [ ] `grep -rn "BrowserConfig\|arun_many\|MemoryAdaptiveDispatcher" harness/` returns nothing
+- [ ] A live fetch of a static page per docs/guides/setup.md returns markdown, and no
+  Chromium process appears in `ps` during the run
+
+### Phase 2: Chromium escalation for JS shells
+**Risk:** flagged (!#2, !#5)
+**Test-first:** required
+**Goal:** An HTTP fetch that succeeds but yields near-empty markdown escalates once to
+Chromium, under its own hard deadline and a low concurrency cap.
+**Requirements:** R1 (escalation), R2 (browser half)
+**Assumes:**
+- Phase 1's `_fetch_one` and the per-URL loop are in place.
+**Files:**
+- `harness/tools/fetch.py` — thin-content check, lazily-created browser crawler, escalation
+  pass over thin results
+- `harness/config.py` — add `min_markdown_words`, `browser_deadline_ms`, `browser_concurrency`
+- `harness.toml` — matching keys
+- `tests/test_fetch.py` — fake browser crawler alongside the HTTP fake
+**Diff budget:** ~120-180 lines across 4 files
+
+**Reuse:**
+- Reuse Phase 1's `_fetch_one` for the browser attempt — do NOT write a second fetch path;
+  it differs only by crawler instance and deadline
+- Keep the existing `page_timeout_ms` as the browser `CrawlerRunConfig` page timeout
+
+**Contracts:**
+- `FetchSettings.min_markdown_words: int` (default 50), `browser_deadline_ms: int`
+  (default 20000), `browser_concurrency: int` (default 2) — all `gt=0`
+- The browser crawler is created lazily on first escalation and closed with the tool call —
+  a run with no thin results launches no browser
+- Escalation is at most one attempt per URL and does NOT consume the R4 retry budget
+
+**Out of scope:**
+- Escalating on failure outcomes (only thin-but-successful results escalate)
+- `text_mode` (it disables JavaScript, defeating escalation); `light_mode` is optional
+- Blocklist and PDF handling
+
+**Tests (write first, confirm red):**
+- [ ] A thin-markdown success escalates exactly once and returns the browser's richer result
+- [ ] A rich HTTP result never escalates, and no browser crawler is constructed
+- [ ] A failed/timed-out HTTP fetch does not escalate
+- [ ] An escalation exceeding `browser_deadline_ms` yields `timeout`, not a hang
+- [ ] Escalations in flight never exceed `browser_concurrency`
+
+**Steps:**
+1. Write the tests above; run them; confirm they FAIL (red).
+2. Add config fields plus `harness.toml` keys.
+3. Add the thin-content predicate and the lazy browser escalation pass.
+4. Run the tests; confirm they PASS (green).
+
+**Acceptance criteria:**
+- [ ] A live fetch of a static page launches no Chromium; a live fetch of a known
+  JS-rendered page returns non-empty markdown
+
+### Phase 3: PDF precheck and download containment
+**Risk:** flagged (!#3)
+**Test-first:** required
+**Goal:** PDF URLs are identified before their body is fetched and disclosed as `non_html`,
+and no crawl4ai download ever lands outside the workspace.
+**Requirements:** R1 (PDF case), R5 (disclosure)
+**Assumes:**
+- Phase 1's per-URL loop exists to host the precheck.
+**Files:**
+- `harness/tools/fetch.py` — `httpx.head()` precheck ahead of the fetch; pin `downloads_path`
+- `harness/config.py` — add `downloads_dir` (workspace-relative)
+- `harness.toml` — matching key
+- `tests/test_fetch.py` — fake HEAD responses
+**Diff budget:** ~80-120 lines across 4 files
+
+**Reuse:**
+- `httpx` is already a declared dependency — do NOT add a new HTTP client
+- Reuse the existing `non_html` outcome and `FetchedPage` shape; no new outcome value here
+
+**Contracts:**
+- `FetchSettings.downloads_dir: str` — passed to crawl4ai as `downloads_path` so nothing
+  writes to `~/.crawl4ai/downloads`
+- A HEAD that errors, times out, or is rejected falls through to a normal fetch attempt
+  (never a hard failure)
+
+**Out of scope:**
+- Extracting PDF text, adding `pypdf`/`crawl4ai[pdf]`
+- Fixing the backlog's broader `non_html`/404 classification gaps
+- Prechecking content types other than PDF
+
+**Tests (write first, confirm red):**
+- [ ] An `application/pdf` HEAD yields `non_html` with no fetch attempted and no file written
+- [ ] A `text/html` HEAD proceeds to a normal fetch
+- [ ] A HEAD that fails or times out falls through to a normal fetch
+- [ ] The crawler is constructed with `downloads_path` inside the configured workspace
+
+**Steps:**
+1. Write the tests above; run them; confirm they FAIL (red).
+2. Add `downloads_dir` config plus the `harness.toml` key and pin it on the crawler.
+3. Add the HEAD precheck to the per-URL path.
+4. Run the tests; confirm they PASS (green).
+
+**Acceptance criteria:**
+- [ ] After a live run against a PDF URL, `~/.crawl4ai/downloads` gains no new file
+
+### Phase 4: Persistent domain blocklist
+**Risk:** flagged (!#4)
+**Test-first:** required
+**Goal:** A 403 or 401 records the domain in a persistent JSON blocklist; blocked domains are
+skipped without a fetch for 30 days and disclosed as skipped.
+**Requirements:** R3, R5 (skip disclosure)
+**Assumes:**
+- Phase 1's `_status_from_error` reliably recovers 403/401.
+**Files:**
+- `harness/blocklist.py` — NEW: load/prune/record/contains over a JSON map, injectable clock.
+  New file because no file-persistence precedent exists and a flat module matches
+  `config.py`/`sources.py`
+- `harness/tools/fetch.py` — gate before fetch; record on 403/401; `skipped` outcome
+- `harness/config.py` — add `blocklist_path`, `blocklist_ttl_days`
+- `harness.toml` — matching keys
+- `tests/test_blocklist.py` — NEW: TTL, prune, atomic write, malformed-file cases
+- `tests/test_fetch.py` — gate and record integration
+**Diff budget:** ~180-260 lines across 6 files
+
+**Reuse:**
+- Derive the host key with the same parsing conventions as `normalize_url()` in
+  `harness/sources.py` — do NOT hand-roll a second URL parser
+- Pattern to mirror: `harness/tools/search.py`'s typed-failure convention for the new outcome
+- `make_config` in `tests/conftest.py` for config construction; `tmp_path` for the file
+
+**Contracts:**
+- `FetchOutcome` gains `"skipped"` — the disclosure value for a blocklisted domain
+- `FetchSettings.blocklist_path: str`, `blocklist_ttl_days: int` (default 30, `gt=0`)
+- On-disk format: JSON object mapping lowercased host to an ISO-8601 UTC timestamp
+- Blocklist functions take an injectable clock (defaulting to UTC now) so TTL is testable
+- Writes go through temp-file + `os.replace`; readers never observe a partial file
+
+**Out of scope:**
+- File locking or any cross-process coordination (D4)
+- Blocking on 429/503 — those stay ordinary retryable/blocked outcomes
+- A CLI or tool for editing the blocklist (it is hand-editable JSON)
+
+**Tests (write first, confirm red):**
+- [ ] A 403 and a 401 each record the domain; a 429 does not
+- [ ] A blocked domain is skipped with no fetch attempted, disclosed as `skipped`
+- [ ] Entries older than the TTL are pruned on load; fresh entries survive
+- [ ] A missing or malformed blocklist file degrades to empty rather than raising
+- [ ] A recorded write leaves a complete, parseable file (atomic replace)
+
+**Steps:**
+1. Write the tests above; run them; confirm they FAIL (red).
+2. Build `harness/blocklist.py` with the clock seam.
+3. Add config keys plus `harness.toml` entries.
+4. Wire the gate and the record path into the per-URL loop; add the `skipped` outcome.
+5. Run the tests; confirm they PASS (green).
+
+**Acceptance criteria:**
+- [ ] Two consecutive live runs against a 403ing URL show a fetch on the first and a
+  `skipped` disclosure with no request on the second
+
+### Phase 5: Subagent cap config contract
+**Risk:** none
+**Test-first:** required
+**Goal:** A validated `max_subagents` setting exists and is documented as the bound the
+future agent loop must honor.
+**Requirements:** R6
+**Files:**
+- `harness/config.py` — add `max_subagents` to the roles/agent settings
+- `harness.toml` — matching key with default 3
+- `docs/architecture.md` — record the bound and its worst-case fetch load
+- `tests/test_config.py` — validation coverage (create if absent)
+**Diff budget:** ~30-50 lines across 4 files
+
+**Reuse:**
+- Extend the existing settings model that already validates the `head`/`subagent` role names
+  (`harness/config.py:84`) — do NOT add a parallel config surface
+
+**Contracts:**
+- `max_subagents: int` (default 3, `gt=0`) — the agent loop, when built, must not run more
+  than this many subagents concurrently
+
+**Out of scope:**
+- Any runtime enforcement, scheduler, or shared-budget machinery (D6)
+- Building or wiring the agent loop
+
+**Tests (write first, confirm red):**
+- [ ] The key loads with its default and rejects non-positive values
+
+**Steps:**
+1. Write the test above; run it; confirm it FAILS (red).
+2. Add the field, the `harness.toml` key, and the architecture note.
+3. Run the test; confirm it PASSES (green).
+
+**Acceptance criteria:**
+- [ ] `docs/architecture.md` states the cap and the `max_subagents * http_concurrency`
+  worst-case fetch load
+
+## Verification
+- [ ] `uv run pytest`
+- [ ] `uv run ruff check .`
+- [ ] `uv run ruff format --check .`
+- [ ] `uv run mypy .`
+- [ ] Coverage stays at or above the CI 90% floor
+- [ ] Live check per docs/guides/setup.md: a mixed URL set (static page, JS-rendered page,
+  PDF, 403ing domain) returns one disclosed outcome each and no run hangs
+
+## Notes
+- `docs/decisions.md` currently records "Chromium via crawl4ai-managed Playwright is the only
+  path, and no config key selects a browser". This plan deliberately reverses that; the
+  decision log needs an entry saying so when the work lands.
+- `docs/backlog.md` items this touches: the missing retry pass (closed by Phase 1) and the
+  PDF classification gap (partly closed by Phase 3). The 404-as-`fetched` gap is untouched.
+- Both crawl4ai landmines from the Intent constraints (`downloads_path`, shared
+  `user_data_dir`) are recorded there rather than restated per phase.
+
+## Risks
+#1. **The HTTP status code is recovered by string-parsing crawl4ai's error message** — on a
+    non-2xx the 0.9.2 HTTP strategy raises internally, leaving `CrawlResult.status_code` as
+    `None`; the number survives only inside `error_message` as `"HTTP 403: ..."`. The 403/401
+    blocklist gate therefore rests on a library-internal string format. It is stable because
+    the version is pinned exactly. Confirm the parse against the installed package before
+    any crawl4ai upgrade, and keep a test asserting the exact message shape.
+#2. **Dropping `arun_many` removes crawl4ai's memory backpressure** — `MemoryAdaptiveDispatcher`
+    only applies to the batch API, so per-URL calls lose its system-wide memory throttling.
+    That is harmless on the HTTP path (small buffered bodies) but means Chromium escalation
+    concurrency is bounded only by our own cap. Keep `browser_concurrency` low (2) and treat
+    raising it as a decision requiring a memory measurement on the box.
+#3. **The HEAD precheck adds a round trip and some servers reject HEAD** — cost is one extra
+    request per URL, which the 3s deadline bounds. Servers answering HEAD with 405 or a wrong
+    Content-Type fall through to a normal fetch, so the failure mode is "no worse than today",
+    but a PDF served by such a server will still be downloaded; `downloads_path` containment
+    is the backstop.
+#4. **A transient 403 locks out a domain for 30 days** — a one-off block (aggressive WAF, a
+    rate-limit answered as 403) blocklists the whole domain well beyond the incident. The file
+    is hand-editable JSON and the entry expires on its own; if false positives show up in
+    practice, the cheap fix is requiring two strikes before recording, not shortening the TTL.
+#5. **The thin-content threshold is a tuning guess** — too high and ordinary short pages
+    escalate to Chromium (slow, defeats the plan's purpose); too low and real JS shells are
+    returned as near-empty sources. Start at 50 words, and check the escalation rate on a live
+    run before treating the default as settled.
+
+## Reconciliations
+<!-- Drift amendments written by /implement during execution. Append-only. Outdated phase
+text above is struck through (~~...~~) but preserved; entries here are the authoritative
+correction. Empty at plan creation. -->
+
+## Discoveries
+<!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
+Append-only, empty at plan creation. -->
+
+## Phase Handoff Log
+<!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
+phase). Append-only, empty at plan creation. -->
