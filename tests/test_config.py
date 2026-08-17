@@ -109,6 +109,7 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
     assert config.fetch.min_markdown_words == 50
     assert config.fetch.browser_deadline_ms == 20000
     assert config.fetch.browser_concurrency == 2
+    assert config.fetch.downloads_dir == "workspace/downloads"
     assert config.search.default_max_results == 10
 
 

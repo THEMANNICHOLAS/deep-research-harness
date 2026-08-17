@@ -3,6 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from crawl4ai import (  # type: ignore[import-untyped]
     BrowserConfig,
@@ -136,6 +137,37 @@ def install_crawler(monkeypatch):
         return fake_cls
 
     return _install
+
+
+@pytest.fixture
+def install_head(monkeypatch):
+    """Route fetch's PDF-precheck AsyncClient through a MockTransport running `handler`,
+    mirroring tests/test_search.py's `_install` seam for the SearXNG client.
+    """
+    real = httpx.AsyncClient
+
+    def _install(handler):
+        def factory(**kwargs):
+            return real(transport=httpx.MockTransport(handler), **kwargs)
+
+        monkeypatch.setattr("harness.tools.fetch.httpx.AsyncClient", factory)
+
+    return _install
+
+
+@pytest.fixture(autouse=True)
+def _default_head_response(install_head):
+    """Every `_fetch()` call now issues a PDF-precheck HEAD, so a test that doesn't care
+    about it (nearly all of them, pre-dating Phase 3) still needs to stay offline rather
+    than hit the real network for `*.test` URLs. Defaults to a `text/html` reply so those
+    tests keep proceeding to the fake crawler unchanged; a test exercising the precheck
+    itself calls `install_head` again to override this default.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/html"})
+
+    install_head(handler)
 
 
 async def test_empty_url_list_returns_empty_content_and_artifact(install_crawler, make_config):
@@ -1150,3 +1182,171 @@ async def test_browser_concurrency_never_exceeds_its_configured_cap(install_craw
 
     assert fake_cls.instances[1].max_in_flight == 2
     assert fake_cls.instances[0].max_in_flight == 5
+
+
+async def test_pdf_head_short_circuits_without_fetching_the_body(
+    install_crawler, install_head, make_config
+):
+    # R1's PDF case: the body is never fetched, and the non_html result can't escalate.
+    config = make_config()
+    registry = SourceRegistry()
+    fake_cls = install_crawler([])
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "application/pdf"})
+
+    install_head(handler)
+
+    _, pages = await fetch._fetch(["https://pdf.test/doc.pdf"], config, registry)
+
+    assert pages[0].outcome == "non_html"
+    assert pages[0].markdown == ""
+    assert fake_cls.calls == []
+    # Only the HTTP crawler is ever constructed — no browser escalation for a PDF.
+    assert len(fake_cls.constructed_with) == 1
+
+
+async def test_html_head_proceeds_to_a_normal_fetch(install_crawler, install_head, make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://a.test", markdown=_FakeMarkdown(raw_markdown="body", fit_markdown="body")
+        )
+    ]
+    fake_cls = install_crawler(results)
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/html"})
+
+    install_head(handler)
+
+    _, pages = await fetch._fetch(["https://a.test"], config, registry)
+
+    assert pages[0].outcome == "fetched"
+    assert len(fake_cls.calls) == 1
+
+
+async def test_malformed_url_does_not_sink_the_whole_batch(install_crawler, make_config):
+    # httpx raises InvalidURL (NOT a subclass of HTTPError) while parsing the URL, before
+    # any transport runs — so the precheck's except clause has to be wider than httpx's own
+    # error tree. The module contract is that no single URL can fail the batch, and the
+    # model supplies these URLs, so a malformed one is expected traffic.
+    config = make_config()
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://ok.test", markdown=_FakeMarkdown(raw_markdown="body", fit_markdown="body")
+        )
+    ]
+    install_crawler(results)
+
+    _, pages = await fetch._fetch(["http://[::1", "https://ok.test"], config, registry)
+
+    by_url = {page.url: page for page in pages}
+    assert by_url["https://ok.test"].outcome == "fetched"
+    assert by_url["http://[::1"].outcome == "error"
+
+
+@pytest.mark.parametrize("kind", ["transport_error", "timeout", "rejected"])
+async def test_head_failure_falls_through_to_a_normal_fetch(
+    install_crawler, install_head, make_config, kind
+):
+    # Risk !#3's "no worse than today" guarantee: a HEAD that errors, times out, or is
+    # rejected must never turn into a hard failure — it proceeds to a normal fetch.
+    config = make_config()
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://a.test", markdown=_FakeMarkdown(raw_markdown="body", fit_markdown="body")
+        )
+    ]
+    fake_cls = install_crawler(results)
+
+    def handler(request):
+        if kind == "transport_error":
+            raise httpx.ConnectError("refused")
+        if kind == "timeout":
+            raise httpx.ConnectTimeout("timed out")
+        # A 405 rejection, with a content-type that would otherwise look like a PDF —
+        # the non-2xx status alone must be enough to fall through.
+        return httpx.Response(405, headers={"content-type": "application/pdf"})
+
+    install_head(handler)
+
+    _, pages = await fetch._fetch(["https://a.test"], config, registry)
+
+    assert pages[0].outcome == "fetched"
+    assert len(fake_cls.calls) == 1
+
+
+async def test_downloads_path_is_pinned_on_both_crawlers(
+    install_crawler, install_head, make_config, tmp_path
+):
+    downloads_dir = str(tmp_path / "downloads")
+    config = make_config(downloads_dir=downloads_dir, min_markdown_words=5)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://shell.test": [
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
+            ),
+            _FakeResult(
+                "https://shell.test",
+                markdown=_FakeMarkdown(
+                    raw_markdown="a rich rendered body with plenty of words",
+                    fit_markdown="a rich rendered body with plenty of words",
+                ),
+            ),
+        ],
+    }
+    fake_cls = install_crawler([], behaviors=behaviors)
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/html"})
+
+    install_head(handler)
+
+    await fetch._fetch(["https://shell.test"], config, registry)
+
+    http_strategy = fake_cls.constructed_with[0]["crawler_strategy"]
+    assert http_strategy.browser_config.downloads_path == downloads_dir
+
+    browser_config = fake_cls.constructed_with[1]["config"]
+    assert browser_config.downloads_path == downloads_dir
+
+
+async def test_precheck_runs_once_per_url_not_per_attempt(
+    install_crawler, install_head, make_config
+):
+    # Pins where the precheck sits relative to the retry loop: a URL whose fetch attempts
+    # are 5xx to the retry budget must still issue exactly one HEAD.
+    config = make_config(max_retries=2)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://flaky.test": [
+            _FakeResult(
+                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
+            ),
+            _FakeResult(
+                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
+            ),
+            _FakeResult(
+                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
+            ),
+        ],
+    }
+    fake_cls = install_crawler([], behaviors=behaviors)
+    captured_requests = []
+
+    def handler(request):
+        captured_requests.append(request)
+        return httpx.Response(200, headers={"content-type": "text/html"})
+
+    install_head(handler)
+
+    await fetch._fetch(["https://flaky.test"], config, registry)
+
+    assert len(fake_cls.calls) == config.fetch.max_retries + 1
+    assert len(captured_requests) == 1

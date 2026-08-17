@@ -29,6 +29,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
         min_markdown_words: int = 1,
         browser_deadline_ms: int = 20000,
         browser_concurrency: int = 2,
+        downloads_dir: str = "workspace/downloads",
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
     ) -> HarnessConfig:
@@ -53,6 +54,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
                 min_markdown_words=min_markdown_words,
                 browser_deadline_ms=browser_deadline_ms,
                 browser_concurrency=browser_concurrency,
+                downloads_dir=downloads_dir,
             ),
             search=SearchSettings(base_url=base_url, default_max_results=default_max_results),
         )

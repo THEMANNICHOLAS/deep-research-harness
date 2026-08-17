@@ -12,6 +12,7 @@ import asyncio
 import re
 from typing import Literal
 
+import httpx
 from crawl4ai import (  # type: ignore[import-untyped]
     AsyncWebCrawler,
     BrowserConfig,
@@ -190,6 +191,37 @@ async def _fetch_one(
     )
 
 
+async def _is_pdf(url: str, timeout_ms: int) -> bool:
+    """HEAD-precheck `url` for `application/pdf` before its body is ever fetched (D5).
+
+    Returns True only on a 2xx response whose `content-type` contains `application/pdf`
+    (case-insensitive). Never raises: any non-2xx status, missing/other content type, or
+    ANY exception returns False so the caller falls through to a normal fetch attempt.
+
+    The `except` is deliberately broad rather than `httpx.HTTPError`. A malformed URL — and
+    the model supplies these — raises `httpx.InvalidURL` or `idna.IDNAError` during URL
+    parsing, neither of which is an `httpx.HTTPError`; letting one escape would propagate
+    out of `asyncio.gather` and sink the whole `fetch_pages` call, breaking this module's
+    "no single URL can fail the batch" contract.
+
+    Risk !#3: this costs one extra round trip per URL. `asyncio.wait_for` bounds the whole
+    HEAD, because httpx's `timeout=` is per-phase (connect/read/write/pool each get the full
+    value), so a stalling server could otherwise hold a concurrency slot for a multiple of
+    it. A server that rejects HEAD is no worse off than before this precheck existed.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout_ms / 1000) as client:
+            response = await asyncio.wait_for(
+                client.head(url, follow_redirects=True), timeout_ms / 1000
+            )
+    except Exception:
+        return False
+    if response.status_code // 100 != 2:
+        return False
+    content_type = response.headers.get("content-type", "")
+    return "application/pdf" in content_type.lower()
+
+
 def _is_retryable(page: FetchedPage) -> bool:
     """Retryable: timeouts, 5xx (503 is also classified `blocked` — that overlap is
     intended), and network errors (an `error` outcome with no status). Not retryable: any
@@ -213,7 +245,26 @@ async def _fetch_with_retries(
     """Attempt `url` up to `max_retries + 1` times, returning the first non-retryable page
     or the last attempt once the budget is exhausted. No backoff between attempts — none
     is specified, and the per-attempt deadline already bounds each one.
+
+    The PDF precheck runs once here, ahead of the retry loop, rather than inside it, so a
+    URL that gets retried still issues exactly one HEAD. It shares `semaphore` with the
+    fetch attempts so it counts toward the same concurrency bound. The resulting `non_html`
+    page can never escalate to Chromium: `_is_thin` only escalates a `non_html` result whose
+    `content_type` is absent or HTML-like, and `application/pdf` is neither (R1).
     """
+    async with semaphore:
+        if await _is_pdf(url, deadline_ms):
+            return FetchedPage(
+                source_id="",
+                url=url,
+                outcome="non_html",
+                status_code=None,
+                title=None,
+                markdown="",
+                error=None,
+                content_type="application/pdf",
+            )
+
     page: FetchedPage | None = None
     for _ in range(max_retries + 1):
         async with semaphore:
@@ -330,7 +381,9 @@ async def _fetch(
     # banner (Discovery #1, deferred — the HTTP path's banner remains). The browser crawler
     # below passes BrowserConfig(verbose=False) explicitly, closing the gap for that path.
     async with AsyncWebCrawler(
-        crawler_strategy=AsyncHTTPCrawlerStrategy(browser_config=HTTPCrawlerConfig())
+        crawler_strategy=AsyncHTTPCrawlerStrategy(
+            browser_config=HTTPCrawlerConfig(downloads_path=config.fetch.downloads_dir)
+        )
     ) as crawler:
         fetched_pages = await asyncio.gather(
             *(
@@ -366,7 +419,9 @@ async def _fetch(
             **_shared_run_config_kwargs,
         )
         browser_semaphore = asyncio.Semaphore(config.fetch.browser_concurrency)
-        async with AsyncWebCrawler(config=BrowserConfig(verbose=False)) as browser:
+        async with AsyncWebCrawler(
+            config=BrowserConfig(verbose=False, downloads_path=config.fetch.downloads_dir)
+        ) as browser:
             escalated = await asyncio.gather(
                 *(
                     _escalate_one(

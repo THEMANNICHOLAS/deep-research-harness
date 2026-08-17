@@ -81,6 +81,12 @@ class FetchSettings(_StrictModel):
     # MemoryAdaptiveDispatcher backpressure, so this is now the only thing bounding browser
     # memory use. Raising it requires a memory measurement on the box, not just an edit here.
     browser_concurrency: int = Field(default=2, gt=0)
+    # A plain relative path, not resolved against anything: no workspace/reports root key
+    # exists in this config yet (see docs/plans/PLAN-http-first-fetch.md Phase 3 notes). This
+    # IS the containment mechanism for now — a real workspace root, once one exists, should
+    # absorb it. Passed to crawl4ai as `downloads_path` so nothing writes to
+    # ~/.crawl4ai/downloads. No `gt=0` here: it is a path, not a bound.
+    downloads_dir: str = Field(default="workspace/downloads")
 
 
 class SearchSettings(_StrictModel):

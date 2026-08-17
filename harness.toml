@@ -32,6 +32,7 @@ max_urls_per_call = 5
 min_markdown_words = 50
 browser_deadline_ms = 20000
 browser_concurrency = 2
+downloads_dir = "workspace/downloads"
 
 [search]
 base_url = "http://localhost:8080"   # local dev instance — see searxng/docker-compose.yml

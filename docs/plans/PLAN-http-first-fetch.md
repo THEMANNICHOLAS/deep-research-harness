@@ -192,7 +192,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 - [x] Phase 1: HTTP-first fetch with hard deadline and retry budget
 - [x] Phase 2: Chromium escalation for JS shells
-- [ ] Phase 3: PDF precheck and download containment
+- [x] Phase 3: PDF precheck and download containment
 - [ ] Phase 4: Persistent domain blocklist
 - [ ] Phase 5: Subagent cap config contract
 - [ ] Final verification
@@ -343,10 +343,10 @@ and no crawl4ai download ever lands outside the workspace.
 - Prechecking content types other than PDF
 
 **Tests (write first, confirm red):**
-- [ ] An `application/pdf` HEAD yields `non_html` with no fetch attempted and no file written
-- [ ] A `text/html` HEAD proceeds to a normal fetch
-- [ ] A HEAD that fails or times out falls through to a normal fetch
-- [ ] The crawler is constructed with `downloads_path` inside the configured workspace
+- [x] An `application/pdf` HEAD yields `non_html` with no fetch attempted and no file written
+- [x] A `text/html` HEAD proceeds to a normal fetch
+- [x] A HEAD that fails or times out falls through to a normal fetch
+- [x] The crawler is constructed with `downloads_path` inside the configured workspace
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -355,7 +355,10 @@ and no crawl4ai download ever lands outside the workspace.
 4. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] After a live run against a PDF URL, `~/.crawl4ai/downloads` gains no new file
+- [ ] After a live run against a PDF URL, `~/.crawl4ai/downloads` gains no new file —
+  **not run**: needs the homelab box. Statically confirmed during review that the 0.9.2
+  fallback to `~/.crawl4ai/downloads` (`async_crawler_strategy.py:2739`) is the only such
+  write path and is now closed by the pinned `downloads_path`.
 
 ### Phase 4: Persistent domain blocklist
 **Risk:** flagged (!#4)
@@ -605,5 +608,27 @@ Append-only, empty at plan creation. -->
   renders an SPA, and risk !#5's escalation rate at 50 words. Phase 3's HEAD precheck is the
   next thing to touch `_fetch()`'s per-URL path; it must land ahead of the fetch, and its
   `downloads_path` goes on `HTTPCrawlerConfig`, not the strategy.
+
+### 2026-08-17 — Phase 3: PDF precheck and download containment
+- Done: `_is_pdf()` HEAD precheck runs once per URL at the top of `_fetch_with_retries`
+  (inside the semaphore, before the retry loop); an `application/pdf` 2xx short-circuits to
+  `non_html` with no body fetched. `downloads_path` pinned on both `HTTPCrawlerConfig` and
+  `BrowserConfig` from the new `FetchSettings.downloads_dir`. 139 tests green; ruff, format,
+  mypy clean.
+- Learned: `httpx.InvalidURL` is NOT a subclass of `httpx.HTTPError` — a malformed URL raises
+  during URL parsing, before any transport, so `_is_pdf`'s except must be broad or the
+  exception escapes `asyncio.gather` (called without `return_exceptions`) and sinks the whole
+  `fetch_pages` call. Found as a Blocker in review, fixed with a regression test. httpx's
+  `timeout=` is PER-PHASE (connect/read/write/pool each get the full value), not a total, so
+  the HEAD is additionally wrapped in `asyncio.wait_for`. crawl4ai's only
+  `~/.crawl4ai/downloads` write path is the `browser_config.downloads_path or <default>`
+  fallback at `async_crawler_strategy.py:2739`, now closed. `BrowserConfig.downloads_path`
+  only matters under `accept_downloads` (defaults False).
+- Drift: none. Every `_fetch()` test now needs a HEAD stub, so `tests/test_fetch.py` gained an
+  autouse `_default_head_response` fixture returning `text/html`; review confirmed it is
+  offline-safe via `httpx.MockTransport` and that no precheck test rides it implicitly.
+- Watch-next: Phase 4 adds the `skipped` outcome and gates on the blocklist — the gate must
+  sit BEFORE `_is_pdf` so a blocked domain costs no request at all, and `FetchOutcome` is a
+  `Literal`, so adding `"skipped"` touches the type and every exhaustive check over it.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->
