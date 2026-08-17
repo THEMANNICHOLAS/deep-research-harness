@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.config import ConfigError, load_config
+from harness.config import ConfigError, GuardSettings, load_config
 
 VALID_TOML = """
 [providers.opencode]
@@ -412,6 +412,46 @@ def test_a_real_env_var_wins_over_the_same_key_in_dotenv(tmp_path, monkeypatch):
     config = load_config(path)
 
     assert config.providers["opencode"].api_key == "from-environment"
+
+
+# --- Phase 3: GuardSettings / [guard] ---------------------------------------------------
+
+
+def test_guard_defaults_to_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+
+    config = load_config(path)
+
+    assert config.guard.enabled is True
+
+
+def test_guard_section_is_parsed_from_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + "\n[guard]\nenabled = false\n"
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.guard.enabled is False
+
+
+def test_guard_section_rejects_unknown_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + '\n[guard]\nenabled = true\ntypo_key = "oops"\n'
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "typo_key" in str(excinfo.value)
+
+
+def test_guard_settings_model_defaults_enabled():
+    assert GuardSettings().enabled is True
 
 
 def test_dotenv_value_containing_an_equals_sign_survives_intact(tmp_path, monkeypatch):

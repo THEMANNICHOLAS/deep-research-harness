@@ -237,7 +237,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 - [x] Phase 1: Identity-model migration
 - [x] Phase 2: Guard scanner core
-- [ ] Phase 3: Firewall wiring in fetch and search
+- [x] Phase 3: Firewall wiring in fetch and search
 - [ ] Phase 4: Strict URL provenance
 - [ ] Phase 5: Spotlighting, report hygiene, containment tests
 - [ ] Final verification
@@ -392,7 +392,7 @@ markdown is byte-sanitized before capture. Search titles/snippets scanned the sa
 4. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full suite green: `uv run pytest`
+- [x] Full suite green: `uv run pytest`
 
 ### Phase 4: Strict URL provenance
 **Risk:** flagged (!#2)
@@ -562,11 +562,18 @@ correction. Empty at plan creation. -->
 Append-only, empty at plan creation. -->
 
 ### 2026-08-17 — Phase 2 review findings (deferred by developer: "I'll do at home")
-- **[Major, open]** harness/guard.py obfuscation char class includes U+200D (ZWJ) with no
+- **[Major, resolved 2026-08-17]** (U+200D deleted from the char class pre-Phase-3,
+  developer-approved; guard tests green) harness/guard.py obfuscation char class includes U+200D (ZWJ) with no
   firing fixture — breaches the phase's no-regex-without-fixture rule, and ZWJ is common in
   benign content (compound emoji, Indic/Persian scripts), so it will false-positive once
   Phase 3 wires the scan. Fix: delete the character or add a justifying fixture. MUST be
   resolved before/with Phase 3.
+### 2026-08-17 — Phase 3 review finding (deferred)
+- **[Simplify, deferred]** `_guard_blocked_detail` is byte-identical in
+  harness/tools/fetch.py and harness/tools/search.py; per D3 the formatter belongs in
+  harness/guard.py with both tools importing it. Defer to Phase 5, which touches guard.py
+  anyway.
+
 - **[Minor, open]** guard.py role_spoofing rule `^\s*\[?system\]?\s*:` (MULTILINE, brackets
   optional) blocks benign "System: Ubuntu 22.04"-style lines. Within risk #1's accepted
   breadth; watch the `guard_blocked` rate once Phase 3 makes it observable, tighten if noisy.
@@ -584,6 +591,12 @@ Append-only, empty at plan creation. -->
 - Learned: the benign security-blog fixture quoting override phrases IS blocked, asserted deliberately per R1's accepted-cost line — do not "fix" that test.
 - Drift: none. Two review findings deferred by the developer — see `## Discoveries` 2026-08-17: [Major] U+200D in the obfuscation class has no firing fixture and will FP on emoji/Indic pages (resolve before/with Phase 3); [Minor] role_spoofing matches bare "System: ..." lines.
 - Watch-next: resolve the ZWJ Major FIRST, then Phase 3 wires `scan` into `_fetch` per the frozen order scan -> classify -> mint -> sanitize -> capture -> render, plus `GuardSettings`/`[guard]` config and search-side scanning.
+### 2026-08-17 — Phase 3: Firewall wiring in fetch and search
+- Done: `scan` wired inside `_fetch` for both HTML and PDF batches per the frozen order scan -> classify -> mint -> sanitize -> capture -> render; blocked pages vanish (no FetchedPage/Sn/capture/render) and disclose via `guard_blocked` incidents (URL + families); search titles/snippets scanned per result via `_drop_guarded`; `strip_invisibles` added to guard.py and applied to survivor markdown unconditionally; `GuardSettings`/`[guard] enabled` config added (developer decision: enabled=false disables the SCAN only — sanitize still runs); conftest `make_config` gained `guard=`. Pre-phase: the deferred ZWJ [Major] resolved by deleting U+200D from the obfuscation class (developer-approved). Full suite 461 green, all gates clean, quality scan clean.
+- Learned: scan-before-classify means a failed crawl whose error page fires a signal discloses as `guard_blocked`, not `fetch_failed` — by design (D5), noted for operator expectations. Blocked URLs have no `pages_by_url` entry, so the final pages assembly filters membership.
+- Drift: none. One deferred simplify — `_guard_blocked_detail` duplicated in fetch.py/search.py, move to guard.py in Phase 5 (see `## Discoveries`).
+- Watch-next: Phase 4 (strict provenance, flagged !#2) adds `approve`/`is_approved` to `SourceRegistry` keyed by `normalize_url`, approves on search ingestion and user URLs at run start (`harness/__main__.py`), enforces pre-crawl inside `_fetch` — rejection must be per-URL, never failing the approved batch.
+
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so

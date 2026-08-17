@@ -20,6 +20,7 @@ from pydantic import PrivateAttr, SecretStr
 from harness.config import (
     AgentSettings,
     FetchSettings,
+    GuardSettings,
     HarnessConfig,
     ProviderConfig,
     RoleConfig,
@@ -414,6 +415,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         default_max_results: int = 10,
         max_consecutive_failures: int = 3,
         agent: AgentSettings | None = None,
+        guard: GuardSettings | None = None,
         head_model: str = "test-model",
         researcher_model: str = "test-model",
         reader_model: str = "test-model",
@@ -448,6 +450,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
                 max_consecutive_failures=max_consecutive_failures,
             ),
             agent=agent,
+            guard=guard or GuardSettings(),
         )
 
     return _make

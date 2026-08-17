@@ -6,11 +6,17 @@ import pytest
 from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter  # type: ignore[import-untyped]
 from langchain_core.tools import BaseTool
 
-from harness.config import AgentSettings
+from harness.config import AgentSettings, GuardSettings
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
 from harness.tools import fetch
 from tests.conftest import _FakeMarkdown, _FakeResult
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
+
+
+def _attack_markdown() -> str:
+    return (FIXTURES_DIR / "attack_instruction_override_ignore.txt").read_text(encoding="utf-8")
 
 
 def _rendered(markdown: str, cap: int) -> str:
@@ -1253,3 +1259,155 @@ async def test_failed_fetch_outcomes_are_recorded_on_the_run_log(install_crawler
     assert "https://blocked.test" in incidents[0].detail
     assert "blocked" in incidents[0].detail
     assert "status 403" in incidents[0].detail
+
+
+# --- Phase 3: firewall wiring (scan -> classify -> mint -> sanitize -> capture -> render) ----
+
+
+async def test_a_page_carrying_an_attack_string_mints_no_sn_writes_no_file_and_is_absent(  # R1
+    install_crawler, make_config, tmp_path
+):
+    """A blocked page vanishes from the pipeline entirely; a clean page in the same batch
+    still fetches and renders normally (mixed batch)."""
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    run_log = RunLog()
+    attack_markdown = _attack_markdown()
+    results = [
+        _FakeResult(
+            "https://evil.test",
+            markdown=_FakeMarkdown(raw_markdown=attack_markdown, fit_markdown=attack_markdown),
+        ),
+        _FakeResult(
+            "https://clean.test",
+            markdown=_FakeMarkdown(raw_markdown="clean body", fit_markdown="clean body"),
+        ),
+    ]
+    install_crawler(results)
+    fetch_pages = fetch.build_fetch_tool(config, registry, run_log)
+
+    message = await fetch_pages.ainvoke(
+        _tool_call(["https://evil.test", "https://clean.test"], "call-guard-1")
+    )
+
+    # Blocked page vanished: no artifact entry, no Sn, absent from render. The clean page
+    # in the same batch still fetches and registers normally.
+    assert [page.url for page in message.artifact] == ["https://clean.test"]
+    assert [source.url for source in registry.all()] == ["https://clean.test"]
+    assert "https://evil.test" not in message.content
+    assert "clean body" in message.content
+
+    captures_dir = sources_dir(config, registry)
+    written = list(captures_dir.glob("*.md"))
+    assert len(written) == 1
+    assert "clean body" in written[0].read_text(encoding="utf-8")
+
+    incidents = [i for i in run_log.incidents() if i.kind == "guard_blocked"]
+    assert len(incidents) == 1
+    assert "https://evil.test" in incidents[0].detail
+    assert "instruction_override" in incidents[0].detail
+
+
+async def test_a_blocked_pdf_page_is_dropped_identically_to_an_html_page(  # R1
+    install_crawler, make_config
+):
+    config = make_config()
+    registry = SourceRegistry()
+    run_log = RunLog()
+    attack_markdown = _attack_markdown()
+    pdf_results = [
+        _FakeResult(
+            "https://docs.test/evil.pdf",
+            markdown=_FakeMarkdown(raw_markdown=attack_markdown, fit_markdown=attack_markdown),
+        )
+    ]
+    install_crawler([], pdf_results=pdf_results)
+
+    content, pages = await fetch._fetch(["https://docs.test/evil.pdf"], config, registry, run_log)
+
+    assert pages == []
+    assert registry.all() == []
+    assert "https://docs.test/evil.pdf" not in content
+
+    incidents = [i for i in run_log.incidents() if i.kind == "guard_blocked"]
+    assert len(incidents) == 1
+    assert "https://docs.test/evil.pdf" in incidents[0].detail
+
+
+async def test_guard_disabled_bypasses_scanning_and_the_attack_page_fetches_normally(  # R1
+    install_crawler, make_config
+):
+    config = make_config(guard=GuardSettings(enabled=False))
+    registry = SourceRegistry()
+    run_log = RunLog()
+    attack_markdown = _attack_markdown()
+    results = [
+        _FakeResult(
+            "https://evil.test",
+            markdown=_FakeMarkdown(raw_markdown=attack_markdown, fit_markdown=attack_markdown),
+        ),
+    ]
+    install_crawler(results)
+
+    content, pages = await fetch._fetch(["https://evil.test"], config, registry, run_log)
+
+    assert len(pages) == 1
+    assert pages[0].outcome == "fetched"
+    assert pages[0].source_id is not None
+    assert registry.all() != []
+    assert [i for i in run_log.incidents() if i.kind == "guard_blocked"] == []
+
+
+async def test_survivor_markdown_zero_width_chars_stripped_when_guard_disabled(  # D5/D3
+    install_crawler, make_config, tmp_path
+):
+    """The obfuscation family blocks on zero-width chars, so proving the sanitize-still-runs
+    invariant (guard toggles detection, not hygiene) needs the guard OFF for THIS variant.
+    """
+    config = make_config(
+        agent=AgentSettings(workspace_dir=tmp_path), guard=GuardSettings(enabled=False)
+    )
+    registry = SourceRegistry()
+    dirty_markdown = "wo​rd"
+    results = [
+        _FakeResult(
+            "https://zerowidth.test",
+            markdown=_FakeMarkdown(raw_markdown=dirty_markdown, fit_markdown=dirty_markdown),
+        )
+    ]
+    install_crawler(results)
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(_tool_call(["https://zerowidth.test"], "call-zw-1"))
+
+    page = message.artifact[0]
+    assert page.outcome == "fetched"
+    captures_dir = sources_dir(config, registry)
+    text = (captures_dir / f"{page.source_id}.md").read_text(encoding="utf-8")
+    assert "word" in text
+    assert "​" not in text
+
+
+async def test_survivor_markdown_control_chars_stripped_with_guard_enabled(  # D5/D3
+    install_crawler, make_config, tmp_path
+):
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    dirty_markdown = "be\x07ll"
+    results = [
+        _FakeResult(
+            "https://control.test",
+            markdown=_FakeMarkdown(raw_markdown=dirty_markdown, fit_markdown=dirty_markdown),
+        )
+    ]
+    install_crawler(results)
+    fetch_pages = fetch.build_fetch_tool(config, registry)
+
+    message = await fetch_pages.ainvoke(_tool_call(["https://control.test"], "call-ctrl-1"))
+
+    page = message.artifact[0]
+    assert page.outcome == "fetched"
+    captures_dir = sources_dir(config, registry)
+    text = (captures_dir / f"{page.source_id}.md").read_text(encoding="utf-8")
+    assert "bell" in text
+    assert "\x07" not in text

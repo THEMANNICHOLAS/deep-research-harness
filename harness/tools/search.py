@@ -13,6 +13,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.config import HarnessConfig
+from harness.guard import scan
 from harness.runlog import RunLog, or_default
 
 
@@ -77,6 +78,32 @@ def _parse_results(
             continue
 
     return results[:max_results], dropped
+
+
+def _guard_blocked_detail(url: str, signals: list[str]) -> str:
+    """One incident line for a search result dropped by the guard (D4/D5, mirrors fetch.py)."""
+    return f"{url}: blocked by guard ({', '.join(signals)})"
+
+
+def _drop_guarded(
+    results: list[SearchResult], config: HarnessConfig, run_log: RunLog
+) -> list[SearchResult]:
+    """Scan each result's title+snippet, dropping any that fire the guard (R1).
+
+    Runs after parsing, before `_render`: a blocked result is excluded from both the
+    rendered content and the returned artifact, with one `guard_blocked` incident each.
+    """
+    if not config.guard.enabled:
+        return results
+
+    survivors: list[SearchResult] = []
+    for result in results:
+        scan_result = scan(f"{result.title}\n{result.snippet}")
+        if scan_result.blocked:
+            run_log.record("guard_blocked", _guard_blocked_detail(result.url, scan_result.signals))
+        else:
+            survivors.append(result)
+    return survivors
 
 
 def _render(query: str, outcome: list[SearchResult] | SearchFailure) -> str:
@@ -146,6 +173,8 @@ async def _search(
                 f'search for "{query}": {dropped} malformed result {noun} '
                 "dropped from the response",
             )
+        if isinstance(outcome, list):
+            outcome = _drop_guarded(outcome, config, run_log)
 
     if isinstance(outcome, SearchFailure):
         run_log.record(
@@ -199,7 +228,13 @@ class SearchUnavailableError(Exception):
 
 
 def build_search_tool(config: HarnessConfig, run_log: RunLog | None = None) -> BaseTool:
-    """Build the `search_web` tool, closing over `config` and the shared `run_log`."""
+    """Build the `search_web` tool, closing over `config` and the shared `run_log`.
+
+    The guard is invisible here (D5, mirrors fetch.py): every result's title+snippet is
+    scanned for injection signals inside `_search`, after parsing and before rendering. A
+    blocked result is dropped from both the rendered content and the returned artifact,
+    disclosed only via a `guard_blocked` `RunLog` incident.
+    """
 
     log = or_default(run_log)
 

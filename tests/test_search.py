@@ -1,12 +1,21 @@
 """Behavioral tests for harness.tools.search."""
 
+from pathlib import Path
+
 import httpx
 import pytest
 from langchain_core.tools import BaseTool
 
+from harness.config import GuardSettings
 from harness.runlog import RunLog
 from harness.tools import search
 from tests.conftest import install_search_transport
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
+
+
+def _attack_text() -> str:
+    return (FIXTURES_DIR / "attack_instruction_override_ignore.txt").read_text(encoding="utf-8")
 
 
 async def test_well_formed_response_maps_to_search_results(monkeypatch, make_config):
@@ -564,6 +573,75 @@ async def test_dropped_malformed_results_are_counted_on_the_run_log(monkeypatch,
     incidents = run_log.incidents()
     assert [incident.kind for incident in incidents] == ["search_results_dropped"]
     assert "2 malformed result entries" in incidents[0].detail
+
+
+# --- Phase 3: firewall wiring for search titles/snippets --------------------------------
+
+
+async def test_a_result_with_an_injected_snippet_is_dropped_and_disclosed(  # R1
+    monkeypatch, make_config
+):
+    attack_text = _attack_text()
+    payload = {
+        "query": "x",
+        "results": [
+            {
+                "url": "https://evil.test",
+                "title": "Evil",
+                "content": attack_text,
+                "engine": "e",
+            },
+            {"url": "https://ok.test", "title": "OK", "content": "good", "engine": "e"},
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    run_log = RunLog()
+
+    content, artifact = await search._search("x", 10, config, run_log)
+
+    assert isinstance(artifact, list)
+    assert [r.url for r in artifact] == ["https://ok.test"]
+    assert "https://evil.test" not in content
+    assert "OK" in content
+
+    incidents = [i for i in run_log.incidents() if i.kind == "guard_blocked"]
+    assert len(incidents) == 1
+    assert "https://evil.test" in incidents[0].detail
+    assert "instruction_override" in incidents[0].detail
+
+
+async def test_guard_disabled_bypasses_scanning_for_search_results(monkeypatch, make_config):  # R1
+    attack_text = _attack_text()
+    payload = {
+        "query": "x",
+        "results": [
+            {
+                "url": "https://evil.test",
+                "title": "Evil",
+                "content": attack_text,
+                "engine": "e",
+            },
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config(guard=GuardSettings(enabled=False))
+    run_log = RunLog()
+
+    content, artifact = await search._search("x", 10, config, run_log)
+
+    assert isinstance(artifact, list)
+    assert [r.url for r in artifact] == ["https://evil.test"]
+    assert "https://evil.test" in content
+    assert [i for i in run_log.incidents() if i.kind == "guard_blocked"] == []
 
 
 async def test_a_clean_search_records_no_incident(monkeypatch, make_config):

@@ -1,11 +1,20 @@
 """Behavioral tests for harness.tools.fallback (the `fetch_raw` recovery tool, D2/R2/R5)."""
 
+from pathlib import Path
+
 from langchain_core.tools import BaseTool
 
 from harness.config import AgentSettings
+from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
 from harness.tools import fallback, fetch
 from tests.conftest import _FakeMarkdown, _FakeResult
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
+
+
+def _attack_markdown() -> str:
+    return (FIXTURES_DIR / "attack_instruction_override_ignore.txt").read_text(encoding="utf-8")
 
 
 def _tool_call(urls: list[str], reason: str, call_id: str) -> dict:
@@ -174,6 +183,40 @@ async def test_a_call_over_the_url_limit_is_rejected_before_any_fetch(install_cr
     assert message.status == "error"
     assert f"At most {limit} URLs" in message.content
     assert fake_cls.calls == []
+
+
+async def test_fetch_raw_drops_a_blocked_page_the_same_as_fetch_pages(  # R1
+    install_crawler, make_config, tmp_path
+):
+    """Proves the shared `_fetch` covers both surfaces: a blocked page mints no Sn, writes
+    no capture file, is absent from the rendered content, and records one `guard_blocked`
+    incident, through `fetch_raw` exactly as through `fetch_pages`."""
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    run_log = RunLog()
+    attack_markdown = _attack_markdown()
+    results = [
+        _FakeResult(
+            "https://evil.test",
+            markdown=_FakeMarkdown(raw_markdown=attack_markdown, fit_markdown=attack_markdown),
+        )
+    ]
+    install_crawler(results)
+    fetch_raw = fallback.build_fallback_tool(config, registry, run_log)
+
+    message = await fetch_raw.ainvoke(
+        _tool_call(["https://evil.test"], "some reason", "call-guard-raw-1")
+    )
+
+    assert message.artifact == []
+    assert registry.all() == []
+    assert "https://evil.test" not in message.content
+    assert list(sources_dir(config, registry).glob("*.md")) == []
+
+    incidents = [i for i in run_log.incidents() if i.kind == "guard_blocked"]
+    assert len(incidents) == 1
+    assert "https://evil.test" in incidents[0].detail
+    assert "instruction_override" in incidents[0].detail
 
 
 async def test_fetch_raw_exposes_the_pinned_contract(make_config):

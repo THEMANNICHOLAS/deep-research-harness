@@ -18,6 +18,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
+from harness.guard import scan, strip_invisibles
 from harness.runlog import RunLog, or_default
 from harness.sources import (
     SourceRegistry,
@@ -250,6 +251,11 @@ def _failure_detail(page: FetchedPage) -> str:
     return f"{page.url}: {' — '.join(bits)}"
 
 
+def _guard_blocked_detail(url: str, signals: list[str]) -> str:
+    """One incident line for a page dropped by the guard (D4): URL plus fired families."""
+    return f"{url}: blocked by guard ({', '.join(signals)})"
+
+
 def _no_result_page(url: str) -> FetchedPage:
     """The page recorded when a batch comes back short one result.
 
@@ -340,6 +346,16 @@ async def _fetch(
                 continue
 
             markdown = _markdown_of(result)
+
+            # D5: scan raw markdown BEFORE classify/mint/capture — nothing blocked ever
+            # reaches disk. A blocked page vanishes entirely: no FetchedPage, no Sn, no
+            # capture file, absent from the rendered content (D4).
+            if config.guard.enabled:
+                scan_result = scan(markdown)
+                if scan_result.blocked:
+                    run_log.record("guard_blocked", _guard_blocked_detail(url, scan_result.signals))
+                    continue
+
             title = _title_of(result)
             status_code = getattr(result, "status_code", None)
             error_message = getattr(result, "error_message", None)
@@ -353,6 +369,10 @@ async def _fetch(
             # Only a `fetched` outcome is evidence (R5): a failure mints no id, so it can
             # never end up with a capture file to be mistaken for real content.
             source_id = registry.add(url, title=title) if outcome == "fetched" else None
+            if outcome == "fetched":
+                # Byte hygiene on survivor markdown, unconditional (D3): the guard flag
+                # bypasses detection, not this sanitization.
+                markdown = strip_invisibles(markdown)
             pages_by_url[url] = FetchedPage(
                 source_id=source_id,
                 url=url,
@@ -391,6 +411,14 @@ async def _fetch(
                 continue
 
             markdown = _markdown_of(result)
+
+            # D5: same guard site as the HTML batch — scan raw markdown before classify/mint.
+            if config.guard.enabled:
+                scan_result = scan(markdown)
+                if scan_result.blocked:
+                    run_log.record("guard_blocked", _guard_blocked_detail(url, scan_result.signals))
+                    continue
+
             title = _title_of(result)
             status_code = getattr(result, "status_code", None)
             error_message = getattr(result, "error_message", None)
@@ -403,6 +431,8 @@ async def _fetch(
             # "pdf" reroute signal forever.
             outcome = classify(status_code, error_message, "text/html", markdown)
             source_id = registry.add(url, title=title) if outcome == "fetched" else None
+            if outcome == "fetched":
+                markdown = strip_invisibles(markdown)
             pages_by_url[url] = FetchedPage(
                 source_id=source_id,
                 url=url,
@@ -413,7 +443,9 @@ async def _fetch(
                 error=error_message,
             )
 
-    pages = [pages_by_url[url] for url in urls]
+    # A guard-blocked URL never got a `pages_by_url` entry (D4: it vanishes entirely, not
+    # even as a failure outcome) — filter it out rather than indexing a KeyError.
+    pages = [pages_by_url[url] for url in urls if url in pages_by_url]
 
     # Recorded here, in the shared path, so `fetch_pages` and `fetch_raw` disclose alike.
     # The model already sees each failure in its rendered block; this is the operator's copy.
@@ -436,6 +468,11 @@ def build_fetch_tool(
 
     Creates `<workspace_dir>/<run_id>/sources` up front, so an unwritable workspace fails at
     startup rather than silently losing captures mid-run.
+
+    The guard is invisible here (D5): every fetched page is scanned for injection signals
+    inside the shared `_fetch`, before classification, minting, or capture. A blocked page
+    vanishes from the pipeline entirely and is disclosed only via a `guard_blocked`
+    `RunLog` incident — see harness/guard.py and PLAN-prompt-injection-defense.md Phase 3.
     """
     sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 

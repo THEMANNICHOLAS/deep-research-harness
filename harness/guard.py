@@ -51,7 +51,7 @@ _FAMILY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     ],
     "obfuscation": [
         # attack_obfuscation_zerowidth.txt — zero-width chars used to split flagged phrases
-        re.compile(r"[​‌‍﻿]"),
+        re.compile(r"[​‌﻿]"),
         # attack_obfuscation_base64.txt
         re.compile(r"decode and execute", re.IGNORECASE),
     ],
@@ -64,6 +64,22 @@ _FAMILY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         ),
     ],
 }
+
+
+# The same zero-width set the obfuscation rule matches (U+200B, U+200C, U+FEFF), plus C0
+# control chars other than \n and \t — \r is stripped too, since captures are normalized
+# markdown. Byte hygiene, not detection: this runs on survivor markdown regardless of
+# whether `[guard] enabled` bypassed the scan (Phase 3 D3/D5).
+_INVISIBLE_RE = re.compile(r"[​‌﻿\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def strip_invisibles(text: str) -> str:
+    """Strip zero-width chars and C0 control chars (except `\\n`/`\\t`) from `text`.
+
+    Mechanical byte hygiene only — never called before `scan`, which must see raw text
+    (see harness/tools/fetch.py's frozen pipeline order).
+    """
+    return _INVISIBLE_RE.sub("", text)
 
 
 class ScanResult(BaseModel):
