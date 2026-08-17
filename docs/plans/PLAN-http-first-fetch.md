@@ -193,7 +193,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: HTTP-first fetch with hard deadline and retry budget
 - [x] Phase 2: Chromium escalation for JS shells
 - [x] Phase 3: PDF precheck and download containment
-- [ ] Phase 4: Persistent domain blocklist
+- [x] Phase 4: Persistent domain blocklist
 - [ ] Phase 5: Subagent cap config contract
 - [ ] Final verification
 
@@ -398,11 +398,11 @@ skipped without a fetch for 30 days and disclosed as skipped.
 - A CLI or tool for editing the blocklist (it is hand-editable JSON)
 
 **Tests (write first, confirm red):**
-- [ ] A 403 and a 401 each record the domain; a 429 does not
-- [ ] A blocked domain is skipped with no fetch attempted, disclosed as `skipped`
-- [ ] Entries older than the TTL are pruned on load; fresh entries survive
-- [ ] A missing or malformed blocklist file degrades to empty rather than raising
-- [ ] A recorded write leaves a complete, parseable file (atomic replace)
+- [x] A 403 and a 401 each record the domain; a 429 does not
+- [x] A blocked domain is skipped with no fetch attempted, disclosed as `skipped`
+- [x] Entries older than the TTL are pruned on load; fresh entries survive
+- [x] A missing or malformed blocklist file degrades to empty rather than raising
+- [x] A recorded write leaves a complete, parseable file (atomic replace)
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -413,7 +413,8 @@ skipped without a fetch for 30 days and disclosed as skipped.
 
 **Acceptance criteria:**
 - [ ] Two consecutive live runs against a 403ing URL show a fetch on the first and a
-  `skipped` disclosure with no request on the second
+  `skipped` disclosure with no request on the second — **not run**: needs the homelab box;
+  deferred to the plan's final live verification
 
 ### Phase 5: Subagent cap config contract
 **Risk:** none
@@ -630,5 +631,29 @@ Append-only, empty at plan creation. -->
 - Watch-next: Phase 4 adds the `skipped` outcome and gates on the blocklist — the gate must
   sit BEFORE `_is_pdf` so a blocked domain costs no request at all, and `FetchOutcome` is a
   `Literal`, so adding `"skipped"` touches the type and every exhaustive check over it.
+
+### 2026-08-17 — Phase 4: Persistent domain blocklist
+- Done: new `harness/blocklist.py` (`load`/`record` over a JSON `{host: iso-timestamp}` map,
+  injectable clock, TTL pruned on load, atomic temp-file + `os.replace`). `FetchOutcome` gains
+  `"skipped"`; `_fetch()` loads the blocklist once per call and gates BEFORE the HEAD precheck
+  and before crawler construction, so a blocked domain costs zero requests and an all-skipped
+  call builds no crawler; 401/403 hosts are recorded once each after the gather. New
+  `harness/config.py` keys `blocklist_path` and `blocklist_ttl_days`. 155 tests green; ruff,
+  format, mypy clean.
+- Learned: `datetime.fromisoformat` accepts an offset-LESS `"2026-08-17T09:30:00"` and a bare
+  `"2026-08-17"`, returning a naive datetime whose comparison against an aware cutoff raises
+  `TypeError` — `load` now coerces naive to UTC. `record` swallows `OSError` (it runs after
+  the gather, and the blocklist is regenerable, so a read-only workspace must not discard a
+  finished batch) and merges into `load`'s pruned view rather than the raw file, so expired
+  entries actually leave. `record` therefore takes `ttl_days`. `_host_of` reuses
+  `normalize_url` and cannot raise.
+- Drift: none. Three review findings (2 Major, 1 Minor) fixed in-phase with regression tests.
+- Watch-next: Phase 5 is small and config-only — `max_subagents` goes on the settings model
+  that already validates the `head`/`subagent` role names, plus a `docs/architecture.md` note
+  stating the `max_subagents * http_concurrency` worst-case fetch load. Also still open: the
+  `docs/decisions.md` entry this plan reverses (see `## Notes`) and the whole live-check set.
+- Pattern worth carrying: three phases running, the defect was an exception type missing from
+  an `except` clause on a path contracted never to fail the batch. At a batch boundary, guard
+  broadly by default; narrow only where a specific type is genuinely handled differently.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. -->

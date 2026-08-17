@@ -12,7 +12,7 @@ from harness.config import (
 
 
 @pytest.fixture
-def make_config(monkeypatch: pytest.MonkeyPatch):
+def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
     """Return a factory building a valid HarnessConfig from pydantic models (no TOML)."""
 
     def _make(
@@ -30,10 +30,17 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
         browser_deadline_ms: int = 20000,
         browser_concurrency: int = 2,
         downloads_dir: str = "workspace/downloads",
+        # Defaults under tmp_path, not production's "workspace/blocklist.json": a 403/401
+        # in any pre-Phase-4 test would otherwise record into the real repo workspace. Every
+        # test gets its own isolated, initially-empty file unless it overrides this.
+        blocklist_path: str | None = None,
+        blocklist_ttl_days: int = 30,
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
     ) -> HarnessConfig:
         monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+        if blocklist_path is None:
+            blocklist_path = str(tmp_path / "blocklist.json")
         return HarnessConfig(
             providers={
                 "opencode": ProviderConfig(
@@ -55,6 +62,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch):
                 browser_deadline_ms=browser_deadline_ms,
                 browser_concurrency=browser_concurrency,
                 downloads_dir=downloads_dir,
+                blocklist_path=blocklist_path,
+                blocklist_ttl_days=blocklist_ttl_days,
             ),
             search=SearchSettings(base_url=base_url, default_max_results=default_max_results),
         )

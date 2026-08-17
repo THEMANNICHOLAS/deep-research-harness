@@ -11,6 +11,7 @@ resolution via `harness.sources.SourceRegistry`).
 import asyncio
 import re
 from typing import Literal
+from urllib.parse import urlsplit
 
 import httpx
 from crawl4ai import (  # type: ignore[import-untyped]
@@ -28,10 +29,16 @@ from crawl4ai.async_crawler_strategy import (  # type: ignore[import-untyped]
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
+from harness import blocklist
 from harness.config import HarnessConfig
 from harness.sources import SourceRegistry, normalize_url
 
-FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error"]
+FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error", "skipped"]
+
+# Statuses that record a domain into the persistent blocklist (R3). 429/503 stay ordinary
+# retryable/blocked outcomes — a rate limit or transient outage is not evidence the whole
+# domain refuses this harness the way a 403/401 is.
+_BLOCKLIST_STATUSES = frozenset({401, 403})
 
 _BLOCKED_STATUSES = frozenset({403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
@@ -123,6 +130,24 @@ def _status_from_error(error: str | None) -> int | None:
         return None
     match = _HTTP_STATUS.search(error)
     return int(match.group(1)) if match else None
+
+
+def _host_of(url: str) -> str | None:
+    """Return `url`'s lowercased host for blocklist gating/recording, or `None` if it has
+    none recoverable.
+
+    Runs `url` through `normalize_url` first — the SAME parsing conventions the source
+    registry uses — rather than hand-rolling a second URL parser. `normalize_url` is total
+    (a URL too malformed to parse returns unchanged rather than raising), so this guards the
+    same `ValueError` `urlsplit`/`.hostname` can raise on that unchanged, still-malformed
+    string. No placeholder key is invented for a URL with no recoverable host — it is simply
+    never blocked or recorded.
+    """
+    try:
+        hostname = urlsplit(normalize_url(url)).hostname
+    except ValueError:
+        return None
+    return hostname.lower() if hostname else None
 
 
 async def _fetch_one(
@@ -359,8 +384,38 @@ async def _fetch(
     if not urls:
         return "", []
 
+    # Gate before any request (R3): a URL whose host was previously recorded (403/401) is
+    # never fetched at all — no task, no HEAD, no `arun`. Loaded once per tool call so one
+    # call issues at most one read regardless of how many URLs it carries.
+    blocked_hosts = blocklist.load(config.fetch.blocklist_path, config.fetch.blocklist_ttl_days)
+
+    pages_list: list[FetchedPage | None] = [None] * len(urls)
+    to_fetch: list[str] = []
+    fetch_indices: list[int] = []
+    for i, url in enumerate(urls):
+        host = _host_of(url)
+        if host is not None and host in blocked_hosts:
+            pages_list[i] = FetchedPage(
+                source_id="",
+                url=url,
+                outcome="skipped",
+                status_code=None,
+                title=None,
+                markdown="",
+                error=(
+                    f"{host} is on the blocklist (a prior 403/401 was recorded for this "
+                    "domain) and was skipped without a fetch"
+                ),
+                content_type=None,
+            )
+        else:
+            to_fetch.append(url)
+            fetch_indices.append(i)
+
     # Shared by the HTTP and (lazily built, below) browser run configs — built once so the
-    # policy list lives in exactly one place rather than as two parallel literals.
+    # policy list lives in exactly one place rather than as two parallel literals. Building
+    # this dict issues no request, so it's built unconditionally even if every URL is
+    # skipped; only the crawler construction itself is gated on `to_fetch`.
     _shared_run_config_kwargs: dict[str, object] = {
         "excluded_tags": _EXCLUDED_TAGS,
         "markdown_generator": DefaultMarkdownGenerator(content_filter=PruningContentFilter()),
@@ -368,40 +423,59 @@ async def _fetch(
         "stream": False,
         "verbose": False,
     }
-    run_config = CrawlerRunConfig(
-        page_timeout=config.fetch.page_timeout_ms,
-        **_shared_run_config_kwargs,
-    )
-    semaphore = asyncio.Semaphore(config.fetch.http_concurrency)
 
-    # verbose=False above is deliberate: crawl4ai defaults it True and prints into our
-    # process. The HTTP strategy/config below exposes no separate verbose flag to silence,
-    # and AsyncWebCrawler.__init__ falls back to BrowserConfig() (verbose defaults True) to
-    # build its logger regardless of strategy, so this crawler still prints one startup
-    # banner (Discovery #1, deferred — the HTTP path's banner remains). The browser crawler
-    # below passes BrowserConfig(verbose=False) explicitly, closing the gap for that path.
-    async with AsyncWebCrawler(
-        crawler_strategy=AsyncHTTPCrawlerStrategy(
-            browser_config=HTTPCrawlerConfig(downloads_path=config.fetch.downloads_dir)
+    if to_fetch:
+        run_config = CrawlerRunConfig(
+            page_timeout=config.fetch.page_timeout_ms,
+            **_shared_run_config_kwargs,
         )
-    ) as crawler:
-        fetched_pages = await asyncio.gather(
-            *(
-                _fetch_with_retries(
-                    crawler,
-                    url,
-                    run_config,
-                    config.fetch.http_deadline_ms,
-                    config.fetch.max_retries,
-                    semaphore,
-                )
-                for url in urls
+        semaphore = asyncio.Semaphore(config.fetch.http_concurrency)
+
+        # verbose=False above is deliberate: crawl4ai defaults it True and prints into our
+        # process. The HTTP strategy/config below exposes no separate verbose flag to
+        # silence, and AsyncWebCrawler.__init__ falls back to BrowserConfig() (verbose
+        # defaults True) to build its logger regardless of strategy, so this crawler still
+        # prints one startup banner (Discovery #1, deferred — the HTTP path's banner
+        # remains). The browser crawler below passes BrowserConfig(verbose=False)
+        # explicitly, closing the gap for that path.
+        async with AsyncWebCrawler(
+            crawler_strategy=AsyncHTTPCrawlerStrategy(
+                browser_config=HTTPCrawlerConfig(downloads_path=config.fetch.downloads_dir)
             )
-        )
+        ) as crawler:
+            fetched_pages = await asyncio.gather(
+                *(
+                    _fetch_with_retries(
+                        crawler,
+                        url,
+                        run_config,
+                        config.fetch.http_deadline_ms,
+                        config.fetch.max_retries,
+                        semaphore,
+                    )
+                    for url in to_fetch
+                )
+            )
 
-    pages_list = list(fetched_pages)
+        for idx, page in zip(fetch_indices, fetched_pages, strict=True):
+            pages_list[idx] = page
+
+        # Record (after the gather, not inside the per-URL task): one write per newly
+        # blocked host instead of racing concurrent writers within this call. 429/503 stay
+        # ordinary blocked/retryable outcomes and never record.
+        newly_blocked: set[str] = set()
+        for page in fetched_pages:
+            if page.status_code in _BLOCKLIST_STATUSES:
+                host = _host_of(page.url)
+                if host is not None:
+                    newly_blocked.add(host)
+        for host in newly_blocked:
+            blocklist.record(config.fetch.blocklist_path, host, config.fetch.blocklist_ttl_days)
+
     thin = [
-        i for i, page in enumerate(pages_list) if _is_thin(page, config.fetch.min_markdown_words)
+        i
+        for i, page in enumerate(pages_list)
+        if page is not None and _is_thin(page, config.fetch.min_markdown_words)
     ]
     if thin:
         # The browser attempt gets its own CrawlerRunConfig (Reconciliation #3): reusing the
@@ -441,9 +515,10 @@ async def _fetch(
             pages_list[i] = page
 
     pages: list[FetchedPage] = []
-    for url, page in zip(urls, pages_list, strict=True):
-        source_id = registry.add(url, title=page.title)
-        pages.append(page.model_copy(update={"source_id": source_id}))
+    for url, maybe_page in zip(urls, pages_list, strict=True):
+        assert maybe_page is not None  # every index above was filled: skip, fetch, or escalate
+        source_id = registry.add(url, title=maybe_page.title)
+        pages.append(maybe_page.model_copy(update={"source_id": source_id}))
 
     content = "\n\n".join(_render(page, config.fetch.per_page_char_cap) for page in pages)
     return content, pages

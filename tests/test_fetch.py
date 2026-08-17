@@ -1,6 +1,7 @@
 """Behavioral tests for harness.tools.fetch."""
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -15,6 +16,7 @@ from crawl4ai.async_crawler_strategy import (  # type: ignore[import-untyped]
 )
 from langchain_core.tools import BaseTool
 
+from harness import blocklist
 from harness.sources import SourceRegistry
 from harness.tools import fetch
 
@@ -1350,3 +1352,114 @@ async def test_precheck_runs_once_per_url_not_per_attempt(
 
     assert len(fake_cls.calls) == config.fetch.max_retries + 1
     assert len(captured_requests) == 1
+
+
+async def test_a_403_and_a_401_record_the_domain_a_429_does_not(
+    install_crawler, make_config, tmp_path
+):
+    blocklist_path = str(tmp_path / "blocklist.json")
+    config = make_config(blocklist_path=blocklist_path)
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://forbidden.test", error_message="HTTP 403: Forbidden", status_code=None
+        ),
+        _FakeResult(
+            "https://unauthorized.test", error_message="HTTP 401: Unauthorized", status_code=None
+        ),
+        _FakeResult("https://ratelimited.test", status_code=429),
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(
+        ["https://forbidden.test", "https://unauthorized.test", "https://ratelimited.test"],
+        config,
+        registry,
+    )
+
+    entries = blocklist.load(blocklist_path, config.fetch.blocklist_ttl_days)
+    assert "forbidden.test" in entries
+    assert "unauthorized.test" in entries
+    assert "ratelimited.test" not in entries
+
+
+async def test_a_blocklisted_host_is_skipped_with_no_head_and_no_arun(
+    install_crawler, install_head, make_config, tmp_path
+):
+    blocklist_path = str(tmp_path / "blocklist.json")
+    blocklist.record(blocklist_path, "blocked-domain.test", 30)
+    config = make_config(blocklist_path=blocklist_path)
+    registry = SourceRegistry()
+    fake_cls = install_crawler([])
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(200, headers={"content-type": "text/html"})
+
+    install_head(handler)
+
+    _, pages = await fetch._fetch(["https://blocked-domain.test/page"], config, registry)
+
+    assert pages[0].outcome == "skipped"
+    assert pages[0].status_code is None
+    assert pages[0].markdown == ""
+    assert pages[0].content_type is None
+    assert "blocked-domain.test" in pages[0].error
+    assert fake_cls.calls == []
+    assert captured_requests == []
+    # Every URL was skipped, so no crawler was ever constructed.
+    assert fake_cls.constructed_with == []
+
+
+async def test_a_skipped_url_keeps_its_source_id_in_order_and_a_sibling_still_fetches(
+    install_crawler, install_head, make_config, tmp_path
+):
+    blocklist_path = str(tmp_path / "blocklist.json")
+    blocklist.record(blocklist_path, "blocked-domain.test", 30)
+    config = make_config(blocklist_path=blocklist_path)
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://ok.test", markdown=_FakeMarkdown(raw_markdown="fine", fit_markdown="fine")
+        ),
+    ]
+    fake_cls = install_crawler(results)
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(200, headers={"content-type": "text/html"})
+
+    install_head(handler)
+
+    _, pages = await fetch._fetch(
+        ["https://blocked-domain.test/page", "https://ok.test"], config, registry
+    )
+
+    assert [p.source_id for p in pages] == ["S1", "S2"]
+    assert pages[0].outcome == "skipped"
+    assert pages[1].outcome == "fetched"
+    assert [c.url for c in fake_cls.calls] == ["https://ok.test"]
+    # Only ok.test's HEAD precheck fires — the skipped host never reaches it.
+    assert [str(r.url.host) for r in captured_requests] == ["ok.test"]
+
+
+async def test_an_expired_blocklist_entry_does_not_skip(install_crawler, make_config, tmp_path):
+    blocklist_path = str(tmp_path / "blocklist.json")
+    long_ago = datetime.now(UTC) - timedelta(days=31)
+    blocklist.record(blocklist_path, "expired-domain.test", 30, now=long_ago)
+    config = make_config(blocklist_path=blocklist_path, blocklist_ttl_days=30)
+    registry = SourceRegistry()
+    results = [
+        _FakeResult(
+            "https://expired-domain.test",
+            markdown=_FakeMarkdown(raw_markdown="fresh", fit_markdown="fresh"),
+        )
+    ]
+    fake_cls = install_crawler(results)
+
+    _, pages = await fetch._fetch(["https://expired-domain.test"], config, registry)
+
+    assert pages[0].outcome == "fetched"
+    assert len(fake_cls.calls) == 1

@@ -87,6 +87,13 @@ class FetchSettings(_StrictModel):
     # absorb it. Passed to crawl4ai as `downloads_path` so nothing writes to
     # ~/.crawl4ai/downloads. No `gt=0` here: it is a path, not a bound.
     downloads_dir: str = Field(default="workspace/downloads")
+    # Path convention matches downloads_dir above (no workspace/reports root exists yet).
+    blocklist_path: str = Field(default="workspace/blocklist.json")
+    # Risk !#4: a transient 403 (aggressive WAF, a rate-limit answered as 403) locks the
+    # whole domain out for the full TTL. The file is hand-editable JSON, so an operator can
+    # delete a wrongly-blocked entry directly; if false positives show up in practice the
+    # cheap fix is requiring two strikes before recording, not shortening this default.
+    blocklist_ttl_days: int = Field(default=30, gt=0)
 
 
 class SearchSettings(_StrictModel):

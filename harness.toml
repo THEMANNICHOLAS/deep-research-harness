@@ -33,6 +33,8 @@ min_markdown_words = 50
 browser_deadline_ms = 20000
 browser_concurrency = 2
 downloads_dir = "workspace/downloads"
+blocklist_path = "workspace/blocklist.json"
+blocklist_ttl_days = 30
 
 [search]
 base_url = "http://localhost:8080"   # local dev instance — see searxng/docker-compose.yml
