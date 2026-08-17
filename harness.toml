@@ -27,7 +27,6 @@ provider = "cerebras"
 model = "TODO"                       # TODO: Cerebras worker-model ID, e.g. gemma-4-31b
 
 [fetch]
-page_timeout_ms = 15000
 http_concurrency = 10
 http_deadline_ms = 3000
 max_retries = 2

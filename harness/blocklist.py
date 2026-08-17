@@ -21,7 +21,10 @@ def _read_raw(path: str) -> dict[str, object]:
     try:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        # ValueError, not just json.JSONDecodeError: a hand-edited file re-saved in a
+        # non-UTF-8 encoding raises UnicodeDecodeError (a ValueError subclass) from the
+        # decode, and the "never raises" contract covers that corruption too.
         return {}
     return raw if isinstance(raw, dict) else {}
 

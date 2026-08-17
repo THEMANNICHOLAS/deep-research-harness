@@ -40,7 +40,9 @@ FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error", "sk
 # domain refuses this harness the way a 403/401 is.
 _BLOCKLIST_STATUSES = frozenset({401, 403})
 
-_BLOCKED_STATUSES = frozenset({403, 429, 503})
+# 401 included: both blocklist statuses classify the same way, so an auth-walled domain
+# reads "blocked" on first encounter rather than "error" with a raw crawl4ai string.
+_BLOCKED_STATUSES = frozenset({401, 403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
 
 # A markdown heading line. crawl4ai hands us flat strings with no heading tree, so a cut
@@ -216,12 +218,15 @@ async def _fetch_one(
     )
 
 
-async def _is_pdf(url: str, timeout_ms: int) -> bool:
+async def _is_pdf(client: httpx.AsyncClient, url: str, timeout_ms: int) -> bool:
     """HEAD-precheck `url` for `application/pdf` before its body is ever fetched (D5).
 
     Returns True only on a 2xx response whose `content-type` contains `application/pdf`
     (case-insensitive). Never raises: any non-2xx status, missing/other content type, or
     ANY exception returns False so the caller falls through to a normal fetch attempt.
+
+    `client` is shared across the batch — one connection pool per `fetch_pages` call
+    rather than one per URL.
 
     The `except` is deliberately broad rather than `httpx.HTTPError`. A malformed URL — and
     the model supplies these — raises `httpx.InvalidURL` or `idna.IDNAError` during URL
@@ -235,10 +240,9 @@ async def _is_pdf(url: str, timeout_ms: int) -> bool:
     it. A server that rejects HEAD is no worse off than before this precheck existed.
     """
     try:
-        async with httpx.AsyncClient(timeout=timeout_ms / 1000) as client:
-            response = await asyncio.wait_for(
-                client.head(url, follow_redirects=True), timeout_ms / 1000
-            )
+        response = await asyncio.wait_for(
+            client.head(url, follow_redirects=True), timeout_ms / 1000
+        )
     except Exception:
         return False
     if response.status_code // 100 != 2:
@@ -261,6 +265,7 @@ def _is_retryable(page: FetchedPage) -> bool:
 
 async def _fetch_with_retries(
     crawler: object,
+    head_client: httpx.AsyncClient,
     url: str,
     run_config: object,
     deadline_ms: int,
@@ -278,7 +283,7 @@ async def _fetch_with_retries(
     `content_type` is absent or HTML-like, and `application/pdf` is neither (R1).
     """
     async with semaphore:
-        if await _is_pdf(url, deadline_ms):
+        if await _is_pdf(head_client, url, deadline_ms):
             return FetchedPage(
                 source_id="",
                 url=url,
@@ -386,8 +391,12 @@ async def _fetch(
 
     # Gate before any request (R3): a URL whose host was previously recorded (403/401) is
     # never fetched at all — no task, no HEAD, no `arun`. Loaded once per tool call so one
-    # call issues at most one read regardless of how many URLs it carries.
-    blocked_hosts = blocklist.load(config.fetch.blocklist_path, config.fetch.blocklist_ttl_days)
+    # call issues at most one read regardless of how many URLs it carries. `to_thread`
+    # keeps the disk read off the event loop, where it would stall every other
+    # concurrently-running fetch's deadline timer.
+    blocked_hosts = await asyncio.to_thread(
+        blocklist.load, config.fetch.blocklist_path, config.fetch.blocklist_ttl_days
+    )
 
     pages_list: list[FetchedPage | None] = [None] * len(urls)
     to_fetch: list[str] = []
@@ -425,8 +434,13 @@ async def _fetch(
     }
 
     if to_fetch:
+        # page_timeout aligned to http_deadline_ms, mirroring the browser config below
+        # (Reconciliation #3's pattern): asyncio.wait_for in _fetch_one is the hard bound,
+        # and crawl4ai's own timeout must never bind FIRST — an operator raising
+        # http_deadline_ms would otherwise hit a hidden lower cap misreported as a
+        # crawl4ai-side failure.
         run_config = CrawlerRunConfig(
-            page_timeout=config.fetch.page_timeout_ms,
+            page_timeout=config.fetch.http_deadline_ms,
             **_shared_run_config_kwargs,
         )
         semaphore = asyncio.Semaphore(config.fetch.http_concurrency)
@@ -438,39 +452,32 @@ async def _fetch(
         # prints one startup banner (Discovery #1, deferred — the HTTP path's banner
         # remains). The browser crawler below passes BrowserConfig(verbose=False)
         # explicitly, closing the gap for that path.
-        async with AsyncWebCrawler(
-            crawler_strategy=AsyncHTTPCrawlerStrategy(
-                browser_config=HTTPCrawlerConfig(downloads_path=config.fetch.downloads_dir)
-            )
-        ) as crawler:
-            fetched_pages = await asyncio.gather(
-                *(
-                    _fetch_with_retries(
-                        crawler,
-                        url,
-                        run_config,
-                        config.fetch.http_deadline_ms,
-                        config.fetch.max_retries,
-                        semaphore,
-                    )
-                    for url in to_fetch
+        # One HEAD-precheck client for the whole batch: constructing an AsyncClient (and
+        # its connection pool) per URL would scale setup cost with http_concurrency for
+        # no benefit.
+        async with httpx.AsyncClient(timeout=config.fetch.http_deadline_ms / 1000) as head_client:
+            async with AsyncWebCrawler(
+                crawler_strategy=AsyncHTTPCrawlerStrategy(
+                    browser_config=HTTPCrawlerConfig(downloads_path=config.fetch.downloads_dir)
                 )
-            )
+            ) as crawler:
+                fetched_pages = await asyncio.gather(
+                    *(
+                        _fetch_with_retries(
+                            crawler,
+                            head_client,
+                            url,
+                            run_config,
+                            config.fetch.http_deadline_ms,
+                            config.fetch.max_retries,
+                            semaphore,
+                        )
+                        for url in to_fetch
+                    )
+                )
 
         for idx, page in zip(fetch_indices, fetched_pages, strict=True):
             pages_list[idx] = page
-
-        # Record (after the gather, not inside the per-URL task): one write per newly
-        # blocked host instead of racing concurrent writers within this call. 429/503 stay
-        # ordinary blocked/retryable outcomes and never record.
-        newly_blocked: set[str] = set()
-        for page in fetched_pages:
-            if page.status_code in _BLOCKLIST_STATUSES:
-                host = _host_of(page.url)
-                if host is not None:
-                    newly_blocked.add(host)
-        for host in newly_blocked:
-            blocklist.record(config.fetch.blocklist_path, host, config.fetch.blocklist_ttl_days)
 
     thin = [
         i
@@ -481,8 +488,8 @@ async def _fetch(
         # The browser attempt gets its own CrawlerRunConfig (Reconciliation #3): reusing the
         # HTTP one's wait_until="domcontentloaded" fires before client-side render, so
         # Chromium could return the same near-empty markdown the HTTP path already produced.
-        # page_timeout is aligned to browser_deadline_ms rather than the HTTP page_timeout_ms
-        # (15000 < 20000) so crawl4ai's own page timeout no longer preempts the escalation
+        # page_timeout is aligned to browser_deadline_ms (as the HTTP config's is to
+        # http_deadline_ms) so crawl4ai's own page timeout never preempts the escalation
         # budget — asyncio.wait_for(browser_deadline_ms) in _escalate_one remains the hard
         # no-hang bound (R2); this page_timeout is the cooperative one, deliberately the same
         # number. Built only here, inside `if thin:`, so a run with no thin results does no
@@ -513,6 +520,23 @@ async def _fetch(
         # fallback (decision carried in from the phase gate).
         for i, page in zip(thin, escalated, strict=True):
             pages_list[i] = page
+
+    # Record AFTER escalation over the final per-URL outcomes, so a 403/401 from the
+    # Chromium path blocklists the domain too (R3 has no HTTP-only scoping — a WAF that
+    # tolerates plain HTTP but bot-blocks the browser would otherwise re-launch Chromium
+    # on every future run). Still one write per newly blocked host, off the event loop
+    # for the same reason as the load above; skipped pages carry no status and never
+    # re-record. 429/503 stay ordinary blocked/retryable outcomes and never record.
+    newly_blocked: set[str] = set()
+    for maybe_page in pages_list:
+        if maybe_page is not None and maybe_page.status_code in _BLOCKLIST_STATUSES:
+            host = _host_of(maybe_page.url)
+            if host is not None:
+                newly_blocked.add(host)
+    for host in newly_blocked:
+        await asyncio.to_thread(
+            blocklist.record, config.fetch.blocklist_path, host, config.fetch.blocklist_ttl_days
+        )
 
     pages: list[FetchedPage] = []
     for url, maybe_page in zip(urls, pages_list, strict=True):

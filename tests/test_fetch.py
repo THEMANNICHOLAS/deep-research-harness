@@ -142,17 +142,11 @@ def install_crawler(monkeypatch):
 
 
 @pytest.fixture
-def install_head(monkeypatch):
-    """Route fetch's PDF-precheck AsyncClient through a MockTransport running `handler`,
-    mirroring tests/test_search.py's `_install` seam for the SearXNG client.
-    """
-    real = httpx.AsyncClient
+def install_head(install_httpx_mock):
+    """Route fetch's PDF-precheck AsyncClient through the shared conftest httpx-mock seam."""
 
     def _install(handler):
-        def factory(**kwargs):
-            return real(transport=httpx.MockTransport(handler), **kwargs)
-
-        monkeypatch.setattr("harness.tools.fetch.httpx.AsyncClient", factory)
+        install_httpx_mock("harness.tools.fetch", handler)
 
     return _install
 
@@ -222,6 +216,7 @@ async def test_mixed_batch_returns_one_entry_per_url_with_successes_intact(
 @pytest.mark.parametrize(
     ("status_code", "error_message", "content_type", "markdown", "expected"),
     [
+        (401, None, "text/html", "content", "blocked"),
         (403, None, "text/html", "content", "blocked"),
         (429, None, "text/html", "content", "blocked"),
         (503, None, "text/html", "content", "blocked"),
@@ -379,7 +374,9 @@ async def test_content_has_a_heading_for_every_url_including_failures(install_cr
 
 
 async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_config):
-    config = make_config(page_timeout_ms=1234)
+    # The HTTP run config's page_timeout must track http_deadline_ms — a separate, lower
+    # crawl4ai-side cap would silently bind before the configured deadline.
+    config = make_config(http_deadline_ms=1234)
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -1061,9 +1058,9 @@ async def test_escalation_run_config_uses_browser_deadline_and_render_aware_wait
     install_crawler, make_config
 ):
     # Reconciliation #3: the browser attempt must get its own CrawlerRunConfig — its
-    # page_timeout aligned to browser_deadline_ms (not the HTTP page_timeout_ms) and a
+    # page_timeout aligned to browser_deadline_ms (not the HTTP deadline) and a
     # render-aware wait, while the HTTP attempt's config is untouched.
-    config = make_config(min_markdown_words=5, page_timeout_ms=1234, browser_deadline_ms=20000)
+    config = make_config(min_markdown_words=5, http_deadline_ms=1234, browser_deadline_ms=20000)
     registry = SourceRegistry()
     behaviors: dict[str, list[object]] = {
         "https://shell.test": [
@@ -1381,6 +1378,34 @@ async def test_a_403_and_a_401_record_the_domain_a_429_does_not(
     assert "forbidden.test" in entries
     assert "unauthorized.test" in entries
     assert "ratelimited.test" not in entries
+
+
+async def test_a_403_from_the_escalation_path_records_the_domain(
+    install_crawler, make_config, tmp_path
+):
+    # R3 has no HTTP-only scoping: a WAF that serves plain HTTP a thin shell but 403s the
+    # browser must still blocklist the domain, or every future run re-launches Chromium.
+    blocklist_path = str(tmp_path / "blocklist.json")
+    config = make_config(min_markdown_words=5, blocklist_path=blocklist_path)
+    registry = SourceRegistry()
+    behaviors: dict[str, list[object]] = {
+        "https://wafwall.test": [
+            _FakeResult(
+                "https://wafwall.test",
+                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
+            ),
+            _FakeResult(
+                "https://wafwall.test", error_message="HTTP 403: Forbidden", status_code=None
+            ),
+        ],
+    }
+    install_crawler([], behaviors=behaviors)
+
+    _, pages = await fetch._fetch(["https://wafwall.test"], config, registry)
+
+    assert pages[0].outcome == "blocked"
+    entries = blocklist.load(blocklist_path, config.fetch.blocklist_ttl_days)
+    assert "wafwall.test" in entries
 
 
 async def test_a_blocklisted_host_is_skipped_with_no_head_and_no_arun(

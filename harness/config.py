@@ -60,10 +60,10 @@ class RoleConfig(_StrictModel):
 class FetchSettings(_StrictModel):
     # Bounded, not merely typed: these cross the config trust boundary into crawl4ai's
     # HTTP strategy and the per-page truncation cap, where 0 or a negative is nonsense.
-    page_timeout_ms: int = Field(default=15000, gt=0)
     http_concurrency: int = Field(default=10, gt=0)
     # ~3s: crawl4ai's HTTP strategy hardcodes a 10s connect timeout, so this deadline is
-    # enforced by our own caller-side asyncio.wait_for, not by crawl4ai itself.
+    # enforced by our own caller-side asyncio.wait_for; it is also passed to crawl4ai as
+    # the cooperative page_timeout so no hidden lower cap binds first.
     http_deadline_ms: int = Field(default=3000, gt=0)
     # gt=0, not ge=0: the contract forbids disabling retries outright (2 extra attempts
     # after the first is the plan's floor, not an oversight to relax).

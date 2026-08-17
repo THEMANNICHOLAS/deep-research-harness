@@ -67,6 +67,17 @@ def test_invalid_json_loads_as_empty_rather_than_raising(tmp_path):
     assert entries == {}
 
 
+def test_a_non_utf8_file_loads_as_empty_rather_than_raising(tmp_path):
+    # The file is hand-editable by design; an operator re-saving it as UTF-16 (Notepad's
+    # "Unicode") must degrade like any other corruption, not raise UnicodeDecodeError.
+    path = tmp_path / "blocklist.json"
+    path.write_bytes(json.dumps({"blocked.test": _NOW.isoformat()}).encode("utf-16"))
+
+    entries = blocklist.load(str(path), _TTL_DAYS, now=_NOW)
+
+    assert entries == {}
+
+
 def test_a_non_object_top_level_loads_as_empty_rather_than_raising(tmp_path):
     path = str(tmp_path / "blocklist.json")
     _write_raw(path, ["a.test", "b.test"])

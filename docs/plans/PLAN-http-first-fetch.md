@@ -542,6 +542,19 @@ correction. Empty at plan creation. -->
     no-hang bound. The HTTP run config is unchanged. Risk !#5's live escalation-rate check
     should now also confirm escalated pages come back non-empty.
 
+#4. 2026-08-17 — PR #20 review fixes, applied post-implementation. (a) R3 recording moved
+    after escalation and now runs over the final per-URL outcomes, so a 403/401 from the
+    Chromium path blocklists the domain too — the record loop previously saw only HTTP
+    results. (b) `_read_raw` catches `ValueError` (covering `UnicodeDecodeError`), honoring
+    the module's never-raises contract for a hand-edited non-UTF-8 file. (c) 401 joins
+    `_BLOCKED_STATUSES` so both blocklist statuses classify identically. (d) The
+    Reconciliation #3 pattern is applied to the HTTP path as well: its `page_timeout` is
+    aligned to `http_deadline_ms` and the now-dead `page_timeout_ms` key is removed from
+    config — crawl4ai's own timeout could otherwise bind before a raised deadline. (e)
+    `blocklist.load`/`record` run via `asyncio.to_thread`; the HEAD precheck shares one
+    `httpx.AsyncClient` per batch (@tests/conftest.py also gains the suite's single
+    httpx-mock seam).
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
