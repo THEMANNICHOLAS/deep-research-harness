@@ -11,10 +11,12 @@ from datetime import date
 from typing import Any, Literal
 
 from deepagents import (
+    FilesystemMiddleware,
     FilesystemPermission,
     GeneralPurposeSubagentProfile,
     HarnessProfile,
     SubAgent,
+    SubAgentMiddleware,
     create_deep_agent,
     register_harness_profile,
 )
@@ -47,6 +49,7 @@ from harness.runlog import RunLog
 from harness.sources import SourceRegistry, pending_digest_scope
 from harness.tools import build_tools
 from harness.tools.ask_user import ASK_USER_TOOL_NAME
+from harness.tools.search import SearchUnavailableError
 
 # The summarizer's policy, deliberately not config-driven (D7). `trigger` sits above the
 # profile fallback of 170,000: generous for a reasoning model that spends heavily on output,
@@ -66,14 +69,33 @@ _INTERRUPT_ON: dict[str, bool | InterruptOnConfig] = {
 
 # D2: a reader crash must not kill the run. Phase 3's prompt keys off the "READER FAILED"
 # prefix, so the derived label must stay exact for `subagent_type="reader"`. Derived, not
-# hardcoded: this middleware wraps EVERY `task` dispatch, so a future researcher tier fails as
+# hardcoded: this middleware wraps EVERY `task` dispatch, so the researcher tier fails as
 # "RESEARCHER FAILED" without touching this function, the prompt contract, or its pinned test.
-def _reader_failure_message(exc: Exception, request: ToolCallRequest) -> str:
-    """Render a subagent (`task`) crash as content for an error `ToolMessage`."""
+def _reader_failure_message(exc: Exception, request: ToolCallRequest) -> str | None:
+    """Render a subagent (`task`) crash as content for an error `ToolMessage`.
+
+    Returns `None` for `SearchUnavailableError` (and only it — Drift C): a mid-run search
+    abort must reach `__main__`'s existing abort handling as a raised exception, not be
+    stringified into a soft "... FAILED" message that would hide the documented
+    three-consecutive-failures invariant. `ToolErrorMiddleware.on_error` treats a `None`
+    return as "let the exception propagate".
+    """
+    if isinstance(exc, SearchUnavailableError):
+        return None
     # `.get`: the args are model-supplied, and a malformed call must still get a label
     # rather than raising a KeyError out of the error handler itself.
     subagent_type = str(request.tool_call["args"].get("subagent_type", "task"))
     return f"{subagent_type.upper()} FAILED ({type(exc).__name__}): {exc}"
+
+
+def _retry_on_non_search_abort(exc: Exception) -> bool:
+    """Exclude `SearchUnavailableError` from the task-tool retry (Drift C).
+
+    Retrying would waste a whole researcher (or reader) re-run before the abort ever reaches
+    `_reader_failure_message`'s propagate branch. `ToolRetryMiddleware.retry_on` accepts this
+    predicate form alongside its default exception-tuple shape.
+    """
+    return not isinstance(exc, SearchUnavailableError)
 
 
 def _digest_text(result: ToolMessage | Command[Any]) -> str:
@@ -94,13 +116,15 @@ def _digest_text(result: ToolMessage | Command[Any]) -> str:
 
 
 class _ReaderDigestMiddleware(AgentMiddleware[Any, Any, Any]):
-    """Promote reader-fetched sources to `digested` only when a digest reaches the lead (R5).
+    """Promote reader-fetched sources to `digested` only when a digest reaches the researcher
+    that dispatched it (R5, relocated from the lead in Step 3 — the mechanism, not the
+    semantics, moved).
 
     The reader's `fetch_pages` call only NOMINATES the source IDs it captured
     (`sources.note_digest_candidate`, context-local per task attempt); this middleware marks
     them when — and only when — the attempt returns a non-empty digest. A crash (converted to
     a `... FAILED` error ToolMessage by the outer `ToolErrorMiddleware`) or an empty digest
-    leaves them "unread", so the report never discloses a digest the lead never received.
+    leaves them "unread", so the report never discloses a digest nobody ever received.
 
     Async-only, like the tools it observes: the graph is driven with `ainvoke`/`astream`
     (substrate D1) and `fetch_pages` itself is coroutine-only.
@@ -151,14 +175,35 @@ def _register_no_shell_profile(model: BaseChatModel) -> None:
 
 
 def _reader_spec(
-    config: HarnessConfig, reader_model: BaseChatModel, reader_tools: list[BaseTool]
+    config: HarnessConfig,
+    reader_model: BaseChatModel,
+    reader_tools: list[BaseTool],
+    backend: BackendProtocol,
 ) -> SubAgent:
-    """Build the declared `reader` `SubAgent` spec (D1): the lead's only route to `fetch_pages`.
+    """Build the declared `reader` `SubAgent` spec (D1): the researcher's only route to
+    `fetch_pages` (Step 3 nested this one level deeper — the lead never dispatches it directly).
 
     `interrupt_on` is deliberately left unset — the reader has no checkpointer forwarded and
-    cannot interrupt, so inheriting the lead's `ask_user` entry would register an interrupt
+    cannot interrupt, so inheriting an ancestor's `ask_user` entry would register an interrupt
     that can never fire.
+
+    `middleware=[FilesystemMiddleware(backend=backend)]` restores the scratch workspace
+    `reader.md` promises (`write_file`/`read_file`/`edit_file`/`ls`/`glob`/`grep`): nesting the
+    reader via a hand-built `SubAgentMiddleware` (Step 3) bypasses `create_deep_agent`'s own
+    top-level `subagents=` path, which is the ONLY place that auto-injects a base middleware
+    stack (`graph.py`'s `FilesystemMiddleware(backend=backend, custom_tool_descriptions=...,
+    _permissions=...)` for each declared subagent) — a manually nested spec gets none of that
+    for free. Mirrors only the `backend` argument from that site: this harness never sets
+    `tool_description_overrides` or per-subagent `permissions`, so the other two kwargs there
+    are always `None` and add nothing here.
     """
+    # Explicitly typed, matching `_middleware`'s own convention: `FilesystemMiddleware`'s state
+    # type param is fixed to `FilesystemState`, and an unannotated list literal here infers that
+    # concrete type instead of the broad `AgentMiddleware[Any, Any, Any]` `SubAgent["middleware"]`
+    # expects, which mypy then rejects as a list-item mismatch.
+    reader_middleware: list[AgentMiddleware[Any, Any, Any]] = [
+        FilesystemMiddleware(backend=backend)
+    ]
     return SubAgent(
         name="reader",
         description=(
@@ -172,6 +217,57 @@ def _reader_spec(
         ),
         model=reader_model,
         tools=reader_tools,
+        middleware=reader_middleware,
+    )
+
+
+def _researcher_spec(
+    config: HarnessConfig,
+    researcher_model: BaseChatModel,
+    researcher_tools: list[BaseTool],
+    reader_spec: SubAgent,
+    backend: BackendProtocol,
+    registry: SourceRegistry,
+) -> SubAgent:
+    """Build the declared `researcher` `SubAgent` spec (Step 3): the lead's only route to
+    `search_web` and (through its own nested `reader` declaration) page reading.
+
+    `interrupt_on` is deliberately left unset (D6): interrupts are pinned off below the lead —
+    a nested researcher has no checkpointer forwarded and cannot interrupt.
+
+    `middleware` is the task-scoped tail of `_middleware` RELOCATED here, same objects/args,
+    new owner: `SubAgentMiddleware` nests the reader tier under THIS researcher's own `task`
+    tool; the ToolError/ToolRetry pair guards a crashed (or aborted, Drift C) reader dispatch,
+    the same shape as the lead's own guard on dispatching a researcher; and
+    `_ReaderDigestMiddleware` marks a source `digested` only when a reader's digest actually
+    reaches this researcher (R7's mechanism moved, not broken).
+    """
+    return SubAgent(
+        name="researcher",
+        description=(
+            "Researches one assigned angle of the question: searches the web and delegates "
+            "page reading to the reader, returning a source-cited report of its findings."
+        ),
+        system_prompt=render(
+            "subagent",
+            current_date=date.today().isoformat(),
+            max_urls_per_call=config.fetch.max_urls_per_call,
+        ),
+        model=researcher_model,
+        tools=researcher_tools,
+        middleware=[
+            SubAgentMiddleware(backend=backend, subagents=[reader_spec]),
+            ToolErrorMiddleware(on_error=_reader_failure_message, tools=["task"]),
+            ToolRetryMiddleware(
+                max_retries=1,
+                tools=["task"],
+                on_failure="error",
+                initial_delay=0.0,
+                jitter=False,
+                retry_on=_retry_on_non_search_abort,
+            ),
+            _ReaderDigestMiddleware(registry),
+        ],
     )
 
 
@@ -182,7 +278,8 @@ def build_agent(
 
     The research question is NOT baked into the system prompt: this signature has no access to
     it. It travels as the initial `HumanMessage` the caller streams in, and the rendered
-    orchestrator prompt carries only `$current_date` and `$max_urls_per_call`.
+    orchestrator prompt carries only `$current_date` — the lead no longer manages URL batching
+    itself (Step 3 moved that detail down onto the researcher/reader tiers).
 
     `run_log` collects the tools' degraded-coverage incidents; the caller shares one instance
     between this agent and the report so disclosure sees everything (best-effort + disclose).
@@ -190,7 +287,10 @@ def build_agent(
     model = models.build_chat_model(config, "head")
     _register_no_shell_profile(model)
 
-    reader_model = models.build_chat_model(config, "subagent")
+    researcher_model = models.build_chat_model(config, "researcher")
+    _register_no_shell_profile(researcher_model)
+
+    reader_model = models.build_chat_model(config, "reader")
     _register_no_shell_profile(reader_model)
 
     # Rooted at THIS run's subdirectory, not the shared workspace: the agent can only
@@ -204,7 +304,11 @@ def build_agent(
     system_prompt = render(
         "orchestrator",
         current_date=date.today().isoformat(),
-        max_urls_per_call=config.fetch.max_urls_per_call,
+    )
+
+    reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
+    researcher_spec = _researcher_spec(
+        config, researcher_model, tool_sets.researcher, reader_spec, backend, registry
     )
 
     return create_deep_agent(
@@ -218,8 +322,8 @@ def build_agent(
         permissions=[
             FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="allow")
         ],
-        middleware=_middleware(model, backend, registry),
-        subagents=[_reader_spec(config, reader_model, tool_sets.reader)],
+        middleware=_middleware(model, backend),
+        subagents=[researcher_spec],
         # One saver per call, holding this run's thread. In-memory keeps the no-database
         # invariant (D5): no durable, cross-invocation checkpointing.
         checkpointer=InMemorySaver(),
@@ -227,9 +331,7 @@ def build_agent(
     )
 
 
-def _middleware(
-    model: Any, backend: BackendProtocol, registry: SourceRegistry
-) -> list[AgentMiddleware[Any, Any, Any]]:
+def _middleware(model: Any, backend: BackendProtocol) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build the middleware list with an explicit, broad element type.
 
     Without the annotation mypy unifies the element type from the first entry and rejects the
@@ -241,18 +343,19 @@ def _middleware(
     issues a destructive `RemoveMessage(REMOVE_ALL_MESSAGES)` with no recovery path for a
     dropped `[Sn]`-to-finding association, which D7/R3/R7 depend on.
 
-    The last two entries (D2) scope to the `task` tool only: `ToolErrorMiddleware` defined
-    first (outermost) catches whatever exception exhausts `ToolRetryMiddleware` (inner,
-    `on_failure="error"` so the exhausted exception reaches the outer catch rather than being
-    swallowed into a "continue" message here) and converts it to a `status="error"`
-    ToolMessage. `max_retries=1`: retrying `task` re-runs the whole reader subagent, so the
-    budget already doubles at one retry. `initial_delay=0.0, jitter=False`: this retry exists
-    for reader crashes, not transient network waits, so it should be deterministic and
-    test-fast rather than backed off.
-
-    `_ReaderDigestMiddleware` is defined last (innermost, inside the retry) so each attempt
-    gets its own digest-candidate scope: a crashed first attempt's fetches are discarded, and
-    only the attempt whose digest actually returns marks its sources `digested`.
+    The last two entries (D2) scope to the `task` tool only, and now guard the LEAD's dispatch
+    of a RESEARCHER (Step 3 relocated `_ReaderDigestMiddleware` down onto the researcher's own
+    middleware, since its subject — a reader's digest — is nested one level deeper here):
+    `ToolErrorMiddleware` defined first (outermost) catches whatever exception exhausts
+    `ToolRetryMiddleware` (inner, `on_failure="error"` so the exhausted exception reaches the
+    outer catch rather than being swallowed into a "continue" message here) and converts it to
+    a `status="error"` ToolMessage. `max_retries=1`: retrying `task` re-runs the whole
+    researcher subagent, so the budget already doubles at one retry. `initial_delay=0.0,
+    jitter=False`: this retry exists for researcher crashes, not transient network waits, so it
+    should be deterministic and test-fast rather than backed off. `retry_on` excludes
+    `SearchUnavailableError` (Drift C) so a mid-run search abort is not wastefully retried
+    through a whole researcher re-run before it reaches `_reader_failure_message`'s propagate
+    branch.
     """
     return [
         TodoListMiddleware(),
@@ -266,6 +369,6 @@ def _middleware(
             on_failure="error",
             initial_delay=0.0,
             jitter=False,
+            retry_on=_retry_on_non_search_abort,
         ),
-        _ReaderDigestMiddleware(registry),
     ]

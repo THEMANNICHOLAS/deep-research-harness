@@ -277,9 +277,56 @@ Step 1 (live checks) gates Step 2 (committing model IDs to config).
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+2026-08-15 — Phase 2 Step 3: D6's per-researcher recursion bound is unimplementable —
+deepagents 0.7.5 offers NO per-subagent recursion_limit route (no SubAgent field, no
+`.with_config` on `create_sub_agent`, no task-tool config key; site-packages verified).
+→ Developer decision: run-level bounds only (wall clock, lead round cap, ambient 9,999
+crash-stop) plus prompt-side budget guidance in the researcher contract; D5's
+CompiledSubAgent route stays rejected. Details in the Phase 2 sub-plan's Reconciliations.
+
+2026-08-15 — Phase 2 Step 3: the frozen researcher contract's Tools section
+(search_web + fetch_pages direct) contradicted R5's delegated-reading design.
+→ Developer decision: "frozen" scopes the research contract (mission, output shape), not
+tool mechanics — subagent.md's Tools section is updated to search_web +
+task(subagent_type="reader"). reader.md already assumed a researcher caller.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+
+### 2026-08-15 — Phase 2 Step 3 (acted)
+- deepagents 0.7.5 auto-injects FilesystemMiddleware/summarization/PatchToolCalls ONLY for
+  specs on `create_deep_agent`'s own top-level `subagents=` — a SubAgent nested via a
+  hand-built `SubAgentMiddleware` gets none of them. The nested reader silently lost its
+  scratch workspace (reader.md still promised one). Acted (developer, 2026-08-15): restore
+  via explicit `FilesystemMiddleware(backend=...)` on `_reader_spec`'s middleware, pinned by
+  a nested-tool-surface test. Remember this for ANY future nested tier.
+
+### 2026-08-15 — Phase 2 Step 3 (deferred, 3F Minors)
+- No test pins the researcher spec's `interrupt_on` omission (D6 below-lead half is pinned
+  only for the reader). Code omits it today; add the one-line spec assertion with Step 4's
+  test work.
+- Step 3's diff landed at 769+/246- across 13 files vs the planned ~200–350/4 — fully
+  accounted for by reconciliations Drift A/B/C; recorded so the budget miss is visible.
+
+### 2026-08-16 — Phase 2 Step 4 (deferred, 3F simplify)
+- tests/test_delegation_e2e.py's new mixed-disclosure test re-copies the `_run_delegation`
+  scaffolding (~50 lines, second occurrence). Parametrize the helper when a THIRD scripted
+  e2e appears, per CLAUDE.md's factor-on-third rule.
+- Pre-existing wording quirk (not this phase): `_UNREAD_HEADING`'s "fetch never succeeded"
+  parenthetical in @harness/report.py is inaccurate for a crash-after-successful-fetch path.
+
+### 2026-08-16 — Phase 2 Step 5 (recorded)
+- Diff budget: 309+/426- across 6 files vs the planned ~80–150/4 (3F Major). Mostly the 8
+  superseded per-paragraph-verdict tests being removed plus two e2e files the extra model
+  call forced; recorded so the miss is visible rather than absorbed.
+- 3F simplify (deferred): `_paragraph_block` in @harness/report.py is now a two-line
+  is_code guard over `_paragraph_prose` — inlineable, but it touches the `_answer_section`
+  call site and the docstring recording the Step 5 change. Do it when that area is next open.
+- Orchestrator observation (deferred): `renders_content` in @harness/paragraphs.py documents
+  itself as shared by report.py and verify.py, but only verify.py calls it — report.py
+  filters falsy blocks on its own. Two mechanisms that must agree is how the off-by-N
+  consolidator anchor returns; point report.py's filter at the predicate when next open.
 
 ### 2026-08-15 — Phase 1 Step 1 (deferred)
 - Query re-encode asymmetry in `normalize_url` (@harness/sources.py): the query is

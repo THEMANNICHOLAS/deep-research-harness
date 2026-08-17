@@ -1,7 +1,7 @@
 """Build LangChain chat model clients for the harness's configured roles.
 
-Each role (`head`, `subagent`, ...) resolves through `harness.toml`'s `[roles]` and
-`[providers]` tables to a concrete `ChatOpenAI` client. Retry is the OpenAI SDK's own
+Each role (`head`, `researcher`, `reader`, `verifier`) resolves through `harness.toml`'s
+`[roles]` and `[providers]` tables to a concrete `ChatOpenAI` client. Retry is the OpenAI SDK's own
 bounded exponential backoff with jitter (via `max_retries`); callers must not wrap the
 returned client in another retry layer.
 """

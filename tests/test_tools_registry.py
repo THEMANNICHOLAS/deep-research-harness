@@ -23,10 +23,11 @@ def test_build_tools_returns_the_frozen_tool_set(make_config, monkeypatch):
     tool_sets = build_tools(config, SourceRegistry())
 
     # Ordered, not a set: `harness/tools/__init__.py`'s builder list is part of the contract.
-    # `fetch_pages` moved off the lead onto the reader (Phase 1) — the lead delegates through
-    # `task` instead of fetching directly. `fetch_raw` (Phase 2) is the lead's fallback path
-    # when digestion fails, appended after the pre-existing two.
-    assert [tool.name for tool in tool_sets.lead] == ["search_web", "ask_user", "fetch_raw"]
+    # Step 3: `search_web` and `fetch_raw` both moved off the lead onto the researcher — the
+    # lead delegates through `task` instead of researching directly, and the digest-recovery
+    # loop belongs to whoever dispatches readers. `fetch_pages` stays on the reader.
+    assert [tool.name for tool in tool_sets.lead] == ["ask_user"]
+    assert [tool.name for tool in tool_sets.researcher] == ["search_web", "fetch_raw"]
     assert [tool.name for tool in tool_sets.reader] == ["fetch_pages"]
 
     # The fetch instance is built exactly once and routed to the reader, never duplicated.
@@ -37,7 +38,7 @@ def test_every_tool_exposes_description_and_json_schema(make_config):
     config = make_config()
 
     tool_sets = build_tools(config, SourceRegistry())
-    tools = [*tool_sets.lead, *tool_sets.reader]
+    tools = [*tool_sets.lead, *tool_sets.researcher, *tool_sets.reader]
 
     by_name = {tool.name: tool for tool in tools}
     for tool in tools:
@@ -71,7 +72,9 @@ async def test_build_tools_wires_the_callers_registry_into_the_fetch_tool(make_c
     monkeypatch.setattr("harness.tools.fetch._fetch", _spy)
 
     tool_sets = build_tools(config, registry)
-    by_name = {tool.name: tool for tool in [*tool_sets.lead, *tool_sets.reader]}
+    by_name = {
+        tool.name: tool for tool in [*tool_sets.lead, *tool_sets.researcher, *tool_sets.reader]
+    }
     await by_name["fetch_pages"].ainvoke({"urls": ["https://example.test/a"]})
 
     assert len(seen) == 1
@@ -83,7 +86,7 @@ def test_tools_are_langchain_base_tools_with_content_and_artifact(make_config):
 
     tool_sets = build_tools(config, SourceRegistry())
 
-    for tool in [*tool_sets.lead, *tool_sets.reader]:
+    for tool in [*tool_sets.lead, *tool_sets.researcher, *tool_sets.reader]:
         assert isinstance(tool, BaseTool)
         assert tool.response_format == "content_and_artifact"
 

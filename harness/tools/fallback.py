@@ -1,4 +1,4 @@
-"""`fetch_raw`: the lead's recovery path when reader digestion failed or returned empty (D2).
+"""`fetch_raw`: the researcher's recovery path when reader digestion failed or returned empty (D2).
 
 Reuses `harness.tools.fetch`'s `_fetch`/`_render` internals rather than re-implementing
 fetching or capture writing (same package; fetch.py's own tests already import these

@@ -19,7 +19,7 @@ api_key_env = "CEREBRAS_API_KEY"
 provider = "opencode"
 model = "glm-5.2"
 
-[roles.subagent]
+[roles.researcher]
 provider = "cerebras"
 model = "gemma-4-31b"
 
@@ -48,7 +48,7 @@ api_key_env = "CEREBRAS_API_KEY"
 provider = "opencode"
 model = "glm-5.2"
 
-[roles.subagent]
+[roles.researcher]
 provider = "cerebras"
 model = "gemma-4-31b"
 
@@ -78,8 +78,8 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
 
     assert config.roles["head"].provider == "opencode"
     assert config.roles["head"].model == "glm-5.2"
-    assert config.roles["subagent"].provider == "cerebras"
-    assert config.roles["subagent"].model == "gemma-4-31b"
+    assert config.roles["researcher"].provider == "cerebras"
+    assert config.roles["researcher"].model == "gemma-4-31b"
 
     assert config.fetch.page_timeout_ms == 20000
     assert config.fetch.max_concurrency == 8
@@ -121,8 +121,8 @@ def test_role_referencing_undeclared_provider_names_role_and_provider(tmp_path, 
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
     toml_content = VALID_TOML.replace(
-        '[roles.subagent]\nprovider = "cerebras"',
-        '[roles.subagent]\nprovider = "nonexistent"',
+        '[roles.researcher]\nprovider = "cerebras"',
+        '[roles.researcher]\nprovider = "nonexistent"',
     )
     path = _write(tmp_path, toml_content)
 
@@ -130,7 +130,7 @@ def test_role_referencing_undeclared_provider_names_role_and_provider(tmp_path, 
         load_config(path)
 
     message = str(excinfo.value)
-    assert "subagent" in message
+    assert "researcher" in message
     assert "nonexistent" in message
 
 
@@ -243,7 +243,7 @@ def test_literal_api_key_in_the_file_is_rejected(tmp_path, monkeypatch):
             "roles",
             [
                 '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\n\n',
-                '[roles.subagent]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n',
+                '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n',
             ],
         ),
     ],
@@ -321,20 +321,6 @@ def test_missing_head_role_raises_config_error_naming_head(tmp_path, monkeypatch
         load_config(path)
 
     assert "head" in str(excinfo.value)
-
-
-def test_missing_subagent_role_raises_config_error_naming_subagent(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
-    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
-    toml_content = VALID_TOML.replace(
-        '[roles.subagent]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n', ""
-    )
-    path = _write(tmp_path, toml_content)
-
-    with pytest.raises(ConfigError) as excinfo:
-        load_config(path)
-
-    assert "subagent" in str(excinfo.value)
 
 
 def test_agent_section_loads_declared_values(tmp_path, monkeypatch):
