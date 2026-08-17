@@ -59,41 +59,13 @@ class RoleConfig(_StrictModel):
 
 class FetchSettings(_StrictModel):
     # Bounded, not merely typed: these cross the config trust boundary into crawl4ai's
-    # HTTP strategy and the per-page truncation cap, where 0 or a negative is nonsense.
-    http_concurrency: int = Field(default=10, gt=0)
-    # ~3s: crawl4ai's HTTP strategy hardcodes a 10s connect timeout, so this deadline is
-    # enforced by our own caller-side asyncio.wait_for; it is also passed to crawl4ai as
-    # the cooperative page_timeout so no hidden lower cap binds first.
-    http_deadline_ms: int = Field(default=3000, gt=0)
-    # gt=0, not ge=0: the contract forbids disabling retries outright (2 extra attempts
-    # after the first is the plan's floor, not an oversight to relax).
-    max_retries: int = Field(default=2, gt=0)
+    # dispatcher and the per-page truncation cap, where 0 or a negative is nonsense.
+    page_timeout_ms: int = Field(default=15000, gt=0)
+    max_concurrency: int = Field(default=5, gt=0)
     per_page_char_cap: int = Field(default=12000, gt=0)
     # 5 is engineering judgment, not a measured optimum (D1): it bounds one call to ~15k
     # tokens at the current per-page cap. Operators change it here, not in code.
     max_urls_per_call: int = Field(default=5, gt=0)
-    # 50 is a starting guess (risk !#5), not a measured threshold: check the escalation
-    # rate on a real run before treating it as settled — too high sends ordinary short
-    # pages to Chromium needlessly, too low lets real JS shells through as "fetched".
-    min_markdown_words: int = Field(default=50, gt=0)
-    browser_deadline_ms: int = Field(default=20000, gt=0)
-    # 2 is deliberately low (risk !#2): dropping arun_many also dropped crawl4ai's
-    # MemoryAdaptiveDispatcher backpressure, so this is now the only thing bounding browser
-    # memory use. Raising it requires a memory measurement on the box, not just an edit here.
-    browser_concurrency: int = Field(default=2, gt=0)
-    # A plain relative path, not resolved against anything: no workspace/reports root key
-    # exists in this config yet (see docs/plans/PLAN-http-first-fetch.md Phase 3 notes). This
-    # IS the containment mechanism for now — a real workspace root, once one exists, should
-    # absorb it. Passed to crawl4ai as `downloads_path` so nothing writes to
-    # ~/.crawl4ai/downloads. No `gt=0` here: it is a path, not a bound.
-    downloads_dir: str = Field(default="workspace/downloads")
-    # Path convention matches downloads_dir above (no workspace/reports root exists yet).
-    blocklist_path: str = Field(default="workspace/blocklist.json")
-    # Risk !#4: a transient 403 (aggressive WAF, a rate-limit answered as 403) locks the
-    # whole domain out for the full TTL. The file is hand-editable JSON, so an operator can
-    # delete a wrongly-blocked entry directly; if false positives show up in practice the
-    # cheap fix is requiring two strikes before recording, not shortening this default.
-    blocklist_ttl_days: int = Field(default=30, gt=0)
 
 
 class SearchSettings(_StrictModel):
@@ -106,11 +78,6 @@ class HarnessConfig(_StrictModel):
     roles: dict[str, RoleConfig]
     fetch: FetchSettings = Field(default_factory=FetchSettings)
     search: SearchSettings
-    # D6/R6: a declared contract, not runtime enforcement — no agent loop exists yet to
-    # honor it, so nothing here schedules or counts subagents. It multiplies with
-    # `fetch.http_concurrency` to set the worst-case fetch load; the arithmetic lives in
-    # docs/architecture.md `## Concurrency Bounds` rather than being restated here.
-    max_subagents: int = Field(default=3, gt=0)
 
     @model_validator(mode="after")
     def _cross_check_roles(self) -> "HarnessConfig":

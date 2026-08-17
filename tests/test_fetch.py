@@ -1,22 +1,11 @@
 """Behavioral tests for harness.tools.fetch."""
 
-import asyncio
-from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-import httpx
 import pytest
-from crawl4ai import (  # type: ignore[import-untyped]
-    BrowserConfig,
-    DefaultMarkdownGenerator,
-    PruningContentFilter,
-)
-from crawl4ai.async_crawler_strategy import (  # type: ignore[import-untyped]
-    AsyncHTTPCrawlerStrategy,
-)
+from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter  # type: ignore[import-untyped]
 from langchain_core.tools import BaseTool
 
-from harness import blocklist
 from harness.sources import SourceRegistry
 from harness.tools import fetch
 
@@ -50,37 +39,15 @@ class _FakeResult:
         self.markdown = markdown
 
 
-def _make_fake_crawler_class(
-    results: list[_FakeResult], behaviors: dict[str, list[object]] | None = None
-) -> type:
-    """Build a fake AsyncWebCrawler class serving per-URL `arun` calls.
-
-    `results` are bucketed by URL once (the grouping `_pair` used to do) and the first
-    match is popped per call, so every test that only passes a plain `results` list keeps
-    working unchanged. `behaviors` lets a test script a multi-attempt sequence (retries,
-    timeouts, hangs) for one URL without disturbing the rest: each entry is a `_FakeResult`
-    (returned), an `Exception` instance (raised), or the string `"hang"` (sleeps far longer
-    than any test deadline). A URL absent from `behaviors` falls back to the `results`
-    bucket; exhausting a URL's `behaviors` list is a test bug and raises `AssertionError`.
-    """
-    by_url: dict[str, list[_FakeResult]] = {}
-    for result in results:
-        by_url.setdefault(result.url, []).append(result)
-    scripted: dict[str, list[object]] = behaviors or {}
+def _make_fake_crawler_class(results: list[_FakeResult]) -> type:
+    """Build a fake AsyncWebCrawler class recording construction and `arun_many` calls."""
 
     class _FakeCrawler:
-        constructed_with: list[dict[str, object]] = []
+        constructed_with: list[object] = []
         calls: list[SimpleNamespace] = []
-        # Phase 2 constructs a second (browser) AsyncWebCrawler from this same patched
-        # class, so per-instance in_flight/max_in_flight keep the HTTP and browser
-        # concurrency caps from conflating; instances is order-preserving construction order.
-        instances: list["_FakeCrawler"] = []
 
-        def __init__(self, **kwargs: object) -> None:
-            _FakeCrawler.constructed_with.append(kwargs)
-            self.in_flight = 0
-            self.max_in_flight = 0
-            _FakeCrawler.instances.append(self)
+        def __init__(self, config: object = None) -> None:
+            _FakeCrawler.constructed_with.append(config)
 
         async def __aenter__(self) -> "_FakeCrawler":
             return self
@@ -88,27 +55,13 @@ def _make_fake_crawler_class(
         async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
             return False
 
-        async def arun(self, url: str, config: object = None) -> _FakeResult | None:
-            _FakeCrawler.calls.append(SimpleNamespace(url=url, config=config))
-            self.in_flight += 1
-            self.max_in_flight = max(self.max_in_flight, self.in_flight)
-            try:
-                # Yields control at least once so overlapping arun calls actually interleave
-                # under the semaphore, rather than each running to completion synchronously.
-                await asyncio.sleep(0)
-                if url in scripted:
-                    if not scripted[url]:
-                        raise AssertionError(f"{url}'s scripted behaviors were exhausted")
-                    behavior = scripted[url].pop(0)
-                    if isinstance(behavior, Exception):
-                        raise behavior
-                    if behavior == "hang":
-                        await asyncio.sleep(3600)
-                    return behavior  # type: ignore[return-value]
-                bucket = by_url.get(url)
-                return bucket.pop(0) if bucket else None
-            finally:
-                self.in_flight -= 1
+        async def arun_many(
+            self, urls: list[str], config: object = None, dispatcher: object = None
+        ) -> list[_FakeResult]:
+            _FakeCrawler.calls.append(
+                SimpleNamespace(urls=urls, config=config, dispatcher=dispatcher)
+            )
+            return results
 
     return _FakeCrawler
 
@@ -131,39 +84,12 @@ def _rendered(markdown: str, cap: int) -> str:
 def install_crawler(monkeypatch):
     """Patch fetch's AsyncWebCrawler with a fake serving canned results; returns the class."""
 
-    def _install(
-        results: list[_FakeResult], behaviors: dict[str, list[object]] | None = None
-    ) -> type:
-        fake_cls = _make_fake_crawler_class(results, behaviors)
+    def _install(results: list[_FakeResult]) -> type:
+        fake_cls = _make_fake_crawler_class(results)
         monkeypatch.setattr("harness.tools.fetch.AsyncWebCrawler", fake_cls)
         return fake_cls
 
     return _install
-
-
-@pytest.fixture
-def install_head(install_httpx_mock):
-    """Route fetch's PDF-precheck AsyncClient through the shared conftest httpx-mock seam."""
-
-    def _install(handler):
-        install_httpx_mock("harness.tools.fetch", handler)
-
-    return _install
-
-
-@pytest.fixture(autouse=True)
-def _default_head_response(install_head):
-    """Every `_fetch()` call now issues a PDF-precheck HEAD, so a test that doesn't care
-    about it (nearly all of them, pre-dating Phase 3) still needs to stay offline rather
-    than hit the real network for `*.test` URLs. Defaults to a `text/html` reply so those
-    tests keep proceeding to the fake crawler unchanged; a test exercising the precheck
-    itself calls `install_head` again to override this default.
-    """
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, headers={"content-type": "text/html"})
-
-    install_head(handler)
 
 
 async def test_empty_url_list_returns_empty_content_and_artifact(install_crawler, make_config):
@@ -216,7 +142,6 @@ async def test_mixed_batch_returns_one_entry_per_url_with_successes_intact(
 @pytest.mark.parametrize(
     ("status_code", "error_message", "content_type", "markdown", "expected"),
     [
-        (401, None, "text/html", "content", "blocked"),
         (403, None, "text/html", "content", "blocked"),
         (429, None, "text/html", "content", "blocked"),
         (503, None, "text/html", "content", "blocked"),
@@ -251,7 +176,7 @@ async def test_equivalent_url_spellings_are_fetched_once_with_one_source_id(
     )
 
     # One crawl, one page, one heading — never two [Sn] blocks over one identity.
-    assert [call.url for call in fake_cls.calls] == ["https://dup.test/a"]
+    assert fake_cls.calls[0].urls == ["https://dup.test/a"]
     assert len(pages) == 1
     assert registry.get(pages[0].source_id) is not None
     assert len(registry.all()) == 1
@@ -374,9 +299,7 @@ async def test_content_has_a_heading_for_every_url_including_failures(install_cr
 
 
 async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_config):
-    # The HTTP run config's page_timeout must track http_deadline_ms — a separate, lower
-    # crawl4ai-side cap would silently bind before the configured deadline.
-    config = make_config(http_deadline_ms=1234)
+    config = make_config(page_timeout_ms=1234, max_concurrency=3)
     registry = SourceRegistry()
     results = [
         _FakeResult(
@@ -389,10 +312,12 @@ async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_confi
     await fetch._fetch(["https://a.test"], config, registry)
 
     assert len(fake_cls.calls) == 1
-    assert fake_cls.calls[0].config.page_timeout == 1234
+    recorded = fake_cls.calls[0]
+    assert recorded.config.page_timeout == 1234
+    assert recorded.dispatcher.max_session_permit == 3
 
 
-async def test_crawl4ai_logging_is_silenced_on_the_run_config(install_crawler, make_config):
+async def test_dispatcher_is_memory_bounded_and_rate_limited(install_crawler, make_config):
     config = make_config()
     registry = SourceRegistry()
     results = [
@@ -402,9 +327,28 @@ async def test_crawl4ai_logging_is_silenced_on_the_run_config(install_crawler, m
 
     await fetch._fetch(["https://a.test"], config, registry)
 
-    # crawl4ai defaults `verbose` to True on CrawlerRunConfig and prints into our process.
-    # The HTTP strategy/config exposes no separate verbose flag to silence.
+    dispatcher = fake_cls.calls[0].dispatcher
+    # 75%, not crawl4ai's 90% default: each permit is a real browser page.
+    assert dispatcher.memory_threshold_percent == 75.0
+    # Not a retry count — 0.9.2 re-fetches nothing on a 429/503; this caps how many times a
+    # domain's backoff delay doubles, and that sleep holds a concurrency permit.
+    assert dispatcher.rate_limiter is not None
+    assert dispatcher.rate_limiter.max_retries == 1
+
+
+async def test_crawl4ai_logging_is_silenced_on_both_configs(install_crawler, make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    results = [
+        _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"))
+    ]
+    fake_cls = install_crawler(results)
+
+    await fetch._fetch(["https://a.test"], config, registry)
+
+    # crawl4ai defaults `verbose` to True on both configs and prints into our process.
     assert fake_cls.calls[0].config.verbose is False
+    assert fake_cls.constructed_with[0].verbose is False
 
 
 async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(install_crawler, make_config):
@@ -421,23 +365,6 @@ async def test_boilerplate_stripping_config_reaches_the_crawl4ai_call(install_cr
     assert set(recorded.excluded_tags) >= {"nav", "header", "footer", "aside", "script"}
     assert isinstance(recorded.markdown_generator, DefaultMarkdownGenerator)
     assert isinstance(recorded.markdown_generator.content_filter, PruningContentFilter)
-
-
-async def test_crawler_is_constructed_with_the_http_strategy_not_a_browser(
-    install_crawler, make_config
-):
-    config = make_config()
-    registry = SourceRegistry()
-    results = [
-        _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"))
-    ]
-    fake_cls = install_crawler(results)
-
-    await fetch._fetch(["https://a.test"], config, registry)
-
-    assert len(fake_cls.constructed_with) == 1
-    strategy = fake_cls.constructed_with[0]["crawler_strategy"]
-    assert isinstance(strategy, AsyncHTTPCrawlerStrategy)
 
 
 async def test_built_tool_exposes_the_pinned_contract_and_returns_content_and_artifact(
@@ -565,185 +492,68 @@ async def test_input_url_with_no_result_reports_a_single_error_outcome(
 ):
     config = make_config()
     registry = SourceRegistry()
-    fake_cls = install_crawler([])
+    install_crawler([])
 
     _, pages = await fetch._fetch(["https://a.test"], config, registry)
 
-    # The `None`-return branch of `_fetch_one`, exercised when a URL has no matching result.
+    # This is the `None`-pairing branch (fetch.py:212-224), which was previously
+    # untested; it must survive the removal of the positional fallback.
     assert len(pages) == 1
     assert pages[0].url == "https://a.test"
     assert pages[0].outcome == "error"
     assert pages[0].markdown == ""
     assert pages[0].error == "no result returned for this URL"
-    # A statusless `error` counts as a network error, so this path now exhausts the retry
-    # budget rather than reporting after one attempt as it did under `arun_many`.
-    assert len(fake_cls.calls) == config.fetch.max_retries + 1
 
 
-async def test_a_hung_url_times_out_without_blocking_a_sibling_url(install_crawler, make_config):
-    config = make_config(http_deadline_ms=20, max_retries=1)
-    registry = SourceRegistry()
-    results = [
-        _FakeResult(
-            "https://fast.test",
-            markdown=_FakeMarkdown(raw_markdown="fine", fit_markdown="fine"),
-        ),
-    ]
-    fake_cls = install_crawler(results, behaviors={"https://hang.test": ["hang", "hang"]})
-
-    _, pages = await fetch._fetch(["https://hang.test", "https://fast.test"], config, registry)
-
-    by_url = {page.url: page for page in pages}
-    assert by_url["https://hang.test"].outcome == "timeout"
-    assert by_url["https://fast.test"].outcome == "fetched"
-    # Pins the contract's "Retryable: timeout" line: max_retries=1 means the hung URL is
-    # attempted twice, not once. Without this the test passes whatever the retry rule does.
-    assert len([c for c in fake_cls.calls if c.url == "https://hang.test"]) == 2
-
-
-async def test_5xx_is_retried_to_the_budget_404_is_not_and_recovery_stops_early(
+async def test_the_first_of_two_results_for_one_url_is_the_one_reported(
     install_crawler, make_config
 ):
-    config = make_config(max_retries=2)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://flaky.test": [
-            _FakeResult(
-                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-            _FakeResult(
-                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-            _FakeResult(
-                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-        ],
-        "https://notfound.test": [
-            _FakeResult(
-                "https://notfound.test", error_message="HTTP 404: Not Found", status_code=None
-            ),
-        ],
-        "https://recovers.test": [
-            _FakeResult(
-                "https://recovers.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-            _FakeResult(
-                "https://recovers.test",
-                markdown=_FakeMarkdown(raw_markdown="recovered", fit_markdown="recovered"),
-            ),
-        ],
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-
-    _, pages = await fetch._fetch(
-        ["https://flaky.test", "https://notfound.test", "https://recovers.test"],
-        config,
-        registry,
-    )
-
-    assert len([c for c in fake_cls.calls if c.url == "https://flaky.test"]) == 3
-    assert len([c for c in fake_cls.calls if c.url == "https://notfound.test"]) == 1
-    assert len([c for c in fake_cls.calls if c.url == "https://recovers.test"]) == 2
-
-    by_url = {page.url: page for page in pages}
-    assert by_url["https://recovers.test"].outcome == "fetched"
-
-
-async def test_a_403_recovered_from_the_error_message_classifies_as_blocked(
-    install_crawler, make_config
-):
+    # Pins `_pair`'s documented `bucket.pop(0)`: under memory pressure the dispatcher can
+    # return a "Requeued" placeholder AND re-queue the crawl, and the first result wins.
     config = make_config()
     registry = SourceRegistry()
     results = [
-        _FakeResult("https://blocked.test", error_message="HTTP 403: Forbidden", status_code=None)
+        _FakeResult("https://a.test", error_message="Requeued", status_code=None),
+        _FakeResult(
+            "https://a.test",
+            markdown=_FakeMarkdown(raw_markdown="retry body", fit_markdown="retry body"),
+        ),
     ]
     install_crawler(results)
 
-    _, pages = await fetch._fetch(["https://blocked.test"], config, registry)
+    content, pages = await fetch._fetch(["https://a.test"], config, registry)
 
-    assert pages[0].status_code == 403
-    assert pages[0].outcome == "blocked"
-
-
-@pytest.mark.parametrize(
-    ("error", "expected"),
-    [
-        ("HTTP 500: Server Error", 500),
-        (None, None),
-        ("some other failure with no status", None),
-    ],
-)
-def test_status_from_error_parses_the_http_status_or_returns_none(error, expected):
-    assert fetch._status_from_error(error) == expected
+    assert len(pages) == 1
+    assert pages[0].outcome == "error"
+    assert pages[0].error == "Requeued"
+    assert "retry body" not in content
 
 
-def test_status_from_error_keeps_the_exact_http_code_colon_message_shape():
-    # Risk !#1: pins the exact "HTTP <code>: ..." format crawl4ai 0.9.2 raises internally;
-    # a library upgrade that changes it must fail here, not silently stop recovering statuses.
-    assert fetch._status_from_error("HTTP 403: Forbidden") == 403
-
-
-def test_status_from_error_parses_the_wrapped_message_production_actually_sees():
-    # The bare string above never reaches us: `AsyncWebCrawler.arun` catches the internal
-    # `HTTPStatusError` and stores it wrapped in a traceback blob with trailing code context.
-    # Phase 4's blocklist gate keys on this number, so the wrapper — not just the inner
-    # format — is what must keep parsing. Note the parse relies on "Error:" preceding
-    # "Code context:", since the regex takes the first match in the blob.
-    wrapped = (
-        "Unexpected error in _crawl_web at line 2461 in wrapper "
-        "(crawl4ai/async_crawler_strategy.py):\n"
-        "Error: HTTP 403: Forbidden\n\n"
-        "Code context:\n"
-        "  2459     if response.status >= 400:\n"
-        "  2460         message = await response.text()\n"
-        "  2461 ->      raise HTTPStatusError(response.status, message)\n"
-    )
-    assert fetch._status_from_error(wrapped) == 403
-
-
-async def test_concurrency_never_exceeds_the_configured_cap(install_crawler, make_config):
-    config = make_config(http_concurrency=2)
+async def test_result_matching_no_input_url_never_supplies_another_urls_body(
+    install_crawler, make_config
+):
+    # Supersedes the deleted test_result_whose_url_diff_from_input_paired, which asserted
+    # the opposite: that an unrelated result could be handed to an input URL positionally.
+    # A visible `error` is strictly safer than a plausible wrong citation.
+    config = make_config()
     registry = SourceRegistry()
-    urls = [f"https://c{n}.test" for n in range(5)]
     results = [
-        _FakeResult(url, markdown=_FakeMarkdown(raw_markdown="ok", fit_markdown="ok"))
-        for url in urls
-    ]
-    fake_cls = install_crawler(results)
-
-    await fetch._fetch(urls, config, registry)
-
-    assert fake_cls.instances[0].max_in_flight == 2
-
-
-async def test_output_order_follows_input_order_not_completion_order(install_crawler, make_config):
-    # Replaces the deleted `_pair`-pinning tests (Reconciliation #1): `asyncio.gather`
-    # preserves input order structurally, so this pins that guarantee instead.
-    config = make_config(max_retries=2)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://slow.test": [
-            _FakeResult(
-                "https://slow.test", error_message="HTTP 500: Server Error", status_code=None
+        _FakeResult(
+            "https://redirected.test/final",
+            markdown=_FakeMarkdown(
+                raw_markdown="redirected content", fit_markdown="redirected content"
             ),
-            _FakeResult(
-                "https://slow.test",
-                markdown=_FakeMarkdown(raw_markdown="slow body", fit_markdown="slow body"),
-            ),
-        ],
-    }
-    results = [
-        _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a")),
-        _FakeResult("https://c.test", markdown=_FakeMarkdown(raw_markdown="c", fit_markdown="c")),
+        )
     ]
-    install_crawler(results, behaviors=behaviors)
+    install_crawler(results)
 
-    _, pages = await fetch._fetch(
-        ["https://a.test", "https://slow.test", "https://c.test"], config, registry
-    )
+    content, pages = await fetch._fetch(["https://original.test/start"], config, registry)
 
-    assert [page.url for page in pages] == ["https://a.test", "https://slow.test", "https://c.test"]
-    assert [page.source_id for page in pages] == ["S1", "S2", "S3"]
+    assert len(pages) == 1  # R6 — exactly one outcome per input URL
+    assert pages[0].url == "https://original.test/start"
+    assert pages[0].outcome == "error"
+    assert pages[0].markdown == ""
+    assert "redirected content" not in content
 
 
 async def test_a_call_over_the_url_limit_is_rejected_before_any_fetch(install_crawler, make_config):
@@ -887,604 +697,3 @@ async def test_a_call_at_exactly_the_limit_fetches_every_url(install_crawler, ma
     ]
     assert "## [S1] https://limit1.test" in message.content
     assert "## [S2] https://limit2.test" in message.content
-
-
-async def test_a_thin_result_escalates_once_and_the_browser_result_wins(
-    install_crawler, make_config
-):
-    config = make_config(min_markdown_words=5)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://shell.test": [
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
-            ),
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(
-                    raw_markdown="a rich rendered body with plenty of real words",
-                    fit_markdown="a rich rendered body with plenty of real words",
-                ),
-            ),
-        ],
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-
-    _, pages = await fetch._fetch(["https://shell.test"], config, registry)
-
-    assert pages[0].markdown == "a rich rendered body with plenty of real words"
-    assert len([c for c in fake_cls.calls if c.url == "https://shell.test"]) == 2
-    assert len(fake_cls.constructed_with) == 2
-    assert isinstance(fake_cls.constructed_with[1]["config"], BrowserConfig)
-
-
-async def test_a_rich_result_never_escalates_and_constructs_no_browser(
-    install_crawler, make_config
-):
-    config = make_config(min_markdown_words=5)
-    registry = SourceRegistry()
-    results = [
-        _FakeResult(
-            "https://rich.test",
-            markdown=_FakeMarkdown(
-                raw_markdown="plenty of real words here already",
-                fit_markdown="plenty of real words here already",
-            ),
-        ),
-    ]
-    fake_cls = install_crawler(results)
-
-    await fetch._fetch(["https://rich.test"], config, registry)
-
-    assert len([c for c in fake_cls.calls if c.url == "https://rich.test"]) == 1
-    assert len(fake_cls.constructed_with) == 1
-
-
-async def test_failure_outcomes_do_not_escalate(install_crawler, make_config):
-    config = make_config(min_markdown_words=5, http_deadline_ms=20, max_retries=1)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://hang.test": ["hang", "hang"],
-        "https://notfound.test": [
-            _FakeResult(
-                "https://notfound.test", error_message="HTTP 404: Not Found", status_code=None
-            ),
-        ],
-        "https://blocked.test": [
-            _FakeResult(
-                "https://blocked.test", error_message="HTTP 403: Forbidden", status_code=None
-            ),
-        ],
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-
-    _, pages = await fetch._fetch(
-        ["https://hang.test", "https://notfound.test", "https://blocked.test"], config, registry
-    )
-
-    by_url = {page.url: page for page in pages}
-    assert by_url["https://hang.test"].outcome == "timeout"
-    assert by_url["https://notfound.test"].outcome == "error"
-    assert by_url["https://blocked.test"].outcome == "blocked"
-    # Neither a timeout, a 404, nor a blocked outcome is escalatable, so thinness alone never
-    # triggers escalation — only one (HTTP) crawler is ever constructed.
-    assert len(fake_cls.constructed_with) == 1
-
-
-async def test_empty_but_html_non_html_result_escalates(install_crawler, make_config):
-    # Reconciliation #2: a 200 text/html page with empty generated markdown classifies as
-    # `non_html` (classify()'s existing behavior), not `fetched` — but it is the canonical
-    # JS-shell case (`<div id="root"></div>`) and must still escalate.
-    config = make_config(min_markdown_words=5)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://shell.test": [
-            _FakeResult(
-                "https://shell.test",
-                response_headers={"Content-Type": "text/html"},
-                markdown=_FakeMarkdown(raw_markdown="", fit_markdown=""),
-            ),
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(
-                    raw_markdown="a rich rendered body with plenty of real words",
-                    fit_markdown="a rich rendered body with plenty of real words",
-                ),
-            ),
-        ],
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-
-    _, pages = await fetch._fetch(["https://shell.test"], config, registry)
-
-    assert pages[0].markdown == "a rich rendered body with plenty of real words"
-    assert len([c for c in fake_cls.calls if c.url == "https://shell.test"]) == 2
-    assert len(fake_cls.constructed_with) == 2
-
-
-async def test_empty_pdf_non_html_result_does_not_escalate(install_crawler, make_config):
-    # A genuine non-HTML resource (PDF) with empty markdown must stay `non_html` and never
-    # trigger a browser launch, even though it is also "thin".
-    config = make_config(min_markdown_words=5)
-    registry = SourceRegistry()
-    results = [
-        _FakeResult(
-            "https://pdf.test/doc",
-            response_headers={"Content-Type": "application/pdf"},
-            markdown=_FakeMarkdown(raw_markdown="", fit_markdown=""),
-        )
-    ]
-    fake_cls = install_crawler(results)
-
-    _, pages = await fetch._fetch(["https://pdf.test/doc"], config, registry)
-
-    assert pages[0].outcome == "non_html"
-    assert len([c for c in fake_cls.calls if c.url == "https://pdf.test/doc"]) == 1
-    assert len(fake_cls.constructed_with) == 1
-
-
-async def test_empty_result_with_no_content_type_header_escalates(install_crawler, make_config):
-    # No `content-type` header at all still reads as "looks like HTML" — `content_type` is
-    # `None`, not a non-HTML type — so it escalates too.
-    config = make_config(min_markdown_words=5)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://noheader.test": [
-            _FakeResult(
-                "https://noheader.test",
-                response_headers=None,
-                markdown=_FakeMarkdown(raw_markdown="", fit_markdown=""),
-            ),
-            _FakeResult(
-                "https://noheader.test",
-                markdown=_FakeMarkdown(
-                    raw_markdown="a rich rendered body with plenty of real words",
-                    fit_markdown="a rich rendered body with plenty of real words",
-                ),
-            ),
-        ],
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-
-    _, pages = await fetch._fetch(["https://noheader.test"], config, registry)
-
-    assert pages[0].markdown == "a rich rendered body with plenty of real words"
-    assert len([c for c in fake_cls.calls if c.url == "https://noheader.test"]) == 2
-    assert len(fake_cls.constructed_with) == 2
-
-
-async def test_escalation_run_config_uses_browser_deadline_and_render_aware_wait(
-    install_crawler, make_config
-):
-    # Reconciliation #3: the browser attempt must get its own CrawlerRunConfig — its
-    # page_timeout aligned to browser_deadline_ms (not the HTTP deadline) and a
-    # render-aware wait, while the HTTP attempt's config is untouched.
-    config = make_config(min_markdown_words=5, http_deadline_ms=1234, browser_deadline_ms=20000)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://shell.test": [
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
-            ),
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(
-                    raw_markdown="a rich rendered body with plenty of real words",
-                    fit_markdown="a rich rendered body with plenty of real words",
-                ),
-            ),
-        ],
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-
-    await fetch._fetch(["https://shell.test"], config, registry)
-
-    calls = [c for c in fake_cls.calls if c.url == "https://shell.test"]
-    assert len(calls) == 2
-    http_config, browser_config = calls[0].config, calls[1].config
-    assert http_config.page_timeout == 1234
-    assert browser_config.page_timeout == 20000
-    assert browser_config.wait_until == "networkidle"
-    assert http_config.wait_until != "networkidle"
-
-
-async def test_an_escalation_exceeding_its_deadline_yields_timeout_not_a_hang(
-    install_crawler, make_config
-):
-    config = make_config(min_markdown_words=5, browser_deadline_ms=20)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://shell.test": [
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
-            ),
-            "hang",
-        ],
-    }
-    install_crawler([], behaviors=behaviors)
-
-    _, pages = await asyncio.wait_for(
-        fetch._fetch(["https://shell.test"], config, registry), timeout=5
-    )
-
-    assert pages[0].outcome == "timeout"
-    assert pages[0].markdown == ""
-
-
-async def test_escalation_does_not_consume_the_retry_budget(install_crawler, make_config):
-    config = make_config(min_markdown_words=5, max_retries=2)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://flaky.test": [
-            _FakeResult(
-                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-            _FakeResult(
-                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-            _FakeResult(
-                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-        ],
-        "https://shell.test": [
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
-            ),
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(
-                    raw_markdown="a rich rendered body with plenty of words",
-                    fit_markdown="a rich rendered body with plenty of words",
-                ),
-            ),
-        ],
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-
-    _, pages = await fetch._fetch(["https://flaky.test", "https://shell.test"], config, registry)
-
-    assert (
-        len([c for c in fake_cls.calls if c.url == "https://flaky.test"])
-        == config.fetch.max_retries + 1
-    )
-    assert len([c for c in fake_cls.calls if c.url == "https://shell.test"]) == 2
-
-    by_url = {page.url: page for page in pages}
-    assert by_url["https://flaky.test"].outcome == "error"
-    assert by_url["https://shell.test"].markdown == "a rich rendered body with plenty of words"
-
-
-async def test_browser_concurrency_never_exceeds_its_configured_cap(install_crawler, make_config):
-    config = make_config(min_markdown_words=5, browser_concurrency=2, http_concurrency=10)
-    registry = SourceRegistry()
-    urls = [f"https://shell{n}.test" for n in range(5)]
-    behaviors: dict[str, list[object]] = {
-        url: [
-            _FakeResult(url, markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin")),
-            _FakeResult(
-                url,
-                markdown=_FakeMarkdown(
-                    raw_markdown="a rich rendered body with plenty of words",
-                    fit_markdown="a rich rendered body with plenty of words",
-                ),
-            ),
-        ]
-        for url in urls
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-
-    await fetch._fetch(urls, config, registry)
-
-    assert fake_cls.instances[1].max_in_flight == 2
-    assert fake_cls.instances[0].max_in_flight == 5
-
-
-async def test_pdf_head_short_circuits_without_fetching_the_body(
-    install_crawler, install_head, make_config
-):
-    # R1's PDF case: the body is never fetched, and the non_html result can't escalate.
-    config = make_config()
-    registry = SourceRegistry()
-    fake_cls = install_crawler([])
-
-    def handler(request):
-        return httpx.Response(200, headers={"content-type": "application/pdf"})
-
-    install_head(handler)
-
-    _, pages = await fetch._fetch(["https://pdf.test/doc.pdf"], config, registry)
-
-    assert pages[0].outcome == "non_html"
-    assert pages[0].markdown == ""
-    assert fake_cls.calls == []
-    # Only the HTTP crawler is ever constructed — no browser escalation for a PDF.
-    assert len(fake_cls.constructed_with) == 1
-
-
-async def test_html_head_proceeds_to_a_normal_fetch(install_crawler, install_head, make_config):
-    config = make_config()
-    registry = SourceRegistry()
-    results = [
-        _FakeResult(
-            "https://a.test", markdown=_FakeMarkdown(raw_markdown="body", fit_markdown="body")
-        )
-    ]
-    fake_cls = install_crawler(results)
-
-    def handler(request):
-        return httpx.Response(200, headers={"content-type": "text/html"})
-
-    install_head(handler)
-
-    _, pages = await fetch._fetch(["https://a.test"], config, registry)
-
-    assert pages[0].outcome == "fetched"
-    assert len(fake_cls.calls) == 1
-
-
-async def test_malformed_url_does_not_sink_the_whole_batch(install_crawler, make_config):
-    # httpx raises InvalidURL (NOT a subclass of HTTPError) while parsing the URL, before
-    # any transport runs — so the precheck's except clause has to be wider than httpx's own
-    # error tree. The module contract is that no single URL can fail the batch, and the
-    # model supplies these URLs, so a malformed one is expected traffic.
-    config = make_config()
-    registry = SourceRegistry()
-    results = [
-        _FakeResult(
-            "https://ok.test", markdown=_FakeMarkdown(raw_markdown="body", fit_markdown="body")
-        )
-    ]
-    install_crawler(results)
-
-    _, pages = await fetch._fetch(["http://[::1", "https://ok.test"], config, registry)
-
-    by_url = {page.url: page for page in pages}
-    assert by_url["https://ok.test"].outcome == "fetched"
-    assert by_url["http://[::1"].outcome == "error"
-
-
-@pytest.mark.parametrize("kind", ["transport_error", "timeout", "rejected"])
-async def test_head_failure_falls_through_to_a_normal_fetch(
-    install_crawler, install_head, make_config, kind
-):
-    # Risk !#3's "no worse than today" guarantee: a HEAD that errors, times out, or is
-    # rejected must never turn into a hard failure — it proceeds to a normal fetch.
-    config = make_config()
-    registry = SourceRegistry()
-    results = [
-        _FakeResult(
-            "https://a.test", markdown=_FakeMarkdown(raw_markdown="body", fit_markdown="body")
-        )
-    ]
-    fake_cls = install_crawler(results)
-
-    def handler(request):
-        if kind == "transport_error":
-            raise httpx.ConnectError("refused")
-        if kind == "timeout":
-            raise httpx.ConnectTimeout("timed out")
-        # A 405 rejection, with a content-type that would otherwise look like a PDF —
-        # the non-2xx status alone must be enough to fall through.
-        return httpx.Response(405, headers={"content-type": "application/pdf"})
-
-    install_head(handler)
-
-    _, pages = await fetch._fetch(["https://a.test"], config, registry)
-
-    assert pages[0].outcome == "fetched"
-    assert len(fake_cls.calls) == 1
-
-
-async def test_downloads_path_is_pinned_on_both_crawlers(
-    install_crawler, install_head, make_config, tmp_path
-):
-    downloads_dir = str(tmp_path / "downloads")
-    config = make_config(downloads_dir=downloads_dir, min_markdown_words=5)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://shell.test": [
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
-            ),
-            _FakeResult(
-                "https://shell.test",
-                markdown=_FakeMarkdown(
-                    raw_markdown="a rich rendered body with plenty of words",
-                    fit_markdown="a rich rendered body with plenty of words",
-                ),
-            ),
-        ],
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-
-    def handler(request):
-        return httpx.Response(200, headers={"content-type": "text/html"})
-
-    install_head(handler)
-
-    await fetch._fetch(["https://shell.test"], config, registry)
-
-    http_strategy = fake_cls.constructed_with[0]["crawler_strategy"]
-    assert http_strategy.browser_config.downloads_path == downloads_dir
-
-    browser_config = fake_cls.constructed_with[1]["config"]
-    assert browser_config.downloads_path == downloads_dir
-
-
-async def test_precheck_runs_once_per_url_not_per_attempt(
-    install_crawler, install_head, make_config
-):
-    # Pins where the precheck sits relative to the retry loop: a URL whose fetch attempts
-    # are 5xx to the retry budget must still issue exactly one HEAD.
-    config = make_config(max_retries=2)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://flaky.test": [
-            _FakeResult(
-                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-            _FakeResult(
-                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-            _FakeResult(
-                "https://flaky.test", error_message="HTTP 500: Server Error", status_code=None
-            ),
-        ],
-    }
-    fake_cls = install_crawler([], behaviors=behaviors)
-    captured_requests = []
-
-    def handler(request):
-        captured_requests.append(request)
-        return httpx.Response(200, headers={"content-type": "text/html"})
-
-    install_head(handler)
-
-    await fetch._fetch(["https://flaky.test"], config, registry)
-
-    assert len(fake_cls.calls) == config.fetch.max_retries + 1
-    assert len(captured_requests) == 1
-
-
-async def test_a_403_and_a_401_record_the_domain_a_429_does_not(
-    install_crawler, make_config, tmp_path
-):
-    blocklist_path = str(tmp_path / "blocklist.json")
-    config = make_config(blocklist_path=blocklist_path)
-    registry = SourceRegistry()
-    results = [
-        _FakeResult(
-            "https://forbidden.test", error_message="HTTP 403: Forbidden", status_code=None
-        ),
-        _FakeResult(
-            "https://unauthorized.test", error_message="HTTP 401: Unauthorized", status_code=None
-        ),
-        _FakeResult("https://ratelimited.test", status_code=429),
-    ]
-    install_crawler(results)
-
-    await fetch._fetch(
-        ["https://forbidden.test", "https://unauthorized.test", "https://ratelimited.test"],
-        config,
-        registry,
-    )
-
-    entries = blocklist.load(blocklist_path, config.fetch.blocklist_ttl_days)
-    assert "forbidden.test" in entries
-    assert "unauthorized.test" in entries
-    assert "ratelimited.test" not in entries
-
-
-async def test_a_403_from_the_escalation_path_records_the_domain(
-    install_crawler, make_config, tmp_path
-):
-    # R3 has no HTTP-only scoping: a WAF that serves plain HTTP a thin shell but 403s the
-    # browser must still blocklist the domain, or every future run re-launches Chromium.
-    blocklist_path = str(tmp_path / "blocklist.json")
-    config = make_config(min_markdown_words=5, blocklist_path=blocklist_path)
-    registry = SourceRegistry()
-    behaviors: dict[str, list[object]] = {
-        "https://wafwall.test": [
-            _FakeResult(
-                "https://wafwall.test",
-                markdown=_FakeMarkdown(raw_markdown="thin", fit_markdown="thin"),
-            ),
-            _FakeResult(
-                "https://wafwall.test", error_message="HTTP 403: Forbidden", status_code=None
-            ),
-        ],
-    }
-    install_crawler([], behaviors=behaviors)
-
-    _, pages = await fetch._fetch(["https://wafwall.test"], config, registry)
-
-    assert pages[0].outcome == "blocked"
-    entries = blocklist.load(blocklist_path, config.fetch.blocklist_ttl_days)
-    assert "wafwall.test" in entries
-
-
-async def test_a_blocklisted_host_is_skipped_with_no_head_and_no_arun(
-    install_crawler, install_head, make_config, tmp_path
-):
-    blocklist_path = str(tmp_path / "blocklist.json")
-    blocklist.record(blocklist_path, "blocked-domain.test", 30)
-    config = make_config(blocklist_path=blocklist_path)
-    registry = SourceRegistry()
-    fake_cls = install_crawler([])
-    captured_requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured_requests.append(request)
-        return httpx.Response(200, headers={"content-type": "text/html"})
-
-    install_head(handler)
-
-    _, pages = await fetch._fetch(["https://blocked-domain.test/page"], config, registry)
-
-    assert pages[0].outcome == "skipped"
-    assert pages[0].status_code is None
-    assert pages[0].markdown == ""
-    assert pages[0].content_type is None
-    assert "blocked-domain.test" in pages[0].error
-    assert fake_cls.calls == []
-    assert captured_requests == []
-    # Every URL was skipped, so no crawler was ever constructed.
-    assert fake_cls.constructed_with == []
-
-
-async def test_a_skipped_url_keeps_its_source_id_in_order_and_a_sibling_still_fetches(
-    install_crawler, install_head, make_config, tmp_path
-):
-    blocklist_path = str(tmp_path / "blocklist.json")
-    blocklist.record(blocklist_path, "blocked-domain.test", 30)
-    config = make_config(blocklist_path=blocklist_path)
-    registry = SourceRegistry()
-    results = [
-        _FakeResult(
-            "https://ok.test", markdown=_FakeMarkdown(raw_markdown="fine", fit_markdown="fine")
-        ),
-    ]
-    fake_cls = install_crawler(results)
-    captured_requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured_requests.append(request)
-        return httpx.Response(200, headers={"content-type": "text/html"})
-
-    install_head(handler)
-
-    _, pages = await fetch._fetch(
-        ["https://blocked-domain.test/page", "https://ok.test"], config, registry
-    )
-
-    assert [p.source_id for p in pages] == ["S1", "S2"]
-    assert pages[0].outcome == "skipped"
-    assert pages[1].outcome == "fetched"
-    assert [c.url for c in fake_cls.calls] == ["https://ok.test"]
-    # Only ok.test's HEAD precheck fires — the skipped host never reaches it.
-    assert [str(r.url.host) for r in captured_requests] == ["ok.test"]
-
-
-async def test_an_expired_blocklist_entry_does_not_skip(install_crawler, make_config, tmp_path):
-    blocklist_path = str(tmp_path / "blocklist.json")
-    long_ago = datetime.now(UTC) - timedelta(days=31)
-    blocklist.record(blocklist_path, "expired-domain.test", 30, now=long_ago)
-    config = make_config(blocklist_path=blocklist_path, blocklist_ttl_days=30)
-    registry = SourceRegistry()
-    results = [
-        _FakeResult(
-            "https://expired-domain.test",
-            markdown=_FakeMarkdown(raw_markdown="fresh", fit_markdown="fresh"),
-        )
-    ]
-    fake_cls = install_crawler(results)
-
-    _, pages = await fetch._fetch(["https://expired-domain.test"], config, registry)
-
-    assert pages[0].outcome == "fetched"
-    assert len(fake_cls.calls) == 1

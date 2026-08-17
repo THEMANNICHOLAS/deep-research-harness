@@ -35,28 +35,3 @@ sentences each, append-only, newest last.
   whose only boundary is near the top now returns that much and says it was truncated; the
   no-boundary and boundary-at-0 cases still take the whole allowance. See
   @docs/plans/PLAN-crawler-refinement.md Reconciliation #3.
-
-- **Fetch is HTTP-first; Chromium is an escalation, and config keys now select the path.**
-  This reverses the previous entry above: crawl4ai's `AsyncHTTPCrawlerStrategy` is the
-  primary extraction path (no browser launched at all for an ordinary page), and a browser
-  crawler is constructed lazily only to re-fetch a page whose generated markdown reads like
-  a JS shell. `arun_many` and `MemoryAdaptiveDispatcher` are gone in favour of one deadlined
-  `arun()` per URL under our own semaphore and retry budget, which is what makes a hard
-  per-URL deadline possible — crawl4ai exposes none on the batch API. The cost is losing the
-  dispatcher's system-wide memory backpressure, so `fetch.browser_concurrency` is the only
-  thing bounding browser memory. See @docs/plans/PLAN-http-first-fetch.md D1-D3 and
-  @harness/tools/fetch.py.
-
-- **A 403/401 blocklists the whole domain for 30 days, persisted as hand-editable JSON.**
-  No database (the no-DB constraint), no file locking: a single small map written via
-  temp-file + `os.replace`, pruned on load, last-write-wins across concurrent writers because
-  a lost entry is simply re-learned on the next block. Both `load` and `record` degrade
-  instead of raising — the file is regenerable, so a malformed or unwritable one must never
-  fail a batch of fetches. The accepted risk is that a transient 403 locks a domain out for
-  the full TTL; the cheap fix if that bites is two strikes before recording, not a shorter
-  TTL. See @harness/blocklist.py and @docs/plans/PLAN-http-first-fetch.md D4.
-
-- **`max_subagents` is a declared bound with no runtime enforcement.** There is no agent
-  loop yet, so nothing counts or schedules subagents; the key exists so the loop, when
-  built, has a single validated place to honor. Rejected building enforcement now — no
-  caller, nothing to test against. See @docs/architecture.md `## Concurrency Bounds`.
