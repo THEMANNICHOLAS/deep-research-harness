@@ -236,7 +236,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Identity-model migration
-- [ ] Phase 2: Guard scanner core
+- [x] Phase 2: Guard scanner core
 - [ ] Phase 3: Firewall wiring in fetch and search
 - [ ] Phase 4: Strict URL provenance
 - [ ] Phase 5: Spotlighting, report hygiene, containment tests
@@ -337,7 +337,7 @@ signals and returns a block/pass verdict with the signals that fired.
 4. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `uv run mypy .` and `uv run ruff check .` clean with the new module
+- [x] `uv run mypy .` and `uv run ruff check .` clean with the new module
 
 ### Phase 3: Firewall wiring in fetch and search
 **Risk:** none
@@ -561,6 +561,16 @@ correction. Empty at plan creation. -->
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+### 2026-08-17 — Phase 2 review findings (deferred by developer: "I'll do at home")
+- **[Major, open]** harness/guard.py obfuscation char class includes U+200D (ZWJ) with no
+  firing fixture — breaches the phase's no-regex-without-fixture rule, and ZWJ is common in
+  benign content (compound emoji, Indic/Persian scripts), so it will false-positive once
+  Phase 3 wires the scan. Fix: delete the character or add a justifying fixture. MUST be
+  resolved before/with Phase 3.
+- **[Minor, open]** guard.py role_spoofing rule `^\s*\[?system\]?\s*:` (MULTILINE, brackets
+  optional) blocks benign "System: Ubuntu 22.04"-style lines. Within risk #1's accepted
+  breadth; watch the `guard_blocked` rate once Phase 3 makes it observable, tighten if noisy.
+
 ## Phase Handoff Log
 
 ### 2026-08-17 — Phase 1: Identity-model migration
@@ -568,6 +578,12 @@ Append-only, empty at plan creation. -->
 - Learned: report's `_is_usable` and verify's pooled-read still handle a registered source with a missing/unreadable capture — that path stays reachable via the `capture_write_failed` OSError branch, so Phase 3/5 must not assume "registered => file exists", only "file exists => real page text". Four tests beyond the plan's named list needed the same mechanical fix (PDF-batch/heading tests in test_fetch.py, one in test_fallback.py).
 - Drift: none.
 - Watch-next: Phase 2 is greenfield (`harness/guard.py` + fixtures); the Phase 3 contract "a capture file exists => content is real page text" is now the invariant to protect when wiring the scan.
+
+### 2026-08-17 — Phase 2: Guard scanner core
+- Done: `harness/guard.py` (`scan` -> `ScanResult`, five regex signal families) + `tests/test_guard.py` (11 tests) + `tests/fixtures/injection/` (11 attack, 3 benign fixtures with README provenance map). Full suite 449 green; all quality gates clean.
+- Learned: the benign security-blog fixture quoting override phrases IS blocked, asserted deliberately per R1's accepted-cost line — do not "fix" that test.
+- Drift: none. Two review findings deferred by the developer — see `## Discoveries` 2026-08-17: [Major] U+200D in the obfuscation class has no firing fixture and will FP on emoji/Indic pages (resolve before/with Phase 3); [Minor] role_spoofing matches bare "System: ..." lines.
+- Watch-next: resolve the ZWJ Major FIRST, then Phase 3 wires `scan` into `_fetch` per the frozen order scan -> classify -> mint -> sanitize -> capture -> render, plus `GuardSettings`/`[guard]` config and search-side scanning.
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so
