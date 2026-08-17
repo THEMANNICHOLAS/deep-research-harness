@@ -6,6 +6,10 @@
 # Secrets are never stored here — each provider names an environment variable
 # (see `.env.example`), resolved at load time.
 
+# The bound the agent loop must honor once it exists (R6/D6). Nothing enforces it today —
+# see docs/architecture.md for the worst-case fetch load it implies.
+max_subagents = 3
+
 [providers.opencode]
 base_url = "TODO"                    # TODO: OpenCode API base URL, e.g. https://<host>/v1
 api_key_env = "OPENCODE_API_KEY"
@@ -23,10 +27,17 @@ provider = "cerebras"
 model = "TODO"                       # TODO: Cerebras worker-model ID, e.g. gemma-4-31b
 
 [fetch]
-page_timeout_ms = 15000
-max_concurrency = 5
+http_concurrency = 10
+http_deadline_ms = 3000
+max_retries = 2
 per_page_char_cap = 12000
 max_urls_per_call = 5
+min_markdown_words = 50
+browser_deadline_ms = 20000
+browser_concurrency = 2
+downloads_dir = "workspace/downloads"
+blocklist_path = "workspace/blocklist.json"
+blocklist_ttl_days = 30
 
 [search]
 base_url = "http://localhost:8080"   # local dev instance — see searxng/docker-compose.yml
