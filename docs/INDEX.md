@@ -59,9 +59,9 @@
 | Lead agent | @harness/agent.py | `build_agent` — the deepagents lead, its backend, middleware and interrupts |
 | Source registry | @harness/sources.py | Per-run registry assigning `[Sn]` citation IDs to fetched pages; also the capture-file policy (`sources_dir`, `is_failed_capture`) shared by report/verify/tests |
 | Run log | @harness/runlog.py | `RunLog`/`Incident` — per-run degraded-coverage incidents, echoed live to the terminal and disclosed in the report's gaps section |
-| Paragraph unit | @harness/paragraphs.py | `Paragraph` / `split_paragraphs` / `strip_markers` — the one definition of a paragraph, shared by verification and rendering (D1) |
-| Claim verification | @harness/verify.py | `verify_paragraphs` — one pooled model call per paragraph, judging it against all its cited sources together |
-| Report assembly | @harness/report.py | `RunOutcome` + `write_report` — per-paragraph `Sources:`/`Verdict:` rendering, disclosure sections |
+| Paragraph unit | @harness/paragraphs.py | `Paragraph` / `split_paragraphs` / `strip_markers` / `renders_content` — the one definition of a paragraph and of "renders in `## Answer`", shared by verification and rendering (D1) |
+| Claim verification | @harness/verify.py | `verify_paragraphs` — one pooled model call per paragraph, judging it against all its cited sources together, plus the consolidated reviewer paragraph |
+| Report assembly | @harness/report.py | `RunOutcome` + `write_report` — numbered answer paragraphs, the reviewer paragraph under `## Sources`, disclosure sections |
 | Prompt loader | @harness/prompts.py | Loads/renders `harness/prompts/*.md` `$variable` templates |
 | Reader wiring | @harness/agent.py | `_reader_spec` — declares the `reader` `SubAgent`, nested one level under the researcher, never dispatched by the lead directly |
 | Researcher wiring | @harness/agent.py | `_researcher_spec` — declares the `researcher` `SubAgent`, the lead's only `subagents` entry; nests `_reader_spec` via `SubAgentMiddleware` and owns `search_web`/`fetch_raw` |

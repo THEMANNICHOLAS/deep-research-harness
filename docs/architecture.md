@@ -7,31 +7,34 @@ research question and writes one timestamped, cited markdown report. A single
 `deepagents` lead agent (@harness/agent.py) drives the substrate's tools over the
 head role, streaming its todo plan to the terminal; Python then verifies the
 draft's claims (@harness/verify.py) and assembles the report (@harness/report.py).
-Model roles are config-declared, never literal: `[roles.head]` plans, synthesizes
-and checks claims, `[roles.subagent]` is the cheap worker driving the wired reader
-tier.
+Model roles are config-declared, never literal: `[roles.head]` plans and
+synthesizes, `[roles.researcher]` researches one assigned angle, `[roles.reader]`
+digests fetched pages, and `[roles.verifier]` checks the draft's claims and writes
+the consolidated reviewer paragraph. All four are preflighted at startup
+(@harness/__main__.py `_PREFLIGHT_ROLES`).
 
 ## Agent Topology
 
-The reader tier is wired: the lead delegates page reading to a declared `reader`
-subagent through deepagents' own `task` tool, and `fetch_pages` lives only on the
-reader's toolset, never the lead's (@harness/agent.py, @harness/tools/__init__.py).
-The researcher tier remains only a frozen prompt contract —
-@harness/prompts/subagent.md — with nothing delegating to it yet; unlike the
-researcher, @harness/prompts/reader.md is now the reader's live system prompt.
-Each contract freezes the four fields a task must carry
-(objective, output format, tools, boundaries) and the three a tier must return
-(findings, source IDs, conflicts), so the tiers can be built without renegotiating
-the seam. Neither tier may ask the developer anything: clarification is the lead's
-alone, or a tier-3 reader would interrupt mid-fan-out. Both tiers must therefore be
-built with a filtered tool list rather than the lead's — @harness/tools/__init__.py
-always returns `search_web` and `ask_user`, and a deepagents subagent inherits the
-parent's tools unless given its own, which would silently produce a reader that can
-search and a tier that can interrupt the developer. The reader always receives
-the facet it is supporting, never a bare URL — a reader handed a URL without
-knowing why it mattered is the documented telephone-game failure. Delegation costs
-3-10x the tokens of a single agent and compounds per level, which is why the tiers
-wait for a measured baseline (the Phase 3 figure in docs/plans/PLAN-research-loop.md).
+Both delegation tiers are wired (three agent tiers total): the lead dispatches a
+declared `researcher` subagent through deepagents' own `task` tool, and each
+researcher dispatches a `reader` nested one level below it via a hand-built
+`SubAgentMiddleware` (@harness/agent.py — that manual nesting bypasses
+`create_deep_agent`'s auto-injected base middleware, which `_reader_spec` restores
+explicitly). Live system prompts: @harness/prompts/subagent.md (researcher) and
+@harness/prompts/reader.md. Tools split by tier (@harness/tools/__init__.py):
+the lead keeps only `ask_user`, the researcher gets `search_web` and `fetch_raw`
+(digest recovery belongs to whoever dispatches readers), and `fetch_pages` lives
+only on the reader's toolset. Each prompt contract freezes the four fields a task
+must carry (objective, output format, tools, boundaries) and the three a tier must
+return (findings, source IDs, conflicts), so the seam holds without renegotiation.
+Neither tier may ask the developer anything: clarification is the lead's alone, or
+a tier-3 reader would interrupt mid-fan-out — which is why each tier gets its own
+filtered tool list, since a deepagents subagent inherits the parent's tools unless
+given its own. The reader always receives the facet it is supporting, never a bare
+URL — a reader handed a URL without knowing why it mattered is the documented
+telephone-game failure. Delegation costs 3-10x the tokens of a single agent and
+compounds per level (baseline: the Phase 3 figure in
+docs/plans/PLAN-research-loop.md).
 
 Every run owns a `<workspace_dir>/<run_id>/` subdirectory — the agent's
 `FilesystemBackend` is rooted there, and its notes, captured sources and evicted
