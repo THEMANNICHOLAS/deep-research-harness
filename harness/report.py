@@ -16,7 +16,7 @@ from langchain_core.messages import UsageMetadata
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig, run_workspace_dir
-from harness.paragraphs import LIST_ITEM_RE, Paragraph, strip_markers
+from harness.paragraphs import LIST_ITEM_RE, Paragraph, renders_content, strip_markers
 from harness.runlog import Incident
 from harness.sources import Source, SourceRegistry, is_failed_capture, sources_dir
 from harness.verify import ParagraphVerdict, VerificationResult
@@ -195,7 +195,9 @@ def _sources_section(
     if reviewer_summary:
         if lines:
             lines.append("")
-        lines.append(reviewer_summary)
+        # Demoted like answer prose and workspace notes: the reviewer paragraph is
+        # model-authored too, and its prompt-level "no headings" instruction is not a guarantee.
+        lines.append(_demote_headings(reviewer_summary))
 
     return "\n".join(lines)
 
@@ -363,19 +365,30 @@ def _paragraph_block(paragraph: Paragraph, verdict: ParagraphVerdict | None) -> 
 
 
 def _answer_section(outcome: RunOutcome) -> str:
-    """Render every paragraph in `outcome.paragraphs`, in order.
+    """Render every paragraph in `outcome.paragraphs`, in order, each prefixed with its
+    paragraph number.
 
     Never re-splits `outcome.answer` (D2): `__main__.py` splits once and hands the list here.
-    An empty block (a citation-only paragraph strips to no visible text) is dropped from the
-    join entirely, not just left blank — joining it in would leave a stray blank paragraph
-    between its neighbors (3F review issue 2).
+    A paragraph that renders no content (a citation-only paragraph strips to no visible text)
+    is dropped entirely, not just left blank — joining it in would leave a stray blank
+    paragraph between its neighbors (3F review issue 2). Dropped AND numbered by
+    `renders_content`, the same shared test `verify.py`'s `_format_verdicts_block` counts by
+    (D1): the reviewer paragraph under `## Sources` names claims as "Paragraph N", and these
+    rendered numbers are what make that pointer resolvable without hand-counting.
     """
     verdicts = outcome.verification.verdicts if outcome.verification is not None else []
-    blocks = [
-        _paragraph_block(paragraph, verdicts[i] if i < len(verdicts) else None)
-        for i, paragraph in enumerate(outcome.paragraphs)
-    ]
-    return "\n\n".join(block for block in blocks if block)
+    blocks: list[str] = []
+    number = 0
+    for i, paragraph in enumerate(outcome.paragraphs):
+        if not renders_content(paragraph):
+            continue
+        number += 1
+        block = _paragraph_block(paragraph, verdicts[i] if i < len(verdicts) else None)
+        # A fence must open at the start of its own line, so the number sits as a separate
+        # paragraph above a code block; prose and lists absorb it into their first line.
+        separator = "\n\n" if paragraph.is_code else "\n"
+        blocks.append(f"**{number}.**{separator}{block}")
+    return "\n\n".join(blocks)
 
 
 def _conflicts_section(outcome: RunOutcome, verification: VerificationResult) -> str:

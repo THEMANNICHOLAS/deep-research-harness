@@ -632,8 +632,10 @@ def test_no_marker_or_markdown_link_ever_appears_inside_a_paragraphs_prose(make_
     body = write_report(outcome, config).read_text(encoding="utf-8")
     answer_section = _section(body, "## Answer")
 
-    # `_section` keeps the blank line after the heading, so the prose is the first non-empty line.
-    prose_line = next(line for line in answer_section.splitlines() if line.strip())
+    # The first non-empty line is the paragraph-number prefix; the prose follows it.
+    prose_line = next(
+        line for line in answer_section.splitlines() if line.strip() and line != "**1.**"
+    )
     assert prose_line == "The pump failed under load."
     assert "[S" not in prose_line
     assert "](" not in prose_line
@@ -665,7 +667,8 @@ def test_a_citation_only_paragraph_does_not_leave_a_blank_paragraph_gap(make_con
     answer_section = _section(body, "## Answer")
 
     assert "\n\n\n" not in answer_section
-    assert answer_section.strip() == "First paragraph.\n\nThird paragraph."
+    # The dropped paragraph takes no number either: its neighbors renumber as 1 and 2.
+    assert answer_section.strip() == "**1.**\nFirst paragraph.\n\n**2.**\nThird paragraph."
 
 
 # `test_sources_line_is_space_separated_deduped_first_appearance_order_before_verdict` is
@@ -881,6 +884,74 @@ def test_no_per_paragraph_sources_or_verdict_lines_and_reviewer_paragraph_under_
     assert "**Sources:**" not in answer_section
     assert "**Verdict:**" not in answer_section
     assert "One paragraph was checked and fully supported." in sources_section
+
+
+def test_answer_paragraphs_are_numbered_to_match_the_reviewer_paragraph(make_config):
+    """The reviewer paragraph names claims by paragraph number (`verify_summary.md`), so
+    `## Answer` must actually show those numbers — without them the number is a pointer the
+    reader can only resolve by hand-counting (PR review finding 4). Numbered by
+    `renders_content`, matching `_format_verdicts_block`: a citation-only paragraph renders
+    nothing and takes no number; a fenced code block takes one.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id)
+    answer = (
+        f"First finding [{source_id}].\n\n"
+        f"[{source_id}]\n\n"
+        f"Second finding [{source_id}].\n\n"
+        "```python\nprint('hi')\n```"
+    )
+    outcome = RunOutcome(
+        question="Numbered paragraphs",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=split_paragraphs(answer),
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    answer_section = _section(body, "## Answer")
+
+    assert "**1.**\nFirst finding." in answer_section
+    # The citation-only paragraph renders nothing, so the next visible paragraph is 2 — the
+    # same count `_format_verdicts_block` hands the reviewer model.
+    assert "**2.**\nSecond finding." in answer_section
+    assert "**3.**" in answer_section  # the code block counts too (renders_content is True)
+    assert "**4.**" not in answer_section
+
+
+def test_reviewer_summary_headings_are_demoted_under_sources(make_config):
+    """The reviewer paragraph is model-authored prose like answer paragraphs and workspace
+    notes, so its headings are demoted the same way — a model-written `# ` line must not
+    collide with the report's own title/section depths (PR review finding 5).
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id)
+    answer = f"Everything checks out [{source_id}]."
+    verification = VerificationResult(
+        verdicts=[
+            ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[source_id])
+        ],
+        reviewer_summary="# Review\n\nAll claims held up.",
+    )
+    outcome = RunOutcome(
+        question="Demoted reviewer heading",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=split_paragraphs(answer),
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    sources_section = _section(body, "## Sources")
+
+    assert "### Review" in sources_section
+    assert not any(line.startswith("# Review") for line in sources_section.splitlines())
 
 
 def test_a_none_reviewer_summary_renders_sources_exactly_as_before(make_config):
@@ -1110,7 +1181,7 @@ def test_write_report_a_hard_wrapped_paragraph_renders_as_one_clean_prose_block(
     # (`_answer_section`), so a real split shows up as a second entry here.
     blocks = [block.strip() for block in answer_section.split("\n\n") if block.strip()]
     assert len(blocks) == 1
-    assert blocks[0] == "The vendor quoted a price of\n$4.20 per unit."
+    assert blocks[0] == "**1.**\nThe vendor quoted a price of\n$4.20 per unit."
 
 
 # `test_a_paragraphs_verdict_binds_to_its_own_prose_not_the_next_paragraphs`,
@@ -1265,7 +1336,7 @@ def test_write_report_with_verification_none_and_no_registered_source_renders_pr
     body = write_report(outcome, config).read_text(encoding="utf-8")
     answer_section = _section(body, "## Answer")
 
-    assert answer_section.strip() == "Answer text with no citation at all."
+    assert answer_section.strip() == "**1.**\nAnswer text with no citation at all."
     assert "Verdict:" not in answer_section
     assert "Sources:" not in answer_section
 
