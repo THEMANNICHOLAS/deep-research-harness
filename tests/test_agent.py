@@ -1270,6 +1270,43 @@ async def test_main_exits_nonzero_when_a_dispatch_role_is_not_declared(
     assert role in captured.err
 
 
+async def test_a_model_error_from_build_agent_exits_cleanly(make_config, monkeypatch, capsys):
+    """A `ModelError` raised by `build_agent` itself — after preflight, under the live
+    renderer — must take the same `error:` + exit-1 path as a preflight failure, never a raw
+    traceback with the terminal left on the alternate screen (PR review finding 2).
+
+    Preflight is no-opped so the missing role survives to `build_agent`'s own
+    `build_chat_model` calls — the situation a preflight bug or role/preflight drift would
+    produce for real.
+    """
+    config = make_config()
+    broken = HarnessConfig(
+        providers=config.providers,
+        roles={name: spec for name, spec in config.roles.items() if name != "reader"},
+        fetch=config.fetch,
+        search=config.search,
+        agent=config.agent,
+    )
+    monkeypatch.setattr(main_module, "load_config", lambda: broken)
+
+    async def _noop_preflight(cfg, role):
+        return None
+
+    monkeypatch.setattr("harness.models.preflight", _noop_preflight)
+
+    async def _noop_search_preflight(cfg):
+        return None
+
+    monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
+
+    exit_code = await main_module.main(["a question"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "error:" in captured.err
+    assert "reader" in captured.err
+
+
 # --- Phase 5: round cap, wall clock, and cut-short reporting ---------------------------
 
 

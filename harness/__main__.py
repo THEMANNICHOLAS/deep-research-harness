@@ -296,7 +296,16 @@ async def main(argv: list[str] | None = None) -> int:
 
     registry = SourceRegistry(run_id=started_at.strftime("%Y-%m-%d-%H%M%S"))
     run_log = RunLog()
-    agent = build_agent(config, registry, run_log)
+    # Same close/print/exit-1 shape as the preflight loop above: `build_agent` resolves every
+    # role itself, so a role preflight missed (or a preflight/roles drift) raises HERE, under
+    # the live renderer — unhandled, that is a raw traceback onto the alternate screen with
+    # the terminal never restored.
+    try:
+        agent = build_agent(config, registry, run_log)
+    except ModelError as exc:
+        renderer.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     # Live disclosure (best-effort + disclose): every incident a tool records is echoed to
     # the terminal as soon as the stream yields control back, and `alerts_emitted` keeps a
