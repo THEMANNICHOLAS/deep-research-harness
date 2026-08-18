@@ -1149,6 +1149,65 @@ async def test_main_exits_nonzero_when_verifier_role_is_not_declared(
     assert "verifier" in captured.err
 
 
+@pytest.mark.parametrize("role", ["researcher", "reader"])
+async def test_main_exits_nonzero_when_a_dispatch_role_is_not_declared(
+    make_config, monkeypatch, capsys, role
+):
+    """Startup preflights `researcher` and `reader` alongside `head`/`verifier`: a config
+    missing either dispatch role fails the same clean ModelError path (error: + exit 1),
+    never a raw traceback after the TUI has taken the screen.
+
+    Same real-`preflight`/faked-transport shape as the `verifier` test above, and for the
+    same reason: `patch_run`/`patch_model` fake `build_chat_model` role-blind, which would
+    hide the very per-role check under test.
+    """
+    import harness.models as models_module
+
+    config = make_config()
+    broken = HarnessConfig(
+        providers=config.providers,
+        roles={name: spec for name, spec in config.roles.items() if name != role},
+        fetch=config.fetch,
+        search=config.search,
+        agent=config.agent,
+    )
+    monkeypatch.setattr(main_module, "load_config", lambda: broken)
+
+    real_chat_openai = models_module.ChatOpenAI
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "pong"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    def _factory(**kwargs: Any) -> Any:
+        kwargs["http_async_client"] = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+        return real_chat_openai(**kwargs)
+
+    monkeypatch.setattr(models_module, "ChatOpenAI", _factory)
+
+    exit_code = await main_module.main(["a question"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "error:" in captured.err
+    assert role in captured.err
+
+
 # --- Phase 5: round cap, wall clock, and cut-short reporting ---------------------------
 
 

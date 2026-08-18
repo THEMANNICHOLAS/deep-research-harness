@@ -1,6 +1,6 @@
 """CLI entrypoint: `python -m harness "<question>"`.
 
-Loads config, preflights the `head` and `verifier` roles before anything is spent (R6), builds
+Loads config, preflights every model role the run will call before anything is spent (R6), builds
 the agent, drives it while echoing todo-list progress (R10), and writes the report. The report
 path is the final line of stdout — frozen, because R1 depends on it. Nothing may print after it.
 
@@ -92,7 +92,7 @@ _SYNTHESIS_RECURSION_LIMIT = 10
 
 # Roles preflighted before any agent work, in the order they are checked. Adding a role to
 # the config means adding it here — nothing else in `main` knows the list.
-_PREFLIGHT_ROLES = ("head", "verifier")
+_PREFLIGHT_ROLES = ("head", "researcher", "reader", "verifier")
 
 # The runaway backstop's sizing, named alongside `_SYNTHESIS_RECURSION_LIMIT` rather than left
 # inline: both are recursion-limit safety margins and a tuning pass should find them together.
