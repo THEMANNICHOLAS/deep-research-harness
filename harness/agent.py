@@ -23,7 +23,11 @@ from deepagents import (
 from deepagents._models import get_model_identifier, get_model_provider
 from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.protocol import BackendProtocol
-from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from deepagents.middleware.summarization import (
+    SummarizationMiddleware,
+    create_summarization_middleware,
+)
 from langchain.agents.middleware import (
     AgentMiddleware,
     InterruptOnConfig,
@@ -231,22 +235,26 @@ def _reader_spec(
     cannot interrupt, so inheriting an ancestor's `ask_user` entry would register an interrupt
     that can never fire.
 
-    `middleware=[FilesystemMiddleware(backend=backend)]` restores the scratch workspace
-    `reader.md` promises (`write_file`/`read_file`/`edit_file`/`ls`/`glob`/`grep`): nesting the
-    reader via a hand-built `SubAgentMiddleware` (Step 3) bypasses `create_deep_agent`'s own
-    top-level `subagents=` path, which is the ONLY place that auto-injects a base middleware
-    stack (`graph.py`'s `FilesystemMiddleware(backend=backend, custom_tool_descriptions=...,
-    _permissions=...)` for each declared subagent) — a manually nested spec gets none of that
-    for free. Mirrors only the `backend` argument from that site: this harness never sets
+    `middleware` restores the base stack `create_deep_agent`'s top-level `subagents=` path
+    auto-injects for each declared subagent (`graph.py`): nesting the reader via a hand-built
+    `SubAgentMiddleware` (Step 3) bypasses that path, which is the ONLY place the injection
+    happens — a manually nested spec gets none of it for free. `FilesystemMiddleware` is the
+    scratch workspace `reader.md` promises (`write_file`/`read_file`/`edit_file`/`ls`/`glob`/
+    `grep`); mirrors only the `backend` argument from that site, since this harness never sets
     `tool_description_overrides` or per-subagent `permissions`, so the other two kwargs there
-    are always `None` and add nothing here.
+    are always `None` and add nothing here. `create_summarization_middleware` keeps a
+    large-page digest from dying mid-turn on context length (`per_page_char_cap` x
+    `max_urls_per_call` can put ~150k tokens into one `fetch_pages` result — previously evicted
+    automatically); `PatchToolCallsMiddleware` completes the mirrored stack.
     """
     # Explicitly typed, matching `_middleware`'s own convention: `FilesystemMiddleware`'s state
     # type param is fixed to `FilesystemState`, and an unannotated list literal here infers that
     # concrete type instead of the broad `AgentMiddleware[Any, Any, Any]` `SubAgent["middleware"]`
     # expects, which mypy then rejects as a list-item mismatch.
     reader_middleware: list[AgentMiddleware[Any, Any, Any]] = [
-        FilesystemMiddleware(backend=backend)
+        FilesystemMiddleware(backend=backend),
+        create_summarization_middleware(reader_model, backend),
+        PatchToolCallsMiddleware(),
     ]
     return SubAgent(
         name="reader",

@@ -259,10 +259,18 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
         max_urls_per_call=config.fetch.max_urls_per_call,
     )
     assert spec["tools"] is reader_tools
-    # Restores the scratch workspace `reader.md` promises — nesting via a hand-built
-    # `SubAgentMiddleware` (Step 3) does not auto-inject this the way `create_deep_agent`'s own
-    # top-level `subagents=` path does.
+    # Restores the FULL base stack `create_deep_agent`'s own top-level `subagents=` path
+    # auto-injects (graph.py) — nesting via a hand-built `SubAgentMiddleware` (Step 3) gets
+    # none of it for free: the scratch workspace `reader.md` promises, the summarizer that
+    # keeps a large-page digest from dying on context length (per_page_char_cap x
+    # max_urls_per_call can put ~150k tokens in one fetch_pages result), and the tool-call
+    # patcher (PR review finding 3).
+    from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+    from deepagents.middleware.summarization import SummarizationMiddleware
+
     assert any(isinstance(m, FilesystemMiddleware) for m in spec["middleware"])
+    assert any(isinstance(m, SummarizationMiddleware) for m in spec["middleware"])
+    assert any(isinstance(m, PatchToolCallsMiddleware) for m in spec["middleware"])
     # The reader has no checkpointer forwarded and cannot interrupt — inheriting the lead's
     # `ask_user` interrupt entry would register an interrupt that can never fire.
     assert "interrupt_on" not in spec
