@@ -29,6 +29,7 @@ from harness.report import (
     _ROUND_CAP_TEXT,
     _WALL_CLOCK_TEXT,
 )
+from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from tests.conftest import (
     ScriptedChatModel,
@@ -461,14 +462,19 @@ def build_researcher(make_config, tmp_path):
     from harness.agent import _reader_spec, _researcher_spec
     from harness.tools import build_tools
 
-    def _build(researcher_model: Any, reader_model: Any, registry: SourceRegistry | None = None):
+    def _build(
+        researcher_model: Any,
+        reader_model: Any,
+        registry: SourceRegistry | None = None,
+        run_log: RunLog | None = None,
+    ):
         config = make_config()
         registry = registry if registry is not None else SourceRegistry()
         backend = FilesystemBackend(root_dir=tmp_path / "workspace")
         tool_sets = build_tools(config, registry)
         reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
         researcher_spec = _researcher_spec(
-            config, researcher_model, tool_sets.researcher, reader_spec, backend, registry
+            config, researcher_model, tool_sets.researcher, reader_spec, backend, registry, run_log
         )
         return create_sub_agent(researcher_spec), registry
 
@@ -643,6 +649,62 @@ async def test_a_researcher_crash_becomes_an_error_task_message_after_one_retry(
     assert researcher_model._call_count == 2  # initial attempt + exactly one retry
     # The run continued past the failed dispatch onto the lead's next scripted turn.
     assert result["messages"][-1].content == "done despite the failed angle"
+
+
+async def test_a_researcher_crash_is_recorded_in_the_run_log(
+    make_config, patch_models_by_role, scripted_model
+):
+    """Best-effort + disclose: converting a crashed researcher dispatch into a
+    `RESEARCHER FAILED (...)` ToolMessage must also record a run-log incident — without it a
+    run whose every dispatch failed writes a report with `incidents=0` and the cause never
+    reaches `## Gaps and disclosures` (PR review finding 1)."""
+    from pydantic import SecretStr
+
+    head_model = scripted_model(
+        [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
+    )
+    researcher_model = _RaisingChatModel(
+        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    reader_model = scripted_model([AIMessage(content="unused")])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    run_log = RunLog()
+    graph = build_agent(make_config(), SourceRegistry(), run_log)
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    incidents = run_log.incidents()
+    assert any("RESEARCHER FAILED" in incident.detail for incident in incidents)
+    assert all(incident.kind == "subagent_failure" for incident in incidents)
+
+
+async def test_a_reader_crash_is_recorded_in_the_run_log(build_researcher, scripted_model):
+    """The reader tier's half of the same disclosure: a crashed reader dispatch (converted to
+    `READER FAILED (...)` by the researcher's own middleware) records an incident too — the
+    worse variant in the review was a dead reader under a live researcher, which produced a
+    normal-looking report while every reader dispatch failed."""
+    from pydantic import SecretStr
+
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = _RaisingChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    run_log = RunLog()
+    researcher, _ = build_researcher(researcher_model, reader_model, run_log=run_log)
+
+    await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    assert any("READER FAILED" in incident.detail for incident in run_log.incidents())
 
 
 async def test_lead_to_researcher_to_reader_digest_reaches_the_lead(

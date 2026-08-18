@@ -45,7 +45,7 @@ from langgraph.types import Command
 from harness import models
 from harness.config import HarnessConfig, run_workspace_dir
 from harness.prompts import render
-from harness.runlog import RunLog
+from harness.runlog import RunLog, or_default
 from harness.sources import SourceRegistry, pending_digest_scope
 from harness.tools import build_tools
 from harness.tools.ask_user import ASK_USER_TOOL_NAME
@@ -86,6 +86,50 @@ def _reader_failure_message(exc: Exception, request: ToolCallRequest) -> str | N
     # rather than raising a KeyError out of the error handler itself.
     subagent_type = str(request.tool_call["args"].get("subagent_type", "task"))
     return f"{subagent_type.upper()} FAILED ({type(exc).__name__}): {exc}"
+
+
+def _record_task_failure(run_log: RunLog) -> Callable[[Exception, ToolCallRequest], str | None]:
+    """`_reader_failure_message` plus disclosure: every dispatch converted to a `... FAILED`
+    ToolMessage also records a run-log incident, so a run whose dispatches all failed still
+    names the cause under `## Gaps and disclosures` instead of shipping `incidents=0` with an
+    empty answer. The propagate branch (`None`, Drift C) records nothing — the raised abort
+    reaches `__main__`'s hard-error path, which is its own disclosure."""
+
+    def _on_error(exc: Exception, request: ToolCallRequest) -> str | None:
+        message = _reader_failure_message(exc, request)
+        if message is not None:
+            run_log.record("subagent_failure", message)
+        return message
+
+    return _on_error
+
+
+def _task_dispatch_middleware(run_log: RunLog) -> list[AgentMiddleware[Any, Any, Any]]:
+    """The ToolError/ToolRetry pair guarding one tier's `task` dispatches (D2), shared by the
+    lead (`_middleware`) and the researcher (`_researcher_spec`) so the two sites cannot
+    drift apart.
+
+    `ToolErrorMiddleware` defined first (outermost) catches whatever exception exhausts
+    `ToolRetryMiddleware` (inner, `on_failure="error"` so the exhausted exception reaches the
+    outer catch rather than being swallowed into a "continue" message here) and converts it to
+    a `status="error"` ToolMessage, recording the incident. `max_retries=1`: retrying `task`
+    re-runs a whole subagent, so the budget already doubles at one retry. `initial_delay=0.0,
+    jitter=False`: this retry exists for subagent crashes, not transient network waits, so it
+    should be deterministic and test-fast rather than backed off. `retry_on` excludes
+    `SearchUnavailableError` (Drift C) so a mid-run search abort is not wastefully retried
+    through a whole subagent re-run before it reaches `_reader_failure_message`'s propagate
+    branch."""
+    return [
+        ToolErrorMiddleware(on_error=_record_task_failure(run_log), tools=["task"]),
+        ToolRetryMiddleware(
+            max_retries=1,
+            tools=["task"],
+            on_failure="error",
+            initial_delay=0.0,
+            jitter=False,
+            retry_on=_retry_on_non_search_abort,
+        ),
+    ]
 
 
 def _retry_on_non_search_abort(exc: Exception) -> bool:
@@ -228,6 +272,7 @@ def _researcher_spec(
     reader_spec: SubAgent,
     backend: BackendProtocol,
     registry: SourceRegistry,
+    run_log: RunLog | None = None,
 ) -> SubAgent:
     """Build the declared `researcher` `SubAgent` spec (Step 3): the lead's only route to
     `search_web` and (through its own nested `reader` declaration) page reading.
@@ -235,10 +280,9 @@ def _researcher_spec(
     `interrupt_on` is deliberately left unset (D6): interrupts are pinned off below the lead —
     a nested researcher has no checkpointer forwarded and cannot interrupt.
 
-    `middleware` is the task-scoped tail of `_middleware` RELOCATED here, same objects/args,
-    new owner: `SubAgentMiddleware` nests the reader tier under THIS researcher's own `task`
-    tool; the ToolError/ToolRetry pair guards a crashed (or aborted, Drift C) reader dispatch,
-    the same shape as the lead's own guard on dispatching a researcher; and
+    `middleware`: `SubAgentMiddleware` nests the reader tier under THIS researcher's own `task`
+    tool; `_task_dispatch_middleware` guards a crashed (or aborted, Drift C) reader dispatch,
+    the same shared pair as the lead's own guard on dispatching a researcher; and
     `_ReaderDigestMiddleware` marks a source `digested` only when a reader's digest actually
     reaches this researcher (R7's mechanism moved, not broken).
     """
@@ -257,15 +301,7 @@ def _researcher_spec(
         tools=researcher_tools,
         middleware=[
             SubAgentMiddleware(backend=backend, subagents=[reader_spec]),
-            ToolErrorMiddleware(on_error=_reader_failure_message, tools=["task"]),
-            ToolRetryMiddleware(
-                max_retries=1,
-                tools=["task"],
-                on_failure="error",
-                initial_delay=0.0,
-                jitter=False,
-                retry_on=_retry_on_non_search_abort,
-            ),
+            *_task_dispatch_middleware(or_default(run_log)),
             _ReaderDigestMiddleware(registry),
         ],
     )
@@ -284,6 +320,10 @@ def build_agent(
     `run_log` collects the tools' degraded-coverage incidents; the caller shares one instance
     between this agent and the report so disclosure sees everything (best-effort + disclose).
     """
+    # Resolved once, up front: the tools, the lead's dispatch guard, and the researcher's all
+    # share the one instance (a tool recording into a private log is an incident nobody sees).
+    run_log = or_default(run_log)
+
     model = models.build_chat_model(config, "head")
     _register_no_shell_profile(model)
 
@@ -308,7 +348,7 @@ def build_agent(
 
     reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
     researcher_spec = _researcher_spec(
-        config, researcher_model, tool_sets.researcher, reader_spec, backend, registry
+        config, researcher_model, tool_sets.researcher, reader_spec, backend, registry, run_log
     )
 
     return create_deep_agent(
@@ -322,7 +362,7 @@ def build_agent(
         permissions=[
             FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="allow")
         ],
-        middleware=_middleware(model, backend),
+        middleware=_middleware(model, backend, run_log),
         subagents=[researcher_spec],
         # One saver per call, holding this run's thread. In-memory keeps the no-database
         # invariant (D5): no durable, cross-invocation checkpointing.
@@ -331,7 +371,9 @@ def build_agent(
     )
 
 
-def _middleware(model: Any, backend: BackendProtocol) -> list[AgentMiddleware[Any, Any, Any]]:
+def _middleware(
+    model: Any, backend: BackendProtocol, run_log: RunLog
+) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build the middleware list with an explicit, broad element type.
 
     Without the annotation mypy unifies the element type from the first entry and rejects the
@@ -343,32 +385,15 @@ def _middleware(model: Any, backend: BackendProtocol) -> list[AgentMiddleware[An
     issues a destructive `RemoveMessage(REMOVE_ALL_MESSAGES)` with no recovery path for a
     dropped `[Sn]`-to-finding association, which D7/R3/R7 depend on.
 
-    The last two entries (D2) scope to the `task` tool only, and now guard the LEAD's dispatch
-    of a RESEARCHER (Step 3 relocated `_ReaderDigestMiddleware` down onto the researcher's own
-    middleware, since its subject — a reader's digest — is nested one level deeper here):
-    `ToolErrorMiddleware` defined first (outermost) catches whatever exception exhausts
-    `ToolRetryMiddleware` (inner, `on_failure="error"` so the exhausted exception reaches the
-    outer catch rather than being swallowed into a "continue" message here) and converts it to
-    a `status="error"` ToolMessage. `max_retries=1`: retrying `task` re-runs the whole
-    researcher subagent, so the budget already doubles at one retry. `initial_delay=0.0,
-    jitter=False`: this retry exists for researcher crashes, not transient network waits, so it
-    should be deterministic and test-fast rather than backed off. `retry_on` excludes
-    `SearchUnavailableError` (Drift C) so a mid-run search abort is not wastefully retried
-    through a whole researcher re-run before it reaches `_reader_failure_message`'s propagate
-    branch.
+    `_task_dispatch_middleware` here guards the LEAD's dispatch of a RESEARCHER (Step 3
+    relocated `_ReaderDigestMiddleware` down onto the researcher's own middleware, since its
+    subject — a reader's digest — is nested one level deeper); see its docstring for the
+    retry/error semantics shared with the researcher tier.
     """
     return [
         TodoListMiddleware(),
         SummarizationMiddleware(
             model=model, backend=backend, trigger=_SUMMARIZATION_TRIGGER, keep=_SUMMARIZATION_KEEP
         ),
-        ToolErrorMiddleware(on_error=_reader_failure_message, tools=["task"]),
-        ToolRetryMiddleware(
-            max_retries=1,
-            tools=["task"],
-            on_failure="error",
-            initial_delay=0.0,
-            jitter=False,
-            retry_on=_retry_on_non_search_abort,
-        ),
+        *_task_dispatch_middleware(run_log),
     ]
