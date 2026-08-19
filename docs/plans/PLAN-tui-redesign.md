@@ -1,6 +1,6 @@
 # PLAN: TUI Redesign
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-17
 **Type:** Single plan
 
@@ -230,7 +230,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R7 | Modern truecolor terminals | Final verification (manual, WezTerm) |
 
 ## Progress
-- [ ] Phase 1: Raw-key input foundation
+- [x] Phase 1: Raw-key input foundation
 - [ ] Phase 2: Welcome screen and slash commands
 - [ ] Phase 3: Running pane — task meta, stage round/elapsed, structured tool log
 - [ ] Phase 4: Finished summary — inline report path
@@ -275,7 +275,7 @@ beyond the contract (Home/End/Delete/history are not in any R).
    existing coverage posture — see `## Notes`) and `LineBuffer`.
 3. Run the tests; confirm they PASS (green).
 **Acceptance criteria:**
-- [ ] `uv run mypy .` clean on the new module.
+- [x] `uv run mypy .` clean on the new module.
 
 ### Phase 2: Welcome screen and slash commands
 **Risk:** flagged (!#2)
@@ -547,6 +547,53 @@ reader tier gets a strip, per the mockup).
 
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution. Append-only. -->
+- 2026-08-19 — Phase 1: `## Notes`' coverage-policy line says Phase 1's `# pragma: no
+  cover` "match[es] how the repo already treats similarly thin I/O". It does not — a
+  repo-wide grep finds ZERO `pragma` occurrences in `harness/` and no
+  `[tool.coverage.report] exclude_lines` in `pyproject.toml`. Phase 1 introduces the
+  FIRST pragma in the codebase. The directive itself is unchanged and was followed as
+  written (inline pragma + one-line reason, no coverage-config `omit`, no broad
+  exclusion); only the "already exists" justification was false. Noted so a later phase
+  does not cite Phase 1's pragma as long-standing precedent.
+- 2026-08-19 — Phase 1 review, DEFERRED to Phases 2/5: `read_keys()` is a bare
+  generator, so tty restore runs in its `finally` only when the consumer closes the
+  iterator (loop exit or GC). A consumer that parks the iterator on an object and keeps
+  running leaves the terminal raw — exactly risk #1's failure mode, left as a consumer
+  obligation rather than made structurally impossible. Deferred deliberately: the plan's
+  own risk #1 mitigation assigns terminal-restore proof to Phases 2 and 5's Ctrl+C
+  acceptance checks. Preferred fix when Phase 2 wires it: wrap `read_keys` in a
+  `contextlib.contextmanager` so raw mode is scoped by `with`, not by GC.
+- 2026-08-19 — Phase 1 review, SIMPLIFY (deferred, behavior-changing): `read_keys`'
+  POSIX branch builds a per-keystroke `pending` list and a nested `read_char` closure
+  purely so the loop can peek for EOF before decoding. Now that both decoders return
+  `None` on `""`, the loop could pass `sys.stdin.read(1)` directly and drop the closure —
+  but only if the loop no longer needs to distinguish "EOF, stop iterating" from "ignore
+  this key", which today it does. Not mechanical; revisit if Phase 2's contextmanager
+  rework touches this loop anyway.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each phase gate. Append-only. MUST remain the LAST section. -->
+
+### 2026-08-19 — Phase 1: Raw-key input foundation
+- Done: New `harness/input.py` (`KeyEvent`/`KeyKind`, `decode_posix`, `decode_windows`,
+  `read_keys`, `LineBuffer`) and `tests/test_input.py` (42 tests, three parametrized
+  tables). Contracts landed exactly as pinned. Both decoders return `None` on the `""`
+  EOF sentinel — a review fix applied before commit, since Phases 2 and 5 call them
+  directly. 554 tests pass; ruff/format/mypy clean; `harness/input.py` at 91%, package
+  total 97% against CI's 90% floor.
+- Learned: (1) The stale-worktree warning in `## Notes` is RESOLVED — commit `de4c18f`
+  merged `development` in, and `git diff development -- harness/` is empty, so this
+  worktree is a valid implementation base after all. (2) `uv` cannot create a `.venv`
+  inside this worktree — Windows Application Control blocks it. Every `uv` command must
+  run with `UV_PROJECT_ENVIRONMENT=C:/Users/sting/Documents/ai-harness-fun-project/.venv`
+  (developer-approved 2026-08-19); brief every implementation subagent with this or its
+  first command fails. (3) `harness/` uses frozen dataclasses + `Literal` aliases, never
+  pydantic, for small value types; tests use tuple-form `@pytest.mark.parametrize`.
+- Drift: none. Two `## Discoveries` entries logged (false pragma precedent in `## Notes`;
+  deferred `read_keys` teardown + simplify).
+- Watch-next: Phase 2 wires `read_keys()` for the first time. Wrap it in a
+  `contextlib.contextmanager` so raw-mode restore is scoped by `with` rather than by the
+  consumer closing the generator — that is the deferred half of risk #1, and Phase 2's
+  Ctrl+C acceptance check is where it must be proven. Also: Phase 2's `harness.toml`
+  `choices` list of 19 model display names is marked UNCONFIRMED in the plan and must be
+  confirmed with the developer before implementing, not invented.
