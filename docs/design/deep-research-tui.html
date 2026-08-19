@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>deep-research — TUI design spec</title>
+<style>
+  :root{
+    /* Tokens read off opencode_main_screen.png (welcome chrome) and
+       Screenshot-2026-08-15-135624.png (the harness's live render). */
+    --bg:#0a0a0a;              /* opencode canvas — near-black, not #000 */
+    --surface:#1c1c1c;         /* input box fill */
+    --surface-2:#141414;
+    --fg:#e8e8e8;              /* "code" white in the wordmark, hint keys */
+    --fg-2:#c8ccd1;            /* panel border, spinner row */
+    --dim:#8a8f96;             /* placeholder, hint labels */
+    --muted:#6a6f76;           /* status bar, timings */
+    --wordmark-back:#7a7a7a;   /* "open" gray half of the lockup */
+    --border:#242424;
+    --rule:#4a4f55;            /* the grey50 Rule in display.py */
+    --accent:#4a7fd8;          /* input left bar + mode label blue */
+    --accent-2:#6b8cff;        /* bright_blue: the in-progress task */
+    --pending:#474747;         /* pending tasks, grayed back (was display.py's #207d99) */
+    --ok:#3fd15a;              /* [x] green as rendered */
+    --warn:#d9a33a;            /* warning lines + the tip dot */
+    --cyan:#56b6c2;            /* ask_user panel border */
+    --mono:"JetBrains Mono","SFMono-Regular","SF Mono",ui-monospace,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{background:#050505}
+  body{
+    background:#050505;color:var(--fg);font-family:var(--mono);
+    font-size:13.5px;line-height:1.55;min-height:100vh;
+    padding:24px 18px 52px;-webkit-font-smoothing:antialiased;
+  }
+
+  /* ---------- spec chrome (mock navigation only) ---------- */
+  .spec{max-width:1180px;margin:0 auto}
+  .spec-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  .spec-head h1{font-size:14px;font-weight:600;letter-spacing:0.02em}
+  .spec-head .sub{font-size:11.5px;color:var(--muted);letter-spacing:0.01em}
+  .spec-note{font-size:11.5px;color:var(--muted);max-width:80ch;margin:6px 0 16px}
+  .spec-note b{color:var(--dim);font-weight:500}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+  .tab{
+    font-family:var(--mono);font-size:11.5px;letter-spacing:0.02em;
+    background:transparent;color:var(--muted);
+    border:1px solid var(--border);border-radius:4px;padding:5px 10px;
+    cursor:pointer;transition:all .13s ease;
+  }
+  .tab:hover{color:var(--fg);border-color:var(--rule);background:var(--surface-2)}
+  .tab[aria-selected="true"]{color:#0a0a0a;background:var(--accent);border-color:var(--accent);font-weight:600}
+  .tab .k{opacity:.62;margin-right:6px}
+
+  /* ---------- terminal window ---------- */
+  .term{
+    background:var(--bg);border:1px solid #1a1a1a;border-radius:8px;
+    box-shadow:0 26px 64px -22px rgba(0,0,0,.9);overflow:hidden;
+  }
+  .titlebar{
+    display:flex;align-items:center;gap:8px;padding:8px 13px;
+    background:#2b2b2b;border-bottom:1px solid #1a1a1a;position:relative;
+  }
+  .dot{width:10px;height:10px;border-radius:50%}
+  .dot.r{background:#e05c4e}.dot.y{background:#dfa53c}.dot.g{background:#43c04a}
+  .titlebar .name{
+    position:absolute;left:0;right:0;text-align:center;
+    font-size:11.5px;font-weight:600;color:#d8d8d8;letter-spacing:0.01em;pointer-events:none;
+  }
+  .titlebar .badge{
+    margin-left:auto;z-index:1;font-size:9.5px;letter-spacing:0.09em;text-transform:uppercase;
+    color:var(--muted);border:1px solid #3a3a3a;border-radius:3px;padding:1px 6px;
+  }
+  .screen{display:none;min-height:600px;flex-direction:column}
+  .screen.active{display:flex}
+
+  /* ---------- shared primitives ---------- */
+  .rule{height:1px;background:var(--rule);opacity:.5;margin:12px 0}
+  .dimtext{color:var(--dim)}.muted{color:var(--muted)}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.acc{color:var(--accent)}.cy{color:var(--cyan)}
+  .caret{display:inline-block;width:8px;height:15px;background:var(--fg);vertical-align:-3px;animation:blink 1.06s step-end infinite}
+  @keyframes blink{50%{opacity:0}}
+
+  /* ═══════════ 1 · WELCOME — opencode composition ═══════════ */
+  #screen-welcome{padding:0;justify-content:space-between}
+  .welcome-stage{
+    flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    padding:56px 24px 20px;
+  }
+  .wordmark{display:flex;gap:1.4ch;margin-bottom:40px;line-height:1.02}
+  .wordmark pre{font-size:19px;letter-spacing:-0.02em}
+  .wordmark .back{color:var(--wordmark-back)}
+  .wordmark .front{color:var(--fg)}
+
+  .entry{width:min(760px,100%)}
+  .inputbox{
+    background:var(--surface);border-left:2px solid var(--accent);
+    padding:16px 20px 14px;display:flex;flex-direction:column;gap:14px;
+  }
+  .inputbox .askrow{color:var(--dim);font-size:14px}
+  .inputbox .askrow .cursor{background:var(--fg);color:var(--bg)}
+  .inputbox .askrow .example{color:var(--muted)}
+  .inputbox .moderow{font-size:13.5px;display:flex;gap:.9ch;flex-wrap:wrap}
+  .inputbox .moderow .mode{color:var(--accent)}
+  .inputbox .moderow .sep{color:var(--muted)}
+  .inputbox .moderow .model{color:var(--fg)}
+  .inputbox .moderow .prov{color:var(--muted)}
+
+  .hints{display:flex;gap:2.2ch;margin-top:12px;font-size:13px;flex-wrap:wrap}
+  .hints .key{color:var(--fg)}
+  .hints .lbl{color:var(--muted);margin-left:.7ch}
+
+  .roles-line{
+    margin-top:10px;font-size:12.5px;color:var(--muted);display:flex;gap:1.6ch;flex-wrap:wrap;
+  }
+  .roles-line .r{color:var(--dim)}
+
+  .tip{margin-top:52px;font-size:13.5px;color:var(--muted);text-align:center}
+  .tip .dot-i{color:var(--warn)}
+  .tip .word{color:var(--warn)}
+  .tip .cmd{color:var(--fg)}
+
+  .statusbar{
+    display:flex;justify-content:space-between;gap:16px;
+    padding:14px 24px 16px;font-size:12.5px;color:var(--muted);
+  }
+
+  /* ═══════════ running / fan-out ═══════════ */
+  .pane{padding:14px 18px 12px;display:flex;flex-direction:column;flex:1}
+  .tasks-head{color:var(--accent-2);font-weight:600;margin-bottom:2px}
+  .task{display:flex;gap:1ch;padding-left:2ch}
+  .task .mark{flex:none;width:3ch}
+  .task.done .mark{color:var(--ok)}
+  .task.done .content{color:var(--fg)}
+  .task.now{color:var(--accent-2);font-weight:600}
+  .task.now .mark{width:1ch}
+  .task.todo{color:var(--pending)}
+  .task .content{flex:1}
+  .task .meta{color:var(--muted);font-size:11.5px;flex:none}
+
+  .panel{border:1px solid var(--fg-2);padding:8px 12px 10px}
+  .panel.cyan{border-color:var(--cyan)}
+  .alert{color:var(--warn);padding-left:1ch;word-break:break-all}
+  .stage-line{display:flex;align-items:baseline;gap:1ch;margin:2px 0 3px;color:var(--fg)}
+  .stage-line .spin{color:var(--fg-2);width:1ch;flex:none}
+  .stage-line .elapsed{margin-left:auto;color:var(--muted);font-size:11.5px}
+  .timeline{padding-left:1ch;margin-bottom:4px}
+  .tl{display:flex;gap:1ch}
+  .tl .mark{color:var(--ok);flex:none}
+  .tl .t{color:var(--muted);font-size:11.5px}
+
+  .log{display:flex;flex-direction:column;padding-left:2ch}
+  .call{display:flex;gap:1ch;align-items:baseline}
+  .call .tool{color:var(--fg);flex:none}
+  .call .arg{color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .call.retry .tool,.call.retry .arg{color:var(--warn)}
+  .call .res{color:var(--muted);font-size:11.5px;flex:none}
+  .call.live .res{color:var(--fg-2)}
+
+  .footer-hint{margin-top:auto;padding-top:12px;color:var(--dim);display:flex;gap:2.4ch;flex-wrap:wrap}
+
+  /* reader strip — pinned live rows between the stage line and the log.
+     Present only while `task` calls are open; absent otherwise. */
+  .readers{display:flex;flex-direction:column;padding-left:2ch;margin-bottom:2px}
+  .reader{display:flex;gap:1ch;align-items:baseline}
+  .reader .tree{color:var(--rule);flex:none}
+  .reader .id{color:var(--accent-2);flex:none;min-width:9ch}
+  .reader.done .id{color:var(--ok)}
+  .reader .brief{color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .reader .st{color:var(--muted);font-size:11.5px;flex:none}
+  .reader.done .st{color:var(--muted)}
+  .reader.live .st{color:var(--fg-2)}
+
+  /* scrollback screens */
+  .scroll{padding:14px 18px 12px;display:flex;flex-direction:column;flex:1}
+  .shell{display:flex;gap:1ch}
+  .shell .ps{color:var(--ok);flex:none}
+  .blank{height:11px}
+  .summary-head{color:var(--fg);font-weight:600}
+  .summary-line{color:var(--dim);padding-left:2ch}
+  .summary-line .v{color:var(--fg)}
+  .reportpath{margin-top:11px;border-left:2px solid var(--accent);padding:1px 0 1px 12px;color:var(--dim)}
+  .reportpath .p{color:var(--accent);word-break:break-all}
+  .answer-line{display:flex;gap:1ch;margin-top:9px}
+  .answer-line .ps{color:var(--cyan);flex:none}
+
+  /* ask_user overlay - covers the log region inside the same frame, then retracts */
+  .stagewrap{position:relative}
+  .emptylog{min-height:8.4em}
+  .askoverlay{
+    position:absolute;left:0;right:0;top:0;
+    background:var(--bg);
+    opacity:0;transform:translateY(-5px);pointer-events:none;
+    transition:opacity .16s ease, transform .16s ease;
+  }
+  .askoverlay.open{opacity:1;transform:none;pointer-events:auto}
+  .askoverlay.retracting{opacity:0;transform:translateY(-5px)}
+  .panel-title{
+    display:inline-block;position:relative;top:-16px;left:2px;background:var(--bg);
+    padding:0 6px;font-size:10.5px;letter-spacing:0.09em;text-transform:uppercase;
+    color:var(--cyan);margin-bottom:-12px;
+  }
+
+  @media (max-width:860px){
+    .reader .brief{display:none}
+    .reader .id{min-width:8ch}
+    .wordmark pre{font-size:11px}
+    body{padding:14px 8px 36px}
+  }
+</style>
+</head>
+<body>
+<div class="spec" data-od-id="spec-root">
+
+  <header class="spec-head" data-od-id="spec-header">
+    <h1>deep-research — TUI design spec</h1>
+    <span class="sub">rich 15.0.0 · Live(screen=True) · harness/display.py</span>
+  </header>
+  <p class="spec-note" data-od-id="spec-note">
+    Palette read off your two references: <b>opencode_main_screen.png</b> for the welcome chrome
+    (near-black canvas, split gray/white wordmark, left-bar input, amber tip, status bar) and
+    <b>Screenshot-2026-08-15-135624.png</b> for the live render (green <b>[x]</b>, bright-blue
+    current task, light-gray panel border, yellow <b>[S14]</b> warnings). Screens 2 and 3 are the
+    <b>same screen</b> — reader delegation is a sub-state of <b>researching</b>, so the reader
+    strip appears between the stage line and the log while <b>task</b> calls are open, and
+    vanishes when they close. Screens 4 and 5 sit on the <b>normal</b> buffer — the Live is
+    stopped before either paints.
+  </p>
+
+  <nav class="tabs" role="tablist" aria-label="Screens" data-od-id="screen-tabs">
+    <button class="tab" role="tab" aria-selected="true"  data-screen="welcome"   data-od-id="tab-welcome"><span class="k">1</span>welcome</button>
+    <button class="tab" role="tab" aria-selected="false" data-screen="running"   data-od-id="tab-running"><span class="k">2</span>running · head only</button>
+    <button class="tab" role="tab" aria-selected="false" data-screen="subagents" data-od-id="tab-subagents"><span class="k">3</span>running · readers in flight</button>
+    <button class="tab" role="tab" aria-selected="false" data-screen="question"  data-od-id="tab-question"><span class="k">4</span>question</button>
+    <button class="tab" role="tab" aria-selected="false" data-screen="finished"  data-od-id="tab-finished"><span class="k">5</span>finished</button>
+  </nav>
+
+  <div class="term" data-od-id="terminal-window">
+    <div class="titlebar" data-od-id="terminal-titlebar">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="name">deep-research</span>
+      <span class="badge" id="buffer-badge">alt screen</span>
+    </div>
+
+    <!-- ═══════════════════ 1 · WELCOME ═══════════════════ -->
+    <section class="screen active" id="screen-welcome" data-od-id="screen-welcome">
+      <div class="welcome-stage">
+
+        <div class="wordmark" data-od-id="wordmark" aria-label="deep-research">
+<pre class="back">█▀▄ █▀▀ █▀▀ █▀█
+█▄▀ ██▄ ██▄ █▀▀</pre>
+<pre class="front">█▀█ █▀▀ █▀ █▀▀ ▄▀█ █▀█ █▀▀ █ █
+█▀▄ ██▄ ▄█ ██▄ █▀█ █▀▄ █▄▄ █▀█</pre>
+        </div>
+
+        <div class="entry" data-od-id="question-input">
+          <div class="inputbox">
+            <div class="askrow">
+              <span class="cursor">A</span><span>sk anything&#8230;</span>
+              <span class="example">&nbsp;"How does DeepSeek V4 Pro price long-context runs?"</span>
+            </div>
+            <div class="moderow">
+              <span class="mode">Research</span>
+              <span class="sep">·</span>
+              <span class="model">deepseek-v4-pro</span>
+            </div>
+          </div>
+
+          <div class="hints" data-od-id="welcome-hints">
+            <span><span class="key">enter</span><span class="lbl">run</span></span>
+            <span><span class="key">/</span><span class="lbl">commands</span></span>
+            <span><span class="key">ctrl+j</span><span class="lbl">newline</span></span>
+            <span><span class="key">ctrl+c</span><span class="lbl">exit</span></span>
+          </div>
+
+          <div class="roles-line" data-od-id="model-roles">
+            <span><span class="r">subagent</span> gpt-5.6-luna</span>
+            <span>·</span>
+            <span><span class="r">verifier</span> gpt-5.6-luna</span>
+            <span>·</span>
+            <span><span class="r">budget</span> 50 rounds / 30 min</span>
+          </div>
+        </div>
+
+        <div class="tip" data-od-id="welcome-tip">
+          <span class="dot-i">&#9679;</span> <span class="word">Tip</span>
+          Run <span class="cmd">/sources</span> to see what the last run captured
+        </div>
+      </div>
+
+      <div class="statusbar" data-od-id="welcome-statusbar">
+        <span>~/deep-research:searxng@localhost:8080</span>
+        <span>0.1.0</span>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ 2 · RUNNING ═══════════════════ -->
+    <section class="screen" id="screen-running" data-od-id="screen-running">
+      <div class="pane">
+        <div class="tasks-head" data-od-id="tasks-heading">Tasks</div>
+        <div data-od-id="task-list">
+          <div class="task done"><span class="mark">[x]</span><span class="content">Search literature on token-usage efficiency techniques</span></div>
+          <div class="task done"><span class="mark">[x]</span><span class="content">Search literature on output quality levers</span></div>
+          <div class="task done"><span class="mark">[x]</span><span class="content">Search literature on current state of AI engineering</span></div>
+          <div class="task done"><span class="mark">[x]</span><span class="content">Delegate page reading to reader subagents for the strongest sources</span></div>
+          <div class="task now"><span class="mark">&gt;</span><span class="content">Synthesize findings into a cited final answer</span><span class="meta">14 sources</span></div>
+          <div class="task todo"><span class="mark">[ ]</span><span class="content">Verify every numeric claim against its source</span></div>
+        </div>
+
+        <div class="rule"></div>
+
+        <div class="panel" data-od-id="activity-panel">
+          <div class="alert" data-od-id="alert-s14">warning: [S14] https://builder.aws.com/content/3FRlppwY0rOsApCRxEksJP0s6hX/the-token-efficiency-playbook: non_html &mdash; status 200</div>
+          <div class="alert" data-od-id="alert-s28">warning: [S28] https://raw.githubusercontent.com/ai-boost/awesome-harness-engineering/main/README.md: non_html &mdash; status 200</div>
+
+          <div class="timeline" data-od-id="stage-timeline">
+            <div class="tl"><span class="mark">ok</span><span>clarifying</span><span class="t">(11.4s)</span></div>
+          </div>
+
+          <div class="stage-line">
+            <span class="spin">&#9679;</span><span>researching</span>
+            <span class="elapsed">04:12 · round 9/50</span>
+          </div>
+
+          <div class="log" data-od-id="tool-log">
+            <div class="call"><span class="tool">search_web:</span><span class="arg">"building efficient AI agent harness token efficiency quality"</span><span class="res">12 results · 1.4s</span></div>
+            <div class="call"><span class="tool">search_web:</span><span class="arg">"model routing cascading small large models cost quality LLM inference"</span><span class="res">9 results · 2.0s</span></div>
+            <div class="call"><span class="tool">fetch_pages:</span><span class="arg">anthropic.com/engineering/context-management +2</span><span class="res">3 ok · 4.1s</span></div>
+            <div class="call retry"><span class="tool">search_web:</span><span class="arg">"LLM evaluation evals agent evaluation quality production"</span><span class="res">timeout · retry 1/2</span></div>
+            <div class="call"><span class="tool">search_web:</span><span class="arg">"LLM evaluation evals agent evaluation quality production"</span><span class="res">11 results · 2.3s</span></div>
+            <div class="call"><span class="tool">fetch_raw:</span><span class="arg">builder.aws.com/content/3FRlppwY0rOsApCRxEksJP0s6hX &mdash; non_html</span><span class="res">1 ok · 0.9s</span></div>
+            <div class="call"><span class="tool">write_file:</span><span class="arg">sources/2f41/S28.md</span><span class="res">7.4 kB</span></div>
+            <div class="call live"><span class="tool">fetch_pages:</span><span class="arg">"LLM context compaction summarization agent memory techniques"</span><span class="res">running&#8230;</span></div>
+          </div>
+        </div>
+
+        <div class="footer-hint" data-od-id="running-hints">
+          <span>Ctrl+C to exit</span>
+          <span class="muted">run 2f41 · 14 usable · 2 unusable</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3 - QUESTION -->
+    <!-- Same frame as `running - head only`. The run has just started: the agent wrote its
+         plan and called ask_user before any tool ran, so the log is empty. The panel briefly
+         covers the log region, takes the answer, then retracts and the first call lands. -->
+    <section class="screen" id="screen-question" data-od-id="screen-question">
+      <div class="pane">
+        <div class="tasks-head" data-od-id="question-tasks-heading">Tasks</div>
+        <div data-od-id="question-task-list">
+          <div class="task now"><span class="mark">&gt;</span><span class="content">Clarify scope before spending the search budget</span></div>
+          <div class="task todo"><span class="mark">[ ]</span><span class="content">Search literature on token-usage efficiency techniques</span></div>
+          <div class="task todo"><span class="mark">[ ]</span><span class="content">Delegate page reading to reader subagents for the strongest sources</span></div>
+          <div class="task todo"><span class="mark">[ ]</span><span class="content">Synthesize findings into a cited final answer</span></div>
+        </div>
+
+        <div class="rule"></div>
+
+        <div class="stagewrap" data-od-id="question-stage">
+          <div class="panel" data-od-id="activity-panel-question">
+            <div class="timeline" id="q-timeline" hidden>
+              <div class="tl"><span class="mark">ok</span><span>clarifying</span><span class="t">(18.6s)</span></div>
+            </div>
+            <div class="stage-line">
+              <span class="spin">&#9679;</span><span id="q-stage">clarifying</span>
+              <span class="elapsed" id="q-elapsed">00:08 &middot; round 1/50</span>
+            </div>
+            <div class="log emptylog" id="q-log" data-od-id="tool-log-question"></div>
+          </div>
+
+          <div class="askoverlay" id="ask-overlay" data-od-id="ask-user-overlay">
+            <div class="panel cyan">
+              <span class="panel-title">ask_user</span>
+              <div style="margin-bottom:7px">You asked to compare DeepSeek V4 Pro and GPT-5.6 Luna on cost. Two readings change the whole search plan:</div>
+              <div style="padding-left:2ch;color:var(--dim)">
+                <div><span class="cy">a)</span> Sticker price per 1M tokens, input and output, from the providers' own pages.</div>
+                <div><span class="cy">b)</span> Effective cost for <span style="color:var(--fg)">your</span> workload &mdash; 200k-context runs with cache hits, which needs benchmark data and a stated hit rate.</div>
+              </div>
+              <div style="margin-top:7px">Which should I price, or both?</div>
+              <div class="answer-line" data-od-id="answer-prompt">
+                <span class="ps">answer &gt;</span>
+                <span>both, but lead with (b)<span class="caret" style="background:var(--cyan)"></span></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="footer-hint" data-od-id="question-hints">
+          <span id="q-hint">Enter to submit</span>
+          <span>Ctrl+C to exit</span>
+          <span class="muted" id="q-note">stage clock paused while the agent waits</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ 4 · FAN-OUT ═══════════════════ -->
+    <section class="screen" id="screen-subagents" data-od-id="screen-subagents">
+      <div class="pane">
+        <div class="tasks-head" data-od-id="fanout-heading">Tasks</div>
+        <div data-od-id="fanout-task-list">
+          <div class="task done"><span class="mark">[x]</span><span class="content">Search literature on token-usage efficiency techniques</span></div>
+          <div class="task now"><span class="mark">&gt;</span><span class="content">Delegate page reading to reader subagents for the strongest sources</span><span class="meta">3 in flight</span></div>
+          <div class="task todo"><span class="mark">[ ]</span><span class="content">Merge findings, resolve contradictions</span></div>
+          <div class="task todo"><span class="mark">[ ]</span><span class="content">Synthesize findings into a cited final answer</span></div>
+        </div>
+
+        <div class="rule"></div>
+
+        <div class="panel" data-od-id="activity-panel-readers">
+          <div class="alert" data-od-id="alert-s14-readers">warning: [S14] https://builder.aws.com/content/3FRlppwY0rOsApCRxEksJP0s6hX/the-token-efficiency-playbook: non_html &mdash; status 200</div>
+
+          <div class="timeline" data-od-id="stage-timeline-readers">
+            <div class="tl"><span class="mark">ok</span><span>clarifying</span><span class="t">(11.4s)</span></div>
+          </div>
+
+          <div class="stage-line">
+            <span class="spin">&#9679;</span><span>researching</span>
+            <span class="elapsed">02:47 · round 5/50 · waiting on 2 readers</span>
+          </div>
+
+          <div class="readers" data-od-id="reader-strip">
+            <div class="reader done"><span class="tree">&#9500;</span><span class="id">reader/1</span><span class="brief">Anthropic + OpenAI engineering posts on context management</span><span class="st">done · 4 sources · 38s</span></div>
+            <div class="reader live"><span class="tree">&#9500;</span><span class="id">reader/2</span><span class="brief">Routing and cascading: cost/quality tradeoff evidence</span><span class="st">fetch_pages &middot; 12s</span></div>
+            <div class="reader live"><span class="tree">&#9492;</span><span class="id">reader/3</span><span class="brief">Eval practice: what production teams actually measure</span><span class="st">fetch_pages &middot; 9s</span></div>
+          </div>
+
+          <div class="log" data-od-id="tool-log-readers">
+            <div class="call"><span class="tool">search_web:</span><span class="arg">"LLM context compaction summarization agent memory techniques"</span><span class="res">11 results · 2.3s</span></div>
+            <div class="call"><span class="tool">task:</span><span class="arg">reader/1 &mdash; context management posts</span><span class="res">returned · 9 findings</span></div>
+            <div class="call"><span class="tool">write_file:</span><span class="arg">sources/2f41/S4..S7.md</span><span class="res">21.8 kB</span></div>
+            <div class="call live"><span class="tool">task:</span><span class="arg">reader/2, reader/3 &mdash; dispatched in parallel</span><span class="res">running&#8230;</span></div>
+          </div>
+        </div>
+
+        <div class="footer-hint" data-od-id="fanout-hints">
+          <span>Ctrl+C to exit</span>
+          <span class="muted">run 2f41 · 17 sources captured</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ 5 · FINISHED ═══════════════════ -->
+    <section class="screen" id="screen-finished" data-od-id="screen-finished">
+      <div class="scroll" data-od-id="finished-scrollback">
+        <div class="shell"><span class="ps">~/deep-research $</span><span>python -m harness</span></div>
+        <div class="blank"></div>
+        <div class="summary-head">summary:</div>
+        <div class="summary-line">clarifying <span class="v">11.4s</span></div>
+        <div class="summary-line">researching <span class="v">247.9s</span></div>
+        <div class="summary-line">verifying <span class="v">63.2s</span></div>
+        <div class="summary-line">writing <span class="v">41.8s</span></div>
+        <div class="summary-line">sources: <span class="v">14 usable</span>, 3 unusable</div>
+        <div class="summary-line">verification failures: <span class="v">1</span></div>
+        <div class="summary-line">tool failures: <span class="v">2</span></div>
+
+        <div class="reportpath" data-od-id="report-path">
+          report written<br>
+          <span class="p">~/deep-research/reports/2f41-token-efficiency-and-quality.md</span>
+        </div>
+
+        <div class="blank"></div>
+        <div class="dimtext">&nbsp;&nbsp;1 claim could not be verified and is flagged inline; 2 tool failures are listed under
+        <span style="color:var(--fg)">## Gaps and disclosures</span>.</div>
+        <div class="blank"></div>
+        <div class="shell"><span class="ps">~/deep-research $</span><span class="caret" style="background:var(--ok)"></span></div>
+
+        <div class="footer-hint" data-od-id="finished-hints">
+          <span class="muted">alternate screen released &mdash; summary stays in scrollback</span>
+        </div>
+      </div>
+    </section>
+
+  </div><!-- /.term -->
+</div>
+
+<script>
+(function(){
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.tab'));
+  var badge = document.getElementById('buffer-badge');
+  var NORMAL = {finished:true};
+
+  function show(name){
+    tabs.forEach(function(t){ t.setAttribute('aria-selected', String(t.dataset.screen === name)); });
+    Array.prototype.forEach.call(document.querySelectorAll('.screen'), function(s){
+      s.classList.toggle('active', s.id === 'screen-' + name);
+    });
+    badge.textContent = NORMAL[name] ? 'normal screen' : 'alt screen';
+    try { localStorage.setItem('dr-tui-screen', name); } catch(e){}
+  }
+
+  tabs.forEach(function(t){ t.addEventListener('click', function(){ show(t.dataset.screen); }); });
+
+  document.addEventListener('keydown', function(e){
+    var i = parseInt(e.key, 10);
+    if (i >= 1 && i <= tabs.length) show(tabs[i-1].dataset.screen);
+  });
+
+  /* ---- ask_user overlay choreography ---- */
+  var overlay  = document.getElementById('ask-overlay');
+  var qLog     = document.getElementById('q-log');
+  var qStage   = document.getElementById('q-stage');
+  var qElapsed = document.getElementById('q-elapsed');
+  var qTimeline= document.getElementById('q-timeline');
+  var qHint    = document.getElementById('q-hint');
+  var qNote    = document.getElementById('q-note');
+  var timers = [], answered = false;
+
+  function clearTimers(){ timers.forEach(clearTimeout); timers = []; }
+  function later(fn, ms){ timers.push(setTimeout(fn, ms)); }
+
+  function logLine(tool, arg, res, live){
+    var row = document.createElement('div');
+    row.className = 'call' + (live ? ' live' : '');
+    row.innerHTML = '<span class="tool"></span><span class="arg"></span><span class="res"></span>';
+    row.children[0].textContent = tool;
+    row.children[1].textContent = arg;
+    row.children[2].textContent = res;
+    qLog.appendChild(row);
+  }
+
+  function resetQuestion(){
+    clearTimers();
+    answered = false;
+    overlay.className = 'askoverlay';
+    qLog.innerHTML = '';
+    qStage.textContent = 'clarifying';
+    qElapsed.textContent = '00:08 \u00b7 round 1/50';
+    qTimeline.hidden = true;
+    qHint.textContent = 'Enter to submit';
+    qNote.textContent = 'stage clock paused while the agent waits';
+    later(function(){ overlay.classList.add('open'); }, 750);
+  }
+
+  function submitAnswer(){
+    if (answered || !overlay.classList.contains('open')) return;
+    answered = true;
+    overlay.classList.remove('open');
+    overlay.classList.add('retracting');
+    qHint.textContent = 'Ctrl+C to exit';
+    qNote.textContent = 'answer accepted \u2014 stage clock resumed';
+    later(function(){
+      logLine('ask_user:', '"sticker price vs effective cost"', 'answered \u00b7 6.2s');
+    }, 260);
+    later(function(){
+      qTimeline.hidden = false;
+      qStage.textContent = 'researching';
+      qElapsed.textContent = '00:31 \u00b7 round 2/50';
+      logLine('search_web:', '"LLM long-context pricing cache hit economics"', 'running\u2026', true);
+    }, 900);
+  }
+
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Enter') submitAnswer();
+  });
+  overlay.addEventListener('click', submitAnswer);
+
+  var _show = show;
+  show = function(name){
+    _show(name);
+    if (name === 'question') resetQuestion(); else clearTimers();
+  };
+  tabs.forEach(function(t){
+    t.addEventListener('click', function(){
+      if (t.dataset.screen === 'question') resetQuestion();
+    });
+  });
+
+  var saved;
+  try { saved = localStorage.getItem('dr-tui-screen'); } catch(e){}
+  show(saved && document.getElementById('screen-' + saved) ? saved : 'welcome');
+})();
+</script>
+</body>
+</html>
