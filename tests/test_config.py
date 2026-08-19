@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.config import ConfigError, load_config
+from harness.config import ConfigError, GuardSettings, load_config
 
 VALID_TOML = """
 [providers.opencode]
@@ -19,7 +19,7 @@ api_key_env = "CEREBRAS_API_KEY"
 provider = "opencode"
 model = "glm-5.2"
 
-[roles.subagent]
+[roles.researcher]
 provider = "cerebras"
 model = "gemma-4-31b"
 
@@ -32,6 +32,7 @@ max_urls_per_call = 3
 [search]
 base_url = "http://localhost:8080"
 default_max_results = 7
+max_consecutive_failures = 4
 """
 
 MINIMAL_TOML = """
@@ -47,7 +48,7 @@ api_key_env = "CEREBRAS_API_KEY"
 provider = "opencode"
 model = "glm-5.2"
 
-[roles.subagent]
+[roles.researcher]
 provider = "cerebras"
 model = "gemma-4-31b"
 
@@ -77,8 +78,8 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
 
     assert config.roles["head"].provider == "opencode"
     assert config.roles["head"].model == "glm-5.2"
-    assert config.roles["subagent"].provider == "cerebras"
-    assert config.roles["subagent"].model == "gemma-4-31b"
+    assert config.roles["researcher"].provider == "cerebras"
+    assert config.roles["researcher"].model == "gemma-4-31b"
 
     assert config.fetch.page_timeout_ms == 20000
     assert config.fetch.max_concurrency == 8
@@ -87,6 +88,7 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
 
     assert config.search.base_url == "http://localhost:8080"
     assert config.search.default_max_results == 7
+    assert config.search.max_consecutive_failures == 4
 
 
 def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
@@ -98,9 +100,10 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
 
     assert config.fetch.page_timeout_ms == 15000
     assert config.fetch.max_concurrency == 5
-    assert config.fetch.per_page_char_cap == 12000
+    assert config.fetch.per_page_char_cap == 120000
     assert config.fetch.max_urls_per_call == 5
     assert config.search.default_max_results == 10
+    assert config.search.max_consecutive_failures == 3
 
 
 def test_missing_env_var_raises_config_error_naming_variable(tmp_path, monkeypatch):
@@ -118,8 +121,8 @@ def test_role_referencing_undeclared_provider_names_role_and_provider(tmp_path, 
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
     toml_content = VALID_TOML.replace(
-        '[roles.subagent]\nprovider = "cerebras"',
-        '[roles.subagent]\nprovider = "nonexistent"',
+        '[roles.researcher]\nprovider = "cerebras"',
+        '[roles.researcher]\nprovider = "nonexistent"',
     )
     path = _write(tmp_path, toml_content)
 
@@ -127,7 +130,7 @@ def test_role_referencing_undeclared_provider_names_role_and_provider(tmp_path, 
         load_config(path)
 
     message = str(excinfo.value)
-    assert "subagent" in message
+    assert "researcher" in message
     assert "nonexistent" in message
 
 
@@ -146,15 +149,15 @@ def test_missing_toml_file_raises_config_error_not_oserror(tmp_path):
 
 
 def test_missing_section_error_names_the_offending_field(tmp_path, monkeypatch):
-    """R7: a missing setting must be identifiable from the message alone.
-
-    Pydantic's bare `msg` is "Field required" with no field name; the loc path is what
-    makes it actionable.
+    """R7: a missing setting must be identifiable from the message alone, and pydantic's bare `msg`
+    is "Field required" with no field name — the `loc` path is what makes it actionable.
     """
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
     toml_content = VALID_TOML.replace(
-        '[search]\nbase_url = "http://localhost:8080"\ndefault_max_results = 7\n', ""
+        '[search]\nbase_url = "http://localhost:8080"\ndefault_max_results = 7\n'
+        "max_consecutive_failures = 4\n",
+        "",
     )
     path = _write(tmp_path, toml_content)
 
@@ -183,6 +186,7 @@ def test_typo_in_key_error_names_the_offending_key(tmp_path, monkeypatch):
         ("max_concurrency", -1),
         ("per_page_char_cap", 0),
         ("max_urls_per_call", 0),
+        ("max_consecutive_failures", 0),
     ],
 )
 def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_value):
@@ -193,6 +197,7 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
         "max_concurrency": 8,
         "per_page_char_cap": 9000,
         "max_urls_per_call": 3,
+        "max_consecutive_failures": 4,
     }
     toml_content = VALID_TOML.replace(
         f"{setting} = {original[setting]}", f"{setting} = {bad_value}"
@@ -238,7 +243,7 @@ def test_literal_api_key_in_the_file_is_rejected(tmp_path, monkeypatch):
             "roles",
             [
                 '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\n\n',
-                '[roles.subagent]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n',
+                '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n',
             ],
         ),
     ],
@@ -260,19 +265,24 @@ def test_missing_top_level_table_raises_config_error_naming_it(
     assert section in str(excinfo.value)
 
 
-def test_shipped_harness_toml_loads_with_its_todo_placeholders(monkeypatch):
-    """Deliberate, disclosed gap: literal "TODO" endpoint/model IDs are well-formed
-    strings, so the checked-in harness.toml loads while nothing reads those values.
-    Validation moves to startup when the agent loop first consumes them — see
-    docs/backlog.md. This test keeps the gap visible instead of accidental.
+def test_shipped_harness_toml_loads_with_no_todo_placeholders_left(monkeypatch):
+    """Literal "TODO" values are well-formed strings `load_config` accepts, so nothing but this
+    test stops one from being reintroduced into the checked-in config; `build_chat_model` rejects a
+    `TODO` handed to it at runtime, and this guards the file itself.
+
+    Checks shape, not the endpoint/model in use: pinning those deployment facts would fail on a
+    legitimate swap, against the config-swappable invariant.
     """
     monkeypatch.setenv("OPENCODE_API_KEY", "any")
-    monkeypatch.setenv("CEREBRAS_API_KEY", "any")
 
     config = load_config()
 
-    assert config.providers["opencode"].base_url == "TODO"
-    assert config.roles["head"].model == "TODO"
+    assert config.providers["opencode"].base_url.startswith("https://")
+    assert config.roles["head"].model != ""
+    offenders = [
+        f"providers.{name}.base_url" for name, p in config.providers.items() if p.base_url == "TODO"
+    ] + [f"roles.{name}.model" for name, r in config.roles.items() if r.model == "TODO"]
+    assert offenders == []
 
 
 def test_shipped_harness_toml_has_no_browser_surface(monkeypatch):
@@ -286,11 +296,10 @@ def test_shipped_harness_toml_has_no_browser_surface(monkeypatch):
 
 
 def test_browser_table_is_rejected_now_that_the_backend_is_gone(tmp_path, monkeypatch):
-    # Proves the key is genuinely GONE rather than merely unread — a config still
-    # carrying it now fails loudly instead of being silently ignored.
+    # The key is genuinely GONE rather than merely unread: a config still carrying it fails loudly.
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
-    # Models a config file written before the backend was removed and never updated.
+    # A config file written before the backend was removed and never updated.
     toml_content = VALID_TOML.replace("[fetch]", '[browser]\nbackend = "playwright"\n\n[fetch]')
     path = _write(tmp_path, toml_content)
 
@@ -314,15 +323,164 @@ def test_missing_head_role_raises_config_error_naming_head(tmp_path, monkeypatch
     assert "head" in str(excinfo.value)
 
 
-def test_missing_subagent_role_raises_config_error_naming_subagent(tmp_path, monkeypatch):
+def test_missing_researcher_role_still_loads(tmp_path, monkeypatch):
+    """`head` is the only role required at LOAD time: a config missing `[roles.researcher]`
+    (or `reader`/`verifier`) loads fine and fails loud later, at build/preflight, via
+    `ModelError` naming the role. Pins the relaxation so a future tightening of
+    `_cross_check_roles` is a deliberate edit, not an accident.
+    """
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
     toml_content = VALID_TOML.replace(
-        '[roles.subagent]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n', ""
+        '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n', ""
+    )
+    assert toml_content != VALID_TOML, "fixture drifted from VALID_TOML — update the block"
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert "researcher" not in config.roles
+    assert "head" in config.roles
+
+
+def test_agent_section_loads_declared_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = (
+        VALID_TOML
+        + """
+[agent]
+max_rounds = 12
+wall_clock_seconds = 600
+workspace_dir = "custom-workspace"
+reports_dir = "custom-reports"
+max_retries = 4
+request_timeout_seconds = 30.0
+"""
+    )
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.agent.max_rounds == 12
+    assert config.agent.wall_clock_seconds == 600
+    assert config.agent.workspace_dir == Path("custom-workspace")
+    assert config.agent.reports_dir == Path("custom-reports")
+    assert config.agent.max_retries == 4
+    assert config.agent.request_timeout_seconds == 30.0
+
+
+def test_agent_section_omitted_falls_back_to_documented_defaults(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+
+    config = load_config(path)
+
+    assert config.agent.max_rounds == 50
+    assert config.agent.wall_clock_seconds == 1800
+    assert config.agent.workspace_dir == Path.home() / "deep-research" / "workspace"
+    assert config.agent.reports_dir == Path.home() / "deep-research" / "reports"
+    assert config.agent.max_retries == 2
+    assert config.agent.request_timeout_seconds == 120.0
+
+
+def test_agent_section_rejects_unknown_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = (
+        VALID_TOML
+        + """
+[agent]
+max_rounds = 12
+typo_key = "oops"
+"""
     )
     path = _write(tmp_path, toml_content)
 
     with pytest.raises(ConfigError) as excinfo:
         load_config(path)
 
-    assert "subagent" in str(excinfo.value)
+    assert "typo_key" in str(excinfo.value)
+
+
+def test_dotenv_beside_the_toml_supplies_a_missing_api_key(tmp_path, monkeypatch):
+    """Keys live in `.env`, never in `harness.toml` — so loading it is part of loading config."""
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+    (tmp_path / ".env").write_text(
+        "# a comment\n\nOPENCODE_API_KEY=from-dotenv\nMALFORMED_NO_EQUALS\n", encoding="utf-8"
+    )
+
+    config = load_config(path)
+
+    assert config.providers["opencode"].api_key == "from-dotenv"
+
+
+def test_a_real_env_var_wins_over_the_same_key_in_dotenv(tmp_path, monkeypatch):
+    """Standard dotenv precedence: the file fills gaps, it never overrides the environment.
+
+    Flipping this would let a stale checked-out `.env` silently outrank the key an operator
+    exported for one run.
+    """
+    monkeypatch.setenv("OPENCODE_API_KEY", "from-environment")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+    (tmp_path / ".env").write_text("OPENCODE_API_KEY=from-dotenv\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.providers["opencode"].api_key == "from-environment"
+
+
+# --- Phase 3: GuardSettings / [guard] ---------------------------------------------------
+
+
+def test_guard_defaults_to_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+
+    config = load_config(path)
+
+    assert config.guard.enabled is True
+
+
+def test_guard_section_is_parsed_from_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + "\n[guard]\nenabled = false\n"
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.guard.enabled is False
+
+
+def test_guard_section_rejects_unknown_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + '\n[guard]\nenabled = true\ntypo_key = "oops"\n'
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "typo_key" in str(excinfo.value)
+
+
+def test_guard_settings_model_defaults_enabled():
+    assert GuardSettings().enabled is True
+
+
+def test_dotenv_value_containing_an_equals_sign_survives_intact(tmp_path, monkeypatch):
+    """Split on the FIRST `=` only — base64 and URL-shaped secrets routinely contain more."""
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+    (tmp_path / ".env").write_text("OPENCODE_API_KEY=abc==def=\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.providers["opencode"].api_key == "abc==def="

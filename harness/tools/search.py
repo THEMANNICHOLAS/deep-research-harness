@@ -1,8 +1,9 @@
 """Query the self-hosted SearXNG JSON API and return normalized results.
 
-Any failure to reach SearXNG, a non-200 response, or a malformed body is surfaced as a
-typed `SearchFailure` rather than an exception, so a dead search backend shows up as data
-for the model to reason about instead of an exception that would sink the whole tool call.
+An unreachable backend, a non-200, or a malformed body all surface as a typed
+`SearchFailure` rather than an exception — rendered for the model AND recorded on the
+run's `RunLog`, so a dead search backend reaches the terminal and the report's
+`## Gaps and disclosures` instead of living only in prose the model may not repeat.
 """
 
 from typing import Literal
@@ -12,6 +13,9 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.config import HarnessConfig
+from harness.guard import fence, guard_blocked_detail, scan
+from harness.runlog import RunLog, or_default
+from harness.sources import SourceRegistry
 
 
 class SearchResult(BaseModel):
@@ -34,25 +38,32 @@ class SearchFailure(BaseModel):
     detail: str
 
 
-def _parse_results(payload: dict, max_results: int) -> list[SearchResult] | SearchFailure:
+def _parse_results(
+    payload: dict, max_results: int
+) -> tuple[list[SearchResult] | SearchFailure, int]:
     """Extract and normalize the `results` array, slicing to `max_results` after parsing.
 
-    Skips any entry that is not a dict, has no truthy `url`, or carries a wrong-typed
-    field — one engine emitting a non-string value must degrade to a skipped entry, not
-    an exception out of the tool call. `raw.get(key) or ""` maps both `None` and missing
-    keys to `""`, matching the frozen `str` fields (`engine` is declared `str | None`
-    upstream in SearXNG).
+    Skips any entry that is not a dict, lacks a truthy `url`, or is wrong-typed: one engine
+    emitting a non-string degrades to a skipped entry, not an exception. `raw.get(key) or ""`
+    maps `None` and missing keys alike to `""`, matching the frozen `str` fields (SearXNG
+    declares `engine` as `str | None`).
+
+    The second element counts the skipped entries: a partially broken engine reads as fewer
+    results, and without the count that thinning is silent (best-effort + disclose).
     """
     raw_results = payload.get("results")
     if not isinstance(raw_results, list):
-        return SearchFailure(reason="malformed", detail="response body has no 'results' list")
+        return SearchFailure(reason="malformed", detail="response body has no 'results' list"), 0
 
     results: list[SearchResult] = []
+    dropped = 0
     for raw in raw_results:
         if not isinstance(raw, dict):
+            dropped += 1
             continue
         url = raw.get("url") or ""
         if not url:
+            dropped += 1
             continue
         try:
             results.append(
@@ -64,59 +75,202 @@ def _parse_results(payload: dict, max_results: int) -> list[SearchResult] | Sear
                 )
             )
         except ValidationError:
+            dropped += 1
             continue
 
-    return results[:max_results]
+    return results[:max_results], dropped
 
 
-def _render(query: str, outcome: list[SearchResult] | SearchFailure) -> str:
-    """Render the model-facing content: a numbered list, a no-results line, or a failure."""
+def _drop_guarded(
+    results: list[SearchResult], config: HarnessConfig, run_log: RunLog
+) -> list[SearchResult]:
+    """Scan each result's title+snippet, dropping any that fire the guard (R1).
+
+    Runs after parsing, before `_render`: a blocked result is excluded from both the
+    rendered content and the returned artifact, with one `guard_blocked` incident each.
+    """
+    if not config.guard.enabled:
+        return results
+
+    survivors: list[SearchResult] = []
+    for result in results:
+        scan_result = scan(f"{result.title}\n{result.snippet}")
+        if scan_result.blocked:
+            run_log.record("guard_blocked", guard_blocked_detail(result.url, scan_result.signals))
+        else:
+            survivors.append(result)
+    return survivors
+
+
+def _approve_survivors(results: list[SearchResult], registry: SourceRegistry) -> None:
+    """Approve every survivor's URL for fetching (Phase 4, R2).
+
+    Only the guard's survivors: a blocked result (`_drop_guarded`) never reaches here, so a
+    guard-blocked URL stays unfetchable even if pasted into a later `fetch_pages` call.
+    """
+    for result in results:
+        registry.approve(result.url)
+
+
+def _render(query: str, outcome: list[SearchResult] | SearchFailure, guard_blocked: int = 0) -> str:
+    """Render the model-facing content: a numbered list, a no-results line, or a failure.
+
+    Titles/snippets are untrusted content (Phase 5, D1 spotlighting): the whole results listing
+    is fenced with `harness.guard.fence` as one block, with the header line kept outside it.
+
+    `guard_blocked` distinguishes "nothing existed" from "everything was withheld": an
+    all-blocked search must not render identically to a genuinely empty one, or the model
+    (and an operator reading the transcript) retries a query that actually had answers.
+    """
     if isinstance(outcome, SearchFailure):
         return f'Search for "{query}" failed: {outcome.reason} — {outcome.detail}'
     if not outcome:
+        if guard_blocked:
+            noun = "result" if guard_blocked == 1 else "results"
+            return (
+                f'Search for "{query}" returned {guard_blocked} {noun}, all withheld by the '
+                "injection guard."
+            )
         return f'Search for "{query}" returned no results.'
 
-    lines = [f'Results for "{query}":']
-    for index, result in enumerate(outcome, start=1):
-        lines.append(f"{index}. {result.title} — {result.url}\n   {result.snippet}")
-    return "\n".join(lines)
+    result_lines = [
+        f"{index}. {result.title} — {result.url}\n   {result.snippet}"
+        for index, result in enumerate(outcome, start=1)
+    ]
+    listing = "\n".join(result_lines)
+    return f'Results for "{query}":\n\n{fence(listing)}'
 
 
-async def _search(
-    query: str, max_results: int, config: HarnessConfig
-) -> tuple[str, list[SearchResult] | SearchFailure]:
-    """Query SearXNG, returning model-facing content and the typed result/failure."""
-    url = f"{config.search.base_url.rstrip('/')}/search"
+def _search_url(config: HarnessConfig) -> str:
+    return f"{config.search.base_url.rstrip('/')}/search"
+
+
+async def _fetch_search_json(query: str, config: HarnessConfig) -> object | SearchFailure:
+    """GET the SearXNG JSON endpoint and parse the body, or return the typed failure.
+
+    The single place the request is made: `_search` and `preflight_search` both go through
+    it, so a change to how SearXNG is called (timeout, headers, TLS) lands in both at once.
+    A bare `httpx.AsyncClient()` so `install_search_transport` swaps it in tests.
+    """
+    url = _search_url(config)
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, params={"q": query, "format": "json"})
     except httpx.RequestError as exc:
-        outcome: list[SearchResult] | SearchFailure = SearchFailure(
-            reason="unreachable", detail=f"{type(exc).__name__}: {exc}"
-        )
-        return _render(query, outcome), outcome
+        return SearchFailure(reason="unreachable", detail=f"{type(exc).__name__}: {exc}")
 
     if response.status_code != 200:
-        outcome = SearchFailure(reason="bad_status", detail=f"HTTP {response.status_code}")
-        return _render(query, outcome), outcome
+        return SearchFailure(reason="bad_status", detail=f"HTTP {response.status_code}")
 
     try:
-        payload = response.json()
+        return response.json()
     except ValueError as exc:
-        outcome = SearchFailure(reason="malformed", detail=f"response body is not JSON: {exc}")
-        return _render(query, outcome), outcome
-
-    if not isinstance(payload, dict):
-        detail = f"response body is not an object (got {type(payload).__name__})"
-        outcome = SearchFailure(reason="malformed", detail=detail)
-        return _render(query, outcome), outcome
-
-    outcome = _parse_results(payload, max_results)
-    return _render(query, outcome), outcome
+        return SearchFailure(reason="malformed", detail=f"response body is not JSON: {exc}")
 
 
-def build_search_tool(config: HarnessConfig) -> BaseTool:
-    """Build the `search_web` tool, closing over `config`."""
+async def _search(
+    query: str, max_results: int, config: HarnessConfig, registry: SourceRegistry, run_log: RunLog
+) -> tuple[str, list[SearchResult] | SearchFailure]:
+    """Query SearXNG, returning model-facing content and the typed result/failure.
+
+    Every `SearchFailure`, and every batch that silently dropped malformed entries, is also
+    recorded on `run_log` — the model-facing rendering alone leaves disclosure up to whether
+    the model chooses to mention it.
+    """
+    payload = await _fetch_search_json(query, config)
+    outcome: list[SearchResult] | SearchFailure
+    guard_blocked = 0
+    if isinstance(payload, SearchFailure):
+        outcome = payload
+    elif not isinstance(payload, dict):
+        outcome = SearchFailure(
+            reason="malformed",
+            detail=f"response body is not an object (got {type(payload).__name__})",
+        )
+    else:
+        outcome, dropped = _parse_results(payload, max_results)
+        if dropped:
+            noun = "entry" if dropped == 1 else "entries"
+            run_log.record(
+                "search_results_dropped",
+                f'search for "{query}": {dropped} malformed result {noun} '
+                "dropped from the response",
+            )
+        if isinstance(outcome, list):
+            survivors = _drop_guarded(outcome, config, run_log)
+            guard_blocked = len(outcome) - len(survivors)
+            outcome = survivors
+            # Phase 4 (R2): only the guard's survivors become fetchable — a blocked result's
+            # URL is never approved, per D2's developer decision.
+            _approve_survivors(outcome, registry)
+
+    if isinstance(outcome, SearchFailure):
+        run_log.record(
+            "search_failed", f'search for "{query}" failed: {outcome.reason} — {outcome.detail}'
+        )
+    return _render(query, outcome, guard_blocked), outcome
+
+
+class SearchPreflightError(Exception):
+    """Raised when the configured SearXNG endpoint fails the startup health check."""
+
+
+_CONTAINER_HINT = "is the container running? (docker compose up in searxng/)"
+
+
+async def preflight_search(config: HarnessConfig) -> None:
+    """Verify the configured SearXNG endpoint answers a real JSON search before any run starts.
+
+    R1/D4: probes via `_fetch_search_json` — the exact request `_search` makes — asserting 200
+    and a parseable JSON body. This catches both the container being down AND the documented
+    "stock container is HTML-only" misconfiguration, either of which would otherwise only
+    surface mid-run.
+
+    Raises `SearchPreflightError` naming SearXNG, the probed URL, and the container hint.
+    """
+    payload = await _fetch_search_json("ping", config)
+    if not isinstance(payload, SearchFailure):
+        return
+
+    url = _search_url(config)
+    if payload.reason == "unreachable":
+        raise SearchPreflightError(
+            f"SearXNG unreachable at {url} — {_CONTAINER_HINT} ({payload.detail})"
+        )
+    if payload.reason == "bad_status":
+        raise SearchPreflightError(
+            f"SearXNG at {url} returned {payload.detail} — {_CONTAINER_HINT}"
+        )
+    raise SearchPreflightError(
+        f"SearXNG at {url} did not return JSON (got HTML? the JSON API may not be enabled) "
+        f"— {_CONTAINER_HINT} ({payload.detail})"
+    )
+
+
+class SearchUnavailableError(Exception):
+    """Raised when SearXNG has failed too many consecutive times in a single run (R2/D3).
+
+    The agent loop never special-cases this — it reaches the generic exception handler like
+    any other unexpected error, ending the run as a hard error with no report.
+    """
+
+
+def build_search_tool(
+    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+) -> BaseTool:
+    """Build the `search_web` tool, closing over `config`, the shared `registry` and `run_log`.
+
+    The guard is invisible here (D5, mirrors fetch.py): every result's title+snippet is
+    scanned for injection signals inside `_search`, after parsing and before rendering. A
+    blocked result is dropped from both the rendered content and the returned artifact,
+    disclosed only via a `guard_blocked` `RunLog` incident.
+
+    Strict URL provenance (Phase 4, R2) is also invisible here: every survivor's URL is
+    approved on `registry` inside `_search`, so a clean result becomes fetchable while a
+    guard-blocked one never does.
+    """
+
+    log = or_default(run_log)
 
     class SearchWebInput(BaseModel):
         """Model-facing input schema for the `search_web` tool."""
@@ -130,6 +284,11 @@ def build_search_tool(config: HarnessConfig) -> BaseTool:
             description="The maximum number of results to return.",
         )
 
+    # D3: per-tool-instance (i.e. per-run) counter of CONSECUTIVE connection-level failures.
+    # Lives in this closure, not in `_search` or at module scope, so it never leaks across
+    # runs/tests. `malformed` failures neither increment nor reset it.
+    consecutive_failures = 0
+
     @tool("search_web", args_schema=SearchWebInput, response_format="content_and_artifact")
     async def search_web(
         query: str, max_results: int
@@ -138,8 +297,23 @@ def build_search_tool(config: HarnessConfig) -> BaseTool:
 
         Failures (unreachable search backend, a non-200 response, or a malformed body) are
         reported as data rather than raising, so a dead search backend never fails the
-        whole tool call.
+        whole tool call — except after too many consecutive connection-level failures in a
+        row, which raises `SearchUnavailableError` to abort the run.
         """
-        return await _search(query, max_results, config)
+        nonlocal consecutive_failures
+        content, outcome = await _search(query, max_results, config, registry, log)
+
+        if isinstance(outcome, SearchFailure) and outcome.reason in ("unreachable", "bad_status"):
+            consecutive_failures += 1
+            if consecutive_failures >= config.search.max_consecutive_failures:
+                raise SearchUnavailableError(
+                    f"SearXNG search failed {consecutive_failures} times in a row — "
+                    "aborting the run (is the container still up?)"
+                )
+        elif not isinstance(outcome, SearchFailure):
+            consecutive_failures = 0
+        # reason == "malformed": leave the counter unchanged.
+
+        return content, outcome
 
     return search_web

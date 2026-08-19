@@ -1,0 +1,7 @@
+Modern network switches use store-and-forward switching by default: the switch buffers
+an entire Ethernet frame, checks its frame check sequence for errors, and only then
+forwards it out the destination port. This trades a small amount of latency for
+reliability, since a corrupted frame is dropped before it can consume bandwidth
+downstream. Cut-through switching, by contrast, begins forwarding as soon as the
+destination address is read from the frame header, reducing latency at the cost of
+occasionally propagating a runt or corrupted frame.

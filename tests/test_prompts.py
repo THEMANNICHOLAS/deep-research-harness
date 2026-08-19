@@ -6,12 +6,21 @@ import pytest
 
 from harness.prompts import PromptError, render, required_variables
 
+# The frozen delegation-tier contracts (R5). Both tiers are wired: `subagent` is the
+# researcher's live system prompt, `reader` the reader's.
+TIER_CONTRACTS = ["subagent", "reader"]
+
 
 @pytest.fixture
 def prompt_dir(tmp_path, monkeypatch):
     """Point harness.prompts at a temp directory of .md fixtures."""
     monkeypatch.setattr("harness.prompts._PROMPTS_DIR", tmp_path)
     return tmp_path
+
+
+def _render_shipped(name):
+    """Render a shipped prompt, stubbing every declared variable with its own name."""
+    return render(name, **{v: f"<{v}>" for v in required_variables(name)})
 
 
 def test_render_substitutes_all_variables(prompt_dir):
@@ -92,14 +101,96 @@ def test_json_braces_and_dollar_escape_render_unchanged(prompt_dir):
     assert "$100" in result
 
 
-@pytest.mark.parametrize("name", ["orchestrator", "subagent"])
+@pytest.mark.parametrize("name", ["orchestrator", "verify", *TIER_CONTRACTS])
 def test_shipped_prompts_render_with_their_declared_variables(name):
-    variables = required_variables(name)
+    assert required_variables(name)
 
-    assert variables
+    rendered = _render_shipped(name)
 
-    rendered = render(name, **{v: f"<{v}>" for v in variables})
-
-    # No unsubstituted placeholder survives rendering. Checked via get_identifiers rather
-    # than `"$" not in rendered`, because a `$$` escape legitimately renders to a literal `$`.
+    # No unsubstituted placeholder survives. Checked via `get_identifiers` rather than
+    # `"$" not in rendered`, because a `$$` escape legitimately renders a literal `$`.
     assert Template(rendered).get_identifiers() == []
+
+
+@pytest.mark.parametrize("name", TIER_CONTRACTS)
+def test_tier_contracts_declare_exactly_their_placeholders(name):
+    # A tier receives its task through the delegation call at run time, never by substitution, so
+    # neither contract declares a task or facet placeholder.
+    assert required_variables(name) == {"current_date", "max_urls_per_call"}
+
+
+@pytest.mark.parametrize("name", TIER_CONTRACTS)
+def test_tier_contract_missing_variable_raises_prompt_error_naming_both(name):
+    supplied = {v: f"<{v}>" for v in required_variables(name) if v != "current_date"}
+
+    with pytest.raises(PromptError) as exc_info:
+        render(name, **supplied)
+
+    message = str(exc_info.value)
+    assert name in message
+    assert "current_date" in message
+
+
+@pytest.mark.parametrize("name", TIER_CONTRACTS)
+def test_tier_contracts_do_not_reference_ask_user(name):
+    # D1: a tier that can interrupt the developer would stall the run mid-fan-out.
+    assert "ask_user" not in _render_shipped(name)
+
+
+@pytest.mark.parametrize("name", TIER_CONTRACTS)
+@pytest.mark.parametrize(
+    "field",
+    ["Objective", "Output format", "Tools", "Boundaries", "Findings", "Source IDs", "Conflicts"],
+)
+def test_tier_contracts_name_their_frozen_fields(name, field):
+    # R5: the next round builds subagent definitions against exactly these names — four a task
+    # must carry, three a tier must return. Anchored to the bolded bullet, since a bare "tools"
+    # would also match the `# Tools` heading and let a renamed field slip through.
+    assert f"**{field}**" in _render_shipped(name)
+
+
+def test_subagent_prompt_teaches_reader_delegation_recovery_and_budget():
+    """The researcher prompt's reader-delegation instructions, `fetch_raw` recovery rule, and
+    budget caps are load-bearing run behavior with no other guard (PR review cleanup): the
+    researcher must delegate reading (never fetch pages itself), reach for `fetch_raw` only
+    after a failed delegation, and stay inside its search/dispatch budget.
+    """
+    rendered = render("subagent", current_date="2026-01-01", max_urls_per_call=5)
+
+    # Reading is delegated: the reader dispatch carries the per-call URL cap and the facet.
+    assert 'subagent_type="reader"' in rendered
+    assert "up to 5" in rendered
+    assert "fetch_pages" not in rendered
+
+    # `fetch_raw` is recovery only, explicitly ordered AFTER a failed/empty delegation.
+    assert "recovery only" in rendered.lower()
+    assert "never as a first resort" in rendered
+
+    # The budget caps: bounded searching and dispatching, partial findings over overrun.
+    assert "4 searches" in rendered
+    assert "6 reader dispatches" in rendered
+
+
+def test_orchestrator_prompt_teaches_the_full_delegation_protocol():
+    """R1's prompt half (Phase 2 Step 3): the lead delegates research angles to the researcher
+    subagent rather than researching directly, and knows what to do when that delegation fails.
+    """
+    rendered = render("orchestrator", current_date="2026-01-01")
+
+    assert 'subagent_type="researcher"' in rendered
+    # The concurrent-researcher bound must appear near the delegation instruction, not merely
+    # anywhere in the prompt (D5) — a stray "3" elsewhere would pass a looser assertion.
+    delegation_pos = rendered.index('subagent_type="researcher"')
+    context = rendered[max(0, delegation_pos - 400) : delegation_pos + 400]
+    assert "3" in context
+
+    assert "never search or fetch a page yourself" in rendered.lower()
+
+    assert "RESEARCHER FAILED (" in rendered
+    assert "empty report" in rendered.lower()
+
+    # The lead no longer searches or fetches directly (R1) — it only delegates.
+    assert "search_web" not in rendered
+    assert "fetch_pages" not in rendered
+    assert "fetch_raw" not in rendered
+    assert 'subagent_type="reader"' not in rendered

@@ -89,3 +89,123 @@ to address.
   other than the three `blocked` codes deserves its own outcome, or whether the caller
   should read `FetchedPage.status_code` (already carried in the artifact) and judge for
   itself. The information is not lost, only unclassified.
+
+- **The wall clock has never been cancelled against a real browser teardown.** Both
+  offline tests expire the clock inside an `httpx.MockTransport` handler sleeping on
+  `asyncio.sleep` — the friendliest possible cancellation target. On a real run the
+  in-flight work at the bound is crawl4ai's `arun_many` inside
+  `async with AsyncWebCrawler(...)` (@harness/tools/fetch.py), whose `__aexit__` tears
+  down a Playwright/Chromium subprocess while the task is being cancelled. Raised by the
+  PR #4 review; nothing offline can settle it. To address: during Phase 5's owed live
+  check, set `wall_clock_seconds` below `fetch.page_timeout_ms` so the clock fires
+  *inside* `arun_many`, then confirm the partial report is still written and no chromium
+  process is left behind.
+
+- **`InMemorySaver` checkpoint growth has never been measured.** Deferred at Phase 4
+  (a checkpointer is required for `interrupt_on`, so it is not optional), inherited by
+  Phase 5, and still untaken after Phase 5's and Phase 6's live checks — the one item
+  the research-loop plan's `## Verification` ticks without evidence behind it. Every
+  superstep writes a full checkpoint to memory and nothing evicts them, so a run long
+  enough to matter is the only thing that can show whether it grows linearly with the
+  whole message history. To address: read the process's RSS at the first tool call and
+  again at completion during a normal-length run, and compare against the run's total
+  input tokens.
+
+- **An agentic verification search tool (greps source text instead of one pooled call per
+  paragraph).** Deferred as a non-goal in @docs/plans/PLAN-reader-delegation.md: today's
+  `verify_paragraphs` (@harness/verify.py) pools a paragraph's whole cited-source text into
+  one model call, which does not scale if a source capture grows large enough that pooling
+  several of them stops fitting the model's context. To address: a verifier that can search
+  within captured source text on demand rather than having it all pooled up front.
+
+- **Persist `fetch_raw`'s `reason` so the report's fallback bucket can disclose why.** Today
+  the model-supplied reason exists only in the run's in-context `<undigested>` marker
+  (@harness/tools/fallback.py); `Source` carries no reason field, so `## Source reading`
+  can only bucket a fallback, not explain it (PR #13 review). To address: an optional
+  `read_reason` on @harness/sources.py's `Source`, set alongside `mark_read("fallback")`
+  and rendered after the link in @harness/report.py's `_read_modes_section`.
+
+The entries below come from a read-only code audit on 2026-08-17 (everything except
+`harness/tools/fetch.py`, under active work in another session). Code-reading findings,
+not observed failures — none has been reproduced against a live run.
+
+- **A resolved API key sits in a plain `str` field and prints everywhere.** After
+  `_resolve_api_key` runs, `ProviderConfig.api_key` (@harness/config.py) holds the live
+  secret in a field with default repr/dump behavior, so `repr(config)`, `model_dump()`, or
+  a logged `ValidationError` emits it — the file boundary is guarded (a literal `api_key`
+  in TOML is rejected) while the object boundary is not. The same design breaks
+  round-tripping: `model_validate(config.model_dump())` raises, because the dump carries
+  the truthy `api_key` the before-validator rejects. Latent until config reaches a log, a
+  traceback, or a serialized boundary. To address: `SecretStr`, or
+  `Field(repr=False, exclude=True)` — the exclude also fixes the round-trip.
+
+- **`SourceRegistry.link` emits unescaped URLs into markdown.** @harness/sources.py renders
+  `[label](url)` verbatim, so a URL containing an unbalanced `)` (query strings, redirect
+  wrappers) closes the link early and bleeds the remainder into the surrounding prose.
+  This now reaches four report surfaces: per-paragraph `Sources:` lines, `## Sources`,
+  `## Source reading`, and `## Conflicting sources` (@harness/report.py). Balanced parens
+  (Wikipedia's `Python_(programming_language)`) survive CommonMark; the unbalanced case
+  does not, and URLs here are model- and web-supplied. To address: percent-encode `(`, `)`,
+  and space in the href at render time, leaving `Source.url` itself canonical.
+
+- **The search HTTP timeout is httpx's implicit 5s default.** `_fetch_search_json`
+  (@harness/tools/search.py) builds a bare `httpx.AsyncClient()`, so nothing in
+  @harness.toml governs how long a search or the startup `preflight_search` may take —
+  unlike `fetch.page_timeout_ms` and `agent.request_timeout_seconds`, which are both
+  config-driven. A SearXNG fan-out across slow upstream engines can legitimately exceed
+  5s, and the result is `SearchFailure(reason="unreachable")` — which also feeds the
+  `max_consecutive_failures` abort counter, so a merely slow backend can read as a dead
+  one and end the run. To address: a `timeout_ms` (or reuse of a shared timeout key) on
+  `SearchSettings`, passed into the client.
+
+- **The `verifier` role is required in practice but not by config validation.**
+  `_cross_check_roles` (@harness/config.py) requires only `head` and `subagent`, yet
+  `_PREFLIGHT_ROLES` in @harness/__main__.py, `verify_paragraphs` (@harness/verify.py),
+  and the run-metadata lines in @harness/report.py all consume `roles.verifier`
+  unconditionally. A config missing `[roles.verifier]` loads cleanly and then fails at
+  preflight as a `ModelError` — caught and readable, but it is exactly the class of gap R7
+  wants surfaced as a startup `ConfigError` naming the field. To address: add `verifier`
+  to the required-roles tuple (and its absence to a config test).
+
+- **CLAUDE.md's model-routing story has drifted from the code.** The project docs state
+  routing as "orchestrator, fallback, worker" with "GLM 5.2 default orchestrator, DeepSeek
+  V4 Pro fallback", but the implemented roles are `head`/`subagent`/`verifier`
+  (@harness/config.py, @harness.toml) with head = deepseek-v4-pro and no fallback role or
+  retry-to-second-model mechanism anywhere. This bites anyone (or any session) planning
+  against the documented invariant. To address: reconcile CLAUDE.md and @docs/INDEX.md to
+  the roles that exist, and decide separately whether a fallback model is still wanted —
+  if so it is new machinery, not a config key.
+
+- **Report token usage undercounts on runs that trigger summarization.** `_sum_usage`
+  (@harness/__main__.py) sums `usage_metadata` over the FINAL state's messages, but the
+  summarization middleware (trigger: 200k tokens, @harness/agent.py) evicts older messages
+  from state — taking their usage metadata with them — so exactly the long, expensive runs
+  report the smallest numbers under `## Run metadata`. Unverified against a live
+  summarizing run; the arithmetic follows from eviction. To address: accumulate usage
+  incrementally in the stream loop (dedup by message id, as `_note_model_turns` already
+  does) instead of summing the survivors at the end.
+
+- **Small guard gaps, batched.** (1) `_load` in @harness/prompts.py rejects `/`, `\`, and
+  `..` but not a Windows drive-relative name (`C:x`), which `Path.__truediv__` treats as
+  a new root — Linux deployment and internal-literal names make this completeness, not
+  exposure. (2) `SearchWebInput.max_results` (@harness/tools/search.py) has `ge=1` and no
+  ceiling, unlike every bounded field in `FetchSettings`. (3) `_load_dotenv`
+  (@harness/config.py) does not strip quotes, so a conventionally written
+  `KEY="value"` line yields a key with literal quote characters that fails auth at
+  preflight with a misleading "credentials rejected". (4) Report filenames
+  (@harness/report.py `_filename`) are second-resolution with no random suffix — the same
+  collision `SourceRegistry.run_id` already guards against — so two same-question runs
+  finishing in the same second silently overwrite one report.
+
+- **Worker-model LLM-judge detection layer (config-gated).** The guard's heuristic scanner
+  (harness/guard.py) is syntactic-only by design — semantic steering passes it and is stopped
+  only by containment (R2/R4). A per-page LLM-judge pass was rejected in
+  @docs/plans/PLAN-prompt-injection-defense.md D1 for its config-role and offline-mock cost,
+  parked here as a later layer. To address: a new config-routed role, a judge prompt, and
+  fixture-based offline tests; gate it behind `[guard]` config so heuristics stay the default.
+
+- **Strict-provenance escape hatch if research reach suffers.** Phase 4 of
+  @docs/plans/PLAN-prompt-injection-defense.md makes non-search, non-user URLs unfetchable with
+  no config override (D2, deliberate). Every rejection is disclosed as a `provenance_rejected`
+  incident, so starvation is observable in reports. If reach measurably suffers, the remedy is
+  a config-gated link-following mode (sanitized or approval-based) — never a silent widening.

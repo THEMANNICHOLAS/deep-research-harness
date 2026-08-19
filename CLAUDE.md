@@ -31,12 +31,22 @@ not the ceiling).
 ## Invariants
 
 - No shell tool in the tool registry — filesystem read/grep/glob is
-  read-only; writes are confined to a designated workspace + reports dir.
+  read-only; the agent's writes are confined to the workspace dir alone.
+  The reports dir is written by `harness/report.py`, not reachable from
+  the agent's backend at all.
 - Model routing (orchestrator, fallback, worker) is config/env-driven —
   never hardcode endpoints, model IDs, or keys.
-- Adding a new tool must require no changes to the agent loop itself.
-- Best-effort + disclose: degraded coverage (rate limits, fetch failures)
-  is answered and disclosed, never silently thinned or hidden.
+- Adding a new tool must require no changes to the agent loop itself. The one
+  standing exception is a tool that must STOP the loop to work — `ask_user`
+  is registered in `harness/agent.py`'s `interrupt_on`, because an interrupt
+  is a property of the loop, not of the tool. Everything else stays additive.
+- Best-effort + disclose, scoped to runs that finish: degraded coverage
+  (rate limits, fetch failures, the round cap, a wall clock that fires
+  after a final answer exists) is answered and disclosed, never silently
+  thinned or hidden. A FAILED run — hard error, SearXNG down at startup
+  or mid-run, user abort, or wall-clock expiry with no final answer —
+  writes no report at all: error to stderr, nonzero exit, nothing in
+  reports/.
 
 ## Stack
 
@@ -56,8 +66,12 @@ not the ceiling).
 - No database — reports are timestamped markdown files on disk.
 - Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium.
 - Search: self-hosted SearXNG (JSON API).
-- Models: OpenCode API (GLM 5.2 default orchestrator, DeepSeek V4 Pro
-  fallback); Cerebras API (Gemma 4 31B default worker, config-swappable).
+- Models: OpenCode API serves four roles — `[roles.head]` = `kimi-k3`,
+  `[roles.researcher]` = `deepseek-v4-pro`, `[roles.reader]` = `deepseek-v4-flash`,
+  `[roles.verifier]` = `gpt-5.6-luna`. Config-swappable; no other provider is
+  declared today. The DeepSeek line required a region opt-in on the OpenCode
+  workspace dashboard for the `-flash` tier — without it the endpoint 403s (see
+  docs/decisions.md); `-pro` worked without a fresh opt-in in a live check.
 - Deployment: homelab Linux machine, operated over SSH.
 
 ## Patterns
