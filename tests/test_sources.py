@@ -459,6 +459,25 @@ def test_extract_urls_strips_trailing_punctuation():
     ]
 
 
+def test_extract_urls_keeps_a_balanced_close_paren_inside_the_url():
+    # A blind rstrip truncated wikipedia-style URLs to `.../Foo_(bar`, so the approval was
+    # keyed on a URL the user never pasted and the real one was provenance-rejected.
+    text = "Read https://en.wikipedia.org/wiki/Foo_(bar) and (see https://example.com/x)."
+
+    assert extract_urls(text) == [
+        "https://en.wikipedia.org/wiki/Foo_(bar)",
+        "https://example.com/x",
+    ]
+
+
+def test_extract_urls_splits_comma_joined_urls():
+    # Two URLs pasted back-to-back with a comma and no space used to match as one garbled
+    # blob, approving neither.
+    text = "Compare https://a.test/one,https://b.test/two please."
+
+    assert extract_urls(text) == ["https://a.test/one", "https://b.test/two"]
+
+
 def test_extract_urls_returns_empty_list_for_text_with_no_urls():
     assert extract_urls("No links in this question at all.") == []
 

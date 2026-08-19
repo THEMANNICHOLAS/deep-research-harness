@@ -165,8 +165,27 @@ def normalize_url(url: str) -> str:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
-_URL_RE = re.compile(r"https?://\S+")
+# A comma ends the match: two URLs pasted back-to-back (`https://a.com,https://b.com`) are a
+# far more common input than a URL with a literal comma, and the unsplit blob approved neither.
+_URL_RE = re.compile(r"https?://[^\s,]+")
 _TRAILING_PUNCTUATION = ".,;:!?)]}>\"'"
+
+
+def _strip_trailing_punctuation(url: str) -> str:
+    """Strip sentence punctuation from the end of a matched URL, keeping balanced parens.
+
+    Char-by-char rather than one `rstrip`: a `)` is kept whenever the URL still contains at
+    least as many `(` — `https://en.wikipedia.org/wiki/Foo_(bar)` keeps its close-paren, while
+    the wrapping paren of `(see https://a.com/x)` is stripped.
+    """
+    while url:
+        last = url[-1]
+        if last not in _TRAILING_PUNCTUATION:
+            break
+        if last == ")" and url.count("(") >= url.count(")"):
+            break
+        url = url[:-1]
+    return url
 
 
 def extract_urls(text: str) -> list[str]:
@@ -178,7 +197,7 @@ def extract_urls(text: str) -> list[str]:
     (`javascript:`, `ftp:`) are never matched — approving one would widen fetchability beyond
     what `_fetch`'s crawler even attempts.
     """
-    return [match.group(0).rstrip(_TRAILING_PUNCTUATION) for match in _URL_RE.finditer(text)]
+    return [_strip_trailing_punctuation(match.group(0)) for match in _URL_RE.finditer(text)]
 
 
 def names_a_different_document(url: str, other: str) -> bool:

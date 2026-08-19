@@ -649,6 +649,45 @@ async def test_a_result_with_an_injected_snippet_is_dropped_and_disclosed(  # R1
     assert "instruction_override" in incidents[0].detail
 
 
+async def test_an_all_blocked_search_is_distinguishable_from_an_empty_one(  # R1
+    monkeypatch, make_config
+):
+    """When every result fires the guard, the model-facing content must say results existed
+    and were withheld — rendering the plain "returned no results" line misleads the model
+    (and an operator reading the transcript) into retrying a query that had answers.
+
+    Also pins one `guard_blocked` incident PER blocked result: a refactor batching the
+    recording into one summary incident would silently reduce disclosure granularity.
+    """
+    attack_text = _attack_text()
+    payload = {
+        "query": "x",
+        "results": [
+            {"url": "https://evil-a.test", "title": "A", "content": attack_text, "engine": "e"},
+            {"url": "https://evil-b.test", "title": "B", "content": attack_text, "engine": "e"},
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config()
+    run_log = RunLog()
+
+    content, artifact = await search._search("x", 10, config, SourceRegistry(), run_log)
+
+    assert artifact == []
+    assert "returned no results" not in content
+    assert "2 results" in content
+    assert "withheld by the injection guard" in content
+
+    incidents = [i for i in run_log.incidents() if i.kind == "guard_blocked"]
+    assert len(incidents) == 2
+    assert "https://evil-a.test" in incidents[0].detail
+    assert "https://evil-b.test" in incidents[1].detail
+
+
 async def test_guard_disabled_bypasses_scanning_for_search_results(monkeypatch, make_config):  # R1
     attack_text = _attack_text()
     payload = {

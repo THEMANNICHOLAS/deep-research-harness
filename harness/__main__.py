@@ -217,11 +217,17 @@ def _describe_tool_call(call: dict[str, Any]) -> str:
     return f'task(researcher): "{args.get("description", "")}"'
 
 
-async def _answer_questions(interrupt: Interrupt, renderer: Renderer) -> list[dict[str, Any]]:
+async def _answer_questions(
+    interrupt: Interrupt, renderer: Renderer, registry: SourceRegistry
+) -> list[dict[str, Any]]:
     """Render each pending `ask_user` question and collect one answer per action request.
 
     One decision per request, in the same order — the middleware raises `ValueError` on a
     count mismatch.
+
+    An answer is user-supplied text exactly like the initial question, so any URL pasted into
+    it is approved here (Phase 4, D2/R2) — the natural reply to "which page do you mean?" is
+    the URL itself, and without this it stayed provenance-rejected for the rest of the run.
     """
     decisions: list[dict[str, Any]] = []
     for request in interrupt.value["action_requests"]:
@@ -230,6 +236,8 @@ async def _answer_questions(interrupt: Interrupt, renderer: Renderer) -> list[di
         renderer.emit(Question(question))
         with renderer.suspend():
             answer = await _read_answer()
+        for url in extract_urls(answer):
+            registry.approve(url)
         # Best-effort + disclose: a bare Enter must not reach the model as an empty tool
         # result, which reads as "answered with nothing said" and hides the open ambiguity.
         decisions.append({"type": "respond", "message": answer.strip() or _NO_ANSWER_GIVEN})
@@ -463,7 +471,9 @@ async def main(argv: list[str] | None = None) -> int:
                     # most one is ever pending, and `Command(resume=...)` delivers ONE value —
                     # fanning several into one decisions list would mis-pair them.
                     stream_input = Command(
-                        resume={"decisions": await _answer_questions(interrupts[0], renderer)}
+                        resume={
+                            "decisions": await _answer_questions(interrupts[0], renderer, registry)
+                        }
                     )
                     continue
 

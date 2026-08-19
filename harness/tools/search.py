@@ -112,15 +112,25 @@ def _approve_survivors(results: list[SearchResult], registry: SourceRegistry) ->
         registry.approve(result.url)
 
 
-def _render(query: str, outcome: list[SearchResult] | SearchFailure) -> str:
+def _render(query: str, outcome: list[SearchResult] | SearchFailure, guard_blocked: int = 0) -> str:
     """Render the model-facing content: a numbered list, a no-results line, or a failure.
 
     Titles/snippets are untrusted content (Phase 5, D1 spotlighting): the whole results listing
     is fenced with `harness.guard.fence` as one block, with the header line kept outside it.
+
+    `guard_blocked` distinguishes "nothing existed" from "everything was withheld": an
+    all-blocked search must not render identically to a genuinely empty one, or the model
+    (and an operator reading the transcript) retries a query that actually had answers.
     """
     if isinstance(outcome, SearchFailure):
         return f'Search for "{query}" failed: {outcome.reason} — {outcome.detail}'
     if not outcome:
+        if guard_blocked:
+            noun = "result" if guard_blocked == 1 else "results"
+            return (
+                f'Search for "{query}" returned {guard_blocked} {noun}, all withheld by the '
+                "injection guard."
+            )
         return f'Search for "{query}" returned no results.'
 
     result_lines = [
@@ -169,6 +179,7 @@ async def _search(
     """
     payload = await _fetch_search_json(query, config)
     outcome: list[SearchResult] | SearchFailure
+    guard_blocked = 0
     if isinstance(payload, SearchFailure):
         outcome = payload
     elif not isinstance(payload, dict):
@@ -186,7 +197,9 @@ async def _search(
                 "dropped from the response",
             )
         if isinstance(outcome, list):
-            outcome = _drop_guarded(outcome, config, run_log)
+            survivors = _drop_guarded(outcome, config, run_log)
+            guard_blocked = len(outcome) - len(survivors)
+            outcome = survivors
             # Phase 4 (R2): only the guard's survivors become fetchable — a blocked result's
             # URL is never approved, per D2's developer decision.
             _approve_survivors(outcome, registry)
@@ -195,7 +208,7 @@ async def _search(
         run_log.record(
             "search_failed", f'search for "{query}" failed: {outcome.reason} — {outcome.detail}'
         )
-    return _render(query, outcome), outcome
+    return _render(query, outcome, guard_blocked), outcome
 
 
 class SearchPreflightError(Exception):

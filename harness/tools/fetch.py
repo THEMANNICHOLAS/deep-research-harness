@@ -368,17 +368,20 @@ async def _fetch(
                 continue
 
             markdown = _markdown_of(result)
+            title = _title_of(result)
 
-            # D5: scan raw markdown BEFORE classify/mint/capture — nothing blocked ever
-            # reaches disk. A blocked page vanishes entirely: no FetchedPage, no Sn, no
-            # capture file, absent from the rendered content (D4).
+            # D5: scan raw markdown AND title BEFORE classify/mint/capture — nothing blocked
+            # ever reaches disk. The title rides along because it is page-controlled content
+            # exactly like the body (search.py scans title+snippet the same way), and
+            # `_write_source_file` puts it on the capture's first line where verify.py reads
+            # it. A blocked page vanishes entirely: no FetchedPage, no Sn, no capture file,
+            # absent from the rendered content (D4).
             if config.guard.enabled:
-                scan_result = scan(markdown)
+                scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
                 if scan_result.blocked:
                     run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
                     continue
 
-            title = _title_of(result)
             status_code = getattr(result, "status_code", None)
             error_message = getattr(result, "error_message", None)
             outcome = classify(status_code, error_message, _content_type(result), markdown)
@@ -392,9 +395,12 @@ async def _fetch(
             # never end up with a capture file to be mistaken for real content.
             source_id = registry.add(url, title=title) if outcome == "fetched" else None
             if outcome == "fetched":
-                # Byte hygiene on survivor markdown, unconditional (D3): the guard flag
-                # bypasses detection, not this sanitization.
+                # Byte hygiene on survivor markdown AND title, unconditional (D3): the guard
+                # flag bypasses detection, not this sanitization. The title needs its own pass
+                # because `_write_source_file` writes `page.title`, not the registry's
+                # already-stripped copy.
                 markdown = strip_invisibles(markdown)
+                title = strip_invisibles(title) if title is not None else None
             pages_by_url[url] = FetchedPage(
                 source_id=source_id,
                 url=url,
@@ -433,15 +439,16 @@ async def _fetch(
                 continue
 
             markdown = _markdown_of(result)
+            title = _title_of(result)
 
-            # D5: same guard site as the HTML batch — scan raw markdown before classify/mint.
+            # D5: same guard site as the HTML batch — scan raw markdown and title before
+            # classify/mint.
             if config.guard.enabled:
-                scan_result = scan(markdown)
+                scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
                 if scan_result.blocked:
                     run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
                     continue
 
-            title = _title_of(result)
             status_code = getattr(result, "status_code", None)
             error_message = getattr(result, "error_message", None)
             if not error_message and not markdown.strip():
@@ -455,6 +462,7 @@ async def _fetch(
             source_id = registry.add(url, title=title) if outcome == "fetched" else None
             if outcome == "fetched":
                 markdown = strip_invisibles(markdown)
+                title = strip_invisibles(title) if title is not None else None
             pages_by_url[url] = FetchedPage(
                 source_id=source_id,
                 url=url,

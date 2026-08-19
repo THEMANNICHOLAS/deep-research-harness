@@ -206,7 +206,8 @@ async def verify_paragraphs(
         pooled_ids = [sid for sid, _, _ in pooled]
         try:
             sources_block = "\n\n".join(f"[{sid}] {url}\n{text}" for sid, url, text in pooled)
-            # D5's capture gating already guarantees this text is scan-passed; fencing (Phase 5,
+            # D5's capture gating guarantees this text — body markdown and title line alike —
+            # was scan-passed and invisible-stripped before it reached disk; fencing (Phase 5,
             # D1) is the second layer, so a page whose provenance was clean still cannot steer
             # the verifier model via untrusted content read straight off disk.
             rendered = render("verify", paragraph=paragraph.text, sources=fence(sources_block))

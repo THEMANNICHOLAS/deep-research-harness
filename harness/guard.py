@@ -26,6 +26,12 @@ FAMILY_ORDER = [
     "exfil_markup",
 ]
 
+# The zero-width set (U+200B, U+200C, U+FEFF) shared by the obfuscation rule (detection)
+# and `_INVISIBLE_RE` (stripping). One constant, not two hand-copied char classes: the sets
+# already drifted once (ZWJ, added and removed per the plan's Discoveries log), and nothing
+# but this constant enforces that what the scanner flags is also what the stripper removes.
+_ZERO_WIDTH_CHARS = "​‌﻿"
+
 _FAMILY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     "instruction_override": [
         # attack_instruction_override_ignore.txt
@@ -52,7 +58,7 @@ _FAMILY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     ],
     "obfuscation": [
         # attack_obfuscation_zerowidth.txt — zero-width chars used to split flagged phrases
-        re.compile(r"[​‌﻿]"),
+        re.compile(f"[{_ZERO_WIDTH_CHARS}]"),
         # attack_obfuscation_base64.txt
         re.compile(r"decode and execute", re.IGNORECASE),
     ],
@@ -67,11 +73,12 @@ _FAMILY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
 }
 
 
-# The same zero-width set the obfuscation rule matches (U+200B, U+200C, U+FEFF), plus C0
-# control chars other than \n and \t — \r is stripped too, since captures are normalized
-# markdown. Byte hygiene, not detection: this runs on survivor markdown regardless of
-# whether `[guard] enabled` bypassed the scan (Phase 3 D3/D5).
-_INVISIBLE_RE = re.compile(r"[​‌﻿\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# `_ZERO_WIDTH_CHARS` (the same set the obfuscation rule matches), plus C0 control chars
+# other than \n and \t — \r is stripped too, since captures are normalized markdown (and a
+# surviving \r let a CRLF-terminated fence-shaped line slip past `FENCE_LINE_RE`'s `$`).
+# Byte hygiene, not detection: this runs on survivor markdown regardless of whether
+# `[guard] enabled` bypassed the scan (Phase 3 D3/D5).
+_INVISIBLE_RE = re.compile(f"[{_ZERO_WIDTH_CHARS}\x00-\x08\x0b-\x1f\x7f]")
 
 
 def strip_invisibles(text: str) -> str:
@@ -119,9 +126,12 @@ def guard_blocked_detail(url: str, signals: list[str]) -> str:
 
 # Matches any boundary-SHAPED line, genuine or forged: `fence` emits hex tokens, but the
 # token part here is any non-space run, so an attacker's `<<<END UNTRUSTED xyz>>>` matches
-# too — the whole line, nothing else on it. Shared by `fence` (neutralizing forged fence
-# lines inside content), `sanitize_for_report` (same, in a report) and tests.
-FENCE_LINE_RE = re.compile(r"^<<<(END )?UNTRUSTED \S+>>>$", re.MULTILINE)
+# too — the whole line, nothing else on it. The `\r?` matters: MULTILINE `$` matches before
+# `\n` only, so without it a CRLF-terminated forged fence line (PDF text and `fence`d
+# non-fetched content are never newline-normalized upstream) escaped neutralization.
+# Shared by `fence` (neutralizing forged fence lines inside content), `sanitize_for_report`
+# (same, in a report) and tests.
+FENCE_LINE_RE = re.compile(r"^<<<(END )?UNTRUSTED \S+>>>\r?$", re.MULTILINE)
 
 # What a neutralized fence-shaped line becomes: two angle brackets, not three, so it can never
 # re-match `FENCE_LINE_RE` on a second pass (idempotence).

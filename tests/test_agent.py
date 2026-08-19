@@ -34,6 +34,7 @@ from tests.conftest import (
     ScriptedChatModel,
     _FakeMarkdown,
     _FakeResult,
+    approve_all,
     drain_stdout,
     install_search_transport,
     patch_model,
@@ -581,7 +582,7 @@ async def test_a_reader_crash_after_a_successful_fetch_leaves_the_source_unread(
     # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
     # directly-fetched URL must arrive pre-approved.
     registry = SourceRegistry()
-    registry.approve("https://a.test")
+    approve_all(registry, ["https://a.test"])
     researcher, registry = build_researcher(researcher_model, reader_model, registry=registry)
     result = await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
@@ -624,7 +625,7 @@ async def test_an_empty_digest_leaves_the_fetched_source_unread(
     # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
     # directly-fetched URL must arrive pre-approved.
     registry = SourceRegistry()
-    registry.approve("https://a.test")
+    approve_all(registry, ["https://a.test"])
     researcher, registry = build_researcher(researcher_model, reader_model, registry=registry)
     await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
@@ -712,7 +713,7 @@ async def test_lead_to_researcher_to_reader_digest_reaches_the_lead(
     # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
     # directly-fetched URL must arrive pre-approved.
     registry = SourceRegistry()
-    registry.approve("https://a.test")
+    approve_all(registry, ["https://a.test"])
     graph = build_agent(make_config(), registry)
     result = await graph.ainvoke(
         {"messages": [HumanMessage(content="research this")]},
@@ -1326,9 +1327,25 @@ async def test_read_answer_returns_what_was_typed(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": "  Yes, region EU-West  ")
     interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which region?"}}]})
 
-    decisions = await main_module._answer_questions(interrupt, PlainRenderer())
+    decisions = await main_module._answer_questions(interrupt, PlainRenderer(), SourceRegistry())
 
     assert decisions == [{"type": "respond", "message": "Yes, region EU-West"}]
+
+
+async def test_a_url_pasted_into_a_clarifying_answer_becomes_fetchable(monkeypatch):
+    """Phase 4 (R2): an answer is user-supplied text like the question itself, so a URL pasted
+    into it must be approved — the natural reply to "which page do you mean?" is that URL, and
+    without approval every later fetch of it is provenance_rejected.
+    """
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt="": "this one: https://example.test/docs/page"
+    )
+    interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which page?"}}]})
+    registry = SourceRegistry()
+
+    await main_module._answer_questions(interrupt, PlainRenderer(), registry)
+
+    assert registry.is_approved("https://example.test/docs/page")
 
 
 async def test_main_cuts_the_run_short_at_the_round_cap(
@@ -1989,7 +2006,7 @@ async def test_a_clarifying_question_can_arrive_without_a_question_argument(
         }
     )
 
-    decisions = await main_module._answer_questions(interrupt, PlainRenderer())
+    decisions = await main_module._answer_questions(interrupt, PlainRenderer(), SourceRegistry())
 
     out, _ = drain_stdout(capsys)
     asked = [line for line in out.splitlines() if line.strip()]
