@@ -16,9 +16,10 @@ from langchain_core.messages import UsageMetadata
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig, run_workspace_dir
+from harness.guard import sanitize_for_report
 from harness.paragraphs import LIST_ITEM_RE, Paragraph, renders_content, strip_markers
 from harness.runlog import Incident
-from harness.sources import Source, SourceRegistry, is_failed_capture, sources_dir
+from harness.sources import Source, SourceRegistry, sources_dir
 from harness.verify import ParagraphVerdict, VerificationResult
 
 _SLUG_MAX_LENGTH = 60
@@ -139,24 +140,22 @@ def _usage_lines(usage: UsageMetadata) -> list[str]:
 
 
 def _is_usable(config: HarnessConfig, registry: SourceRegistry, source: Source) -> bool:
-    """A registered source is usable evidence iff its captured file exists and isn't a stub.
+    """A registered source is usable evidence iff its captured file exists and reads as UTF-8.
 
-    `fetch.py` registers every attempted URL, including 404s and blocked pages, so the
-    registry alone cannot tell a real finding from a dead one. The captured file is the frozen
-    record of what came back, so usability is judged from it. A missing, unreadable or
-    non-UTF-8 file counts as NOT usable, exactly like a stub: a `write_text` dying mid-flush
-    leaves a byte prefix that can end mid-character, and `UnicodeDecodeError` is a
-    `ValueError`, so catching `OSError` alone let it escape `write_report` and lose the whole
-    report of an otherwise finished run.
+    `fetch.py` (R5) only registers a source and writes its capture file on a successful fetch,
+    so a missing file is the only "not usable" shape left — plus an unreadable one: a
+    `write_text` dying mid-flush leaves a byte prefix that can end mid-character, and
+    `UnicodeDecodeError` is a `ValueError`, so catching `OSError` alone let it escape
+    `write_report` and lose the whole report of an otherwise finished run.
     """
     path = sources_dir(config, registry) / f"{source.id}.md"
     if not path.exists():
         return False
     try:
-        source_text = path.read_text(encoding="utf-8")
+        path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-    return not is_failed_capture(source_text)
+    return True
 
 
 def partition_sources(
@@ -533,7 +532,10 @@ def _render_body(outcome: RunOutcome, config: HarnessConfig, now: datetime) -> s
     if read_modes_text:
         lines += [_READ_MODES_HEADING, "", read_modes_text, ""]
 
-    return "\n".join(lines)
+    # The single funnel (Phase 5, D7/R3): every report byte passes through here before disk, so
+    # a hostile string reaching any section above (answer text, a workspace note, an incident
+    # detail, ...) cannot forge a fence boundary or a chat role marker in the written file.
+    return sanitize_for_report("\n".join(lines))
 
 
 def write_report(outcome: RunOutcome, config: HarnessConfig) -> Path:

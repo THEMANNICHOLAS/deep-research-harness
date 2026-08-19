@@ -18,11 +18,10 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
+from harness.guard import fence, guard_blocked_detail, scan, strip_invisibles
 from harness.runlog import RunLog, or_default
 from harness.sources import (
-    FETCH_FAILED_PREFIX,
     SourceRegistry,
-    is_failed_capture,
     names_a_different_document,
     normalize_url,
     note_digest_candidate,
@@ -119,7 +118,7 @@ class FetchedPage(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    source_id: str
+    source_id: str | None
     url: str
     outcome: FetchOutcome
     status_code: int | None
@@ -171,56 +170,28 @@ def _pair(urls: list[str], results: list[object]) -> list[tuple[str, object | No
     return pairs
 
 
-def _holds_successful_capture(path: Path) -> bool:
-    """Whether `path` already holds real captured content rather than a failure stub.
-
-    A missing or unreadable file answers False: the caller asks only to decide whether
-    overwriting would LOSE evidence, and neither case has any to lose.
-    """
-    try:
-        return not is_failed_capture(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError):
-        return False
-
-
 def _write_source_file(captures_dir: Path, page: FetchedPage, run_log: RunLog) -> None:
     """Write `page`'s full-text capture to `<captures_dir>/<source_id>.md`.
 
-    A `fetched` page gets its full untruncated markdown; any other outcome gets a stub whose
-    first line names the outcome, so a reader can treat it as unusable without parsing further.
-    A refetched URL reuses its registry ID and rewrites its file rather than duplicating it
-    (D10) — but only ever upward: a later failure never overwrites captured content, because
-    both attempts share one `[Sn]` and downgrading the file would make a claim cited from the
-    good capture report as unverifiable.
+    Only a `fetched` page is written at all (R5): a failed fetch mints no `source_id` and so
+    has no filename to write under, and it is never evidence in the first place. A refetched
+    URL reuses its registry ID and rewrites its file rather than duplicating it (D10) — the
+    former no-downgrade guard against a later failure overwriting a good capture is obsolete
+    by construction now that a failure never writes at all.
 
     A write failure degrades to a skipped file, never an exception into the model — but it is
     RECORDED on `run_log` (best-effort + disclose): the source will show as unusable evidence,
     and without the incident the report mis-attributes a local disk problem as a fetch failure.
     """
-    path = captures_dir / f"{page.source_id}.md"
-    if page.outcome != "fetched" and _holds_successful_capture(path):
+    if page.outcome != "fetched":
         return
+    assert page.source_id is not None  # every `fetched` page was minted an id
 
-    if page.outcome == "fetched":
-        heading = page.title or page.url
-        text = (
-            f"# {page.source_id}: {heading}\n\n"
-            f"- URL: {page.url}\n"
-            f"- Outcome: fetched\n\n"
-            f"{page.markdown}"
-        )
-    else:
-        lines = [
-            f"{FETCH_FAILED_PREFIX}{page.outcome}",
-            "",
-            f"- URL: {page.url}",
-            f"- Source: {page.source_id}",
-        ]
-        if page.status_code is not None:
-            lines.append(f"- Status: {page.status_code}")
-        if page.error:
-            lines.append(f"- Error: {page.error}")
-        text = "\n".join(lines)
+    path = captures_dir / f"{page.source_id}.md"
+    heading = page.title or page.url
+    text = (
+        f"# {page.source_id}: {heading}\n\n- URL: {page.url}\n- Outcome: fetched\n\n{page.markdown}"
+    )
 
     try:
         path.write_text(text, encoding="utf-8")
@@ -233,8 +204,20 @@ def _write_source_file(captures_dir: Path, page: FetchedPage, run_log: RunLog) -
 
 
 def _render(page: FetchedPage, cap: int) -> str:
-    """Render one page's model-facing block: heading, outcome line, capped markdown."""
-    lines = [f"## [{page.source_id}] {page.url}"]
+    """Render one page's model-facing block: heading, outcome line, capped markdown.
+
+    A failure has no `source_id` (R5), so it renders by URL alone rather than a `[Sn]` heading
+    that would imply it was ever registered as evidence.
+
+    The page's own markdown is untrusted content (Phase 5, D1 spotlighting): it is fenced with
+    `harness.guard.fence` AFTER truncation, never before (risk #4 — truncating a fenced block
+    could cut its closing boundary). Heading and status line stay outside the fence.
+    """
+    if page.source_id is not None:
+        heading = f"## [{page.source_id}] {page.url}"
+    else:
+        heading = f"## {page.url}"
+    lines = [heading]
 
     status_bits: list[str] = [page.outcome]
     if page.status_code is not None:
@@ -254,29 +237,42 @@ def _render(page: FetchedPage, cap: int) -> str:
             window[:cut].rstrip()
             + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
         )
-    lines.append(text)
+    lines.append(fence(text))
 
     return "\n\n".join(lines)
 
 
 def _failure_detail(page: FetchedPage) -> str:
-    """One incident line for a page that did not come back `fetched`."""
+    """One incident line for a page that did not come back `fetched`.
+
+    Keyed by URL only: a failure never has a `source_id` (R5), so there is nothing to prefix.
+    """
     bits: list[str] = [page.outcome]
     if page.status_code is not None:
         bits.append(f"status {page.status_code}")
     if page.error:
         bits.append(page.error)
-    return f"[{page.source_id}] {page.url}: {' — '.join(bits)}"
+    return f"{page.url}: {' — '.join(bits)}"
 
 
-def _no_result_page(url: str, registry: SourceRegistry) -> FetchedPage:
+def _provenance_rejected_detail(url: str) -> str:
+    """One incident line for a URL rejected by strict provenance (Phase 4, D2/R2).
+
+    URL only, no signal families (unlike `guard_blocked_detail`): rejection here has nothing
+    to do with content, only with where the URL came from.
+    """
+    return f"{url}: rejected — not from search results or explicit user approval"
+
+
+def _no_result_page(url: str) -> FetchedPage:
     """The page recorded when a batch comes back short one result.
 
     Both batches pair their results positionally, and both must answer a missing slot the
-    same way — a URL the caller asked for always gets a `FetchedPage`, never a hole.
+    same way — a URL the caller asked for always gets a `FetchedPage`, never a hole. Mints no
+    `source_id` (R5): a missing result is a failure like any other.
     """
     return FetchedPage(
-        source_id=registry.add(url),
+        source_id=None,
         url=url,
         outcome="error",
         status_code=None,
@@ -320,6 +316,20 @@ async def _fetch(
     if not urls:
         return "", []
 
+    # Phase 4 strict provenance (D2/R2): a URL is fetchable only if it arrived from a
+    # `search_web` result or explicit user approval (`__main__` at run start) — never from a
+    # page's own in-body links. Rejection is per-URL: one unapproved URL never fails the rest
+    # of the batch, and a rejected URL never reaches the crawler at all.
+    approved_urls: list[str] = []
+    for url in urls:
+        if registry.is_approved(url):
+            approved_urls.append(url)
+        else:
+            run_log.record("provenance_rejected", _provenance_rejected_detail(url))
+    urls = approved_urls
+    if not urls:
+        return "", []
+
     # One crawler cannot mix strategies in one `arun_many`: partition the batch by extension
     # first (cheap, pre-fetch routing); an extensionless PDF is only discoverable after the
     # Playwright fetch, via its content-type, and is rerouted below.
@@ -354,11 +364,24 @@ async def _fetch(
 
         for url, result in _pair(playwright_urls, results):
             if result is None:
-                pages_by_url[url] = _no_result_page(url, registry)
+                pages_by_url[url] = _no_result_page(url)
                 continue
 
             markdown = _markdown_of(result)
             title = _title_of(result)
+
+            # D5: scan raw markdown AND title BEFORE classify/mint/capture — nothing blocked
+            # ever reaches disk. The title rides along because it is page-controlled content
+            # exactly like the body (search.py scans title+snippet the same way), and
+            # `_write_source_file` puts it on the capture's first line where verify.py reads
+            # it. A blocked page vanishes entirely: no FetchedPage, no Sn, no capture file,
+            # absent from the rendered content (D4).
+            if config.guard.enabled:
+                scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
+                if scan_result.blocked:
+                    run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
+                    continue
+
             status_code = getattr(result, "status_code", None)
             error_message = getattr(result, "error_message", None)
             outcome = classify(status_code, error_message, _content_type(result), markdown)
@@ -368,7 +391,16 @@ async def _fetch(
                 reroute_urls.append(url)
                 continue
 
-            source_id = registry.add(url, title=title)
+            # Only a `fetched` outcome is evidence (R5): a failure mints no id, so it can
+            # never end up with a capture file to be mistaken for real content.
+            source_id = registry.add(url, title=title) if outcome == "fetched" else None
+            if outcome == "fetched":
+                # Byte hygiene on survivor markdown AND title, unconditional (D3): the guard
+                # flag bypasses detection, not this sanitization. The title needs its own pass
+                # because `_write_source_file` writes `page.title`, not the registry's
+                # already-stripped copy.
+                markdown = strip_invisibles(markdown)
+                title = strip_invisibles(title) if title is not None else None
             pages_by_url[url] = FetchedPage(
                 source_id=source_id,
                 url=url,
@@ -403,11 +435,20 @@ async def _fetch(
 
         for url, result in _pair(pdf_batch_urls, pdf_results):
             if result is None:
-                pages_by_url[url] = _no_result_page(url, registry)
+                pages_by_url[url] = _no_result_page(url)
                 continue
 
             markdown = _markdown_of(result)
             title = _title_of(result)
+
+            # D5: same guard site as the HTML batch — scan raw markdown and title before
+            # classify/mint.
+            if config.guard.enabled:
+                scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
+                if scan_result.blocked:
+                    run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
+                    continue
+
             status_code = getattr(result, "status_code", None)
             error_message = getattr(result, "error_message", None)
             if not error_message and not markdown.strip():
@@ -418,7 +459,10 @@ async def _fetch(
             # response headers on success, and reclassifying with that would re-trigger the
             # "pdf" reroute signal forever.
             outcome = classify(status_code, error_message, "text/html", markdown)
-            source_id = registry.add(url, title=title)
+            source_id = registry.add(url, title=title) if outcome == "fetched" else None
+            if outcome == "fetched":
+                markdown = strip_invisibles(markdown)
+                title = strip_invisibles(title) if title is not None else None
             pages_by_url[url] = FetchedPage(
                 source_id=source_id,
                 url=url,
@@ -429,7 +473,9 @@ async def _fetch(
                 error=error_message,
             )
 
-    pages = [pages_by_url[url] for url in urls]
+    # A guard-blocked URL never got a `pages_by_url` entry (D4: it vanishes entirely, not
+    # even as a failure outcome) — filter it out rather than indexing a KeyError.
+    pages = [pages_by_url[url] for url in urls if url in pages_by_url]
 
     # Recorded here, in the shared path, so `fetch_pages` and `fetch_raw` disclose alike.
     # The model already sees each failure in its rendered block; this is the operator's copy.
@@ -452,6 +498,15 @@ def build_fetch_tool(
 
     Creates `<workspace_dir>/<run_id>/sources` up front, so an unwritable workspace fails at
     startup rather than silently losing captures mid-run.
+
+    The guard is invisible here (D5): every fetched page is scanned for injection signals
+    inside the shared `_fetch`, before classification, minting, or capture. A blocked page
+    vanishes from the pipeline entirely and is disclosed only via a `guard_blocked`
+    `RunLog` incident — see harness/guard.py and PLAN-prompt-injection-defense.md Phase 3.
+
+    Strict URL provenance (Phase 4, R2) is enforced the same way, one step earlier: an
+    unapproved URL never reaches the crawler at all, disclosed via a `provenance_rejected`
+    incident instead.
     """
     sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
@@ -485,7 +540,7 @@ def build_fetch_tool(
         # `_ReaderDigestMiddleware` promotes these to "digested" only when the reader's digest
         # actually reaches the lead, so a crash after a successful fetch never over-claims.
         for page in pages:
-            if page.outcome == "fetched":
+            if page.outcome == "fetched" and page.source_id is not None:
                 note_digest_candidate(page.source_id)
         return content, pages
 

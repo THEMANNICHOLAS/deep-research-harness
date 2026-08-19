@@ -21,13 +21,14 @@ from pydantic import PrivateAttr, SecretStr
 from harness.config import (
     AgentSettings,
     FetchSettings,
+    GuardSettings,
     HarnessConfig,
     ProviderConfig,
     RoleConfig,
     SearchSettings,
     run_workspace_dir,
 )
-from harness.sources import FETCH_FAILED_PREFIX, sources_dir
+from harness.sources import sources_dir
 
 
 class _FakeMarkdown:
@@ -380,6 +381,16 @@ def drain_stdout(capsys: pytest.CaptureFixture[str]) -> tuple[str, list[str]]:
     return out, [line for line in out.splitlines() if line.strip()]
 
 
+def approve_all(registry: Any, urls: list[str]) -> None:
+    """Approve every URL in `urls` on `registry` (Phase 4 strict provenance, R2).
+
+    Shared arrange step for fetch/fallback tests that exercise URLs never seen by
+    `search_web` -- without this, `_fetch`'s pre-crawl provenance check rejects them.
+    """
+    for url in urls:
+        registry.approve(url)
+
+
 def write_source_capture(
     config: HarnessConfig,
     registry: Any,
@@ -412,17 +423,6 @@ def write_workspace_note(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
-
-
-def write_failed_capture(
-    config: HarnessConfig, registry: Any, source_id: str, outcome: str = "error"
-) -> None:
-    """Write a failure stub — the shape `harness/tools/fetch.py` writes for a bad fetch."""
-    captures_dir = sources_dir(config, registry)
-    captures_dir.mkdir(parents=True, exist_ok=True)
-    (captures_dir / f"{source_id}.md").write_text(
-        f"{FETCH_FAILED_PREFIX}{outcome}\n", encoding="utf-8"
-    )
 
 
 @pytest.fixture
@@ -460,6 +460,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         default_max_results: int = 10,
         max_consecutive_failures: int = 3,
         agent: AgentSettings | None = None,
+        guard: GuardSettings | None = None,
         head_model: str = "test-model",
         researcher_model: str = "test-model",
         reader_model: str = "test-model",
@@ -494,6 +495,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
                 max_consecutive_failures=max_consecutive_failures,
             ),
             agent=agent,
+            guard=guard or GuardSettings(),
         )
 
     return _make

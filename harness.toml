@@ -39,6 +39,12 @@ base_url = "http://localhost:8080"   # local dev instance — see searxng/docker
 default_max_results = 10
 max_consecutive_failures = 3  # R2: consecutive connection-level search failures that abort the run
 
+[guard]
+# R1: heuristic injection scanner over fetched pages and search results — see
+# docs/plans/PLAN-prompt-injection-defense.md. Toggles detection only; byte
+# sanitization of survivor markdown always runs.
+enabled = true
+
 [agent]
 # Frozen surface for the agent loop (Phase 3) and its workspace/report capture
 # (Phase 2) — see docs/plans/PLAN-research-loop.md.

@@ -26,6 +26,8 @@ def test_build_tools_returns_the_frozen_tool_set(make_config, monkeypatch):
     # Step 3: `search_web` and `fetch_raw` both moved off the lead onto the researcher — the
     # lead delegates through `task` instead of researching directly, and the digest-recovery
     # loop belongs to whoever dispatches readers. `fetch_pages` stays on the reader.
+    # R4 regression (PLAN-prompt-injection-defense.md Phase 5): this exact three-tier split is
+    # the containment floor the fencing/sanitizing work in this phase builds on top of.
     assert [tool.name for tool in tool_sets.lead] == ["ask_user"]
     assert [tool.name for tool in tool_sets.researcher] == ["search_web", "fetch_raw"]
     assert [tool.name for tool in tool_sets.reader] == ["fetch_pages"]

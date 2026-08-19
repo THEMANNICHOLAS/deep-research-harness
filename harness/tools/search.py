@@ -13,7 +13,9 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.config import HarnessConfig
+from harness.guard import fence, guard_blocked_detail, scan
 from harness.runlog import RunLog, or_default
+from harness.sources import SourceRegistry
 
 
 class SearchResult(BaseModel):
@@ -79,17 +81,64 @@ def _parse_results(
     return results[:max_results], dropped
 
 
-def _render(query: str, outcome: list[SearchResult] | SearchFailure) -> str:
-    """Render the model-facing content: a numbered list, a no-results line, or a failure."""
+def _drop_guarded(
+    results: list[SearchResult], config: HarnessConfig, run_log: RunLog
+) -> list[SearchResult]:
+    """Scan each result's title+snippet, dropping any that fire the guard (R1).
+
+    Runs after parsing, before `_render`: a blocked result is excluded from both the
+    rendered content and the returned artifact, with one `guard_blocked` incident each.
+    """
+    if not config.guard.enabled:
+        return results
+
+    survivors: list[SearchResult] = []
+    for result in results:
+        scan_result = scan(f"{result.title}\n{result.snippet}")
+        if scan_result.blocked:
+            run_log.record("guard_blocked", guard_blocked_detail(result.url, scan_result.signals))
+        else:
+            survivors.append(result)
+    return survivors
+
+
+def _approve_survivors(results: list[SearchResult], registry: SourceRegistry) -> None:
+    """Approve every survivor's URL for fetching (Phase 4, R2).
+
+    Only the guard's survivors: a blocked result (`_drop_guarded`) never reaches here, so a
+    guard-blocked URL stays unfetchable even if pasted into a later `fetch_pages` call.
+    """
+    for result in results:
+        registry.approve(result.url)
+
+
+def _render(query: str, outcome: list[SearchResult] | SearchFailure, guard_blocked: int = 0) -> str:
+    """Render the model-facing content: a numbered list, a no-results line, or a failure.
+
+    Titles/snippets are untrusted content (Phase 5, D1 spotlighting): the whole results listing
+    is fenced with `harness.guard.fence` as one block, with the header line kept outside it.
+
+    `guard_blocked` distinguishes "nothing existed" from "everything was withheld": an
+    all-blocked search must not render identically to a genuinely empty one, or the model
+    (and an operator reading the transcript) retries a query that actually had answers.
+    """
     if isinstance(outcome, SearchFailure):
         return f'Search for "{query}" failed: {outcome.reason} — {outcome.detail}'
     if not outcome:
+        if guard_blocked:
+            noun = "result" if guard_blocked == 1 else "results"
+            return (
+                f'Search for "{query}" returned {guard_blocked} {noun}, all withheld by the '
+                "injection guard."
+            )
         return f'Search for "{query}" returned no results.'
 
-    lines = [f'Results for "{query}":']
-    for index, result in enumerate(outcome, start=1):
-        lines.append(f"{index}. {result.title} — {result.url}\n   {result.snippet}")
-    return "\n".join(lines)
+    result_lines = [
+        f"{index}. {result.title} — {result.url}\n   {result.snippet}"
+        for index, result in enumerate(outcome, start=1)
+    ]
+    listing = "\n".join(result_lines)
+    return f'Results for "{query}":\n\n{fence(listing)}'
 
 
 def _search_url(config: HarnessConfig) -> str:
@@ -120,7 +169,7 @@ async def _fetch_search_json(query: str, config: HarnessConfig) -> object | Sear
 
 
 async def _search(
-    query: str, max_results: int, config: HarnessConfig, run_log: RunLog
+    query: str, max_results: int, config: HarnessConfig, registry: SourceRegistry, run_log: RunLog
 ) -> tuple[str, list[SearchResult] | SearchFailure]:
     """Query SearXNG, returning model-facing content and the typed result/failure.
 
@@ -130,6 +179,7 @@ async def _search(
     """
     payload = await _fetch_search_json(query, config)
     outcome: list[SearchResult] | SearchFailure
+    guard_blocked = 0
     if isinstance(payload, SearchFailure):
         outcome = payload
     elif not isinstance(payload, dict):
@@ -146,12 +196,19 @@ async def _search(
                 f'search for "{query}": {dropped} malformed result {noun} '
                 "dropped from the response",
             )
+        if isinstance(outcome, list):
+            survivors = _drop_guarded(outcome, config, run_log)
+            guard_blocked = len(outcome) - len(survivors)
+            outcome = survivors
+            # Phase 4 (R2): only the guard's survivors become fetchable — a blocked result's
+            # URL is never approved, per D2's developer decision.
+            _approve_survivors(outcome, registry)
 
     if isinstance(outcome, SearchFailure):
         run_log.record(
             "search_failed", f'search for "{query}" failed: {outcome.reason} — {outcome.detail}'
         )
-    return _render(query, outcome), outcome
+    return _render(query, outcome, guard_blocked), outcome
 
 
 class SearchPreflightError(Exception):
@@ -198,8 +255,20 @@ class SearchUnavailableError(Exception):
     """
 
 
-def build_search_tool(config: HarnessConfig, run_log: RunLog | None = None) -> BaseTool:
-    """Build the `search_web` tool, closing over `config` and the shared `run_log`."""
+def build_search_tool(
+    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+) -> BaseTool:
+    """Build the `search_web` tool, closing over `config`, the shared `registry` and `run_log`.
+
+    The guard is invisible here (D5, mirrors fetch.py): every result's title+snippet is
+    scanned for injection signals inside `_search`, after parsing and before rendering. A
+    blocked result is dropped from both the rendered content and the returned artifact,
+    disclosed only via a `guard_blocked` `RunLog` incident.
+
+    Strict URL provenance (Phase 4, R2) is also invisible here: every survivor's URL is
+    approved on `registry` inside `_search`, so a clean result becomes fetchable while a
+    guard-blocked one never does.
+    """
 
     log = or_default(run_log)
 
@@ -232,7 +301,7 @@ def build_search_tool(config: HarnessConfig, run_log: RunLog | None = None) -> B
         row, which raises `SearchUnavailableError` to abort the run.
         """
         nonlocal consecutive_failures
-        content, outcome = await _search(query, max_results, config, log)
+        content, outcome = await _search(query, max_results, config, registry, log)
 
         if isinstance(outcome, SearchFailure) and outcome.reason in ("unreachable", "bad_status"):
             consecutive_failures += 1

@@ -40,7 +40,7 @@ def build_tools(
     return ToolSets(
         lead=[build_ask_user_tool(config)],
         researcher=[
-            build_search_tool(config, log),
+            build_search_tool(config, registry, log),
             build_fallback_tool(config, registry, log),
         ],
         reader=[build_fetch_tool(config, registry, log)],

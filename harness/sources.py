@@ -2,10 +2,14 @@
 
 The mechanical half of the citation scheme: minting IDs, deduplicating equivalent URLs, and
 rewriting markers into links. No model involvement, no fetching (D6). Also the home of the
-captured-file policy (`sources_dir`, `FETCH_FAILED_PREFIX`, `is_failed_capture`): it used to
-live in `harness/tools/fetch.py`, but `report.py`, `verify.py` and the test fixtures all need
-it, and importing it from there dragged all of crawl4ai (~1.2s) into every pure-rendering
-module and every test session.
+captured-file policy (`sources_dir`): it used to live in `harness/tools/fetch.py`, but
+`report.py`, `verify.py` and the test fixtures all need it, and importing it from there dragged
+all of crawl4ai (~1.2s) into every pure-rendering module and every test session.
+
+R5's identity model: a `source_id` is minted only for a successful (`fetched`) page, and only
+a `fetched` page ever gets a captures-dir file (`harness/tools/fetch.py`'s `_write_source_file`).
+So "a capture file exists" is now equivalent to "content is real page text" with no further
+convention needed — there is no more failure-stub shape for `report.py`/`verify.py` to detect.
 """
 
 import re
@@ -21,22 +25,9 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict
 
 from harness.config import HarnessConfig, run_workspace_dir
+from harness.guard import strip_invisibles
 
 MARKER_RE = re.compile(r"\[S(\d+)\]")
-
-# The single home for this policy string: fetch.py's `_write_source_file` writes it as the
-# first line of any non-`fetched` capture, and `is_failed_capture` below reads it.
-FETCH_FAILED_PREFIX = "FETCH FAILED: "
-
-
-def is_failed_capture(source_text: str) -> bool:
-    """Whether a captured source file's text is a failure stub rather than real content.
-
-    The single home for READING what `FETCH_FAILED_PREFIX` writes. `report.py` (is this usable
-    evidence?) and `verify.py` (can this settle a claim?) ask the same question, and two copies
-    of "split the first line, test the prefix" could disagree about which sources count.
-    """
-    return source_text.split("\n", 1)[0].startswith(FETCH_FAILED_PREFIX)
 
 
 def sources_dir(config: HarnessConfig, registry: "SourceRegistry") -> Path:
@@ -174,6 +165,41 @@ def normalize_url(url: str) -> str:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+# A comma ends the match: two URLs pasted back-to-back (`https://a.com,https://b.com`) are a
+# far more common input than a URL with a literal comma, and the unsplit blob approved neither.
+_URL_RE = re.compile(r"https?://[^\s,]+")
+_TRAILING_PUNCTUATION = ".,;:!?)]}>\"'"
+
+
+def _strip_trailing_punctuation(url: str) -> str:
+    """Strip sentence punctuation from the end of a matched URL, keeping balanced parens.
+
+    Char-by-char rather than one `rstrip`: a `)` is kept whenever the URL still contains at
+    least as many `(` — `https://en.wikipedia.org/wiki/Foo_(bar)` keeps its close-paren, while
+    the wrapping paren of `(see https://a.com/x)` is stripped.
+    """
+    while url:
+        last = url[-1]
+        if last not in _TRAILING_PUNCTUATION:
+            break
+        if last == ")" and url.count("(") >= url.count(")"):
+            break
+        url = url[:-1]
+    return url
+
+
+def extract_urls(text: str) -> list[str]:
+    """Return every http(s) URL found in `text`, trailing punctuation stripped.
+
+    Phase 4's strict-provenance seam (D2/R2): a question's pasted "read this page" URL is the
+    only other sanctioned way (besides a search result) a URL becomes fetchable, so `__main__`
+    extracts here and `registry.approve`s each one at run start. Non-http(s) schemes
+    (`javascript:`, `ftp:`) are never matched — approving one would widen fetchability beyond
+    what `_fetch`'s crawler even attempts.
+    """
+    return [_strip_trailing_punctuation(match.group(0)) for match in _URL_RE.finditer(text)]
+
+
 def names_a_different_document(url: str, other: str) -> bool:
     """Whether two URLs that share a canonical form still name different documents.
 
@@ -217,11 +243,25 @@ class SourceRegistry:
         )
         self._by_url: dict[str, Source] = {}
         self._by_id: dict[str, Source] = {}
+        # Phase 4 strict provenance (R2): a URL is fetchable only once it lands here — from a
+        # `search_web` result surviving Phase 3's guard, or a user-supplied URL `__main__`
+        # approves at run start. Never from a page's own in-body links (D2).
+        self._approved: set[str] = set()
+
+    def approve(self, url: str) -> None:
+        """Mark `url` fetchable (Phase 4, R2) -- the only sanctioned way to widen fetchability."""
+        self._approved.add(normalize_url(url))
+
+    def is_approved(self, url: str) -> bool:
+        """Whether `url` (any `normalize_url`-equivalent spelling) has been approved."""
+        return normalize_url(url) in self._approved
 
     def add(self, url: str, title: str | None = None) -> str:
         """Register `url` and return its ID; the same normalized URL is never added twice.
 
-        First write wins — an already-registered URL keeps its existing title.
+        First write wins — an already-registered URL keeps its existing title. `title` is run
+        through `strip_invisibles` (Phase 5, R3 hygiene) before storage: a page's own title is
+        untrusted content like anything else it carries.
         """
         normalized = normalize_url(url)
         existing = self._by_url.get(normalized)
@@ -229,7 +269,8 @@ class SourceRegistry:
             return existing.id
 
         source_id = f"S{len(self._by_id) + 1}"
-        source = Source(id=source_id, url=normalized, title=title)
+        clean_title = strip_invisibles(title) if title is not None else None
+        source = Source(id=source_id, url=normalized, title=clean_title)
         self._by_url[normalized] = source
         self._by_id[source_id] = source
         return source_id
@@ -250,17 +291,28 @@ class SourceRegistry:
         return list(self._by_id.values())
 
     def link(self, source_id: str) -> str:
-        """Render `source_id` as a `[domain](url)` link; `KeyError` if unregistered."""
+        """Render `source_id` as a `[domain](url)` link; `KeyError` if unregistered.
+
+        Emits a markdown link ONLY when the URL's scheme is http/https (Phase 5, R3): any other
+        scheme (`javascript:`, `data:`, ...) renders as plain text instead, so a hostile title or
+        URL can never become a clickable non-http(s) action in the report. A URL `normalize_url`
+        itself could not parse (`ValueError` from `urlsplit`) has no scheme to check either way
+        and still renders as a link with itself as the label, matching `add`'s own tolerance for
+        unparseable input.
+        """
         source = self._by_id.get(source_id)
         if source is None:
             raise KeyError(f"unknown source id {source_id!r}")
 
         try:
-            label = urlsplit(source.url).hostname or source.url
+            parts = urlsplit(source.url)
         except ValueError:
-            # `add` stored a URL `normalize_url` could not parse, so it fails here too;
-            # the raw URL is the only label available.
-            label = source.url
+            return f"[{source.url}]({source.url})"
+
+        if parts.scheme.lower() not in ("http", "https"):
+            return source.url
+
+        label = parts.hostname or source.url
         return f"[{label}]({source.url})"
 
     def resolve(self, text: str) -> str:

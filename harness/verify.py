@@ -17,9 +17,10 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
+from harness.guard import fence
 from harness.paragraphs import Paragraph, renders_content, strip_markers
 from harness.prompts import render
-from harness.sources import SourceRegistry, is_failed_capture, sources_dir
+from harness.sources import SourceRegistry, sources_dir
 
 Verdict = Literal[
     "supported", "partially_supported", "not_supported", "no_sources_cited", "not_verified"
@@ -204,9 +205,6 @@ async def verify_paragraphs(
             except (OSError, UnicodeDecodeError):
                 skipped.append(f"{sid}: no readable captured content exists")
                 continue
-            if is_failed_capture(text):
-                skipped.append(f"{sid}: {text.split(chr(10), 1)[0]}")
-                continue
             pooled.append((sid, source.url, text))
 
         if not pooled:
@@ -226,7 +224,11 @@ async def verify_paragraphs(
         pooled_ids = [sid for sid, _, _ in pooled]
         try:
             sources_block = "\n\n".join(f"[{sid}] {url}\n{text}" for sid, url, text in pooled)
-            rendered = render("verify", paragraph=paragraph.text, sources=sources_block)
+            # D5's capture gating guarantees this text — body markdown and title line alike —
+            # was scan-passed and invisible-stripped before it reached disk; fencing (Phase 5,
+            # D1) is the second layer, so a page whose provenance was clean still cannot steer
+            # the verifier model via untrusted content read straight off disk.
+            rendered = render("verify", paragraph=paragraph.text, sources=fence(sources_block))
             reply = await model.ainvoke([HumanMessage(content=rendered)])
             verdict, detail, sources_conflict, unsupported_items = _parse_reply(str(reply.content))
             verdicts.append(

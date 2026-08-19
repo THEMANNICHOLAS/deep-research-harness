@@ -173,10 +173,11 @@ it first. To check it, run:
 PYTHONIOENCODING=utf-8 uv run --env-file .env python -c "
 import asyncio
 from harness.config import load_config
+from harness.sources import SourceRegistry
 from harness.tools.search import build_search_tool
 
 async def main():
-    search_web = build_search_tool(load_config())
+    search_web = build_search_tool(load_config(), SourceRegistry())
     message = await search_web.ainvoke({
         'name': 'search_web',
         'args': {'query': 'solar panel efficiency', 'max_results': 5},

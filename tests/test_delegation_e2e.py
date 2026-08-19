@@ -33,6 +33,12 @@ _READER_DESCRIPTION = (
     "only, not marketing claims."
 )
 
+# Phase 4 strict provenance (R2): neither scenario below ever calls `search_web`, so the
+# reader's directly-fetched URL(s) must arrive pre-approved the only other sanctioned way --
+# pasted inside the question text, extracted and approved by `harness/__main__.py` at run
+# start. Embedding it here keeps that arrange step next to the URL it covers.
+_QUESTION = f"does the widget line show a defect pattern? See {_URL} for details."
+
 
 def _task_call(description: str, subagent_type: str, call_id: str = "call_task") -> AIMessage:
     return AIMessage(
@@ -159,7 +165,7 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
 
     monkeypatch.setattr(main_module, "write_report", _spy)
 
-    exit_code = await main_module.main(["does the widget line show a defect pattern?"])
+    exit_code = await main_module.main([_QUESTION])
 
     return {
         "config": config,
@@ -230,6 +236,12 @@ _READER_B_DESCRIPTION = (
     f"Objective: read {_URL_B} for the supplier recall history. Output format: prose findings "
     "with [Sn] markers. Tools: fetch_pages only, no search. Boundaries: technical specs "
     "only, not marketing claims."
+)
+
+# Phase 4 strict provenance (R2): this scenario's readers fetch both URLs directly, with no
+# `search_web` call in either angle -- both must arrive pre-approved via the question text.
+_QUESTION_MIXED = (
+    f"does the widget line show a defect pattern? See {_URL} and {_URL_B} for details."
 )
 
 
@@ -345,7 +357,7 @@ async def test_report_discloses_a_mixed_digested_and_unread_run(
 
     monkeypatch.setattr(main_module, "write_report", _spy)
 
-    exit_code = await main_module.main(["does the widget line show a defect pattern?"])
+    exit_code = await main_module.main([_QUESTION_MIXED])
 
     assert exit_code == 0
     registry = captured["outcome"].registry

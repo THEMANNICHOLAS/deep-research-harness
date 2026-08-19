@@ -35,6 +35,7 @@ from tests.conftest import (
     ScriptedChatModel,
     _FakeMarkdown,
     _FakeResult,
+    approve_all,
     drain_stdout,
     install_search_transport,
     patch_model,
@@ -165,7 +166,7 @@ async def test_build_agent_exposes_the_harness_tools(noop_agent):
     assert "fetch_pages" not in _tools_by_name(graph)
 
 
-async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):
+async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):  # R4
     _, graph = noop_agent
 
     # `task` now exists (backing the declared `researcher` subagent), so the general-purpose
@@ -173,16 +174,31 @@ async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):
     assert _declared_subagent_names(graph) == {"researcher"}
 
 
-async def test_the_researchers_own_task_tool_declares_only_the_reader(noop_agent):
+async def test_the_researchers_own_task_tool_declares_only_the_reader(noop_agent):  # R4
     """TEST-FIRST item 3 (lead tool surface): the 3-tier hierarchy is nested, not flattened —
     the lead's own declared subagent is exactly `{"researcher"}` (previous test), and the
     researcher's OWN `task` tool, one level deeper, declares exactly `{"reader"}`.
+
+    R4 regression (PLAN-prompt-injection-defense.md Phase 5): pins the containment structure
+    a fenced/sanitized run still relies on — the researcher can dispatch only to the reader,
+    never fan out to another tier of its own choosing.
     """
     _, graph = noop_agent
 
     researcher_runnable = _declared_subagents(graph)["researcher"]
 
     assert _declared_subagent_names(researcher_runnable) == {"reader"}
+
+
+def test_lead_interrupt_on_contains_exactly_ask_user():  # R4
+    """R4 regression (Phase 5, D7): the lead's whole interrupt surface is `ask_user` — pinning
+    `_INTERRUPT_ON`'s key set directly, since that dict is what `build_agent` passes through to
+    `interrupt_on` unmodified.
+    """
+    from harness.agent import _INTERRUPT_ON
+    from harness.tools.ask_user import ASK_USER_TOOL_NAME
+
+    assert set(_INTERRUPT_ON) == {ASK_USER_TOOL_NAME}
 
 
 async def test_the_nested_readers_tool_surface_includes_its_filesystem_workspace(noop_agent):
@@ -273,6 +289,7 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
     assert any(isinstance(m, PatchToolCallsMiddleware) for m in spec["middleware"])
     # The reader has no checkpointer forwarded and cannot interrupt — inheriting the lead's
     # `ask_user` interrupt entry would register an interrupt that can never fire.
+    # R4 regression (Phase 5): `interrupt_on` stays confined to the lead alone.
     assert "interrupt_on" not in spec
 
 
@@ -280,6 +297,8 @@ def test_researcher_spec_has_no_interrupt_on(make_config, scripted_model, tmp_pa
     """Regression pin (D6; deferred from Step 3, developer-approved to land in Step 4): the
     researcher `SubAgent` spec omits `interrupt_on`, the same as the reader above — a nested
     researcher has no checkpointer forwarded and cannot interrupt either.
+
+    R4 regression (Phase 5): `interrupt_on` stays confined to the lead alone.
     """
     from deepagents.backends.filesystem import FilesystemBackend
 
@@ -617,7 +636,11 @@ async def test_a_reader_crash_after_a_successful_fetch_leaves_the_source_unread(
         ]
     )
 
-    researcher, registry = build_researcher(researcher_model, reader_model)
+    # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
+    # directly-fetched URL must arrive pre-approved.
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
+    researcher, registry = build_researcher(researcher_model, reader_model, registry=registry)
     result = await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
     task_messages = [
@@ -656,7 +679,11 @@ async def test_an_empty_digest_leaves_the_fetched_source_unread(
         ]
     )
 
-    researcher, registry = build_researcher(researcher_model, reader_model)
+    # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
+    # directly-fetched URL must arrive pre-approved.
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
+    researcher, registry = build_researcher(researcher_model, reader_model, registry=registry)
     await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
 
     source = registry.get("S1")
@@ -740,7 +767,10 @@ async def test_lead_to_researcher_to_reader_digest_reaches_the_lead(
         ]
     )
 
+    # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
+    # directly-fetched URL must arrive pre-approved.
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     graph = build_agent(make_config(), registry)
     result = await graph.ainvoke(
         {"messages": [HumanMessage(content="research this")]},
@@ -1363,9 +1393,25 @@ async def test_read_answer_returns_what_was_typed(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": "  Yes, region EU-West  ")
     interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which region?"}}]})
 
-    decisions = await main_module._answer_questions(interrupt, PlainRenderer())
+    decisions = await main_module._answer_questions(interrupt, PlainRenderer(), SourceRegistry())
 
     assert decisions == [{"type": "respond", "message": "Yes, region EU-West"}]
+
+
+async def test_a_url_pasted_into_a_clarifying_answer_becomes_fetchable(monkeypatch):
+    """Phase 4 (R2): an answer is user-supplied text like the question itself, so a URL pasted
+    into it must be approved — the natural reply to "which page do you mean?" is that URL, and
+    without approval every later fetch of it is provenance_rejected.
+    """
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt="": "this one: https://example.test/docs/page"
+    )
+    interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which page?"}}]})
+    registry = SourceRegistry()
+
+    await main_module._answer_questions(interrupt, PlainRenderer(), registry)
+
+    assert registry.is_approved("https://example.test/docs/page")
 
 
 async def test_main_cuts_the_run_short_at_the_round_cap(
@@ -2026,7 +2072,7 @@ async def test_a_clarifying_question_can_arrive_without_a_question_argument(
         }
     )
 
-    decisions = await main_module._answer_questions(interrupt, PlainRenderer())
+    decisions = await main_module._answer_questions(interrupt, PlainRenderer(), SourceRegistry())
 
     out, _ = drain_stdout(capsys)
     asked = [line for line in out.splitlines() if line.strip()]

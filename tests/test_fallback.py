@@ -1,11 +1,20 @@
 """Behavioral tests for harness.tools.fallback (the `fetch_raw` recovery tool, D2/R2/R5)."""
 
+from pathlib import Path
+
 from langchain_core.tools import BaseTool
 
 from harness.config import AgentSettings
+from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
 from harness.tools import fallback, fetch
-from tests.conftest import _FakeMarkdown, _FakeResult
+from tests.conftest import _FakeMarkdown, _FakeResult, approve_all
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
+
+
+def _attack_markdown() -> str:
+    return (FIXTURES_DIR / "attack_instruction_override_ignore.txt").read_text(encoding="utf-8")
 
 
 def _tool_call(urls: list[str], reason: str, call_id: str) -> dict:
@@ -23,6 +32,7 @@ async def test_fetch_raw_wraps_each_successful_page_in_the_undigested_marker(
 ):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     results = [
         _FakeResult(
             "https://a.test", markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body")
@@ -45,6 +55,7 @@ async def test_fetch_raw_still_writes_the_normal_capture_file(
 ):
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     results = [
         _FakeResult(
             "https://a.test", markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body")
@@ -66,6 +77,7 @@ async def test_fetch_raw_mints_ids_via_the_shared_registry_continuing_the_sequen
 ):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://one.test", "https://two.test", "https://three.test"])
     fetch_pages = fetch.build_fetch_tool(config, registry)
 
     install_crawler(
@@ -104,11 +116,12 @@ async def test_fetch_raw_mints_ids_via_the_shared_registry_continuing_the_sequen
     assert registry.get("S3") is not None
 
 
-async def test_fetch_raw_marks_successful_pages_fallback_and_leaves_failures_unread(
+async def test_fetch_raw_marks_successful_pages_fallback_and_mints_nothing_for_failures(  # R5
     install_crawler, make_config
 ):
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://ok.test", "https://bad.test"])
     results = [
         _FakeResult(
             "https://ok.test", markdown=_FakeMarkdown(raw_markdown="ok", fit_markdown="ok")
@@ -126,7 +139,35 @@ async def test_fetch_raw_marks_successful_pages_fallback_and_leaves_failures_unr
 
     ok_page, bad_page = message.artifact
     assert registry.get(ok_page.source_id).read_mode == "fallback"
-    assert registry.get(bad_page.source_id).read_mode == "unread"
+    # A failure mints no id at all (R5) — there is no registry entry to leave "unread".
+    assert bad_page.source_id is None
+
+
+async def test_fetch_raw_fences_the_body_nested_inside_the_undigested_wrapper(  # R4
+    install_crawler, make_config
+):
+    """The wrapper stays outermost; the fence's boundary lines sit inside it."""
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
+    results = [
+        _FakeResult(
+            "https://a.test", markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body")
+        )
+    ]
+    install_crawler(results)
+    fetch_raw = fallback.build_fallback_tool(config, registry)
+
+    message = await fetch_raw.ainvoke(_tool_call(["https://a.test"], "some reason", "call-1"))
+
+    content = message.content
+    wrapper_start = content.index('<undigested source="S1"')
+    wrapper_end = content.index("</undigested>")
+    fence_open = content.index("<<<UNTRUSTED")
+    fence_close = content.index("<<<END UNTRUSTED")
+
+    assert wrapper_start < fence_open < fence_close < wrapper_end
+    assert wrapper_start < content.index("A body") < wrapper_end
 
 
 async def test_fetch_raw_never_downgrades_a_digested_source(install_crawler, make_config):
@@ -137,6 +178,7 @@ async def test_fetch_raw_never_downgrades_a_digested_source(install_crawler, mak
     """
     config = make_config()
     registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
     source_id = registry.add("https://a.test")
     registry.mark_read(source_id, "digested")
     install_crawler(
@@ -175,6 +217,41 @@ async def test_a_call_over_the_url_limit_is_rejected_before_any_fetch(install_cr
     assert fake_cls.calls == []
 
 
+async def test_fetch_raw_drops_a_blocked_page_the_same_as_fetch_pages(  # R1
+    install_crawler, make_config, tmp_path
+):
+    """Proves the shared `_fetch` covers both surfaces: a blocked page mints no Sn, writes
+    no capture file, is absent from the rendered content, and records one `guard_blocked`
+    incident, through `fetch_raw` exactly as through `fetch_pages`."""
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://evil.test"])
+    run_log = RunLog()
+    attack_markdown = _attack_markdown()
+    results = [
+        _FakeResult(
+            "https://evil.test",
+            markdown=_FakeMarkdown(raw_markdown=attack_markdown, fit_markdown=attack_markdown),
+        )
+    ]
+    install_crawler(results)
+    fetch_raw = fallback.build_fallback_tool(config, registry, run_log)
+
+    message = await fetch_raw.ainvoke(
+        _tool_call(["https://evil.test"], "some reason", "call-guard-raw-1")
+    )
+
+    assert message.artifact == []
+    assert registry.all() == []
+    assert "https://evil.test" not in message.content
+    assert list(sources_dir(config, registry).glob("*.md")) == []
+
+    incidents = [i for i in run_log.incidents() if i.kind == "guard_blocked"]
+    assert len(incidents) == 1
+    assert "https://evil.test" in incidents[0].detail
+    assert "instruction_override" in incidents[0].detail
+
+
 async def test_fetch_raw_exposes_the_pinned_contract(make_config):
     config = make_config()
     registry = SourceRegistry()
@@ -187,3 +264,27 @@ async def test_fetch_raw_exposes_the_pinned_contract(make_config):
     assert fetch_raw.description
     schema = fetch_raw.args_schema.model_json_schema()
     assert set(schema["properties"]) == {"urls", "reason"}
+
+
+# --- Phase 4: strict URL provenance (R2) -------------------------------------------------
+
+
+async def test_fetch_raw_rejects_an_unapproved_url_before_any_crawl(install_crawler, make_config):
+    """Same rejection behavior as `fetch_pages`, proving the shared `_fetch` covers both."""
+    config = make_config()
+    registry = SourceRegistry()  # deliberately nothing approved
+    run_log = RunLog()
+    fake_cls = install_crawler([])
+    fetch_raw = fallback.build_fallback_tool(config, registry, run_log)
+
+    message = await fetch_raw.ainvoke(
+        _tool_call(["https://never-approved.test"], "some reason", "call-provenance-1")
+    )
+
+    assert message.artifact == []
+    assert fake_cls.calls == []
+    assert registry.all() == []
+
+    incidents = [i for i in run_log.incidents() if i.kind == "provenance_rejected"]
+    assert len(incidents) == 1
+    assert "https://never-approved.test" in incidents[0].detail

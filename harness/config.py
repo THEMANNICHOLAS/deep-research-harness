@@ -96,6 +96,13 @@ class SearchSettings(_StrictModel):
     max_consecutive_failures: int = Field(default=3, gt=0)
 
 
+class GuardSettings(_StrictModel):
+    # R1/D5: toggles the injection SCAN only. Byte-sanitization of survivor markdown still
+    # runs when disabled — the flag bypasses detection, not hygiene (developer decision,
+    # PLAN-prompt-injection-defense.md Phase 3).
+    enabled: bool = True
+
+
 class AgentSettings(_StrictModel):
     max_rounds: int = Field(default=50, gt=0)  # hard cap on agent-loop rounds
     wall_clock_seconds: int = Field(default=1800, gt=0)  # wall-clock budget, in seconds
@@ -118,6 +125,7 @@ class HarnessConfig(_StrictModel):
     fetch: FetchSettings = Field(default_factory=FetchSettings)
     search: SearchSettings
     agent: AgentSettings = Field(default_factory=AgentSettings)
+    guard: GuardSettings = Field(default_factory=GuardSettings)
 
     @model_validator(mode="after")
     def _cross_check_roles(self) -> "HarnessConfig":
