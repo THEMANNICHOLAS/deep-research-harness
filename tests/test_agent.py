@@ -17,7 +17,6 @@ import pytest
 from deepagents.backends.protocol import SandboxBackendProtocol
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import Interrupt
-from pydantic import PrivateAttr
 
 import harness.__main__ as main_module
 from harness.agent import build_agent
@@ -32,6 +31,7 @@ from harness.report import (
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from tests.conftest import (
+    ConcurrencyTrackingModel,
     ScriptedChatModel,
     _FakeMarkdown,
     _FakeResult,
@@ -766,31 +766,6 @@ async def test_lead_to_researcher_to_reader_digest_reaches_the_lead(
     assert source.read_mode == "digested"
 
 
-class _ConcurrencyTrackingModel(ScriptedChatModel):
-    """Tracks in-flight `_agenerate` calls to prove concurrent researcher dispatch (mirrors the
-    shape of test_verify.py's own `_ConcurrencyTrackingModel`, which proves the OPPOSITE —
-    strictly sequential verification calls — so a bare `asyncio.sleep(0)` there is enough to
-    rule out a false negative).
-
-    Proving concurrency the other direction needs a real, non-zero yield: with `sleep(0)`, a
-    single-tick yield, the two gathered coroutines' actual scheduling can still interleave such
-    that one fully completes before the other's Task gets its first turn (observed flaky in
-    this suite) — `sleep(0.05)` reliably gives both a chance to increment before either decrements.
-    """
-
-    _in_flight: int = PrivateAttr(default=0)
-    _peak_in_flight: int = PrivateAttr(default=0)
-
-    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-        self._in_flight += 1
-        self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
-        await asyncio.sleep(0.05)
-        try:
-            return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        finally:
-            self._in_flight -= 1
-
-
 async def test_two_researchers_dispatched_in_one_turn_run_concurrently(
     make_config, patch_models_by_role
 ):
@@ -822,9 +797,11 @@ async def test_two_researchers_dispatched_in_one_turn_run_concurrently(
             AIMessage(content="done"),
         ]
     )
-    researcher_model = _ConcurrencyTrackingModel(
+    researcher_model = ConcurrencyTrackingModel(
         model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script([AIMessage(content="Report A."), AIMessage(content="Report B.")])
+    # A real, non-zero yield — see the class docstring on why proving CONCURRENCY needs it.
+    researcher_model._sleep_seconds = 0.05
     reader_model = ScriptedChatModel(
         model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script([AIMessage(content="unused")])

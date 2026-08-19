@@ -2,7 +2,32 @@
 
 import pytest
 
-from harness.paragraphs import Paragraph, split_paragraphs, strip_markers
+from harness.paragraphs import Paragraph, renders_content, split_paragraphs, strip_markers
+
+
+def test_renders_content_distinguishes_prose_citation_only_and_code():
+    """`renders_content` is the ONE definition of "shows up in `## Answer`" (D1), counted by
+    both `report._answer_section` (numbering/dropping) and `verify._format_verdicts_block`
+    (the reviewer paragraph's numbers) — pinned directly so a change to it is a deliberate
+    edit to that shared contract, not a side effect noticed via one consumer's tests.
+    """
+    prose, citation_only, code = split_paragraphs(
+        "Real prose [S1].\n\n[S2]\n\n```python\nprint('hi')\n```"
+    )
+
+    assert renders_content(prose) is True
+    # A citation-only paragraph strips to nothing and renders nothing.
+    assert renders_content(citation_only) is False
+    # A fence always renders, even though it carries no citations or bullets.
+    assert renders_content(code) is True
+
+
+def test_renders_content_is_false_for_a_citation_only_bullet_list():
+    # A list whose every bullet is nothing but a marker leaves only list syntax, which
+    # `strip_markers` drops — so the block renders nothing.
+    [paragraph] = split_paragraphs("- [S1]\n- [S2]")
+
+    assert renders_content(paragraph) is False
 
 
 def test_fenced_code_block_is_its_own_code_paragraph_keeping_its_content():
