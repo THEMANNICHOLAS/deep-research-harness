@@ -6,8 +6,8 @@ import pytest
 
 from harness.prompts import PromptError, render, required_variables
 
-# The frozen delegation-tier contracts (R5). The reader tier is wired; the subagent
-# contract is not.
+# The frozen delegation-tier contracts (R5). Both tiers are wired: `subagent` is the
+# researcher's live system prompt, `reader` the reader's.
 TIER_CONTRACTS = ["subagent", "reader"]
 
 
@@ -147,6 +147,28 @@ def test_tier_contracts_name_their_frozen_fields(name, field):
     # must carry, three a tier must return. Anchored to the bolded bullet, since a bare "tools"
     # would also match the `# Tools` heading and let a renamed field slip through.
     assert f"**{field}**" in _render_shipped(name)
+
+
+def test_subagent_prompt_teaches_reader_delegation_recovery_and_budget():
+    """The researcher prompt's reader-delegation instructions, `fetch_raw` recovery rule, and
+    budget caps are load-bearing run behavior with no other guard (PR review cleanup): the
+    researcher must delegate reading (never fetch pages itself), reach for `fetch_raw` only
+    after a failed delegation, and stay inside its search/dispatch budget.
+    """
+    rendered = render("subagent", current_date="2026-01-01", max_urls_per_call=5)
+
+    # Reading is delegated: the reader dispatch carries the per-call URL cap and the facet.
+    assert 'subagent_type="reader"' in rendered
+    assert "up to 5" in rendered
+    assert "fetch_pages" not in rendered
+
+    # `fetch_raw` is recovery only, explicitly ordered AFTER a failed/empty delegation.
+    assert "recovery only" in rendered.lower()
+    assert "never as a first resort" in rendered
+
+    # The budget caps: bounded searching and dispatching, partial findings over overrun.
+    assert "4 searches" in rendered
+    assert "6 reader dispatches" in rendered
 
 
 def test_orchestrator_prompt_teaches_the_full_delegation_protocol():

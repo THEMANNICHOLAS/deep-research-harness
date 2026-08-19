@@ -323,6 +323,26 @@ def test_missing_head_role_raises_config_error_naming_head(tmp_path, monkeypatch
     assert "head" in str(excinfo.value)
 
 
+def test_missing_researcher_role_still_loads(tmp_path, monkeypatch):
+    """`head` is the only role required at LOAD time: a config missing `[roles.researcher]`
+    (or `reader`/`verifier`) loads fine and fails loud later, at build/preflight, via
+    `ModelError` naming the role. Pins the relaxation so a future tightening of
+    `_cross_check_roles` is a deliberate edit, not an accident.
+    """
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML.replace(
+        '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n', ""
+    )
+    assert toml_content != VALID_TOML, "fixture drifted from VALID_TOML — update the block"
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert "researcher" not in config.roles
+    assert "head" in config.roles
+
+
 def test_agent_section_loads_declared_values(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")

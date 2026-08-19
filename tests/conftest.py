@@ -1,5 +1,6 @@
 """Shared test fixtures for the harness suite."""
 
+import asyncio
 import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -222,6 +223,40 @@ class ScriptedChatModel(ChatOpenAI):
     ) -> ChatResult:
         # `_generate` records `messages` itself, so the async path needs no second recording.
         return self._generate(messages, stop=stop, **kwargs)
+
+
+class ConcurrencyTrackingModel(ScriptedChatModel):
+    """A `ScriptedChatModel` that tracks in-flight `_agenerate` calls, for asserting on peak
+    concurrency in either direction.
+
+    `_sleep_seconds` is load-bearing both ways. Proving calls are SEQUENTIAL
+    (test_verify.py, D4) needs only `0`: with a single-tick yield, even a concurrent
+    `asyncio.gather` reveals itself, and anything longer just slows the suite. Proving calls
+    are CONCURRENT (test_agent.py) needs a real, non-zero yield — with `sleep(0)` the two
+    gathered coroutines' scheduling can still interleave such that one fully completes before
+    the other's Task gets its first turn (observed flaky in this suite); `0.05` reliably gives
+    both a chance to increment before either decrements. Set it by assigning the private attr
+    after construction: `model._sleep_seconds = 0.05`.
+    """
+
+    _in_flight: int = PrivateAttr(default=0)
+    _peak_in_flight: int = PrivateAttr(default=0)
+    _sleep_seconds: float = PrivateAttr(default=0.0)
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self._in_flight += 1
+        self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
+        await asyncio.sleep(self._sleep_seconds)
+        try:
+            return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        finally:
+            self._in_flight -= 1
 
 
 def patch_model(monkeypatch: pytest.MonkeyPatch, model: Any) -> None:
