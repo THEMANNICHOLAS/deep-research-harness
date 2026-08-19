@@ -782,7 +782,9 @@ async def test_the_consolidation_numbering_skips_paragraphs_that_render_no_text(
     consolidation_prompt = _flatten(model._received_messages[-1])
     # The reader can only count ONE paragraph in `## Answer` — the citation-only one renders
     # nothing — so the partially-supported one must be named "Paragraph 1", not "Paragraph 2".
-    assert "Paragraph 1: partially_supported" in consolidation_prompt
+    assert 'Paragraph 1 (starts: "The gauge read 42 psi."): partially_supported' in (
+        consolidation_prompt
+    )
     assert "Paragraph 2" not in consolidation_prompt
 
 

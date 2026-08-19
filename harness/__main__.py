@@ -91,8 +91,11 @@ _SYNTHESIZE_NOW = (
 _SYNTHESIS_RECURSION_LIMIT = 10
 
 # Roles preflighted before any agent work, in the order they are checked. Adding a role to
-# the config means adding it here — nothing else in `main` knows the list.
-_PREFLIGHT_ROLES = ("head", "verifier")
+# the config means adding it here — nothing else in `main` knows the list. All four roles:
+# they share one provider, but a per-MODEL failure (retired ID, quota, the reader tier's
+# region opt-in — see docs/decisions.md) passes the head's check and would otherwise surface
+# only mid-run, after real budget is spent (PR #18 review).
+_PREFLIGHT_ROLES = ("head", "researcher", "reader", "verifier")
 
 # The runaway backstop's sizing, named alongside `_SYNTHESIS_RECURSION_LIMIT` rather than left
 # inline: both are recursion-limit safety margins and a tuning pass should find them together.
@@ -296,7 +299,15 @@ async def main(argv: list[str] | None = None) -> int:
 
     registry = SourceRegistry(run_id=started_at.strftime("%Y-%m-%d-%H%M%S"))
     run_log = RunLog()
-    agent = build_agent(config, registry, run_log)
+    # Same close/print/exit-1 shape as the preflight loop: `build_agent` resolves every
+    # role through `build_chat_model`, so a missing or TODO role raises `ModelError` here —
+    # unhandled it would escape as a traceback under the alternate screen (PR #18 review).
+    try:
+        agent = build_agent(config, registry, run_log)
+    except ModelError as exc:
+        renderer.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     # Live disclosure (best-effort + disclose): every incident a tool records is echoed to
     # the terminal as soon as the stream yields control back, and `alerts_emitted` keeps a

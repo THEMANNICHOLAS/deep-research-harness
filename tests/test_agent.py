@@ -29,6 +29,7 @@ from harness.report import (
     _ROUND_CAP_TEXT,
     _WALL_CLOCK_TEXT,
 )
+from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from tests.conftest import (
     ScriptedChatModel,
@@ -238,6 +239,10 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
     """
     from deepagents import FilesystemMiddleware
     from deepagents.backends.filesystem import FilesystemBackend
+    from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+    from deepagents.middleware.summarization import (
+        SummarizationMiddleware as DeepagentsSummarizationMiddleware,
+    )
 
     from harness.agent import _reader_spec
     from harness.prompts import render
@@ -258,10 +263,14 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
         max_urls_per_call=config.fetch.max_urls_per_call,
     )
     assert spec["tools"] is reader_tools
-    # Restores the scratch workspace `reader.md` promises — nesting via a hand-built
-    # `SubAgentMiddleware` (Step 3) does not auto-inject this the way `create_deep_agent`'s own
-    # top-level `subagents=` path does.
+    # Restores the FULL base stack `create_deep_agent`'s own top-level `subagents=` path
+    # auto-injects — nesting via a hand-built `SubAgentMiddleware` (Step 3) injects NOTHING:
+    # the filesystem middleware for the scratch workspace `reader.md` promises, the
+    # summarizer so a reader digesting large pages gets context eviction instead of a
+    # provider context-length error, and the tool-call patcher (PR #18 review).
     assert any(isinstance(m, FilesystemMiddleware) for m in spec["middleware"])
+    assert any(isinstance(m, DeepagentsSummarizationMiddleware) for m in spec["middleware"])
+    assert any(isinstance(m, PatchToolCallsMiddleware) for m in spec["middleware"])
     # The reader has no checkpointer forwarded and cannot interrupt — inheriting the lead's
     # `ask_user` interrupt entry would register an interrupt that can never fire.
     assert "interrupt_on" not in spec
@@ -285,7 +294,13 @@ def test_researcher_spec_has_no_interrupt_on(make_config, scripted_model, tmp_pa
     reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
 
     spec = _researcher_spec(
-        config, researcher_model, tool_sets.researcher, reader_spec, backend, SourceRegistry()
+        config,
+        researcher_model,
+        tool_sets.researcher,
+        reader_spec,
+        backend,
+        SourceRegistry(),
+        RunLog(),
     )
 
     assert "interrupt_on" not in spec
@@ -461,14 +476,25 @@ def build_researcher(make_config, tmp_path):
     from harness.agent import _reader_spec, _researcher_spec
     from harness.tools import build_tools
 
-    def _build(researcher_model: Any, reader_model: Any, registry: SourceRegistry | None = None):
+    def _build(
+        researcher_model: Any,
+        reader_model: Any,
+        registry: SourceRegistry | None = None,
+        run_log: RunLog | None = None,
+    ):
         config = make_config()
         registry = registry if registry is not None else SourceRegistry()
         backend = FilesystemBackend(root_dir=tmp_path / "workspace")
         tool_sets = build_tools(config, registry)
         reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
         researcher_spec = _researcher_spec(
-            config, researcher_model, tool_sets.researcher, reader_spec, backend, registry
+            config,
+            researcher_model,
+            tool_sets.researcher,
+            reader_spec,
+            backend,
+            registry,
+            run_log if run_log is not None else RunLog(),
         )
         return create_sub_agent(researcher_spec), registry
 
@@ -506,6 +532,37 @@ async def test_a_reader_crash_becomes_an_error_task_message_after_one_retry(
     assert task_messages[0].status == "error"
     assert str(task_messages[0].content).startswith("READER FAILED")
     assert reader_model._call_count == 2  # initial attempt + exactly one retry
+
+
+async def test_a_swallowed_subagent_crash_records_a_run_log_incident(
+    build_researcher, scripted_model
+):
+    """Best-effort + disclose (PR #18 review): converting a crashed dispatch into a
+    `... FAILED` ToolMessage keeps the run alive, but only the MODEL saw that message — the
+    cause must also reach the shared `RunLog`, which the terminal echoes live and the report
+    renders under `## Gaps and disclosures`. Without this a run whose every dispatch died
+    reported `incidents=0` and never named why its sources were missing.
+    """
+    from pydantic import SecretStr
+
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = _RaisingChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    run_log = RunLog()
+    researcher, _ = build_researcher(researcher_model, reader_model, run_log=run_log)
+
+    await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    incidents = run_log.incidents()
+    assert len(incidents) == 1
+    assert incidents[0].kind == "subagent_failed"
+    assert "reader" in incidents[0].detail
 
 
 async def test_a_reader_ending_with_no_final_text_returns_an_empty_task_message(
@@ -1091,23 +1148,25 @@ async def test_main_exits_nonzero_and_writes_no_report_when_searxng_is_unreachab
     assert not config.agent.reports_dir.exists() or not any(config.agent.reports_dir.iterdir())
 
 
-async def test_main_exits_nonzero_when_verifier_role_is_not_declared(
-    make_config, monkeypatch, capsys
+@pytest.mark.parametrize("missing_role", ["researcher", "reader", "verifier"])
+async def test_main_exits_nonzero_when_a_preflighted_role_is_not_declared(
+    make_config, monkeypatch, capsys, missing_role
 ):
-    """Phase 1 Step 4: startup preflights `verifier` alongside `head`; a config missing the
-    role fails the same ModelError path as a missing `head`/`subagent` role would.
+    """Startup preflights every role the run will call (`_PREFLIGHT_ROLES` — all four since
+    the PR #18 review); a config missing any of them fails the same clean ModelError path as
+    a missing `head` would, never a traceback under the TUI or a mid-run surprise.
 
     Deliberately bypasses `patch_run`/`patch_model`: those fake `build_chat_model` to ignore
     `role` entirely, which would hide the very check under test here. Instead the REAL
     `preflight`/`build_chat_model` run, with only the `ChatOpenAI` transport faked (mirroring
-    `tests/test_models.py`) so the head role's real preflight ping never leaves the process.
+    `tests/test_models.py`) so the earlier roles' real preflight pings never leave the process.
     """
     import harness.models as models_module
 
     config = make_config()
     broken = HarnessConfig(
         providers=config.providers,
-        roles={name: role for name, role in config.roles.items() if name != "verifier"},
+        roles={name: role for name, role in config.roles.items() if name != missing_role},
         fetch=config.fetch,
         search=config.search,
         agent=config.agent,
@@ -1146,7 +1205,37 @@ async def test_main_exits_nonzero_when_verifier_role_is_not_declared(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "error:" in captured.err
-    assert "verifier" in captured.err
+    assert missing_role in captured.err
+
+
+async def test_main_reports_a_model_error_from_build_agent_cleanly(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    """Defense in depth behind the preflight loop (PR #18 review): `build_agent` resolves
+    every role through `build_chat_model`, and a `ModelError` it raises — a TODO placeholder,
+    a role preflight missed — must land on the same close/print/exit-1 shape as a preflight
+    failure, never escape `main()` as a traceback under the alternate screen.
+    """
+    from harness.models import ModelError
+
+    config = make_config()
+    model = scripted_model([AIMessage(content="unused — build_agent raises first")])
+    patch_run(monkeypatch, config, model)
+
+    def _broken_build_agent(*args: Any, **kwargs: Any) -> Any:
+        raise ModelError("role 'reader' is not declared in [roles]")
+
+    # At the source module: `main` imports `build_agent` at call time (heavy-import deferral).
+    monkeypatch.setattr("harness.agent.build_agent", _broken_build_agent)
+
+    exit_code = await main_module.main(["a question"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "error:" in captured.err
+    assert "reader" in captured.err
+    assert "Traceback" not in captured.err
+    assert not config.agent.reports_dir.exists() or not any(config.agent.reports_dir.iterdir())
 
 
 # --- Phase 5: round cap, wall clock, and cut-short reporting ---------------------------

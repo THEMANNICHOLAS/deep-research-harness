@@ -195,7 +195,11 @@ def _sources_section(
     if reviewer_summary:
         if lines:
             lines.append("")
-        lines.append(reviewer_summary)
+        # Model-authored text, demoted like every other model-authored block this module
+        # embeds (`_notes_section`, `_paragraph_prose`): the prompt says "no headings", but a
+        # prompt is not a guarantee, and an undemoted `#`/`##` line here would splice a fake
+        # section into the report's own heading hierarchy.
+        lines.append(_demote_headings(reviewer_summary))
 
     return "\n".join(lines)
 

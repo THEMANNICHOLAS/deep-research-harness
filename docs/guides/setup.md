@@ -47,7 +47,9 @@
    `load_config()` (it is a well-formed string), but is rejected at startup by
    `build_chat_model`, which raises `ModelError` naming the role, the provider, and
    the offending value. A wrong-but-well-formed endpoint or model ID is caught by
-   `preflight` before any research starts, not mid-run.
+   `preflight` before any research starts, not mid-run — all four roles are
+   preflighted, so a per-model failure (a retired ID, the reader tier's region
+   opt-in) also fails at startup.
 
 ## Running with `.env`
 
