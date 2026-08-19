@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig, run_workspace_dir
 from harness.guard import sanitize_for_report
-from harness.paragraphs import LIST_ITEM_RE, Paragraph, strip_markers
+from harness.paragraphs import LIST_ITEM_RE, Paragraph, renders_content, strip_markers
 from harness.runlog import Incident
 from harness.sources import Source, SourceRegistry, sources_dir
 from harness.verify import ParagraphVerdict, VerificationResult
@@ -194,7 +194,11 @@ def _sources_section(
     if reviewer_summary:
         if lines:
             lines.append("")
-        lines.append(reviewer_summary)
+        # Model-authored text, demoted like every other model-authored block this module
+        # embeds (`_notes_section`, `_paragraph_prose`): the prompt says "no headings", but a
+        # prompt is not a guarantee, and an undemoted `#`/`##` line here would splice a fake
+        # section into the report's own heading hierarchy.
+        lines.append(_demote_headings(reviewer_summary))
 
     return "\n".join(lines)
 
@@ -367,14 +371,17 @@ def _answer_section(outcome: RunOutcome) -> str:
     Never re-splits `outcome.answer` (D2): `__main__.py` splits once and hands the list here.
     An empty block (a citation-only paragraph strips to no visible text) is dropped from the
     join entirely, not just left blank — joining it in would leave a stray blank paragraph
-    between its neighbors (3F review issue 2).
+    between its neighbors (3F review issue 2). Dropped by `renders_content`, the SAME shared
+    test `verify.py`'s `_format_verdicts_block` counts paragraphs by (D1) — deriving emptiness
+    independently here is exactly the numbering drift that test guards against.
     """
     verdicts = outcome.verification.verdicts if outcome.verification is not None else []
     blocks = [
         _paragraph_block(paragraph, verdicts[i] if i < len(verdicts) else None)
         for i, paragraph in enumerate(outcome.paragraphs)
+        if renders_content(paragraph)
     ]
-    return "\n\n".join(block for block in blocks if block)
+    return "\n\n".join(blocks)
 
 
 def _conflicts_section(outcome: RunOutcome, verification: VerificationResult) -> str:

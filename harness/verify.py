@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
 from harness.guard import fence
-from harness.paragraphs import Paragraph, renders_content
+from harness.paragraphs import Paragraph, renders_content, strip_markers
 from harness.prompts import render
 from harness.sources import SourceRegistry, sources_dir
 
@@ -96,11 +96,28 @@ def _parse_reply(content: str) -> tuple[Verdict, str, bool, list[int]]:
     return verdict, detail, sources_conflict, unsupported_items
 
 
+def _paragraph_excerpt(paragraph: Paragraph) -> str:
+    """The opening words of `paragraph` as one flattened line, capped at 80 characters.
+
+    Marker-stripped for prose (what the report's reader actually sees); verbatim for a fenced
+    block, whose text the report renders untouched. Feeds `_format_verdicts_block` so the
+    consolidator can QUOTE each claim it names — `## Answer` renders no paragraph numbers, so
+    a number alone gives the reader nothing to search for.
+    """
+    text = paragraph.text if paragraph.is_code else strip_markers(paragraph.text)
+    flattened = " ".join(text.split())
+    return flattened if len(flattened) <= 80 else flattened[:77] + "..."
+
+
 def _format_verdicts_block(paragraphs: list[Paragraph], verdicts: list[ParagraphVerdict]) -> str:
-    """One line per verdict, naming its paragraph number, verdict, detail, and cited sources.
+    """One line per verdict, naming its paragraph number, opening words, verdict, detail, and
+    cited sources.
 
     The consolidator must be able to NAME each not-fully-supported claim (the whole point of
     this step), so every field it would need to do that is here — not just the verdict value.
+    The excerpt is what makes the name findable: `## Answer` renders paragraphs as plain
+    prose with no numbers, so the reviewer paragraph quotes each claim's opening words and the
+    reader searches for those.
 
     Numbered by `renders_content` (D1), NOT by raw list position: `report.py`'s `_answer_section`
     drops an empty-rendering paragraph's block entirely (a citation-only paragraph strips to no
@@ -116,7 +133,8 @@ def _format_verdicts_block(paragraphs: list[Paragraph], verdicts: list[Paragraph
         number += 1
         sources = ", ".join(verdict.source_ids) if verdict.source_ids else "none"
         lines.append(
-            f"Paragraph {number}: {verdict.verdict} - {verdict.detail} (sources: {sources})"
+            f'Paragraph {number} (starts: "{_paragraph_excerpt(paragraph)}"): '
+            f"{verdict.verdict} - {verdict.detail} (sources: {sources})"
         )
     return "\n".join(lines)
 

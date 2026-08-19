@@ -8,18 +8,18 @@ The `_parse_reply` tolerance tests at the end exist because the model is not gua
 bare, complete JSON — every tolerance must have a test that fails if the tolerance is removed.
 """
 
-import asyncio
 import re
 from typing import get_args
 
 import pytest
 from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import PrivateAttr, SecretStr
+from pydantic import SecretStr
 
 from harness.paragraphs import Paragraph
 from harness.sources import SourceRegistry, sources_dir
 from harness.verify import CHECK_FAILED_DETAIL, Verdict, verify_paragraphs
 from tests.conftest import (
+    ConcurrencyTrackingModel,
     ScriptedChatModel,
     verify_reply,
     write_source_capture,
@@ -87,26 +87,6 @@ async def test_pooled_sources_block_is_fenced_in_the_verifier_prompt(  # R4
     assert fence_open_match.start() < prompt_text.index("UNIQUE_MARKER") < fence_close_match.start()
 
 
-class _ConcurrencyTrackingModel(ScriptedChatModel):
-    """Tracks in-flight `_agenerate` calls to prove the verification loop is sequential.
-
-    The `asyncio.sleep(0)` is load-bearing (D4): with no real await point, even a concurrent
-    `asyncio.gather` would show a peak of 1, since nothing yields between increment and decrement.
-    """
-
-    _in_flight: int = PrivateAttr(default=0)
-    _peak_in_flight: int = PrivateAttr(default=0)
-
-    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-        self._in_flight += 1
-        self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
-        await asyncio.sleep(0)
-        try:
-            return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        finally:
-            self._in_flight -= 1
-
-
 async def test_paragraphs_are_checked_strictly_sequentially(make_config, monkeypatch):
     config = make_config()
     registry = SourceRegistry()
@@ -118,7 +98,9 @@ async def test_paragraphs_are_checked_strictly_sequentially(make_config, monkeyp
         for i, source_id in enumerate(ids)
     ]
 
-    model = _ConcurrencyTrackingModel(
+    # Default `_sleep_seconds = 0` is load-bearing (D4): a single-tick yield is exactly what
+    # reveals a concurrent gather, and anything longer just slows the suite.
+    model = ConcurrencyTrackingModel(
         model="test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script([verify_reply("supported", "ok")] * len(ids))
     monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
@@ -808,7 +790,9 @@ async def test_the_consolidation_numbering_skips_paragraphs_that_render_no_text(
     consolidation_prompt = _flatten(model._received_messages[-1])
     # The reader can only count ONE paragraph in `## Answer` — the citation-only one renders
     # nothing — so the partially-supported one must be named "Paragraph 1", not "Paragraph 2".
-    assert "Paragraph 1: partially_supported" in consolidation_prompt
+    assert 'Paragraph 1 (starts: "The gauge read 42 psi."): partially_supported' in (
+        consolidation_prompt
+    )
     assert "Paragraph 2" not in consolidation_prompt
 
 

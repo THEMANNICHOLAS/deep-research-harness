@@ -3,35 +3,43 @@
 ## Overview
 
 One command — `python -m harness "<question>"` (@harness/__main__.py) — takes a
-research question and writes one timestamped, cited markdown report. A single
-`deepagents` lead agent (@harness/agent.py) drives the substrate's tools over the
-head role, streaming its todo plan to the terminal; Python then verifies the
-draft's claims (@harness/verify.py) and assembles the report (@harness/report.py).
-Model roles are config-declared, never literal: `[roles.head]` plans, synthesizes
-and checks claims, `[roles.subagent]` is the cheap worker driving the wired reader
-tier.
+research question and writes one timestamped, cited markdown report. A
+`deepagents` lead agent (@harness/agent.py) plans research angles and dispatches
+them over the substrate's tools, streaming its todo plan to the terminal; Python
+then verifies the draft's claims (@harness/verify.py) and assembles the report
+(@harness/report.py). Model roles are config-declared, never literal:
+`[roles.head]` plans and synthesizes, `[roles.researcher]` works one angle each,
+`[roles.reader]` digests pages, and `[roles.verifier]` checks the draft's claims
+against their cited sources.
 
 ## Agent Topology
 
-The reader tier is wired: the lead delegates page reading to a declared `reader`
-subagent through deepagents' own `task` tool, and `fetch_pages` lives only on the
-reader's toolset, never the lead's (@harness/agent.py, @harness/tools/__init__.py).
-The researcher tier remains only a frozen prompt contract —
-@harness/prompts/subagent.md — with nothing delegating to it yet; unlike the
-researcher, @harness/prompts/reader.md is now the reader's live system prompt.
+The hierarchy is three tiers deep (Phase 2): the lead delegates each research
+angle to a declared `researcher` subagent through deepagents' own `task` tool, and
+each researcher — which owns `search_web` and the `fetch_raw` recovery fallback —
+delegates page reading to its own nested `reader` subagent, so `fetch_pages` lives
+only on the reader's toolset (@harness/agent.py, @harness/tools/__init__.py). The
+researcher's live system prompt is @harness/prompts/subagent.md, the reader's is
+@harness/prompts/reader.md. A nested subagent receives NONE of deepagents'
+auto-injected middleware — `_reader_spec` re-adds the filesystem, summarization
+and tool-call-patch middleware explicitly, and any future nested tier must do the
+same.
+
 Each contract freezes the four fields a task must carry
 (objective, output format, tools, boundaries) and the three a tier must return
 (findings, source IDs, conflicts), so the tiers can be built without renegotiating
 the seam. Neither tier may ask the developer anything: clarification is the lead's
-alone, or a tier-3 reader would interrupt mid-fan-out. Both tiers must therefore be
-built with a filtered tool list rather than the lead's — @harness/tools/__init__.py
-always returns `search_web` and `ask_user`, and a deepagents subagent inherits the
-parent's tools unless given its own, which would silently produce a reader that can
-search and a tier that can interrupt the developer. The reader always receives
-the facet it is supporting, never a bare URL — a reader handed a URL without
-knowing why it mattered is the documented telephone-game failure. Delegation costs
-3-10x the tokens of a single agent and compounds per level, which is why the tiers
-wait for a measured baseline (the Phase 3 figure in docs/plans/PLAN-research-loop.md).
+alone, or a tier-3 reader would interrupt mid-fan-out. Each tier is therefore built
+with its own filtered tool list rather than inheriting the parent's —
+@harness/tools/__init__.py returns a `ToolSets` split (`ask_user` to the lead,
+`search_web`/`fetch_raw` to the researcher, `fetch_pages` to the reader), because a
+deepagents subagent inherits the parent's tools unless given its own, which would
+silently produce a reader that can search and a tier that can interrupt the
+developer. The reader always receives the facet it is supporting, never a bare
+URL — a reader handed a URL without knowing why it mattered is the documented
+telephone-game failure. Delegation costs 3-10x the tokens of a single agent and
+compounds per level, which is why runs carry a round cap and wall clock, and each
+researcher's prompt carries a search/dispatch budget.
 
 Every run owns a `<workspace_dir>/<run_id>/` subdirectory — the agent's
 `FilesystemBackend` is rooted there, and its notes, captured sources and evicted

@@ -889,6 +889,41 @@ def test_no_per_paragraph_sources_or_verdict_lines_and_reviewer_paragraph_under_
     assert "One paragraph was checked and fully supported." in sources_section
 
 
+def test_a_reviewer_summary_heading_is_demoted_below_the_report_sections(make_config):
+    """The reviewer paragraph is model-authored free text, demoted like every other
+    model-authored block this module embeds (PR #18 review): the prompt says "no headings",
+    but an undemoted `## ` line in the reply would splice a fake section into the report and
+    break every consumer that navigates by `## ` boundaries — including `_section` here.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/a")
+    write_source_capture(config, registry, source_id)
+    answer = f"Everything checks out [{source_id}]."
+    paragraphs = split_paragraphs(answer)
+    verification = VerificationResult(
+        verdicts=[
+            ParagraphVerdict(verdict="supported", detail="Confirmed.", source_ids=[source_id])
+        ],
+        reviewer_summary="## Verification notes\n\nAll claims held up.",
+    )
+    outcome = RunOutcome(
+        question="Reviewer summary demotion",
+        answer=answer,
+        registry=registry,
+        usage=_usage(),
+        paragraphs=paragraphs,
+        verification=verification,
+    )
+
+    body = write_report(outcome, config).read_text(encoding="utf-8")
+    sources_section = _section(body, "## Sources")
+
+    # Demoted two levels (`##` -> `####`), so the whole reply stays inside `## Sources`.
+    assert "#### Verification notes" in sources_section
+    assert "All claims held up." in sources_section
+
+
 def test_a_none_reviewer_summary_renders_sources_exactly_as_before(make_config):
     """The best-effort regression guard (D-D): a run whose consolidation never ran or failed
     (`reviewer_summary=None`) must render `## Sources` with no stray heading or blank artifact
