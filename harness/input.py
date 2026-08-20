@@ -12,6 +12,26 @@ KeyKind = Literal[
     "char", "enter", "newline", "backspace", "left", "right", "up", "down", "interrupt"
 ]
 
+# Set by `read_keys()`'s POSIX branch to the closure that restores the saved `termios` mode,
+# and popped by `restore_terminal()` before it is called -- a raising restore then cannot be
+# retried into a loop. A closure over `(fd, saved)` rather than storing the pair directly is
+# what keeps `restore_terminal()` itself platform-free: nothing here ever names `termios`.
+_restore: Callable[[], None] | None = None
+
+
+def restore_terminal() -> None:
+    """Idempotently restore the terminal to its pre-raw-mode state, if anything set it raw.
+
+    Safe to call from a thread other than the one running `read_keys()` -- the overlay's
+    reader runs on a daemon thread, and if the wall clock cancels an open overlay that thread
+    is parked in a blocking read, so its own `finally` never runs. A no-op on Windows, where
+    `msvcrt` never changes terminal modes and nothing ever populates `_restore`.
+    """
+    global _restore
+    restore, _restore = _restore, None
+    if restore is not None:
+        restore()
+
 
 @dataclass(frozen=True)
 class KeyEvent:
@@ -85,9 +105,16 @@ def read_keys() -> Iterator[KeyEvent]:
         import termios
         import tty
 
+        global _restore
+
         fd = sys.stdin.fileno()
         saved = termios.tcgetattr(fd)
         tty.setraw(fd)
+
+        def _do_restore() -> None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+        _restore = _do_restore
         try:
             while True:  # pragma: no cover -- blocking terminal read loop, no unit-testable seam
                 first = sys.stdin.read(1)
@@ -104,7 +131,7 @@ def read_keys() -> Iterator[KeyEvent]:
                 if event is not None:
                     yield event
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            restore_terminal()
 
 
 @contextmanager

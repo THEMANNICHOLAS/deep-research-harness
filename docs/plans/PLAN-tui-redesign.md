@@ -239,7 +239,7 @@ entire decision below is struck and NOT implemented. No `sources.json` is writte
 - [x] Phase 2: Welcome screen and slash commands
 - [x] Phase 3: Running pane — task meta, stage round/elapsed (~~structured tool log~~ → Phase 6)
 - [x] Phase 4: Finished summary — inline report path
-- [ ] Phase 5: ask_user in-place overlay
+- [x] Phase 5: ask_user in-place overlay
 - [ ] Phase 6: Reader-strip visibility hook + structured tool-call log
 - [ ] Final verification
 
@@ -439,20 +439,25 @@ via Phase 1's line editor, retracting on submit.
   `input()` bridge with Phase 1's raw-key loop feeding the overlay's `LineBuffer`
   (D3); preserve the existing behavior that the wall clock keeps running while
   answering.
-- `tests/test_display.py`, `tests/test_main_*.py` — modify.
-**Diff budget:** ~350-500 lines across 3 files
-**Reuse:** Phase 1 `LineBuffer`/key reader (D3); existing `StageTracker`.
+- `harness/input.py` — modify: ADDED to this phase 2026-08-20, developer-approved; gains an
+  idempotent `restore_terminal()`. See `## Reconciliations`.
+- `tests/test_display.py`, `tests/test_input.py`, `tests/test_ask_user.py`,
+  `tests/test_agent.py` — modify. (~~`tests/test_main_*.py`~~ struck: that glob matches only
+  Phase 2's unrelated welcome-screen tests, as Phase 4 already established.)
+**Diff budget:** ~350-500 lines across ~~3~~ 4 source files (source came in at 397)
+**Reuse:** Phase 1 `LineBuffer`/key reader (D3); existing `StageTracker`; Phase 2's per-row
+cursor placement, extracted to a shared `_build_cursor_rows`.
 **Contracts:** none new external.
 **Out of scope:** Multi-question queuing (one pending question at a time, as today);
 overlay fade animation beyond appear/retract; any change to WHEN `ask_user` may be
 called (still clarifying-stage-only, per the existing `interrupt_on` registration).
 **Tests (write first, confirm red):**
-- [ ] With a question pending, the running-screen render shows the cyan overlay in
+- [x] With a question pending, the running-screen render shows the cyan overlay in
   place of the log region while ledger and stage line remain, and typed characters
   echo inline.
-- [ ] After submit, the overlay retracts and the log/stage line resume; the stage
+- [x] After submit, the overlay retracts and the log/stage line resume; the stage
   clock elapsed time excludes the paused interval.
-- [ ] Ctrl+C while the overlay is open still restores the terminal cleanly (R6).
+- [x] Ctrl+C while the overlay is open still restores the terminal cleanly (R6).
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
 2. Implement the overlay, pause/resume, and the raw-key answer path.
@@ -633,6 +638,21 @@ budget: ~550-750 lines across 4 files.
   `harness/__main__.py`'s bare `print(path)` is removed as the phase spec directs; both
   renderers' `close()` print nothing, so the summary genuinely becomes the last stdout
   output. Amended file list and acceptance command are struck in place above.
+- 2026-08-20 — Phase 5: the phase's `**Files:**` list covered only `display.py`,
+  `__main__.py` and tests, but the overlay's key reader has to run on a daemon thread (the async
+  side must only ever `await`, or the event loop is blocked and the `asyncio.timeout` wall clock
+  can never fire — risk #2's failure mode reached from an unexpected direction). Raw mode is
+  process-global state owned by whoever set it, and a thread parked in a blocking read cannot be
+  made to give it back: `read_keys()`'s generator is EXECUTING, so it cannot be closed from the
+  main thread, and a wall-clock cancellation abandons that daemon with its `finally` unrun —
+  leaving the operator's shell in raw mode with no echo. **Developer decision (deciding axis:
+  whether Phase 5 may widen its file list to make terminal restore structural — it may):** add
+  `harness/input.py` to the phase, with a module-level registered restore closure and an
+  idempotent `restore_terminal()` that `read_keys()`' own `finally` and the overlay's `finally`
+  both call. One restore path, safe to call twice and from either thread. The rejected
+  alternative — accept a raw tty on wall-clock expiry and log it — was declined; pausing the
+  wall clock while the overlay is open was never on the table, being forbidden by the phase
+  spec.
 
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution. Append-only. -->
@@ -700,6 +720,32 @@ budget: ~550-750 lines across 4 files.
   line still contains the escape somewhere. Assert the whole value inside ONE span:
   `f"[38;2;{r};{g};{b}m{value}[0m" in raw`. Phase 5's overlay and Phase 6's tool-call
   log and reader strip all render dynamic text with explicit styles.
+- 2026-08-20 — Phase 5: `Renderer.suspend()` / `RichRenderer._suspend()` are now
+  PRODUCTION-UNREACHABLE. `_answer_questions` was their only caller and the overlay replaced it.
+  Deliberately kept: `suspend` is a `Renderer` protocol member and four tests still pin its
+  Live start/stop behavior, so removing it plus its tests is scope creep inside a flagged phase.
+  Delete it in a later cleanup if nothing claims it.
+- 2026-08-20 — Phase 5 review, SIMPLIFY (report, correctly deferred): the
+  `KeyEvent` -> `LineBuffer` dispatch chain now exists TWICE — the overlay's key loop in
+  `_read_answer` and Phase 2's welcome loop. That is the second occurrence, and CLAUDE.md's rule
+  is to factor out when the same lines are about to appear a THIRD time, so both stay inline for
+  now. A shared `_apply_key(buffer, event)` collapses them when a third consumer appears.
+- 2026-08-20 — Phase 5 review, FIXED, and the lesson generalises: a test asserting the flagged
+  risk's OUTER symptom is not a test of the risk. The wall-clock tripwire patches `_read_answer`
+  away wholesale and the Ctrl+C test's fake key source yields immediately, so BOTH stayed green
+  against a rewrite that read keys synchronously on the loop thread — the exact regression risk
+  #2 names. The test that actually discriminates blocks the fake key source on a
+  `threading.Event` and asserts `asyncio.wait_for(..., 0.2)` raises `TimeoutError`, i.e. the loop
+  was alive to time out, with a watchdog releasing the block so a blocking implementation fails
+  rather than hangs. It was verified BOTH ways before being trusted: it passes against the
+  shipped shape and fails against a deliberately blocking one. Phase 6's middleware is also
+  concurrency-shaped — hold its tests to the same standard.
+- 2026-08-20 — Phase 5, KNOWN OPERATOR HAZARD (accepted, disclosed on screen): the clock the
+  overlay freezes is RUN elapsed, while the WALL clock that terminates the run keeps counting.
+  A run can therefore be cut short at a wall time the visible `MM:SS` never displayed. R4 and the
+  mockup both require the pause, so it stays; the overlay's note line reads `clock paused while
+  the agent waits` rather than the mockup's `stage clock paused ...`, because what freezes is not
+  a per-stage timer.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each phase gate. Append-only. MUST remain the LAST section. -->
@@ -803,3 +849,35 @@ budget: ~550-750 lines across 4 files.
   `harness/input.py`'s `scoped_keys` for the overlay's key source rather than writing new
   teardown, and render every dynamic overlay string through `Text(...)` per the new
   `## Discoveries` entry.
+
+### 2026-08-20 — Phase 5: ask_user in-place overlay
+- Done: The question now renders as a cyan `ask_user` panel INSIDE the running `Live` frame,
+  replacing the activity lines only — checklist, timeline and stage line stay visible (R4).
+  New `AnswerDraft`/`QuestionAnswered` events; a shared `_PausableClock` freezing both the
+  displayed `MM:SS` and `StageTracker`'s recorded timings while the overlay is open; Phase 2's
+  per-row cursor placement extracted to `_build_cursor_rows` and reused; `harness/input.py`
+  gained an idempotent `restore_terminal()`. `_read_answer(renderer, prompt)` now branches on
+  `sys.stdin.isatty()` — non-TTY keeps the old `input()` bridge byte-for-byte, TTY runs
+  `read_keys()` on a daemon thread forwarding through an `asyncio.Queue`. 619 tests pass; all
+  four gates clean; source diff 397 lines against a ~350-500 budget.
+- Learned: (1) The three time concepts are NOT interchangeable and only two may pause — wall
+  clock (`asyncio.timeout`) never, displayed `MM:SS` and recorded stage timings both. (2) The
+  wall clock's real failure mode is STRUCTURAL: a key loop that blocks the event loop thread
+  stops the timeout from firing at all, which no amount of "don't call reschedule" discipline
+  prevents. The async side must only ever `await`. (3) Green tests asserting a risk's symptom
+  can leave the risk itself unpinned — see the `## Discoveries` entry; the replacement test was
+  verified to fail against a deliberately blocking implementation before being trusted. (4) The
+  review caught a 7th `_read_answer` call site the implementor missed, passing only because the
+  non-TTY branch ignores `renderer` and `prompt` defaults to the same string; mypy does not
+  check untyped test bodies, so no gate would ever have caught it.
+- Drift: YES — 2026-08-20 entry in `## Reconciliations`: `harness/input.py` added to the phase's
+  file list, developer-approved, so terminal restore is structural rather than dependent on a
+  daemon thread's unrun `finally`.
+- Watch-next: Phase 6 is flagged (!#3) and now owns THREE deliverables, not one — reader strip,
+  the structured tool-call log absorbed from Phase 3, AND live-updating task meta (Phase 3's
+  logged limitation). It is the plan's only `harness/agent.py` touch: mirror
+  `_ReaderDigestMiddleware`'s existing `awrap_tool_call` shape, do not invent a new one, and keep
+  reader dispatch/retry/failure semantics untouched. Its tests are concurrency-shaped like Phase
+  5's — hold them to the same "verified to fail against the broken shape" standard. The manual
+  WezTerm acceptance criteria for Phases 2, 3 and 5 are all still unticked and need a real
+  terminal.

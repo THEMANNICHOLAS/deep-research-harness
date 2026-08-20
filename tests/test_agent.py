@@ -21,7 +21,7 @@ from langgraph.types import Interrupt
 import harness.__main__ as main_module
 from harness.agent import build_agent
 from harness.config import AgentSettings, HarnessConfig, run_workspace_dir
-from harness.display import PlainRenderer
+from harness.display import PlainRenderer, StageTracker
 from harness.report import (
     _CUT_SHORT_HEADING,
     _NO_ANSWER_TEXT,
@@ -1337,7 +1337,7 @@ async def test_read_answer_resolves_instead_of_hanging_when_stdin_is_closed(monk
 
     monkeypatch.setattr("builtins.input", fake_input)
 
-    answer = await asyncio.wait_for(main_module._read_answer(), timeout=5)
+    answer = await asyncio.wait_for(main_module._read_answer(PlainRenderer()), timeout=5)
 
     assert answer == ""
 
@@ -1350,7 +1350,7 @@ async def test_read_answer_resolves_when_stdin_raises_oserror(monkeypatch):
 
     monkeypatch.setattr("builtins.input", fake_input)
 
-    assert await asyncio.wait_for(main_module._read_answer(), timeout=5) == ""
+    assert await asyncio.wait_for(main_module._read_answer(PlainRenderer()), timeout=5) == ""
 
 
 async def test_the_clarification_prompt_never_reaches_stdout(monkeypatch, capsys):
@@ -1360,7 +1360,7 @@ async def test_the_clarification_prompt_never_reaches_stdout(monkeypatch, capsys
     """
     monkeypatch.setattr("builtins.input", lambda: "the metal")
 
-    answer = await main_module._read_answer("> ")
+    answer = await main_module._read_answer(PlainRenderer(), "> ")
 
     captured = capsys.readouterr()
     assert answer == "the metal"
@@ -1381,7 +1381,7 @@ async def test_read_answer_runs_on_a_daemon_thread(monkeypatch):
 
     monkeypatch.setattr("builtins.input", fake_input)
 
-    await main_module._read_answer()
+    await main_module._read_answer(PlainRenderer())
 
     assert recorded.get("daemon") is True
 
@@ -1392,8 +1392,11 @@ async def test_read_answer_returns_what_was_typed(monkeypatch):
     """
     monkeypatch.setattr("builtins.input", lambda prompt="": "  Yes, region EU-West  ")
     interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which region?"}}]})
+    renderer = PlainRenderer()
 
-    decisions = await main_module._answer_questions(interrupt, PlainRenderer(), SourceRegistry())
+    decisions = await main_module._answer_questions(
+        interrupt, renderer, SourceRegistry(), StageTracker(renderer)
+    )
 
     assert decisions == [{"type": "respond", "message": "Yes, region EU-West"}]
 
@@ -1408,8 +1411,9 @@ async def test_a_url_pasted_into_a_clarifying_answer_becomes_fetchable(monkeypat
     )
     interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which page?"}}]})
     registry = SourceRegistry()
+    renderer = PlainRenderer()
 
-    await main_module._answer_questions(interrupt, PlainRenderer(), registry)
+    await main_module._answer_questions(interrupt, renderer, registry, StageTracker(renderer))
 
     assert registry.is_approved("https://example.test/docs/page")
 
@@ -2058,7 +2062,7 @@ async def test_a_clarifying_question_can_arrive_without_a_question_argument(
     shape.
     """
 
-    async def _record(prompt: str = "> ") -> str:
+    async def _record(*_args: object, **_kwargs: object) -> str:
         return "answered"
 
     monkeypatch.setattr(main_module, "_read_answer", _record)
@@ -2072,7 +2076,10 @@ async def test_a_clarifying_question_can_arrive_without_a_question_argument(
         }
     )
 
-    decisions = await main_module._answer_questions(interrupt, PlainRenderer(), SourceRegistry())
+    renderer = PlainRenderer()
+    decisions = await main_module._answer_questions(
+        interrupt, renderer, SourceRegistry(), StageTracker(renderer)
+    )
 
     out, _ = drain_stdout(capsys)
     asked = [line for line in out.splitlines() if line.strip()]

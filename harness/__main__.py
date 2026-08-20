@@ -45,7 +45,9 @@ from harness.config import ConfigError, load_config
 from harness.display import (
     Activity,
     Alert,
+    AnswerDraft,
     Question,
+    QuestionAnswered,
     Renderer,
     RoundsUpdated,
     RunFinished,
@@ -58,7 +60,7 @@ from harness.display import (
     build_model_picker,
     build_renderer,
 )
-from harness.input import KeyEvent, LineBuffer, read_keys, scoped_keys
+from harness.input import KeyEvent, LineBuffer, read_keys, restore_terminal, scoped_keys
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
 from harness.runlog import RunLog
@@ -165,48 +167,115 @@ def _final_answer(messages: list[BaseMessage]) -> str:
     return ""
 
 
-async def _read_answer(prompt: str = "> ") -> str:
-    """Read one clarification answer from the terminal without blocking the event loop.
+async def _read_answer(renderer: Renderer, prompt: str = "> ") -> str:
+    """Read one clarification answer without blocking the event loop (risk #2).
 
-    A daemon thread feeding an `asyncio.Future`, not `asyncio.to_thread`: the default
-    executor's workers are NOT daemons, so the timeout fires on schedule but `asyncio.run()`
-    then blocks at interpreter shutdown joining a worker still parked in `input()` — the run
-    would print its cut-short report and hang at an already-dead `> ` prompt.
+    Non-TTY (`not sys.stdin.isatty()`): unchanged from before this phase, byte-for-byte -- a
+    daemon thread feeding an `asyncio.Future`, not `asyncio.to_thread`: the default executor's
+    workers are NOT daemons, so the timeout fires on schedule but `asyncio.run()` then blocks
+    at interpreter shutdown joining a worker still parked in `input()` — the run would print
+    its cut-short report and hang at an already-dead `> ` prompt. The prompt goes to STDERR,
+    not through `input`'s own argument, which writes it with no trailing newline and so put a
+    pending `> ` on the same stdout line as the report path, breaking the frozen "path is the
+    last line of stdout" contract. This is the path CI and piped/scripted runs take — raw mode
+    requires a real tty.
 
-    The prompt goes to STDERR, not through `input`'s own argument, which writes it with no
-    trailing newline and so put a pending `> ` on the same stdout line as the report path,
-    breaking the frozen "path is the final line of stdout" contract.
+    TTY: the `ask_user` overlay is the prompt (no `suspend()`, nothing written to stderr — a
+    write during a `screen=True` Live lands on the alternate screen anyway). A daemon thread
+    runs the blocking `read_keys()` generator and forwards each event through an
+    `asyncio.Queue` via `call_soon_threadsafe`; the async side only ever `await`s that queue,
+    which is what keeps the loop thread free so the wall clock (`asyncio.timeout` in `main`)
+    can still fire while a question is pending.
     """
+    if not sys.stdin.isatty():
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+
+        def _worker() -> None:
+            try:
+                print(prompt, end="", file=sys.stderr, flush=True)
+                answer = input()
+            except (EOFError, OSError):
+                # stdin is closed or unreadable (piped from /dev/null, run under a service
+                # manager). Resolve with nothing rather than dying before `_resolve` is
+                # scheduled, which left `await future` pending forever with no report at all.
+                # `_answer_questions` turns "" into `_NO_ANSWER_GIVEN`, so the model is told
+                # the question went unanswered and the run proceeds to a report like any other.
+                answer = ""
+
+            def _resolve() -> None:
+                # The wall clock may already have cancelled this future — setting a result on
+                # a done future raises `InvalidStateError`.
+                if not future.done():
+                    future.set_result(answer)
+
+            try:
+                loop.call_soon_threadsafe(_resolve)
+            except RuntimeError:
+                # The loop is already closed — nothing left to resolve, and this must not
+                # raise out of a daemon thread.
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return await future
+
     loop = asyncio.get_running_loop()
-    future: asyncio.Future[str] = loop.create_future()
+    queue: asyncio.Queue[KeyEvent] = asyncio.Queue()
 
-    def _worker() -> None:
+    def _key_worker() -> None:
+        with scoped_keys(read_keys()) as keys:
+            for event in keys:
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, event)
+                except RuntimeError:
+                    # The loop is already closed — nothing left to forward.
+                    return
+                if event.kind in ("enter", "interrupt"):
+                    # Return (rather than break) so this happens INSIDE the `with`, letting
+                    # `scoped_keys`' close probe run the generator's own `finally` teardown on
+                    # this, the happy, path.
+                    return
+        # The generator ended without an `enter`/`interrupt` (EOF): forward a synthetic
+        # `enter` so the async side is never left awaiting forever — `_answer_questions`
+        # turns an empty answer into `_NO_ANSWER_GIVEN`.
         try:
-            print(prompt, end="", file=sys.stderr, flush=True)
-            answer = input()
-        except (EOFError, OSError):
-            # stdin is closed or unreadable (piped from /dev/null, run under a service
-            # manager). Resolve with nothing rather than dying before `_resolve` is
-            # scheduled, which left `await future` pending forever with no report at all.
-            # `_answer_questions` turns "" into `_NO_ANSWER_GIVEN`, so the model is told the
-            # question went unanswered and the run proceeds to a report like any other.
-            answer = ""
-
-        def _resolve() -> None:
-            # The wall clock may already have cancelled this future — setting a result on a
-            # done future raises `InvalidStateError`.
-            if not future.done():
-                future.set_result(answer)
-
-        try:
-            loop.call_soon_threadsafe(_resolve)
+            loop.call_soon_threadsafe(queue.put_nowait, KeyEvent("enter"))
         except RuntimeError:
-            # The loop is already closed — nothing left to resolve, and this must not raise
-            # out of a daemon thread.
             pass
 
-    threading.Thread(target=_worker, daemon=True).start()
-    return await future
+    threading.Thread(target=_key_worker, daemon=True).start()
+
+    buffer = LineBuffer()
+    try:
+        while True:
+            # The await is what keeps the wall clock alive: the loop thread stays free while
+            # this is pending, so `asyncio.timeout` can fire even with a question open.
+            event = await queue.get()
+            if event.kind == "enter":
+                break
+            if event.kind == "interrupt":
+                raise KeyboardInterrupt  # R6 -- `main()`'s existing Ctrl+C teardown runs.
+            if event.kind == "char" and event.char is not None:
+                buffer.insert(event.char)
+            elif event.kind == "newline":
+                buffer.newline()
+            elif event.kind == "backspace":
+                buffer.backspace()
+            elif event.kind == "left":
+                buffer.move_left()
+            elif event.kind == "right":
+                buffer.move_right()
+            elif event.kind == "up":
+                buffer.move_up()
+            elif event.kind == "down":
+                buffer.move_down()
+            renderer.emit(AnswerDraft(buffer.text(), buffer.cursor_row, buffer.cursor_col))
+        return buffer.text()
+    finally:
+        # Runs on submit, on `KeyboardInterrupt` above, and on `CancelledError` when the wall
+        # clock expires with the overlay open — the one restore path is idempotent (step 1)
+        # regardless of which of those three ways this is left.
+        restore_terminal()
 
 
 def _sources_read(registry: SourceRegistry) -> int:
@@ -244,7 +313,7 @@ def _describe_tool_call(call: dict[str, Any]) -> str:
 
 
 async def _answer_questions(
-    interrupt: Interrupt, renderer: Renderer, registry: SourceRegistry
+    interrupt: Interrupt, renderer: Renderer, registry: SourceRegistry, tracker: StageTracker
 ) -> list[dict[str, Any]]:
     """Render each pending `ask_user` question and collect one answer per action request.
 
@@ -254,14 +323,24 @@ async def _answer_questions(
     An answer is user-supplied text exactly like the initial question, so any URL pasted into
     it is approved here (Phase 4, D2/R2) — the natural reply to "which page do you mean?" is
     the URL itself, and without this it stayed provenance-rejected for the rest of the run.
+
+    The overlay is in-frame now (Phase 5): no `suspend()`. `tracker.pause()`/`resume()` and
+    the `QuestionAnswered` emit sit around `_read_answer` in a `finally`, so a `KeyboardInterrupt`
+    or a wall-clock cancellation mid-question cannot leave the displayed clock paused and the
+    overlay stuck open. The WALL clock (`asyncio.timeout` in `main`) is a different clock
+    entirely (risk #2) and nothing here touches it.
     """
     decisions: list[dict[str, Any]] = []
     for request in interrupt.value["action_requests"]:
         args = request.get("args", {})
         question = args.get("question") or request.get("description") or str(args)
         renderer.emit(Question(question))
-        with renderer.suspend():
-            answer = await _read_answer()
+        tracker.pause()
+        try:
+            answer = await _read_answer(renderer)
+        finally:
+            tracker.resume()
+            renderer.emit(QuestionAnswered())
         for url in extract_urls(answer):
             registry.approve(url)
         # Best-effort + disclose: a bare Enter must not reach the model as an empty tool
@@ -711,7 +790,9 @@ async def main(argv: list[str] | None = None) -> int:
                     # fanning several into one decisions list would mis-pair them.
                     stream_input = Command(
                         resume={
-                            "decisions": await _answer_questions(interrupts[0], renderer, registry)
+                            "decisions": await _answer_questions(
+                                interrupts[0], renderer, registry, tracker
+                            )
                         }
                     )
                     continue

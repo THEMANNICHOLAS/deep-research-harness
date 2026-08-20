@@ -226,3 +226,24 @@ def test_line_buffer_text_joins_multiline_with_newline():
     buf.insert("b")
 
     assert buf.text() == "a\nb"
+
+
+# --- Phase 5: idempotent terminal restore --------------------------------------------------
+
+
+def test_restore_terminal_with_nothing_registered_is_a_noop():
+    from harness.input import restore_terminal
+
+    restore_terminal()  # must not raise
+
+
+def test_restore_terminal_calls_the_registered_spy_exactly_once_and_is_idempotent():
+    import harness.input as input_module
+
+    calls: list[None] = []
+    input_module._restore = lambda: calls.append(None)
+
+    input_module.restore_terminal()
+    input_module.restore_terminal()
+
+    assert calls == [None]

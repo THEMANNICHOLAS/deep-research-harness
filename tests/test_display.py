@@ -537,63 +537,137 @@ def test_rich_renderer_layout_order_is_checklist_then_rule_then_activity_then_fo
     assert footer_lines[-1].strip() == "Ctrl+C to exit"
 
 
-def test_rich_renderer_suspend_exits_the_alt_screen_for_a_question_and_restores_after():
+# --- ask_user in-place overlay (Phase 5) ---------------------------------------------------
+#
+# Replaces the old "suspend prints the question panel" tests: the overlay is now the only
+# place a question is shown, and `_suspend()` no longer touches it (step 4).
+
+
+def test_overlay_renders_in_frame_with_the_ledger_and_stage_line_still_visible():
+    """R4: the task ledger and stage line stay visible; the overlay covers only the
+    tool-log region, and carries the panel title, submit hint, and pause disclosure."""
     renderer, buffer = _rich_renderer()
 
-    # Production order (`__main__.py`): the Question is emitted while the Live still owns
-    # the alternate screen, and only then does the run loop enter `suspend()` for input().
-    # The renderer must hold the question and print it on the NORMAL screen inside
-    # `suspend()` — a print while the Live runs would be discarded with the alt buffer.
     renderer.emit(StageStarted("researching"))
-    renderer.emit(Question("Which region?"))
-    with renderer.suspend():
-        pass
-
-    raw = buffer.getvalue()
-    question_index = raw.index("Which region?")
-    exit_index = raw.rindex("\x1b[?1049l", 0, question_index)
-    reenter_index = raw.index("\x1b[?1049h", question_index)
-    assert exit_index < question_index < reenter_index
-
+    renderer.emit(TodosUpdated((TodoItem(content="Find sources", status="in_progress"),)))
+    renderer.emit(Question("Which reading did you mean?"))
+    text = _strip_ansi(buffer.getvalue())
     renderer.close()
 
+    assert "Which reading did you mean?" in text
+    assert "ask_user" in text
+    assert "Enter to submit" in text
+    assert "clock paused while the agent waits" in text
+    assert "Find sources" in text
+    assert "researching" in text
 
-# --- Question panel + suspend tests (Phase 3) ---------------------------------------------
 
-
-def test_rich_renderer_question_renders_as_a_bordered_panel():
+def test_overlay_echoes_the_typed_answer_draft():
     renderer, buffer = _rich_renderer()
 
-    renderer.emit(Question("Which region?"))
-    with renderer.suspend():
-        pass
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(Question("Which reading did you mean?"))
+    renderer.emit(harness.display.AnswerDraft("sticker price", 0, 13))
+    text = _strip_ansi(buffer.getvalue())
     renderer.close()
 
-    text = _strip_ansi(buffer.getvalue())
-    lines = [line for line in text.splitlines() if line.strip()]
-    question_index = next(i for i, line in enumerate(lines) if "Which region?" in line)
-    # A panel border above and below the question text — at least one non-empty line on
-    # each side that is not itself the question text (do not assert box characters).
-    assert question_index > 0
-    assert question_index < len(lines) - 1
+    assert "sticker price" in text
 
 
-def test_rich_renderer_question_is_not_parsed_as_console_markup():
-    """The question is model-authored, and `Panel` renders console markup.
+def test_overlay_question_is_not_parsed_as_console_markup():
+    """The question is model-authored, and the overlay panel renders console markup.
 
     `[/var/log]` raised `MarkupError` and ended the run instead of asking it; `[a]` parsed as
-    an unknown style and vanished from the question the developer was answering.
+    an unknown style and vanished from the question the developer was answering. Mirrors the
+    old suspend-path test of the same name, now against the in-frame overlay.
     """
     renderer, buffer = _rich_renderer()
 
     renderer.emit(Question("Which log, [/var/log] or [a] the app's own?"))
-    with renderer.suspend():
-        pass
+    text = _strip_ansi(buffer.getvalue())
     renderer.close()
 
-    text = _strip_ansi(buffer.getvalue())
     assert "[/var/log]" in text
     assert "[a]" in text
+
+
+def test_overlay_retracts_on_question_answered():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(Activity('search_web: "a query"'))
+    renderer.emit(Question("Which region?"))
+    # Timeline/activity lines live INSIDE the frame (a print under `screen=True` would be
+    # discarded), so every later frame repeats whatever is still current -- assert on the
+    # single frame painted by the retraction itself, not the whole cumulative buffer, which
+    # still carries the earlier (open-overlay) frame's text.
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.QuestionAnswered())
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "Which region?" not in frame
+    assert "clock paused while the agent waits" not in frame
+    assert 'search_web: "a query"' in frame
+
+
+def test_rich_renderer_displayed_clock_excludes_the_paused_interval():
+    """R4/the mockup's own note: the stage line's `MM:SS` must exclude time spent with the
+    overlay open. Asserted on the FORMATTED value actually painted, not a private field."""
+    now = [0.0]
+    renderer, buffer = _rich_renderer(clock=lambda: now[0])
+
+    renderer.emit(StageStarted("researching"))
+    now[0] = 5.0
+    renderer.emit(Activity("tick"))  # unpaused so far: 5s
+    renderer.emit(Question("Which region?"))
+    now[0] = 65.0  # 60s pass while the overlay is open -- must not count
+    renderer.emit(harness.display.QuestionAnswered())
+    now[0] = 67.0  # 2 more unpaused seconds: 5 + 2 = 7s total
+    renderer._live.refresh()
+    text = _strip_ansi(buffer.getvalue())
+    renderer.close()
+
+    assert "00:07" in text
+    assert "01:07" not in text
+
+
+def test_stage_tracker_pause_resume_excludes_the_paused_interval():
+    """The recorded `clarifying` timing must exclude the paused interval too — otherwise a
+    `clarifying 183.0s` that is mostly human thinking time is a wrong number in the report."""
+    renderer = _RecordingRenderer()
+    now = [0.0]
+    tracker = StageTracker(renderer, clock=lambda: now[0])
+
+    tracker.advance("clarifying")
+    now[0] = 1.0
+    tracker.pause()
+    now[0] = 50.0  # a long human wait, must not count
+    tracker.resume()
+    now[0] = 51.0
+    tracker.advance("researching")
+
+    assert tracker.timings() == (("clarifying", 2.0),)
+
+
+def test_pausable_clock_half_pairing_does_not_corrupt_elapsed():
+    """`pause()` while already paused and `resume()` while not paused are both no-ops — the
+    overlay can be opened and retracted on paths that do not perfectly pair."""
+    now = [0.0]
+    clock = harness.display._PausableClock(lambda: now[0])
+
+    clock.pause()
+    clock.pause()  # already paused: must not double up
+    now[0] = 10.0
+    clock.resume()
+    now[0] = 15.0
+
+    assert clock.now() == 5.0  # 15 - 10s paused
+
+    clock.resume()  # no matching pause: must be a no-op
+    now[0] = 20.0
+
+    assert clock.now() == 10.0  # 20 - 10s paused, unaffected by the spurious resume
 
 
 def test_rich_renderer_suspend_stops_the_live_region_and_resume_repaints_after_marker():

@@ -52,6 +52,22 @@ class Question:
 
 
 @dataclass(frozen=True)
+class AnswerDraft:
+    """One repaint of the `ask_user` overlay's answer field (Phase 5), fired after every
+    buffer-mutating key. `cursor_row`/`cursor_col` are the same per-row coordinates `LineBuffer`
+    tracks -- `cursor_col` is a column WITHIN `cursor_row`, never an offset into `text`."""
+
+    text: str
+    cursor_row: int
+    cursor_col: int
+
+
+@dataclass(frozen=True)
+class QuestionAnswered:
+    """Retracts the `ask_user` overlay and resumes the displayed (paused) stage clock."""
+
+
+@dataclass(frozen=True)
 class Alert:
     """A degraded-coverage warning (a `RunLog` incident): rendered as a PERSISTENT line, not
     part of the scrolling activity tail — a failed search must not vanish off the feed."""
@@ -89,6 +105,8 @@ DisplayEvent = (
     | StageCompleted
     | Activity
     | Question
+    | AnswerDraft
+    | QuestionAnswered
     | Alert
     | RunFinished
     | TodosUpdated
@@ -149,9 +167,14 @@ class PlainRenderer:
             for item in event.todos:
                 print(f"  [{item.status}] {item.content}", file=stream)
         elif isinstance(event, RoundsUpdated):
-            # The only event this renderer drops. It is pure live-frame decoration (D2), and
-            # a line per model turn would spam the non-TTY CI logs; every other event carries
-            # a real, one-time textual meaning worth printing.
+            # Dropped: pure live-frame decoration (D2), and a line per model turn would spam
+            # the non-TTY CI logs; every other event carries a real, one-time textual meaning
+            # worth printing.
+            pass
+        elif isinstance(event, AnswerDraft | QuestionAnswered):
+            # Dropped, same reasoning as `RoundsUpdated` above: both are pure live-frame
+            # decoration of the `ask_user` overlay, and one line per keystroke would flood a
+            # non-TTY log. `Question` above already prints the question text itself.
             pass
         else:  # Activity
             print(f"  {event.text}", file=stream)
@@ -163,12 +186,43 @@ class PlainRenderer:
         pass
 
 
+class _PausableClock:
+    """A monotonic clock whose paused intervals do not count toward elapsed time.
+
+    Shared by `StageTracker` (the recorded stage timings) and `RichRenderer` (the displayed
+    `MM:SS`) - both derive elapsed time from a clock callable and both must pause while the
+    `ask_user` overlay is open. This is deliberately NOT the wall clock (`asyncio.timeout` in
+    `__main__`, risk #2): that one must keep running unconditionally, and nothing here touches
+    it. `pause()` while already paused and `resume()` while not paused are both no-ops, so a
+    half-paired open/retract sequence cannot corrupt the running total.
+    """
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self._paused_at: float | None = None
+        self._paused_total: float = 0.0
+
+    def now(self) -> float:
+        if self._paused_at is not None:
+            return self._paused_at - self._paused_total
+        return self._clock() - self._paused_total
+
+    def pause(self) -> None:
+        if self._paused_at is None:
+            self._paused_at = self._clock()
+
+    def resume(self) -> None:
+        if self._paused_at is not None:
+            self._paused_total += self._clock() - self._paused_at
+            self._paused_at = None
+
+
 class StageTracker:
     """Owns stage state and timings (D2: display state lives in the display layer)."""
 
     def __init__(self, renderer: Renderer, clock: Callable[[], float] = time.monotonic) -> None:
         self._renderer = renderer
-        self._clock = clock
+        self._elapsed = _PausableClock(clock)
         self._current: Stage | None = None
         self._started_at: float = 0.0
         self._timings: list[tuple[Stage, float]] = []
@@ -176,12 +230,12 @@ class StageTracker:
     def advance(self, stage: Stage) -> None:
         """Move to `stage`, completing whatever stage was current. A no-op if already there.
 
-        One `clock()` read per transition: the same instant serves as both the elapsed
-        endpoint of the stage being completed and the start of the new one.
+        One clock read per transition: the same instant serves as both the elapsed endpoint
+        of the stage being completed and the start of the new one.
         """
         if stage == self._current:
             return
-        now = self._clock()
+        now = self._elapsed.now()
         if self._current is not None:
             elapsed = now - self._started_at
             self._timings.append((self._current, elapsed))
@@ -194,7 +248,7 @@ class StageTracker:
         """Complete the current stage, if any. Safe to call with none current, or twice."""
         if self._current is None:
             return
-        elapsed = self._clock() - self._started_at
+        elapsed = self._elapsed.now() - self._started_at
         self._timings.append((self._current, elapsed))
         self._renderer.emit(StageCompleted(self._current, elapsed))
         self._current = None
@@ -202,6 +256,14 @@ class StageTracker:
     def timings(self) -> tuple[tuple[Stage, float], ...]:
         """Completed `(stage, elapsed_seconds)` pairs, in the order they finished."""
         return tuple(self._timings)
+
+    def pause(self) -> None:
+        """Freeze the current stage's elapsed time -- the `ask_user` overlay is open."""
+        self._elapsed.pause()
+
+    def resume(self) -> None:
+        """Resume the current stage's elapsed time -- the overlay has retracted."""
+        self._elapsed.resume()
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -245,12 +307,13 @@ class RichRenderer:
         self._timeline: list[Text] = []
         self._alerts: list[Text] = []
         self._todos: tuple[TodoItem, ...] = ()
-        self._pending_question: str | None = None
+        self._overlay_question: str | None = None
+        self._answer_draft: AnswerDraft | None = None
         self._closed = False
-        self._clock = clock
+        self._elapsed = _PausableClock(clock)
         # RUN elapsed, not stage elapsed: this sits beside a run-level round budget, and
         # per-stage timings are already shown in the completed-stage timeline (Step 3).
-        self._started_at = clock()
+        self._started_at = self._elapsed.now()
         self._rounds: tuple[int, int] | None = None
 
     def _build_checklist(self) -> Group:
@@ -274,7 +337,7 @@ class RichRenderer:
         if self._stage is None:
             return Spinner("dots", text=f"[bold]{self._PRE_STAGE_LABEL}[/bold]", style=_FG_2)
         spinner = Spinner("dots", text=f"[bold]{self._stage}[/bold]", style=_FG_2)
-        elapsed = _format_elapsed(self._clock() - self._started_at)
+        elapsed = _format_elapsed(self._elapsed.now() - self._started_at)
         if self._rounds is not None:
             rounds_used, max_rounds = self._rounds
             elapsed = f"{elapsed} · round {rounds_used}/{max_rounds}"
@@ -284,8 +347,38 @@ class RichRenderer:
         grid.add_row(spinner, Text(elapsed, style=_MUTED))
         return grid
 
+    def _build_ask_overlay(self) -> Panel:
+        assert self._overlay_question is not None
+        draft = self._answer_draft or AnswerDraft("", 0, 0)
+        body = Group(
+            # `Text(...)`, not the raw string: the question is model-authored, and `Panel`
+            # renders console markup -- a bracketed path (`[/var/log]`) would raise
+            # `MarkupError` and end the run instead of asking, and a `[a]`-style option label
+            # would be parsed as an unknown style and silently dropped from the question the
+            # developer is answering.
+            Text(self._overlay_question),
+            *_build_cursor_rows(
+                draft.text,
+                draft.cursor_row,
+                draft.cursor_col,
+                style=_FG,
+                cursor_style=f"{_SURFACE} on {_FG}",
+            ),
+            Text("Enter to submit", style=_MUTED),
+            # "clock", not the mockup's "stage clock": what freezes is the RUN elapsed time
+            # shown on the stage line, not a per-stage timer. Worth being exact, because the
+            # WALL clock keeps counting through this pause -- a run can be cut short at a wall
+            # time this display never reached.
+            Text("clock paused while the agent waits", style=_MUTED),
+        )
+        return Panel(body, border_style=_CYAN, title="ask_user")
+
     def _build_activity_group(self) -> Group:
         header = self._build_stage_header()
+        if self._overlay_question is not None:
+            # The overlay REPLACES the activity lines only -- the checklist (outside this
+            # panel), the timeline, and the stage header all stay visible (R4).
+            return Group(*self._timeline, *self._alerts, header, self._build_ask_overlay())
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
         return Group(*self._timeline, *self._alerts, header, *activity_lines)
 
@@ -342,10 +435,27 @@ class RichRenderer:
             if self._live is not None:
                 self._live.refresh()
         elif isinstance(event, Question):
-            # Held, not printed: while the Live owns the alternate screen a print would land
-            # there and be discarded when `suspend()` exits it — the question must appear on
-            # the NORMAL screen, so `_suspend()` prints it after stopping the Live.
-            self._pending_question = event.text
+            # In-frame overlay (Phase 5), not held for `suspend()` to print: the checklist,
+            # timeline, and stage line stay visible, and the stage clock pauses for exactly
+            # as long as the overlay is open (risk #2's OTHER clock -- the wall clock in
+            # `__main__` is untouched here).
+            self._overlay_question = event.text
+            self._answer_draft = AnswerDraft("", 0, 0)
+            self._elapsed.pause()
+            if self._live is None:
+                self._start_live()
+            else:
+                self._live.refresh()
+        elif isinstance(event, AnswerDraft):
+            self._answer_draft = event
+            if self._live is not None:
+                self._live.refresh()
+        elif isinstance(event, QuestionAnswered):
+            self._overlay_question = None
+            self._answer_draft = None
+            self._elapsed.resume()
+            if self._live is not None:
+                self._live.refresh()
         elif isinstance(event, Alert):
             # Appended to a PERSISTENT list rendered inside the frame, not `console.print`ed
             # and not part of the scrolling `_activities` tail: under `screen=True` a print
@@ -416,13 +526,6 @@ class RichRenderer:
         if self._live is not None:
             self._live.stop()
             self._live = None
-        if self._pending_question is not None:
-            # `Text(...)`, not the raw string: `Panel` renders console markup, and the question
-            # is model-authored. A bracketed path (`[/var/log]`) would raise `MarkupError` and
-            # end the run instead of asking, and a `[a]`-style option label would be parsed as
-            # an unknown style and silently dropped from the question the developer answers.
-            self._console.print(Panel(Text(self._pending_question), border_style="cyan"))
-            self._pending_question = None
         try:
             yield
         finally:
@@ -518,38 +621,56 @@ def _build_wordmark() -> Group:
     return Group(line1, line2)
 
 
-def _build_ask_rows(view: WelcomeView) -> list[Text]:
-    """One `Text` per buffer line.
+def _build_cursor_rows(
+    text: str, cursor_row: int, cursor_col: int, *, style: str, cursor_style: str
+) -> list[Text]:
+    """One `Text` per line of `text`, with a block cursor placed on `cursor_row` at
+    `cursor_col`.
 
-    Returns a list rather than a single `Text` so the block cursor can be placed on
-    `cursor_row` at `cursor_col`, and so every line gets its own accent bar. `cursor_col`
-    is a column WITHIN its row, never an offset into the newline-joined text — indexing
-    the joined string draws the cursor over the `\\n` once Ctrl+J has split the buffer.
+    Shared by `_build_ask_rows` (the welcome box) and the `ask_user` overlay (Phase 5) -
+    the per-row cursor placement is the same logic either way. `cursor_col` is a column
+    WITHIN its row, never an offset into the newline-joined text - indexing the joined
+    string draws the cursor over the `\n` once Ctrl+J has split the buffer.
+    """
+    lines = text.split("\n")
+    row_index = max(0, min(cursor_row, len(lines) - 1))
+    rows: list[Text] = []
+    for index, line in enumerate(lines):
+        row = Text()
+        if index != row_index:
+            row.append(line, style=style)
+            rows.append(row)
+            continue
+        col = max(0, min(cursor_col, len(line)))
+        row.append(line[:col], style=style)
+        cursor_char = line[col] if col < len(line) else " "
+        # Reverse video: the cursor's foreground is the box's own background, and its
+        # background is the box's own foreground - swapped, not a `reverse` style
+        # attribute, so the exact palette colors are what actually swap.
+        row.append(cursor_char, style=cursor_style)
+        row.append(line[col + 1 :], style=style)
+        rows.append(row)
+    return rows
+
+
+def _build_ask_rows(view: WelcomeView) -> list[Text]:
+    """One `Text` per buffer line, or the placeholder row when the buffer is empty.
+
+    Delegates the non-empty case to `_build_cursor_rows`; the placeholder and `_SURFACE`
+    background stay here, since the `ask_user` overlay needs neither.
     """
     if not view.question:
         row = Text()
         row.append(_PLACEHOLDER, style=f"{_DIM} on {_SURFACE}")
         row.append(_EXAMPLE_QUESTION, style=f"{_MUTED} on {_SURFACE}")
         return [row]
-    lines = view.question.split("\n")
-    cursor_row = max(0, min(view.cursor_row, len(lines) - 1))
-    rows: list[Text] = []
-    for index, line in enumerate(lines):
-        row = Text()
-        if index != cursor_row:
-            row.append(line, style=f"{_FG} on {_SURFACE}")
-            rows.append(row)
-            continue
-        col = max(0, min(view.cursor_col, len(line)))
-        row.append(line[:col], style=f"{_FG} on {_SURFACE}")
-        cursor_char = line[col] if col < len(line) else " "
-        # Reverse video: the cursor's foreground is the box's own background, and its
-        # background is the box's own foreground — swapped, not a `reverse` style attribute,
-        # so the exact palette colors are what actually swap.
-        row.append(cursor_char, style=f"{_SURFACE} on {_FG}")
-        row.append(line[col + 1 :], style=f"{_FG} on {_SURFACE}")
-        rows.append(row)
-    return rows
+    return _build_cursor_rows(
+        view.question,
+        view.cursor_row,
+        view.cursor_col,
+        style=f"{_FG} on {_SURFACE}",
+        cursor_style=f"{_SURFACE} on {_FG}",
+    )
 
 
 def _build_mode_row(view: WelcomeView) -> Text:
