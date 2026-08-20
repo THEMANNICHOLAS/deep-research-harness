@@ -26,15 +26,20 @@ import argparse
 import asyncio
 import sys
 import threading
+import tomllib
+from collections.abc import Callable, Iterable
 from contextlib import aclosing
+from dataclasses import dataclass
 from datetime import datetime
 from functools import reduce
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.messages.ai import UsageMetadata, add_usage
+from rich.console import Console, RenderableType
 
 from harness.config import ConfigError, load_config
 from harness.display import (
@@ -46,8 +51,13 @@ from harness.display import (
     StageTracker,
     TodoItem,
     TodosUpdated,
+    WelcomeScreen,
+    WelcomeView,
+    build_help_panel,
+    build_model_picker,
     build_renderer,
 )
+from harness.input import KeyEvent, LineBuffer, read_keys, scoped_keys
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
 from harness.runlog import RunLog
@@ -63,6 +73,8 @@ if TYPE_CHECKING:
 
     from langchain_core.runnables import RunnableConfig
     from langgraph.types import Interrupt
+
+    from harness.config import HarnessConfig
 
 _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -247,12 +259,187 @@ async def _answer_questions(
     return decisions
 
 
+# --- Welcome screen (Phase 2, PLAN-tui-redesign) --------------------------------------------
+#
+# `python -m harness` with no argv `question` drops into an interactive welcome screen instead
+# of erroring on a missing positional (D2 — argv mode itself is unchanged, see `main`).
+
+
+@dataclass
+class _WelcomeState:
+    """Mutable welcome-loop state, separate from the pure `WelcomeView` it renders into."""
+
+    mode: Literal["normal", "model_picker"] = "normal"
+    picker_index: int = 0
+    notice: str | None = None
+    panel: RenderableType | None = None
+
+
+@dataclass(frozen=True)
+class _Command:
+    name: str
+    summary: str
+    handler: Callable[[_WelcomeState, HarnessConfig], None]
+
+
+def _handle_help(state: _WelcomeState, config: HarnessConfig) -> None:
+    rows = [(command.name, command.summary) for command in _COMMANDS.values()]
+    state.panel = build_help_panel(rows)
+
+
+def _handle_model(state: _WelcomeState, config: HarnessConfig) -> None:
+    head = config.roles["head"]
+    choices = head.choices or []
+    state.mode = "model_picker"
+    state.picker_index = choices.index(head.model) if head.model in choices else 0
+    state.panel = build_model_picker(choices, state.picker_index, head.model)
+
+
+# A DATA structure (name -> `_Command`), not an if/elif chain (Contracts): adding `/sources`
+# later is one entry here plus its handler, no change to `_run_welcome`'s loop.
+_COMMANDS: dict[str, _Command] = {
+    "/help": _Command("/help", "Show available commands and key hints.", _handle_help),
+    "/model": _Command("/model", "Pick the head model for this session.", _handle_model),
+}
+
+
+@dataclass(frozen=True)
+class _Submission:
+    kind: Literal["question", "command", "unknown", "empty"]
+    text: str
+
+
+def _classify_submission(text: str) -> _Submission:
+    """Pure classification of one submitted buffer, table-driven off `_COMMANDS`.
+
+    Rules: empty/whitespace -> `empty`; leading `/` -> looked up in `_COMMANDS` -> `command`
+    or `unknown`; anything else -> `question` (leading non-slash text is a question even if
+    it contains a `/` later, e.g. `"a/b"`).
+    """
+    stripped = text.strip()
+    if not stripped:
+        return _Submission("empty", stripped)
+    if stripped.startswith("/"):
+        if stripped in _COMMANDS:
+            return _Submission("command", stripped)
+        return _Submission("unknown", stripped)
+    return _Submission("question", stripped)
+
+
+def _package_version() -> str:
+    """The version shown in the welcome screen's status bar, read from `pyproject.toml`.
+
+    Not `importlib.metadata.version`: `[tool.uv] package = false` means this project is never
+    actually installed as a package, so that lookup would raise `PackageNotFoundError`.
+    """
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        data = tomllib.load(f)
+    return str(data["project"]["version"])
+
+
+def _run_welcome(
+    config: HarnessConfig, *, keys: Iterable[KeyEvent], console: Console
+) -> str | None:
+    """Drive the welcome screen until a question is submitted or the user aborts.
+
+    `keys`/`console` are the testability seam: tests feed a list of `KeyEvent`s and a
+    `StringIO`-backed `Console`, no terminal involved. Production passes `read_keys()` and a
+    fresh `Console`.
+    """
+    buffer = LineBuffer()
+    state = _WelcomeState()
+    head = config.roles["head"]
+    roles = (
+        ("researcher", config.roles["researcher"].model),
+        ("reader", config.roles["reader"].model),
+        ("verifier", config.roles["verifier"].model),
+    )
+    budget = f"{config.agent.max_rounds} rounds / {config.agent.wall_clock_seconds // 60} min"
+    status_left = f"{Path.cwd()}:searxng@{urlsplit(config.search.base_url).netloc}"
+    status_right = _package_version()
+
+    def _view() -> WelcomeView:
+        panel = state.panel
+        if state.mode == "model_picker" and head.choices:
+            panel = build_model_picker(head.choices, state.picker_index, head.model)
+        return WelcomeView(
+            question=buffer.text(),
+            cursor_col=buffer.cursor_col,
+            cursor_row=buffer.cursor_row,
+            head_model=head.model,
+            roles=roles,
+            budget=budget,
+            status_left=status_left,
+            status_right=status_right,
+            notice=state.notice,
+            panel=panel,
+        )
+
+    # `scoped_keys` (harness/input.py) owns releasing raw mode — the close probe lives once,
+    # next to the generator that sets raw mode, rather than at each call site. Nesting it
+    # INSIDE `WelcomeScreen` is what gives the risk #1 ordering: the key source's `termios`
+    # restore runs BEFORE `WelcomeScreen` leaves the alternate screen, so a Ctrl+C or
+    # exception mid-loop cannot leave the terminal raw. Do not reorder these.
+    with WelcomeScreen(console) as screen, scoped_keys(keys) as key_source:
+        screen.update(_view())
+        for event in key_source:
+            if event.kind == "interrupt":
+                return None
+            elif event.kind == "char" and event.char is not None:
+                buffer.insert(event.char)
+            elif event.kind == "backspace":
+                buffer.backspace()
+            elif event.kind == "left":
+                buffer.move_left()
+            elif event.kind == "right":
+                buffer.move_right()
+            elif event.kind == "newline":
+                buffer.newline()
+            elif event.kind == "up":
+                if state.mode == "model_picker":
+                    state.picker_index = max(0, state.picker_index - 1)
+                else:
+                    buffer.move_up()
+            elif event.kind == "down":
+                if state.mode == "model_picker":
+                    choices = head.choices or []
+                    if choices:
+                        state.picker_index = min(len(choices) - 1, state.picker_index + 1)
+                else:
+                    buffer.move_down()
+            elif event.kind == "enter":
+                if state.mode == "model_picker":
+                    if head.choices:
+                        head.model = head.choices[state.picker_index]
+                    state.mode = "normal"
+                    state.panel = None
+                else:
+                    submission = _classify_submission(buffer.text())
+                    if submission.kind == "question":
+                        return submission.text
+                    if submission.kind == "command":
+                        state.notice = None
+                        _COMMANDS[submission.text].handler(state, config)
+                        buffer = LineBuffer()
+                    elif submission.kind == "unknown":
+                        state.notice = f"unknown command: {submission.text}"
+                        state.panel = None
+                        buffer = LineBuffer()
+                    # empty -> ignore, nothing submitted
+            screen.update(_view())
+    return None
+
+
 async def main(argv: list[str] | None = None) -> int:
     """Run one research question end to end. Returns the process exit code."""
     parser = argparse.ArgumentParser(
         prog="python -m harness", description="Answer one research question with cited sources."
     )
-    parser.add_argument("question", help="The research question to answer.")
+    # `nargs="?"`: `python -m harness "<question>"` still parses identically to before this
+    # phase — only an ABSENT question now falls through to the welcome screen below, rather
+    # than argparse itself erroring on a missing required positional (D2).
+    parser.add_argument("question", nargs="?", help="The research question to answer.")
     args = parser.parse_args(argv)
 
     try:
@@ -260,6 +447,22 @@ async def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    question = args.question
+    if not question and not sys.stdin.isatty():
+        # No question AND no interactive terminal (piped stdin, cron, nohup): the welcome
+        # screen cannot be driven, and `read_keys()` would raise a bare `termios.error`
+        # putting stdin in raw mode. Restore the pre-welcome behavior for this case — the
+        # same usage message argparse produced when `question` was a required positional.
+        parser.error("the following arguments are required: question")
+    if not question:
+        # Production passes the raw `read_keys()` generator and a fresh `Console` — see
+        # `_run_welcome`'s own docstring for the testability seam and the terminal-teardown
+        # ordering this relies on.
+        question = _run_welcome(config, keys=read_keys(), console=Console())
+        if question is None:
+            # Ctrl+C or EOF out of the welcome screen: a clean exit, no run started, no report.
+            return 0
 
     # The renderer starts BEFORE the heavy imports and the preflight call: together they are
     # several silent seconds, and a terminal that shows nothing through them reads as hung.
@@ -309,7 +512,7 @@ async def main(argv: list[str] | None = None) -> int:
     # Phase 4 strict provenance (D2/R2): a pasted "read this page" URL is the only other
     # sanctioned way a URL becomes fetchable (no `--url` flag) — approved here, before the
     # agent runs, so it is fetchable from the run's very first tool call.
-    for url in extract_urls(args.question):
+    for url in extract_urls(question):
         registry.approve(url)
     run_log = RunLog()
     # Same close/print/exit-1 shape as the preflight loop: `build_agent` resolves every
@@ -351,7 +554,7 @@ async def main(argv: list[str] | None = None) -> int:
             config.agent.max_rounds * _BACKSTOP_SUPERSTEPS_PER_ROUND + _BACKSTOP_FLOOR
         ),
     }
-    stream_input: Any = {"messages": [HumanMessage(content=args.question)]}
+    stream_input: Any = {"messages": [HumanMessage(content=question)]}
 
     last_todos: list[dict[str, Any]] | None = None
     final_state: dict[str, Any] | None = None
@@ -585,7 +788,7 @@ async def main(argv: list[str] | None = None) -> int:
             )
 
     outcome = RunOutcome(
-        question=args.question,
+        question=question,
         answer=answer,
         registry=registry,
         usage=usage,

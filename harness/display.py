@@ -4,16 +4,17 @@
 
 import sys
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from rich.console import Console, Group
+from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.spinner import Spinner
+from rich.table import Table
 from rich.text import Text
 
 Stage = Literal["clarifying", "researching", "verifying", "writing"]
@@ -353,3 +354,259 @@ def build_renderer() -> Renderer:
     if sys.stdout.isatty():
         return RichRenderer()
     return PlainRenderer()
+
+
+# --- Welcome screen (Phase 2, PLAN-tui-redesign) ----------------------------------------
+#
+# Palette taken from docs/design/deep-research-tui.html's `:root` block. Defined once here —
+# later phases (running pane, ask_user overlay) reuse these same constants rather than
+# re-declaring the hex values (CLAUDE.md: "a constant lives in exactly one place").
+_FG = "#e8e8e8"
+_DIM = "#8a8f96"
+_MUTED = "#6a6f76"
+_ACCENT = "#4a7fd8"
+_SURFACE = "#1c1c1c"
+_WORDMARK_BACK = "#7a7a7a"
+_WARN = "#d9a33a"
+_OK = "#3fd15a"
+_CYAN = "#56b6c2"
+
+# Glyph rows taken VERBATIM from docs/design/deep-research-tui.html's `.wordmark` `<pre>`
+# blocks — not hand-drawn letterforms.
+_WORDMARK_BACK_LINE1 = "█▀▄ █▀▀ █▀▀ █▀█"
+_WORDMARK_BACK_LINE2 = "█▄▀ ██▄ ██▄ █▀▀"
+_WORDMARK_FRONT_LINE1 = "█▀█ █▀▀ █▀ █▀▀ ▄▀█ █▀█ █▀▀ █ █"
+_WORDMARK_FRONT_LINE2 = "█▀▄ ██▄ ▄█ ██▄ █▀█ █▀▄ █▄▄ █▀█"
+
+_EXAMPLE_QUESTION = '"How does DeepSeek V4 Pro price long-context runs?"'
+_PLACEHOLDER = "Ask anything… "
+
+_HINTS: tuple[tuple[str, str], ...] = (
+    ("enter", "run"),
+    ("/", "commands"),
+    ("ctrl+j", "newline"),
+    ("ctrl+c", "exit"),
+)
+
+# At most this many choice rows render in the `/model` picker — a long list (19 choices
+# today) gets `…` affordances above/below instead of blowing up the frame.
+_PICKER_WINDOW = 12
+
+
+@dataclass(frozen=True)
+class WelcomeView:
+    """Everything the welcome screen renders — no config object reached into at render
+    time, which keeps `build_welcome` pure and the tests trivial."""
+
+    question: str
+    cursor_col: int
+    head_model: str
+    roles: tuple[tuple[str, str], ...]
+    budget: str
+    status_left: str
+    status_right: str
+    # Pairs with `cursor_col` above, but carries a default so it sits in the defaulted
+    # block: `cursor_col` is a PER-ROW column, so the cursor cannot be placed without
+    # knowing its row once Ctrl+J has split the buffer.
+    cursor_row: int = 0
+    notice: str | None = None
+    panel: RenderableType | None = None
+
+
+def _build_wordmark() -> Group:
+    gap = "  "
+    line1 = Text(_WORDMARK_BACK_LINE1, style=_WORDMARK_BACK)
+    line1.append(gap)
+    line1.append(_WORDMARK_FRONT_LINE1, style=_FG)
+    line2 = Text(_WORDMARK_BACK_LINE2, style=_WORDMARK_BACK)
+    line2.append(gap)
+    line2.append(_WORDMARK_FRONT_LINE2, style=_FG)
+    return Group(line1, line2)
+
+
+def _build_ask_rows(view: WelcomeView) -> list[Text]:
+    """One `Text` per buffer line.
+
+    Returns a list rather than a single `Text` so the block cursor can be placed on
+    `cursor_row` at `cursor_col`, and so every line gets its own accent bar. `cursor_col`
+    is a column WITHIN its row, never an offset into the newline-joined text — indexing
+    the joined string draws the cursor over the `\\n` once Ctrl+J has split the buffer.
+    """
+    if not view.question:
+        row = Text()
+        row.append(_PLACEHOLDER, style=f"{_DIM} on {_SURFACE}")
+        row.append(_EXAMPLE_QUESTION, style=f"{_MUTED} on {_SURFACE}")
+        return [row]
+    lines = view.question.split("\n")
+    cursor_row = max(0, min(view.cursor_row, len(lines) - 1))
+    rows: list[Text] = []
+    for index, line in enumerate(lines):
+        row = Text()
+        if index != cursor_row:
+            row.append(line, style=f"{_FG} on {_SURFACE}")
+            rows.append(row)
+            continue
+        col = max(0, min(view.cursor_col, len(line)))
+        row.append(line[:col], style=f"{_FG} on {_SURFACE}")
+        cursor_char = line[col] if col < len(line) else " "
+        # Reverse video: the cursor's foreground is the box's own background, and its
+        # background is the box's own foreground — swapped, not a `reverse` style attribute,
+        # so the exact palette colors are what actually swap.
+        row.append(cursor_char, style=f"{_SURFACE} on {_FG}")
+        row.append(line[col + 1 :], style=f"{_FG} on {_SURFACE}")
+        rows.append(row)
+    return rows
+
+
+def _build_mode_row(view: WelcomeView) -> Text:
+    row = Text()
+    row.append("Research", style=f"{_ACCENT} on {_SURFACE}")
+    row.append(" · ", style=f"{_MUTED} on {_SURFACE}")
+    row.append(view.head_model, style=f"{_FG} on {_SURFACE}")
+    return row
+
+
+def _left_bar(content: Text) -> Text:
+    """A leading accent bar per line — Rich has no single-side `Panel` border, so this is
+    the chosen substitute (over a `box.HEAVY`-style full border, which reads further from
+    the mockup's thin left-only bar)."""
+    line = Text("▌ ", style=f"{_ACCENT} on {_SURFACE}")
+    line.append_text(content)
+    return line
+
+
+def _build_input_box(view: WelcomeView) -> Panel:
+    rows = [_left_bar(row) for row in _build_ask_rows(view)]
+    body = Group(*rows, _left_bar(_build_mode_row(view)))
+    # `border_style=_SURFACE`: matches the fill so no visible frame competes with the left
+    # bar, which is the only border cue the mockup actually shows.
+    return Panel(body, style=f"on {_SURFACE}", border_style=_SURFACE, padding=(0, 1))
+
+
+def _build_hints_line() -> Text:
+    line = Text()
+    for i, (key, label) in enumerate(_HINTS):
+        if i:
+            line.append("  ")
+        line.append(key, style=_FG)
+        line.append(" ")
+        line.append(label, style=_MUTED)
+    return line
+
+
+def _build_roles_line(view: WelcomeView) -> Text:
+    """`researcher`/`reader`/`verifier` (whatever `view.roles` holds) then `budget` — the
+    head model is NOT repeated here; the input box's mode row already shows it (Reconciliations)."""
+    line = Text()
+    entries = (*view.roles, ("budget", view.budget))
+    for i, (label, value) in enumerate(entries):
+        if i:
+            line.append(" · ", style=_MUTED)
+        line.append(label, style=_DIM)
+        line.append(" ")
+        line.append(value, style=_MUTED)
+    return line
+
+
+def _build_tip_line() -> Text:
+    """Advertises `/help`, not `/sources` (Reconciliations — `/sources` is dropped)."""
+    line = Text()
+    line.append("●", style=_WARN)
+    line.append(" Tip", style=_WARN)
+    line.append(" Run ", style=_MUTED)
+    line.append("/help", style=_FG)
+    line.append(" to see available commands", style=_MUTED)
+    return line
+
+
+def _build_status_bar(view: WelcomeView) -> Table:
+    grid = Table.grid(expand=True)
+    grid.add_column()
+    grid.add_column(justify="right")
+    grid.add_row(Text(view.status_left, style=_MUTED), Text(view.status_right, style=_MUTED))
+    return grid
+
+
+def build_welcome(view: WelcomeView) -> Group:
+    """Render the welcome screen top-to-bottom, per the mockup's `#screen-welcome`."""
+    parts: list[RenderableType] = [_build_wordmark(), _build_input_box(view)]
+    if view.notice:
+        parts.append(Text(view.notice, style=_WARN))
+    if view.panel is not None:
+        parts.append(view.panel)
+    parts.append(_build_hints_line())
+    parts.append(_build_roles_line(view))
+    parts.append(_build_tip_line())
+    parts.append(_build_status_bar(view))
+    return Group(*parts)
+
+
+def build_help_panel(commands: Sequence[tuple[str, str]]) -> Panel:
+    """Lists `commands` (name, summary) pairs — the caller iterates its dispatch table to
+    build this list, so a newly registered command appears automatically."""
+    rows: list[Text] = []
+    for name, summary in commands:
+        row = Text()
+        row.append(name, style=_FG)
+        row.append(f"  {summary}", style=_MUTED)
+        rows.append(row)
+    body = Group(*rows, Text(""), _build_hints_line())
+    return Panel(body, title="Help", border_style=_ACCENT)
+
+
+def build_model_picker(choices: Sequence[str], selected: int, current: str) -> Panel:
+    """One row per choice, `selected` highlighted, the row equal to `current` marked active.
+
+    Renders a window of at most `_PICKER_WINDOW` rows centered on `selected`, with `…`
+    affordances above/below when truncated — a long list (19 choices today) must not blow
+    up the frame.
+    """
+    n = len(choices)
+    window = min(_PICKER_WINDOW, n)
+    if n <= _PICKER_WINDOW:
+        start, end = 0, n
+    else:
+        half = window // 2
+        start = max(0, min(selected - half, n - window))
+        end = start + window
+    lines: list[Text] = []
+    if start > 0:
+        lines.append(Text("…", style=_MUTED))
+    for i in range(start, end):
+        choice = choices[i]
+        row = Text()
+        if i == selected:
+            row.append("> ", style=_ACCENT)
+            row.append(choice, style=f"{_SURFACE} on {_ACCENT}")
+        else:
+            row.append("  ")
+            row.append(choice, style=_FG)
+        if choice == current:
+            row.append("  (current)", style=_MUTED)
+        lines.append(row)
+    if end < n:
+        lines.append(Text("…", style=_MUTED))
+    return Panel(Group(*lines), title="Select model", border_style=_ACCENT)
+
+
+class WelcomeScreen:
+    """Thin `Live` owner for the welcome screen — mirrors `RichRenderer`'s ownership of its
+    own `Live`: the live region owns terminal state (module docstring)."""
+
+    def __init__(self, console: Console | None = None) -> None:
+        self._console = console or Console()
+        self._live: Live | None = None
+
+    def __enter__(self) -> "WelcomeScreen":
+        self._live = Live(console=self._console, screen=True, refresh_per_second=4)
+        self._live.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    def update(self, view: WelcomeView) -> None:
+        if self._live is not None:
+            self._live.update(build_welcome(view))

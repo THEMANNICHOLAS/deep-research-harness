@@ -72,6 +72,20 @@ class ProviderConfig(_StrictModel):
 class RoleConfig(_StrictModel):
     provider: str
     model: str
+    # Only `head` sets this today (the `/model` picker) — every other role omits it and
+    # stays valid, since `None` is a legitimate "no picker" state, not an oversight.
+    choices: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _validate_choices(self) -> "RoleConfig":
+        if self.choices is None:
+            return self
+        if not self.choices:
+            raise ValueError("choices, if set, must be non-empty")
+        for entry in self.choices:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError(f"choices entries must be non-empty strings, got {entry!r}")
+        return self
 
 
 class FetchSettings(_StrictModel):

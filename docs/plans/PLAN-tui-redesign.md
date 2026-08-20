@@ -27,9 +27,11 @@ without changing the loop's reasoning, stage semantics, or verification behavior
   current free-text activity tail), and a reader-subagent strip present only while
   reader tasks are in flight.
 - **R3** — The welcome screen accepts the research question interactively (arrow-key
-  line editing, Enter runs it) and supports exactly `/help`, `/sources`, `/model`
+  line editing, Enter runs it) and supports exactly `/help`, ~~`/sources`,~~ `/model`
   (an up/down-navigable picker over `roles.head.choices` in `harness.toml`, session-
-  only — never written to disk). Invoking with a question already on argv
+  only — never written to disk). ~~`/sources`~~ dropped 2026-08-19 — see
+  `## Reconciliations`; the command dispatch table must stay trivially extensible so it
+  can be added later without reshaping the welcome loop. Invoking with a question already on argv
   (`python -m harness "<question>"`) skips the welcome screen entirely — the existing
   scripted/CI path is unchanged.
 - **R4** — `ask_user` renders as an in-place cyan overlay inside the running frame
@@ -208,7 +210,10 @@ Inherits every `## Intent` non-goal — not re-listed.
   run (existing `_reader_failure_message` behavior is unchanged).
 
 ### D5: `/sources` reads a new small per-run manifest, not raw capture files
-- **Chosen:** at run end, write `<workspace_dir>/<run_id>/sources.json`
+**MOOT as of 2026-08-19 — `/sources` dropped from scope; see `## Reconciliations`. The
+entire decision below is struck and NOT implemented. No `sources.json` is written and
+`report.py`'s `_is_usable` stays report-private.**
+- ~~**Chosen:** at run end, write `<workspace_dir>/<run_id>/sources.json`~~
   (`{run_id, question, sources: [{id, url, title, outcome}], usable, unusable}`)
   alongside the existing `sources/S<n>.md` captures; `/sources` reads the newest
   run's manifest by directory mtime.
@@ -223,7 +228,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 |----|---------|------------|
 | R1 | Five screens faithful to mockup | Phase 2 (welcome), Phase 3 (running pane), Phase 5 (overlay), Phase 1/existing (finished) |
 | R2 | Task meta, round/elapsed, tool-call log, reader strip | Phase 3 (ledger/stage/log), Phase 6 (reader strip) |
-| R3 | Interactive welcome + 3 commands | Phase 1 (input foundation), Phase 2 (welcome+commands) |
+| R3 | Interactive welcome + ~~3~~ 2 commands (`/sources` dropped) | Phase 1 (input foundation), Phase 2 (welcome+commands) |
 | R4 | ask_user in-place overlay | Phase 5 |
 | R5 | Finished summary + inline report path | Phase 4 |
 | R6 | Clean exit on new input paths | Phase 1 (foundation), Phase 5 (overlay Ctrl+C) |
@@ -231,7 +236,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Raw-key input foundation
-- [ ] Phase 2: Welcome screen and slash commands
+- [x] Phase 2: Welcome screen and slash commands
 - [ ] Phase 3: Running pane — task meta, stage round/elapsed, structured tool log
 - [ ] Phase 4: Finished summary — inline report path
 - [ ] Phase 5: ask_user in-place overlay
@@ -282,7 +287,7 @@ beyond the contract (Home/End/Delete/history are not in any R).
 **Test-first:** required
 **Goal:** The welcome screen per the mockup (wordmark, styled input box, hints, roles
 line, tip, status bar), driven by Phase 1's `LineBuffer`/key reader; `/help`,
-`/sources`, `/model` (up/down picker over `roles.head.choices`) dispatch; argv
+~~`/sources`,~~ `/model` (up/down picker over `roles.head.choices`) dispatch; argv
 invocation still skips it entirely (D2).
 **Requirements:** R1, R3
 **Assumes:**
@@ -314,8 +319,9 @@ in `display.py`; `_StrictModel`/`ConfigDict(extra="forbid")` convention in `conf
 editing; any other slash command; writing `harness.toml`; changing what argv-mode
 invocation does.
 **Tests (write first, confirm red):**
-- [ ] Slash parsing: `/help`, `/sources`, `/model` dispatch; unknown `/x` renders an
-  error hint; leading non-slash text is a question.
+- [ ] Slash parsing: `/help`, ~~`/sources`,~~ `/model` dispatch; unknown `/x` renders an
+  error hint; leading non-slash text is a question. Add: an unregistered-but-reserved
+  name is treated as unknown, proving the dispatch table is data, not branches.
 - [ ] `/model` picker: up/down moves the highlight through `roles.head.choices` with
   boundary clamping; Enter applies the highlighted model to the session config only.
 - [ ] Welcome renderable contains hints, roles line, and the CURRENT head model name
@@ -544,6 +550,27 @@ reader tier gets a strip, per the mockup).
   (`harness/agent.py`, 7 phases, each with a recorded live-check) that meets or
   exceeds what that plan proposed to build. This plan was rewritten from scratch
   against `development`'s real code rather than patched.
+- 2026-08-19 — Phase 2: R3 bound "exactly `/help`, `/sources`, `/model`", but the plan
+  assigned `/sources` a data source (D5's per-run `sources.json`) that NO phase's file
+  list ever writes — `/sources` would have read a manifest nothing produced. Raised as a
+  plan gap rather than improvised. **Developer decision: drop `/sources` entirely — "not
+  needed yet" — and instead require that command dispatch be extensible enough to add it
+  later without reshaping the welcome loop.** Amendment, authoritative over the struck
+  text above: Phase 2 ships exactly TWO commands, `/help` and `/model`. D5 is MOOT and
+  not implemented — no `sources.json` is written, and `report.py`'s `_is_usable` stays
+  report-private (so Phase 2 no longer touches `report.py` at all). Command dispatch must
+  be a DATA structure (name → handler mapping), not an if/elif chain, so adding
+  `/sources` later is one table entry plus its handler; a test asserts an unregistered
+  name falls through to the unknown-command hint. Consequence for the mockup: the
+  welcome tip line "Run /sources to see what the last run captured" would advertise a
+  command that does not exist, so it renders the `/help` tip instead — a Preference-level
+  deviation from R1's mockup fidelity, permitted by `## Intent`'s Preferences clause.
+- 2026-08-19 — Phase 2: the mockup's roles line (`subagent … · verifier … · budget …`)
+  encodes the stale two-role model that `## Constraints` already overrides with the real
+  four roles. Developer decision: the roles line renders `researcher · reader ·
+  verifier · budget`, all read from config — the head model is omitted there because the
+  input box's mode row already shows it. Same four-slot shape as the mockup, no
+  duplication, no hidden role.
 
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution. Append-only. -->
@@ -570,6 +597,21 @@ reader tier gets a strip, per the mockup).
   but only if the loop no longer needs to distinguish "EOF, stop iterating" from "ignore
   this key", which today it does. Not mechanical; revisit if Phase 2's contextmanager
   rework touches this loop anyway.
+- 2026-08-19 — Phase 2 review, DEFERRED (developer chose to defer): `/model` on a role
+  whose config omits `choices` enters picker mode before checking it, so the user sees an
+  empty "Select model" panel with inert up/down and a silent Enter, and no notice saying
+  why. Unreachable from the shipped `harness.toml` (which now defines 19 choices) but
+  reachable from any config omitting the key, which `RoleConfig`'s validator deliberately
+  permits. Fix when touched: check `choices` BEFORE setting `mode="model_picker"` and set a
+  notice instead.
+- 2026-08-19 — Phase 2 review, SIMPLIFY (deferred): `harness/display.py`'s `_OK` / `_CYAN`
+  palette constants are defined but unused this phase. Kept deliberately — the palette is
+  transcribed from the mockup once so it lives in exactly one place (CLAUDE.md), and
+  Phases 3/5/6 render the ok/cyan states. Drop them if those phases land without using
+  them. Second item: `state.panel = build_model_picker(...)` in `_run_welcome` is
+  recomputed by `_view()` on every path where `choices` is non-empty, so the picker is
+  built twice per keystroke; the eager assignment only matters in the empty-choices case
+  above, and both should be resolved together.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each phase gate. Append-only. MUST remain the LAST section. -->
@@ -597,3 +639,29 @@ reader tier gets a strip, per the mockup).
   Ctrl+C acceptance check is where it must be proven. Also: Phase 2's `harness.toml`
   `choices` list of 19 model display names is marked UNCONFIRMED in the plan and must be
   confirmed with the developer before implementing, not invented.
+
+### 2026-08-19 — Phase 2: Welcome screen and slash commands
+- Done: Welcome screen per the mockup (verbatim block-glyph wordmark, accent-bar input box
+  with reverse-video cursor, hints, roles line, tip, status bar), `_COMMANDS` dispatch
+  TABLE with `/help` + `/model`, `RoleConfig.choices` + 19 slug IDs under `[roles.head]`,
+  and `nargs="?"` so argv mode is untouched. `/model` mutates the session config only —
+  a test asserts `harness.toml` is byte-identical after a pick. 589 tests pass; all four
+  gates clean; coverage 97% (display 99%, config 100%, `__main__` 94%).
+- Learned: (1) The implementation subagent DIED on an API error mid-verification; all six
+  files were already written, so I finished the gates myself rather than respawning —
+  check `git status` before assuming a dead worker did nothing. (2) The review caught a
+  Major the whole green gate missed: `cursor_col` is a PER-ROW column, and rendering it
+  against the newline-joined text drew the cursor on the wrong line. Fixed by returning
+  one `Text` per line (`_build_ask_rows`); the regression guard that actually catches it
+  through the public API is the accent-bar count test. (3) A non-tty stdin now gets
+  argparse's usage error instead of a `termios` traceback — so any test exercising the
+  welcome loop must `monkeypatch.setattr("sys.stdin.isatty", lambda: True)`.
+- Drift: YES — `/sources` dropped and D5 made MOOT by developer decision; two
+  `## Reconciliations` entries are authoritative over the struck text. Phase 2 ships TWO
+  commands, not three, and never touches `report.py`.
+- Watch-next: Phase 3 renders the running pane. Reuse the palette constants already in
+  `harness/display.py` (`_OK`/`_CYAN` are defined and waiting) rather than adding literal
+  colors — if Phase 3 ends up not using them, drop them per the logged SIMPLIFY item.
+  `harness/input.py` now exports `scoped_keys`, which Phase 5 must use for the overlay's
+  key source instead of writing its own teardown.
+

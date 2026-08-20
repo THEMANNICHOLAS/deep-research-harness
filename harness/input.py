@@ -3,7 +3,8 @@
 """
 
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal
 
@@ -104,6 +105,28 @@ def read_keys() -> Iterator[KeyEvent]:
                     yield event
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+@contextmanager
+def scoped_keys(keys: Iterable[KeyEvent]) -> Iterator[Iterator[KeyEvent]]:
+    """Scope a key source so a generator's raw-mode restore always runs.
+
+    `read_keys()` puts its `termios` restore in a `finally`, which only executes when the
+    generator is closed — so a consumer that parks the iterator and keeps running would
+    leave the terminal raw. Routing every consumer through here makes the release
+    structural instead of a convention each call site has to remember (Phase 1 review).
+
+    A plain iterable — what the tests inject — has nothing to close and passes straight
+    through, which is why the close is probed rather than required. Probing it HERE, next
+    to the generator that owns raw mode, keeps it out of every call site.
+    """
+    iterator = iter(keys)
+    try:
+        yield iterator
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
 
 
 class LineBuffer:

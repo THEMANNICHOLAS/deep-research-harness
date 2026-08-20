@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage
 from rich.console import Console
 
 import harness.__main__ as main_module
+import harness.display
 from harness.config import AgentSettings
 from harness.display import (
     Activity,
@@ -27,7 +28,11 @@ from harness.display import (
     StageTracker,
     TodoItem,
     TodosUpdated,
+    WelcomeView,
+    build_help_panel,
+    build_model_picker,
     build_renderer,
+    build_welcome,
 )
 from harness.sources import SourceRegistry
 from tests.conftest import (
@@ -45,7 +50,7 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def _rich_renderer() -> tuple[RichRenderer, StringIO]:
+def _make_console(*, width: int = 80) -> tuple[Console, StringIO]:
     buffer = StringIO()
     # `legacy_windows=False` (rather than relying on auto-detection): the alternate-screen
     # codes `RichRenderer` now relies on (D1/R5) are suppressed by Rich whenever
@@ -59,11 +64,16 @@ def _rich_renderer() -> tuple[RichRenderer, StringIO]:
     console = Console(
         file=buffer,
         force_terminal=True,
-        width=80,
+        width=width,
         legacy_windows=False,
         color_system="truecolor",
         _environ={},
     )
+    return console, buffer
+
+
+def _rich_renderer() -> tuple[RichRenderer, StringIO]:
+    console, buffer = _make_console()
     return RichRenderer(console=console, auto_refresh=False), buffer
 
 
@@ -685,6 +695,161 @@ def test_rich_renderer_run_finished_summary_prints_on_the_normal_screen_after_th
     assert last_exit_index < summary_index
     # No FURTHER alt-screen entry after the summary — it stays on the normal screen.
     assert "\x1b[?1049h" not in raw[summary_index:]
+
+
+# --- Phase 2: welcome screen (build_welcome, build_help_panel, build_model_picker) -------
+
+
+def _welcome_view(**overrides: Any) -> WelcomeView:
+    defaults: dict[str, Any] = dict(
+        question="",
+        cursor_col=0,
+        head_model="glm-5.3",
+        roles=(
+            ("researcher", "deepseek-v4-pro"),
+            ("reader", "deepseek-v4-flash"),
+            ("verifier", "gpt-5.6-luna"),
+        ),
+        budget="50 rounds / 30 min",
+        status_left="~/deep-research:searxng@localhost:8080",
+        status_right="0.1.0",
+    )
+    defaults.update(overrides)
+    return WelcomeView(**defaults)
+
+
+def _render(renderable: Any) -> str:
+    console, buffer = _make_console()
+    console.print(renderable)
+    return _strip_ansi(buffer.getvalue())
+
+
+def _cursor_spans(row: Any) -> list[tuple[int, int]]:
+    """(start, end) of the reverse-video block cursor within one rendered ask row."""
+    cursor_style = f"{harness.display._SURFACE} on {harness.display._FG}"
+    return [(span.start, span.end) for span in row.spans if span.style == cursor_style]
+
+
+def test_ask_rows_place_the_block_cursor_on_its_own_row_not_the_joined_text():
+    """`cursor_col` is a column WITHIN `cursor_row`, not an offset into `"\\n".join(lines)`.
+
+    Indexing the joined string draws the block over the newline — visually parking the
+    cursor at the end of line 1 no matter where the caret really is.
+    """
+    view = _welcome_view(question="ab\ncd", cursor_row=1, cursor_col=2)
+
+    rows = harness.display._build_ask_rows(view)
+
+    # Row 1 gains a trailing space: the caret sits past the last character.
+    assert [row.plain for row in rows] == ["ab", "cd "]
+    assert _cursor_spans(rows[0]) == []
+    assert _cursor_spans(rows[1]) == [(2, 3)]
+
+
+def test_ask_rows_put_the_cursor_mid_line_on_the_first_row():
+    view = _welcome_view(question="ab\ncd", cursor_row=0, cursor_col=1)
+
+    rows = harness.display._build_ask_rows(view)
+
+    assert _cursor_spans(rows[0]) == [(1, 2)]
+    assert _cursor_spans(rows[1]) == []
+
+
+def test_every_ask_row_gets_its_own_accent_bar():
+    """The mockup's left bar runs down the whole input box, not just its first line."""
+    single = _render(build_welcome(_welcome_view(question="ab", cursor_col=2)))
+    multi = _render(build_welcome(_welcome_view(question="ab\ncd", cursor_row=1, cursor_col=2)))
+
+    # One bar per ask row, plus one for the mode row.
+    assert single.count("▌") == 2
+    assert multi.count("▌") == 3
+
+
+def test_build_welcome_renders_hint_labels_and_current_non_default_head_model():
+    view = _welcome_view(head_model="glm-5.3")
+
+    text = _render(build_welcome(view))
+
+    for key, label in (
+        ("enter", "run"),
+        ("/", "commands"),
+        ("ctrl+j", "newline"),
+        ("ctrl+c", "exit"),
+    ):
+        assert key in text
+        assert label in text
+    assert "researcher" in text
+    assert "deepseek-v4-pro" in text
+    assert "reader" in text
+    assert "deepseek-v4-flash" in text
+    assert "verifier" in text
+    assert "gpt-5.6-luna" in text
+    assert "50 rounds / 30 min" in text
+    # Proves the head model is read from the view, not hardcoded to the shipped default.
+    assert "glm-5.3" in text
+
+
+def test_build_welcome_shows_placeholder_when_question_is_empty():
+    view = _welcome_view(question="")
+
+    text = _render(build_welcome(view))
+
+    assert "Ask anything" in text
+
+
+def test_build_welcome_shows_typed_text_when_question_is_non_empty():
+    view = _welcome_view(question="what does Acme charge", cursor_col=5)
+
+    text = _render(build_welcome(view))
+
+    assert "what does Acme charge" in text
+    assert "Ask anything" not in text
+
+
+def test_build_welcome_tip_line_names_help_and_never_sources():
+    view = _welcome_view()
+
+    text = _render(build_welcome(view))
+
+    assert "Run /help to see available commands" in text
+    assert "/sources" not in text
+
+
+def test_build_help_panel_lists_every_command_in_the_dispatch_table():
+    commands = [(cmd.name, cmd.summary) for cmd in main_module._COMMANDS.values()]
+    assert len(commands) >= 2  # guards against an empty table silently passing
+
+    text = _render(build_help_panel(commands))
+
+    for name, summary in commands:
+        assert name in text
+        assert summary in text
+
+
+def test_build_model_picker_highlights_selected_and_marks_current():
+    choices = ["glm-5.2", "glm-5.3", "kimi-k3"]
+
+    text = _render(build_model_picker(choices, selected=1, current="kimi-k3"))
+
+    lines = text.splitlines()
+    selected_line = next(line for line in lines if "glm-5.3" in line)
+    current_line = next(line for line in lines if "kimi-k3" in line)
+    assert ">" in selected_line
+    assert "(current)" in current_line
+
+
+def test_build_model_picker_windows_a_long_list_with_truncation_affordances():
+    choices = [f"model-{i}" for i in range(19)]
+
+    text = _render(build_model_picker(choices, selected=10, current="model-0"))
+
+    # `re.escape(choice)(?!\d)`, not plain substring: "model-1" is a substring of "model-10"
+    # through "model-19", which would overcount how many distinct rows actually rendered.
+    rendered_choices = [
+        choice for choice in choices if re.search(rf"{re.escape(choice)}(?!\d)", text)
+    ]
+    assert len(rendered_choices) <= 12
+    assert "…" in text
 
 
 def test_stage_tracker_timings_returns_completed_pairs_in_order():
