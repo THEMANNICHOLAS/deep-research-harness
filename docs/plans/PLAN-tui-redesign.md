@@ -240,7 +240,7 @@ entire decision below is struck and NOT implemented. No `sources.json` is writte
 - [x] Phase 3: Running pane — task meta, stage round/elapsed (~~structured tool log~~ → Phase 6)
 - [x] Phase 4: Finished summary — inline report path
 - [x] Phase 5: ask_user in-place overlay
-- [ ] Phase 6: Reader-strip visibility hook + structured tool-call log
+- [x] Phase 6: Reader-strip visibility hook + structured tool-call log
 - [ ] Final verification
 
 ## Phases
@@ -483,10 +483,15 @@ narrow, additive middleware mirroring the existing `_ReaderDigestMiddleware` pat
   `SourceRegistry`/`RunLog` already are (D4).
 - `harness/display.py` — modify: `ReadersUpdated(readers: tuple[ReaderItem, ...])`
   event, `ReaderItem(id, brief, status_text, done: bool)`; strip renderable, present
-  only when non-empty.
+  ~~only when non-empty~~ only while at least one reader is LIVE. Struck 2026-08-20:
+  "non-empty" contradicted this phase's own test bullet and R2 ("present only while
+  reader tasks are in flight") and was implemented literally the first time round —
+  see `## Reconciliations`.
 - `harness/__main__.py` — modify: build and pass the shared reader-activity sink into
   `build_agent` alongside the existing `SourceRegistry`/`RunLog`.
-- `tests/test_agent.py`, `tests/test_display.py` — modify.
+- `harness/activity.py` — new: ADDED to this phase 2026-08-20, developer-approved at the
+  plan-review gate. The sink itself, mirroring `harness/runlog.py`. See `## Reconciliations`.
+- `tests/test_agent.py`, `tests/test_display.py`, `tests/test_activity.py` (new) — modify/new.
 **Diff budget:** ~350-500 lines across 4 files
 **Reuse:** `_ReaderDigestMiddleware`'s exact wrapping pattern (`harness/agent.py`) —
 the phase's named reuse target; existing reader-failure handling
@@ -496,7 +501,10 @@ the phase's named reuse target; existing reader-failure handling
   surfaces via the EXISTING `_reader_failure_message`/incident path, not duplicated
   here.
 **Out of scope:** Nested reader→reader visibility; any change to reader dispatch
-concurrency, retry, or failure semantics; researcher-tier visibility (only the
+concurrency, ~~retry, or failure semantics~~ retry or failure semantics — AMENDED
+2026-08-20, developer-approved: one narrow change was made, adding `DisplayError` to the
+`task` guard's pass-through failures so a renderer bug is not reported as a reader failure.
+See `## Reconciliations`; researcher-tier visibility (only the
 reader tier gets a strip, per the mockup).
 **ABSORBED FROM PHASE 3 (2026-08-19 — see `## Reconciliations`):** the structured
 tool-call log. The same middleware that reports reader dispatch must also report every
@@ -509,11 +517,11 @@ tests: tool/arg/result/timing columns render, a retried call is styled distinctl
 overlong arg/result text truncates with an ellipsis rather than wrapping. Revised diff
 budget: ~550-750 lines across 4 files.
 **Tests (write first, confirm red):**
-- [ ] N reader dispatches (scripted researcher tool calls) each produce a start and
+- [x] N reader dispatches (scripted researcher tool calls) each produce a start and
   a done/failed `ReadersUpdated` transition without ID collisions.
-- [ ] The strip renders only while at least one reader is live; renders nothing
+- [x] The strip renders only while at least one reader is live; renders nothing
   otherwise (R2's presence rule).
-- [ ] A reader that fails still completes the run (existing `_reader_failure_message`
+- [x] A reader that fails still completes the run (existing `_reader_failure_message`
   behavior unchanged) and is reflected as a failed, not stuck-live, strip row.
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -654,6 +662,67 @@ budget: ~550-750 lines across 4 files.
   wall clock while the overlay is open was never on the table, being forbidden by the phase
   spec.
 
+- 2026-08-20 — Phase 6: three amendments, two of them developer decisions at the plan-review
+  gate and one a contradiction the 3F review caught after implementation.
+  (1) **File list widened, developer-approved:** the sink lives in a NEW `harness/activity.py`
+  (plus `tests/test_activity.py`) rather than inside `harness/agent.py`. Deciding axis: whether
+  the sink's import and test path may stay free of `deepagents`. D4 says to thread it "like
+  `SourceRegistry`/`RunLog` already are", and both of those live in their own module precisely
+  so producer and consumer need not import each other; `agent.py`'s docstring claims to be the
+  only module importing `deepagents` (a documented ~2s import cost), so a plain data collector
+  there would route `__main__.py` and its tests through the framework. Same class of widening
+  as Phase 5's `harness/input.py`.
+  (2) **Middleware registers on the researcher and reader tiers ONLY, not the lead,**
+  developer-approved. Deciding axis: whether the whole log comes from one code path or the
+  lead's dispatch keeps its existing line. Consequence: `harness/__main__.py`'s
+  `Activity(_describe_tool_call(call))` and its pinned assertion in `tests/test_display.py`
+  stay untouched, so one free-text row sits alongside the structured rows; the mockup's
+  lead-tier `write_file:` rows are absent (Preference-level deviation, permitted by
+  `## Intent`). `_middleware()` is not touched at all, which keeps the `agent.py` surface for
+  risk #3 smaller than planned.
+  (3) **The sink cannot be DRAINED from the top-level stream — it must PUSH.** The first
+  implementation followed this plan's D4 analogy to `RunLog` all the way, including how
+  `RunLog` is consumed: a high-water-mark drain beside `_emit_new_alerts()` in the stream
+  loop. Measured with a throwaway probe (a lead dispatching a researcher that dispatches a
+  0.5s reader, recording `sink.live_reader_count()` at every top-level chunk): the reader
+  dispatch demonstrably happened (1 reader, 2 records) yet the live count was **0 at all 12
+  chunks**, as were in-flight tool calls. Cause: the middleware writes from inside the lead's
+  `task` tool NODE, and one node is one superstep — the entire researcher->reader pipeline
+  runs within it, so no top-level chunk arrives until every reader has already finished. Every
+  live behaviour this phase adds (`running...`, `waiting on N readers`, `{n} in flight` task
+  meta, and the strip "filling and clearing") was therefore unreachable at runtime, and R2's
+  presence rule could never be exercised. **Developer decision (deciding axis: whether the
+  display is updated by whoever writes the sink, or the top-level stream stays the only thing
+  that talks to the renderer):** `ActivitySink` gains an `on_change` callback; `__main__.py`
+  passes one that emits `ToolCall`/`ReadersUpdated`/`TodosUpdated` to the renderer directly, so
+  a frame repaints when the middleware writes. D4 is otherwise intact — same shared sink,
+  same threading, same events; only who drives the repaint changed. Rejected: `subgraphs=True`
+  on `astream` (nested AIMessages would reach `_note_model_turns` and inflate `rounds_used`,
+  breaking the tested round cap unless filtered by namespace — more risk, in the file the round
+  budget lives in); and accepting a post-hoc-only log (gives up most of the phase's purpose).
+  **The general lesson, for any future nested-tier visibility work: `RunLog`'s drain works only
+  because an incident needs to be EVENTUALLY visible. Anything that must be visible LIVE cannot
+  be read from the top-level stream at all.**
+- 2026-08-20 — Phase 6, fourth amendment: **the phase's `**Out of scope:**` ban on changing
+  retry/failure semantics is narrowed, developer-approved.** Consequence of amendment (3): the
+  sink now pushes from inside `awrap_tool_call`, so an exception out of the display callback
+  lands inside `_task_dispatch_guard` — `ToolRetryMiddleware` re-runs the whole subagent once and
+  `ToolErrorMiddleware` then converts it to `"READER FAILED (...)"` plus a `subagent_failed`
+  incident. A display bug would masquerade as a reader failure at double that subagent's token
+  cost. Deciding axis: whether the phase's own no-change-to-failure-semantics constraint may be
+  narrowed to stop the display being blamed on the reader — the developer's call was that it may.
+  Implemented as `harness/activity.py`'s `DisplayError` plus a single
+  `_PASS_THROUGH_TASK_FAILURES = (SearchUnavailableError, DisplayError)` tuple in
+  `harness/agent.py`, so the retry predicate and the error handler cannot drift into disagreeing
+  about which failures are the subagent's fault. `harness/__main__.py`'s callback re-raises any
+  ordinary exception as `DisplayError`; `main()`'s existing broad `except Exception` then treats
+  it as a hard error, which the fail-fast invariant already turns into no report, exit 1, and a
+  restored terminal via `finally: renderer.close()` — so nothing new was needed there. Pinned
+  BOTH ways: dropping `DisplayError` from the tuple makes the run swallow the error entirely
+  ("DID NOT RAISE"), which was verified before the test was trusted. `DisplayError` lives in
+  `activity.py`, not `display.py`, so `agent.py` can name it without importing the display
+  layer — that dependency would point the wrong way.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution. Append-only. -->
 - 2026-08-19 — Phase 1: `## Notes`' coverage-policy line says Phase 1's `# pragma: no
@@ -746,6 +815,33 @@ budget: ~550-750 lines across 4 files.
   mockup both require the pause, so it stays; the overlay's note line reads `clock paused while
   the agent waits` rather than the mockup's `stage clock paused ...`, because what freezes is not
   a per-stage timer.
+
+- 2026-08-20 — Phase 6: the phase's `**Reuse:**`/`**Contracts:**` name `_reader_failure_message`
+  as the existing reader-crash path. NO SUCH FUNCTION EXISTS anywhere in `harness/` (repo-wide
+  grep). The real mechanism is a `"READER FAILED (...)"`-prefixed `status="error"` `ToolMessage`
+  built by `_task_failure_handler` through `ToolErrorMiddleware`, plus a `RunLog` incident of
+  kind `subagent_failed`, pinned by two existing tests. The instruction it encoded — leave that
+  path untouched — was executable as written and was followed, so this is a stale symbol name
+  rather than a contradiction. Noted so a later phase does not go looking for the function.
+- 2026-08-20 — Phase 6, KNOWN LIMITATION of the tool log's `retry` flag: `_task_dispatch_guard`
+  scopes its `ToolRetryMiddleware` to `tools=["task"]`, so the only retries this middleware can
+  observe are SUBAGENT DISPATCH retries. The mockup shows a retry row for `search_web`; search's
+  own retry lives inside the tool and is invisible here, so that row shape exists but only ever
+  renders for a retried `task`.
+- 2026-08-20 — Phase 6 review, FIXED: `note_reader_source`/`_reader_sources` were written by
+  NOTHING in the whole diff, so the mockup's `done · 4 sources · 38s` status could never be
+  produced by a real run — only a hand-built `ReaderItem` in a display test made it look
+  exercised. Deleted rather than given an invented producer (the only candidate was parsing a
+  count out of a result summary, which is guessing). Reader status is now `done · {elapsed}`: a
+  Preference-level mockup deviation, permitted by `## Intent`. If a real source count is wanted
+  later, the honest producer is the registry, which `_ReaderDigestMiddleware` already holds.
+- 2026-08-20 — Phase 6 review, FIXED, and it generalises to any future push-based event source:
+  `RichRenderer.emit` honored no `_closed` flag. Harmless while the stream loop was the only
+  emitter, but the activity sink now pushes from inside middleware, so a dispatch unwinding under
+  cancellation can emit AFTER `close()` — and every branch calls `_start_live()` when
+  `_live is None`, which would re-enter the alternate screen and hide the cursor with nothing
+  left to stop it. `emit` now returns early when closed, the same guard `_suspend` already had.
+  Verified both ways (disabling the guard fails the new test).
 
 ## Phase Handoff Log
 <!-- Written by /implement at each phase gate. Append-only. MUST remain the LAST section. -->
@@ -881,3 +977,42 @@ budget: ~550-750 lines across 4 files.
   5's — hold them to the same "verified to fail against the broken shape" standard. The manual
   WezTerm acceptance criteria for Phases 2, 3 and 5 are all still unticked and need a real
   terminal.
+
+### 2026-08-20 — Phase 6: Reader-strip visibility hook + structured tool-call log
+- Done: All three deliverables. One `_ToolActivityMiddleware` (mirroring
+  `_ReaderDigestMiddleware`'s `awrap_tool_call` shape) registered innermost on the researcher and
+  reader tiers ONLY — the lead is uninstrumented by developer decision, so `__main__.py`'s
+  `Activity(_describe_tool_call(call))` line and its pinned assertion are untouched. New
+  `harness/activity.py` holds `ActivitySink`/`ToolCallRecord`/`ReaderState`/`reader_scope`/
+  `DisplayError`; new `ToolCall` (emitted twice per call, keyed by `call_id` so the renderer
+  replaces the running row) and `ReadersUpdated` (a snapshot, like `TodosUpdated`) display
+  events; reader strip between the stage line and the log, present only while a reader is LIVE;
+  `waiting on N readers` on the stage line; live-updating `{n} in flight` task meta. 650 tests
+  pass (619 at session start), all four gates clean, coverage 96% against CI's 90% floor. Source
+  diff 690 lines against a ~550-750 budget — inside it, even carrying the extra module.
+- Learned: (1) THE BIG ONE — a shared sink cannot be DRAINED from the top-level stream for
+  anything that must be visible live. The middleware writes from inside the lead's `task` tool
+  NODE and one node is one superstep, so no chunk arrives until the whole researcher->reader
+  pipeline has finished. Measured, not reasoned: `live_reader_count() == 0` at every one of 12
+  chunks of a run whose reader genuinely ran 0.5s. `RunLog`'s drain works ONLY because an
+  incident merely needs to be eventually visible. The sink pushes via `on_change` instead.
+  (2) Pushing from inside middleware has two consequences that are easy to miss and both bit:
+  an emit can now arrive after `close()` (guard `emit` on `_closed`), and an exception from the
+  display now lands inside the `task` retry/error guard, which would re-run a whole subagent and
+  report a display bug as `READER FAILED` (hence `DisplayError` in
+  `_PASS_THROUGH_TASK_FAILURES`). (3) A review's line-count Major is worth re-deriving: 1573
+  "added lines" was source+tests; this project budgets SOURCE, per Phase 5's own entry.
+  (4) The plan's `_reader_failure_message` does not exist — see `## Discoveries`.
+- Drift: YES — four amendments in `## Reconciliations`, all dated 2026-08-20: the
+  `harness/activity.py` file-list widening; researcher+reader-only registration; the
+  drain->push redesign; and the narrowing of this phase's own no-change-to-failure-semantics
+  constraint for `DisplayError`. The first, second and fourth were developer decisions at a
+  gate; the third was a 3F finding, confirmed by probe before being acted on.
+- Watch-next: ONLY `Final verification` remains, and its automated half is already green
+  (`uv run pytest`, ruff check/format, mypy — all clean this session). What is left genuinely
+  cannot be done from a non-interactive session: the manual WezTerm/SSH walkthrough, and the
+  Ctrl+C-at-three-places check. The manual acceptance criteria for Phases 2, 3, 5 and 6 are all
+  still unticked for the same reason. Note the plan's `## Verification` walkthrough still names
+  `/sources`, a command dropped on 2026-08-19 — expect `/help` and `/model` only. Also still
+  pending: push `worktree-mossy-imagining-scroll` and rewrite PR #25's body to cover Phases 1-6
+  in ONE pass; its body currently claims Phases 4-6 are not included.

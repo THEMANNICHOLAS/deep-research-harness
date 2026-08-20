@@ -15,6 +15,7 @@ from rich.console import Console
 
 import harness.__main__ as main_module
 import harness.display
+from harness.activity import ActivitySink
 from harness.config import AgentSettings
 from harness.display import (
     Activity,
@@ -22,6 +23,8 @@ from harness.display import (
     DisplayEvent,
     PlainRenderer,
     Question,
+    ReaderItem,
+    ReadersUpdated,
     RichRenderer,
     RoundsUpdated,
     RunFinished,
@@ -30,6 +33,7 @@ from harness.display import (
     StageTracker,
     TodoItem,
     TodosUpdated,
+    ToolCall,
     WelcomeView,
     build_help_panel,
     build_model_picker,
@@ -50,6 +54,19 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
+
+
+def _span(hex_color: str, value: str) -> str:
+    """The exact truecolor ANSI span Rich emits for `Text(value, style=hex_color)`.
+
+    Whole-value, not just the escape code: a highlighter-shredded line (per-token colours
+    overriding `style=`) would satisfy `"38;2;r;g;b" in raw` too, so every styled-output
+    assertion in this file pins the WHOLE value inside one span (plan `## Discoveries`,
+    2026-08-20). One home for the construction, shared by every Phase 6 pin.
+    """
+    stripped = hex_color.lstrip("#")
+    r, g, b = (int(stripped[i : i + 2], 16) for i in (0, 2, 4))
+    return f"\x1b[38;2;{r};{g};{b}m{value}\x1b[0m"
 
 
 def _make_console(*, width: int = 80) -> tuple[Console, StringIO]:
@@ -336,6 +353,115 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
     assert "  [completed] Search for the answer" in lines
     assert lines.count("  [pending] Write the summary") == 2
     assert lines[-1].strip().endswith(".md")
+
+
+def test_todo_items_prefers_in_flight_over_sources_over_none():
+    """Fix-pass item 5: `_todo_items`'s meta rule was entirely unasserted. Counts chosen so a
+    hardcoded `1`/`3` (the mockup's own numbers) would fail this."""
+    registry = SourceRegistry()
+    for i in range(4):
+        source_id = registry.add(f"https://example.test/{i}")
+        registry.mark_read(source_id, "digested")
+    todos = [
+        {"content": "Investigate the topic", "status": "in_progress"},
+        {"content": "Write the summary", "status": "pending"},
+    ]
+
+    # Live readers present -> "N in flight" wins over the sources count.
+    sink_with_readers = ActivitySink()
+    sink_with_readers.start_reader("Angle A")
+    sink_with_readers.start_reader("Angle B")
+    items = main_module._todo_items(todos, registry, sink_with_readers)
+    in_progress = next(i for i in items if i.status == "in_progress")
+    pending = next(i for i in items if i.status == "pending")
+    assert in_progress.meta == "2 in flight"
+    assert pending.meta is None  # only the in_progress row ever carries meta
+
+    # No live readers, but sources have been read -> falls back to the sources count.
+    sink_idle = ActivitySink()
+    items = main_module._todo_items(todos, registry, sink_idle)
+    in_progress = next(i for i in items if i.status == "in_progress")
+    assert in_progress.meta == "4 sources"
+
+    # Neither live readers nor read sources -> no meta at all.
+    items = main_module._todo_items(todos, SourceRegistry(), sink_idle)
+    in_progress = next(i for i in items if i.status == "in_progress")
+    assert in_progress.meta is None
+
+
+async def test_todos_meta_refreshes_on_live_reader_count_change_and_only_then(
+    make_config, monkeypatch, scripted_model
+):
+    """Fix-pass item 5's second half: with the `on_change` push callback wired (item 1), one
+    `write_todos` call sets the in_progress row ONCE; the todos list never changes again, so
+    any further `TodosUpdated` for it must come from the live-reader-count refresh alone, and
+    the refresh must not repeat while the count stays put.
+    """
+    config = make_config()
+    model = scripted_model(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_todos",
+                        "args": {
+                            "todos": [{"content": "Investigate the topic", "status": "in_progress"}]
+                        },
+                        "id": "call_todo",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "Read the source",
+                            "subagent_type": "researcher",
+                        },
+                        "id": "call_researcher",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {"description": "Digest the source", "subagent_type": "reader"},
+                        "id": "call_reader",
+                    }
+                ],
+            ),
+            AIMessage(content="Reader digest text."),
+            AIMessage(content="Researcher summary text."),
+            AIMessage(content="Final answer about the topic."),
+        ]
+    )
+    patch_run(monkeypatch, config, model)
+
+    recorder = _RecordingRenderer()
+    monkeypatch.setattr(main_module, "build_renderer", lambda: recorder)
+
+    await main_module.main(["a question needing delegation"])
+
+    metas = [
+        item.meta
+        for event in recorder.events
+        if isinstance(event, TodosUpdated)
+        for item in event.todos
+        if item.status == "in_progress"
+    ]
+
+    # The reader's live window produced exactly one "1 in flight" meta -- not zero (the push
+    # never fired) and not more than one (a repeat while the count was static).
+    assert metas.count("1 in flight") == 1
+    # Once the reader finished, a LATER emission for the SAME todos list carries a different
+    # meta -- proof the refresh is driven by the sink's live-reader count, not by a change to
+    # the todos themselves (there is only ever one `write_todos` call in this script).
+    assert metas[-1] != "1 in flight"
 
 
 # --- RichRenderer tests -------------------------------------------------------------------
@@ -812,13 +938,11 @@ def test_the_report_path_line_is_accent_coloured():
     renderer.close()
 
     raw = buffer.getvalue()
-    accent = harness.display._ACCENT.lstrip("#")
-    r, g, b = (int(accent[i : i + 2], 16) for i in (0, 2, 4))
     # The WHOLE path in ONE accent span, not merely the escape appearing somewhere: Rich's
     # `ReprHighlighter` shreds any raw `str` handed to `Console.print` into per-token colours,
     # and on POSIX it claims the whole path as magenta so the accent never appears at all. The
     # weaker `in raw` form passed on Windows against exactly that bug.
-    assert f"\x1b[38;2;{r};{g};{b}m{event.report_path}\x1b[0m" in raw
+    assert _span(harness.display._ACCENT, str(event.report_path)) in raw
 
 
 def test_a_report_path_containing_markup_brackets_still_renders():
@@ -1400,3 +1524,305 @@ async def test_a_dead_search_backend_is_disclosed_on_the_terminal_and_in_the_rep
     assert "## Gaps and disclosures" in body
     assert "Tool failures during the run:" in body
     assert "unreachable" in body
+
+
+# --- Phase 6: structured tool-call log + reader-strip visibility hook --------------------
+
+
+def test_rich_renderer_tool_log_renders_tool_arg_result_and_flags_a_retry_row():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(ToolCall(call_id="c1", tool="search_web", arg_summary="university rankings"))
+    before = len(buffer.getvalue())
+    renderer.emit(
+        ToolCall(
+            call_id="c1",
+            tool="search_web",
+            arg_summary="university rankings",
+            result_summary="11 results",
+            elapsed_seconds=2.3,
+        )
+    )
+    renderer.emit(
+        ToolCall(
+            call_id="c2",
+            tool="fetch_raw",
+            arg_summary="https://example.test/report",
+            result_summary="fetched",
+            elapsed_seconds=1.1,
+            retry=True,
+        )
+    )
+    text = _strip_ansi(buffer.getvalue())
+    raw = buffer.getvalue()[before:]
+    renderer.close()
+
+    assert "search_web" in text
+    assert "university rankings" in text
+    assert "11 results" in text
+    # The completion emit's own frame replaced the running row -- checked against the
+    # buffer written AFTER the start emit's frame, since that earlier frame legitimately
+    # painted "running..." once before being replaced.
+    assert "running..." not in _strip_ansi(raw)
+    # The retry row's tool name is pinned as a whole-value _WARN span, not merely present.
+    assert _span(harness.display._WARN, "fetch_raw") in raw
+
+
+def test_rich_renderer_tool_log_truncates_an_overlong_arg_summary_with_an_ellipsis():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    long_summary = "https://example.test/" + "a" * 200
+    renderer.emit(
+        ToolCall(
+            call_id="c1",
+            tool="fetch_raw",
+            arg_summary=long_summary,
+            result_summary="fetched",
+            elapsed_seconds=1.0,
+        )
+    )
+    frame = _strip_ansi(buffer.getvalue())
+    renderer.close()
+
+    lines = [line for line in frame.splitlines() if "fetch_raw" in line]
+    assert len(lines) == 1  # truncated onto one physical line, not wrapped onto a second
+    assert "…" in frame
+    assert long_summary not in frame
+
+
+def test_rich_renderer_a_second_tool_call_with_the_same_id_replaces_the_running_row():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(ToolCall(call_id="c1", tool="search_web", arg_summary="a query"))
+    before = len(buffer.getvalue())
+    renderer.emit(
+        ToolCall(
+            call_id="c1",
+            tool="search_web",
+            arg_summary="a query",
+            result_summary="11 results",
+            elapsed_seconds=2.3,
+        )
+    )
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "running..." not in frame
+    assert frame.count("search_web") == 1
+
+
+def test_rich_renderer_reader_strip_is_absent_with_no_live_readers():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(ReadersUpdated(()))
+    text = _strip_ansi(buffer.getvalue())
+    renderer.close()
+
+    assert "reader/1" not in text
+
+
+def test_rich_renderer_reader_strip_renders_a_live_row():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    before = len(buffer.getvalue())
+    renderer.emit(
+        ReadersUpdated(
+            (
+                ReaderItem(
+                    id="reader/1", brief="Angle A", status_text="fetch_pages . 3s", done=False
+                ),
+            )
+        )
+    )
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "reader/1" in frame
+    assert "Angle A" in frame
+    assert "fetch_pages . 3s" in frame
+
+
+def test_rich_renderer_reader_strip_uses_ok_for_a_done_row():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(
+        ReadersUpdated(
+            (
+                ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),
+                ReaderItem(id="reader/2", brief="Angle B", status_text="dispatched", done=False),
+            )
+        )
+    )
+    before = len(buffer.getvalue())
+    # reader/1 finishes but reader/2 is still live -- per fix-pass item 2 the strip only
+    # disappears once EVERY reader is done, so this is the mockup's "a finished row beside a
+    # live one" shape, not the all-done case (covered by its own test below).
+    renderer.emit(
+        ReadersUpdated(
+            (
+                ReaderItem(id="reader/1", brief="Angle A", status_text="done . 8s", done=True),
+                ReaderItem(id="reader/2", brief="Angle B", status_text="dispatched", done=False),
+            )
+        )
+    )
+    raw = buffer.getvalue()[before:]
+    renderer.close()
+
+    assert _span(harness.display._OK, "reader/1") in raw
+
+
+def test_rich_renderer_reader_strip_is_absent_once_every_reader_is_done():
+    """Fix-pass item 2: `ReadersUpdated(())` (no readers at all) is already covered above, but
+    that emits no strip for a trivial reason. An all-DONE, non-empty tuple is the real gap: the
+    strip must vanish here too, not linger until `StageCompleted`."""
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(
+        ReadersUpdated(
+            (ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),)
+        )
+    )
+    before = len(buffer.getvalue())
+    renderer.emit(
+        ReadersUpdated(
+            (ReaderItem(id="reader/1", brief="Angle A", status_text="done . 8s", done=True),)
+        )
+    )
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "reader/1" not in frame
+
+
+def test_rich_renderer_stage_line_shows_waiting_on_n_readers_while_live():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    before = len(buffer.getvalue())
+    renderer.emit(
+        ReadersUpdated(
+            tuple(
+                ReaderItem(
+                    id=f"reader/{i}", brief=f"Angle {i}", status_text="dispatched", done=False
+                )
+                for i in (1, 2, 3)
+            )
+        )
+    )
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    # The count is READ from the live readers, not a value a stub could hardcode as "2".
+    assert "waiting on 3 readers" in frame
+
+
+def test_rich_renderer_stage_line_omits_waiting_on_readers_when_none_are_live():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(
+        ReadersUpdated(
+            (ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),)
+        )
+    )
+    before = len(buffer.getvalue())
+    renderer.emit(
+        ReadersUpdated(
+            (ReaderItem(id="reader/1", brief="Angle A", status_text="done . 8s", done=True),)
+        )
+    )
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "waiting on" not in frame
+
+
+def test_rich_renderer_stage_completed_clears_the_tool_log_and_the_reader_strip():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(
+        ToolCall(
+            call_id="c1",
+            tool="search_web",
+            arg_summary="a query",
+            result_summary="11 results",
+            elapsed_seconds=1.0,
+        )
+    )
+    renderer.emit(
+        ReadersUpdated(
+            (ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),)
+        )
+    )
+    before = len(buffer.getvalue())
+    renderer.emit(StageCompleted("researching", 2.0))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "search_web" not in frame
+    assert "reader/1" not in frame
+
+
+def test_plain_renderer_tool_call_prints_one_line_on_completion_only(capsys):
+    renderer = PlainRenderer()
+
+    renderer.emit(ToolCall(call_id="c1", tool="search_web", arg_summary="a query"))
+    _, start_lines = drain_stdout(capsys)
+    assert start_lines == []
+
+    renderer.emit(
+        ToolCall(
+            call_id="c1",
+            tool="search_web",
+            arg_summary="a query",
+            result_summary="11 results",
+            elapsed_seconds=2.3,
+        )
+    )
+    _, lines = drain_stdout(capsys)
+    assert len(lines) == 1
+    assert "search_web" in lines[0]
+    assert "a query" in lines[0]
+    assert "11 results" in lines[0]
+
+
+def test_plain_renderer_readers_updated_produces_no_output(capsys):
+    renderer = PlainRenderer()
+
+    renderer.emit(
+        ReadersUpdated(
+            (ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),)
+        )
+    )
+
+    out, lines = drain_stdout(capsys)
+    assert lines == []
+    assert out == ""
+
+
+def test_rich_renderer_ignores_an_event_emitted_after_close():
+    """A late event must not re-enter the alternate screen.
+
+    Newly reachable in Phase 6: the activity sink pushes from inside middleware execution, so
+    a dispatch unwinding under cancellation can emit after `close()` released the screen. The
+    `ToolCall` branch starts the Live region whenever `_live is None`, so without the guard
+    this would hide the cursor with nothing left to stop it.
+    """
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.close()
+    before = len(buffer.getvalue())
+
+    renderer.emit(ToolCall(call_id="c1", tool="search_web", arg_summary="a query"))
+
+    assert buffer.getvalue()[before:] == ""
+    assert renderer._live is None

@@ -100,6 +100,36 @@ class TodosUpdated:
     todos: tuple[TodoItem, ...]
 
 
+@dataclass(frozen=True)
+class ToolCall:
+    """One row of the structured tool-call log (R2), emitted twice per call -- once on
+    start (`result_summary is None`) and once on completion, keyed by `call_id` so the
+    renderer replaces the running row in place rather than appending a duplicate."""
+
+    call_id: str
+    tool: str
+    arg_summary: str
+    result_summary: str | None = None
+    elapsed_seconds: float | None = None
+    retry: bool = False
+
+
+@dataclass(frozen=True)
+class ReaderItem:
+    id: str
+    brief: str
+    status_text: str
+    done: bool
+
+
+@dataclass(frozen=True)
+class ReadersUpdated:
+    """Every reader dispatched so far this stage -- a replacement, not a delta (same
+    contract as `TodosUpdated`). The strip renders only while at least one is live."""
+
+    readers: tuple[ReaderItem, ...]
+
+
 DisplayEvent = (
     StageStarted
     | StageCompleted
@@ -111,6 +141,8 @@ DisplayEvent = (
     | RunFinished
     | TodosUpdated
     | RoundsUpdated
+    | ToolCall
+    | ReadersUpdated
 )
 
 
@@ -175,6 +207,20 @@ class PlainRenderer:
             # Dropped, same reasoning as `RoundsUpdated` above: both are pure live-frame
             # decoration of the `ask_user` overlay, and one line per keystroke would flood a
             # non-TTY log. `Question` above already prints the question text itself.
+            pass
+        elif isinstance(event, ToolCall):
+            # Only the completion emit prints: the start emit's `running...` row is live-frame
+            # decoration (D-B), and the completed line is the durable fact worth a CI log line.
+            if event.result_summary is not None:
+                retry_suffix = " (retry)" if event.retry else ""
+                print(
+                    f"  {event.tool}: {event.arg_summary} -- {event.result_summary}{retry_suffix}",
+                    file=stream,
+                )
+        elif isinstance(event, ReadersUpdated):
+            # Dropped, same policy as `RoundsUpdated`/`AnswerDraft`/`QuestionAnswered` above:
+            # the reader strip is pure live-frame decoration, presence-only, and a line per
+            # status tick would flood a non-TTY log.
             pass
         else:  # Activity
             print(f"  {event.text}", file=stream)
@@ -274,6 +320,22 @@ def _format_elapsed(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _styled_text(value: str, style: str) -> Text:
+    """`Text(value)` with `style` applied as a SPAN over just `value`'s own length, rather
+    than `Text(value, style=style)`'s base style.
+
+    The difference matters inside a `Table.grid` column: a base style also colors any
+    right-padding Rich adds later to equalize that column's width across rows (`pad_right`
+    appends plain characters with no span of their own, so they fall back to the Text's
+    base style) — bleeding a retry row's `_WARN` into the padding *between* columns, one
+    character past the value a caller (or a test pinning the whole-value ANSI span) expects
+    to end cleanly. A span scoped to `value`'s own length keeps the padding unstyled instead.
+    """
+    text = Text(value)
+    text.stylize(style)
+    return text
+
+
 class RichRenderer:
     """Full-screen TUI (D1/R5): a pinned checklist over a gray rule over the activity feed
     (R1), collapsing stage completions to a timeline line (R2), with a one-line exit-hint
@@ -285,6 +347,11 @@ class RichRenderer:
     """
 
     _ACTIVITY_TAIL = 8
+
+    # Same intent as `_ACTIVITY_TAIL` (bound the tail so a long run's log cannot grow the
+    # frame unboundedly), but a separate constant: the tool log and the free-text activity
+    # feed are now two distinct regions (Phase 6), not one.
+    _TOOL_LOG_TAIL = 8
 
     # The header shown while activity is arriving but no stage has started yet — the agent's
     # first model turn and its initial todo plan, which precede the first `search_web` call.
@@ -307,6 +374,11 @@ class RichRenderer:
         self._timeline: list[Text] = []
         self._alerts: list[Text] = []
         self._todos: tuple[TodoItem, ...] = ()
+        # Insertion-ordered: a replaced key (the completion emit) keeps its original
+        # position, which is what holds the log stable rather than jumping the row to the
+        # bottom on completion.
+        self._tool_calls: dict[str, ToolCall] = {}
+        self._readers: tuple[ReaderItem, ...] = ()
         self._overlay_question: str | None = None
         self._answer_draft: AnswerDraft | None = None
         self._closed = False
@@ -341,10 +413,64 @@ class RichRenderer:
         if self._rounds is not None:
             rounds_used, max_rounds = self._rounds
             elapsed = f"{elapsed} · round {rounds_used}/{max_rounds}"
+        live_readers = sum(1 for reader in self._readers if not reader.done)
+        if live_readers:
+            noun = "reader" if live_readers == 1 else "readers"
+            elapsed = f"{elapsed} · waiting on {live_readers} {noun}"
         grid = Table.grid(expand=True)
         grid.add_column()
         grid.add_column(justify="right")
         grid.add_row(spinner, Text(elapsed, style=_MUTED))
+        return grid
+
+    def _build_tool_log(self) -> Table | None:
+        """The structured tool-call log (R2): tool / arg summary / result-or-running, one
+        grid row per call, truncating rather than wrapping an overlong arg summary."""
+        if not self._tool_calls:
+            return None
+        grid = Table.grid(expand=True, padding=(0, 1, 0, 0))
+        grid.add_column(no_wrap=True)
+        grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        grid.add_column(justify="right", no_wrap=True)
+        calls = list(self._tool_calls.values())[-self._TOOL_LOG_TAIL :]
+        for call in calls:
+            tool_style = _WARN if call.retry else _FG
+            arg_style = _WARN if call.retry else _DIM
+            if call.result_summary is None:
+                result_text = "running..."
+            elif call.elapsed_seconds is not None:
+                result_text = f"{call.result_summary} · {call.elapsed_seconds:.1f}s"
+            else:
+                result_text = call.result_summary
+            grid.add_row(
+                _styled_text(call.tool, tool_style),
+                _styled_text(call.arg_summary, arg_style),
+                _styled_text(result_text, _MUTED),
+            )
+        return grid
+
+    def _build_reader_strip(self) -> Table | None:
+        """The reader strip (D-D): one row per reader dispatched this stage, present ONLY
+        while at least one is LIVE (fix-pass item 2 -- an all-done set renders nothing, even
+        though the done rows themselves still render alongside any still-live ones)."""
+        if not any(not reader.done for reader in self._readers):
+            return None
+        grid = Table.grid(expand=True, padding=(0, 1, 0, 0))
+        grid.add_column(no_wrap=True)
+        grid.add_column(no_wrap=True, min_width=9)
+        grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        grid.add_column(justify="right", no_wrap=True)
+        last_index = len(self._readers) - 1
+        for index, reader in enumerate(self._readers):
+            glyph = "└" if index == last_index else "├"
+            id_style = _OK if reader.done else _ACCENT_2
+            status_style = _MUTED if reader.done else _FG_2
+            grid.add_row(
+                _styled_text(glyph, _RULE),
+                _styled_text(reader.id, id_style),
+                _styled_text(reader.brief, _DIM),
+                _styled_text(reader.status_text, status_style),
+            )
         return grid
 
     def _build_ask_overlay(self) -> Panel:
@@ -375,12 +501,23 @@ class RichRenderer:
 
     def _build_activity_group(self) -> Group:
         header = self._build_stage_header()
+        strip = self._build_reader_strip()
+        # The strip is pinned live state, like the timeline and alerts -- not part of the
+        # log region, so it stays visible even when the overlay below replaces the log.
+        strip_part: tuple[RenderableType, ...] = (strip,) if strip is not None else ()
         if self._overlay_question is not None:
             # The overlay REPLACES the activity lines only -- the checklist (outside this
-            # panel), the timeline, and the stage header all stay visible (R4).
-            return Group(*self._timeline, *self._alerts, header, self._build_ask_overlay())
+            # panel), the timeline, the stage header, and the reader strip all stay visible (R4).
+            return Group(
+                *self._timeline, *self._alerts, header, *strip_part, self._build_ask_overlay()
+            )
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
-        return Group(*self._timeline, *self._alerts, header, *activity_lines)
+        log = self._build_tool_log()
+        log_or_activity: tuple[RenderableType, ...] = (
+            *activity_lines,
+            *((log,) if log is not None else ()),
+        )
+        return Group(*self._timeline, *self._alerts, header, *strip_part, *log_or_activity)
 
     def _build_renderable(self) -> Group:
         return Group(
@@ -410,6 +547,14 @@ class RichRenderer:
         self._live.start(refresh=True)
 
     def emit(self, event: DisplayEvent) -> None:
+        if self._closed:
+            # A late event must not re-enter the alternate screen. Newly reachable in Phase 6:
+            # the activity sink PUSHES from inside middleware execution, so a dispatch
+            # unwinding under cancellation can emit after `close()` has already released the
+            # screen and printed the summary on the normal terminal -- and the branches below
+            # call `_start_live()` whenever `_live is None`, which would hide the cursor with
+            # nothing left to stop it. `_suspend` guards on the same flag.
+            return
         if isinstance(event, StageStarted):
             self._stage = event.stage
             # Deliberately NOT clearing `_activities`: events emitted before the first stage
@@ -422,6 +567,10 @@ class RichRenderer:
         elif isinstance(event, StageCompleted):
             self._stage = None
             self._activities = []
+            # The log and strip are per-stage: a stale row/strip after this stage ends would
+            # read as a tool still running or a reader still in flight from the PREVIOUS stage.
+            self._tool_calls = {}
+            self._readers = ()
             # Collapsed timeline lines live INSIDE the frame: under `screen=True` a
             # `console.print` while the Live runs paints onto the alternate screen at the
             # home position and is overwritten by the next refresh, then discarded on exit.
@@ -484,6 +633,24 @@ class RichRenderer:
             # own — it only repaints an already-running frame, since a round only advances
             # once a stage (and so the frame) exists.
             self._rounds = (event.rounds_used, event.max_rounds)
+            if self._live is not None:
+                self._live.refresh()
+        elif isinstance(event, ToolCall):
+            self._tool_calls[event.call_id] = event
+            # Trimmed to the tail on every emit, not just at render time, so the dict cannot
+            # grow unboundedly across a long run.
+            if len(self._tool_calls) > self._TOOL_LOG_TAIL:
+                for stale_id in list(self._tool_calls)[: -self._TOOL_LOG_TAIL]:
+                    del self._tool_calls[stale_id]
+            # A tool call can precede the first stage, exactly as `Activity` already handles.
+            if self._live is None:
+                self._start_live()
+            else:
+                self._live.refresh()
+        elif isinstance(event, ReadersUpdated):
+            self._readers = event.readers
+            # Pure decoration of a running frame (same as `RoundsUpdated`): does not start
+            # the Live region on its own.
             if self._live is not None:
                 self._live.refresh()
         elif isinstance(event, RunFinished):

@@ -46,7 +46,8 @@ from langgraph.types import Command
 # The MODULE, not `from harness.models import build_chat_model`: a by-value import binds a
 # module-local name each test would have to patch separately. Attribute lookup at call time
 # means patching `harness.models.build_chat_model` covers every caller (see PR #4 review).
-from harness import models
+from harness import activity, models
+from harness.activity import ActivitySink, DisplayError, active_reader, reader_scope
 from harness.config import HarnessConfig, run_workspace_dir
 from harness.prompts import render
 from harness.runlog import RunLog, or_default
@@ -90,13 +91,15 @@ def _task_failure_handler(
     def _handle(exc: Exception, request: ToolCallRequest) -> str | None:
         """Render a subagent (`task`) crash as content for an error `ToolMessage`.
 
-        Returns `None` for `SearchUnavailableError` (and only it — Drift C): a mid-run search
-        abort must reach `__main__`'s existing abort handling as a raised exception, not be
-        stringified into a soft "... FAILED" message that would hide the documented
-        three-consecutive-failures invariant. `ToolErrorMiddleware.on_error` treats a `None`
-        return as "let the exception propagate".
+        Returns `None` for `_PASS_THROUGH_TASK_FAILURES`: a mid-run search abort
+        (`SearchUnavailableError`, Drift C) must reach `__main__`'s existing abort handling as a
+        raised exception, not be stringified into a soft "... FAILED" message that would hide
+        the documented three-consecutive-failures invariant; and a `DisplayError` (Phase 6) is
+        the display's fault, not the subagent's, so labelling it "READER FAILED" and recording a
+        `subagent_failed` incident would blame the wrong component.
+        `ToolErrorMiddleware.on_error` treats a `None` return as "let the exception propagate".
         """
-        if isinstance(exc, SearchUnavailableError):
+        if isinstance(exc, _PASS_THROUGH_TASK_FAILURES):
             return None
         # `.get`: the args are model-supplied, and a malformed call must still get a label
         # rather than raising a KeyError out of the error handler itself.
@@ -111,14 +114,21 @@ def _task_failure_handler(
     return _handle
 
 
+# The two exceptions that must never be retried NOR converted to a soft "... FAILED"
+# ToolMessage — one home, so the retry predicate and the error handler below cannot drift into
+# disagreeing about which failures are the subagent's fault. `SearchUnavailableError` is Drift
+# C's mid-run abort; `DisplayError` is Phase 6's, and see its own docstring for why.
+_PASS_THROUGH_TASK_FAILURES = (SearchUnavailableError, DisplayError)
+
+
 def _retry_on_non_search_abort(exc: Exception) -> bool:
-    """Exclude `SearchUnavailableError` from the task-tool retry (Drift C).
+    """Exclude the pass-through failures from the task-tool retry (Drift C; Phase 6).
 
     Retrying would waste a whole researcher (or reader) re-run before the abort ever reaches
     `_task_failure_handler`'s propagate branch. `ToolRetryMiddleware.retry_on` accepts this
     predicate form alongside its default exception-tuple shape.
     """
-    return not isinstance(exc, SearchUnavailableError)
+    return not isinstance(exc, _PASS_THROUGH_TASK_FAILURES)
 
 
 def _task_dispatch_guard(run_log: RunLog) -> list[AgentMiddleware[Any, Any, Any]]:
@@ -201,6 +211,143 @@ class _ReaderDigestMiddleware(AgentMiddleware[Any, Any, Any]):
         return result
 
 
+def _summarize_tool_args(name: str, args: dict[str, Any]) -> str:
+    """A short, total description of one tool call's arguments for the activity log (D-C).
+
+    Must never raise on model-supplied args -- every lookup here is `.get`-guarded, and an
+    unrecognized tool falls back to its first string-valued argument rather than erroring.
+    """
+    if name == "task":
+        subagent_type = str(args.get("subagent_type") or "")
+        return f"{subagent_type or 'task'} -- {args.get('description', '')}"
+    if name == "search_web":
+        return str(args.get("query", ""))
+    if name in ("fetch_pages", "fetch_raw"):
+        urls = args.get("urls") or []
+        if not urls:
+            return ""
+        first_url = str(urls[0])
+        extra = len(urls) - 1
+        return f"{first_url} +{extra}" if extra else first_url
+    for value in args.values():
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _summarize_tool_result(result: ToolMessage | Command[Any]) -> str:
+    """A short, honest description of one tool call's result for the activity log (D-C).
+
+    Reuses `_digest_text` to pull the message text out however the tool wrapped it. Prefers
+    a leading count when the text already starts with one (e.g. a results count) -- that
+    first line already IS the brevity this needs -- else the first line, truncated to ~60
+    chars: the renderer truncates for display too, so this only has to be short and honest,
+    not a full summary.
+    """
+    text = _digest_text(result)
+    if not text:
+        return ""
+    first_line = text.splitlines()[0].strip()
+    if first_line and first_line[0].isdigit():
+        return first_line
+    if len(first_line) > 60:
+        return first_line[:60].rstrip() + "…"
+    return first_line
+
+
+class _ToolActivityMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Report every observed tool call to the run's `ActivitySink` (Phase 6, D-C).
+
+    Registered on the researcher and reader tiers only -- the lead tier is deliberately NOT
+    instrumented (developer decision at the 3C gate, 2026-08-20). Innermost in each tier's
+    middleware list: `ToolRetryMiddleware` re-invokes the inner handler with the SAME
+    `tool_call["id"]` on a retry, which is how the `retry` flag is derived here with no new
+    retry bookkeeping of its own.
+
+    Distinguishes a reader dispatch from a researcher dispatch by reading
+    `request.tool_call["args"]["subagent_type"]` -- the same way `_task_failure_handler`
+    already does -- never by where it is registered (it is registered on both tiers).
+
+    Known limitation: the mockup shows a retry row for `search_web`, but
+    `_task_dispatch_guard` scopes its retry middleware to `tools=["task"]`, so the only
+    retries this middleware can ever observe are subagent-dispatch retries. Search-level
+    retry lives inside the tool itself and is not observable here.
+
+    Async-only, like the tools it observes and like its sibling `_ReaderDigestMiddleware`:
+    the graph is driven with `ainvoke`/`astream` (substrate D1).
+    """
+
+    def __init__(self, sink: ActivitySink) -> None:
+        super().__init__()
+        self._sink = sink
+        # A retried `task(reader)` dispatch re-invokes this whole method with the SAME
+        # `call_id` (D-C): without this, `start_reader` would mint a SECOND `reader/N` row
+        # for one dispatch. Local to the middleware, not the sink, since it is bookkeeping
+        # about ITS OWN pairing of a call id to the reader id it already minted.
+        self._reader_ids_by_call: dict[str, str] = {}
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        name = request.tool_call["name"]
+        call_id = str(request.tool_call.get("id") or "")
+        if not call_id:
+            # No id means no way to pair this start with its eventual finish -- a missing id
+            # must never break the dispatch itself.
+            return await handler(request)
+        args = request.tool_call["args"] or {}
+        subagent_type = str(args.get("subagent_type", "")) if name == "task" else ""
+        is_reader = name == "task" and subagent_type == "reader"
+
+        retry = self._sink.start_call(call_id, name, _summarize_tool_args(name, args))
+
+        reader_id: str | None = None
+        if is_reader:
+            if retry and call_id in self._reader_ids_by_call:
+                reader_id = self._reader_ids_by_call[call_id]
+                # The first attempt already marked this row done/failed (fix-pass item 3):
+                # without reopening it, the whole retry would read as a finished reader.
+                self._sink.reopen_reader(reader_id)
+            else:
+                reader_id = self._sink.start_reader(str(args.get("description", "")))
+                self._reader_ids_by_call[call_id] = reader_id
+        else:
+            attributed_to = active_reader()
+            if attributed_to is not None:
+                self._sink.note_reader_tool(attributed_to, name)
+
+        try:
+            if reader_id is not None:
+                with reader_scope(reader_id):
+                    result = await handler(request)
+            else:
+                result = await handler(request)
+        except BaseException:
+            # `BaseException`, not `Exception`: a cancelled dispatch (wall clock) must not
+            # leave a row stuck at "running..." either. Re-raised unchanged -- the outer
+            # `ToolRetryMiddleware`/`ToolErrorMiddleware` pair owns the run's failure
+            # semantics (out of scope: no change to reader dispatch retry/failure behavior).
+            self._sink.finish_call(call_id, "failed")
+            if reader_id is not None:
+                self._sink.finish_reader(reader_id, failed=True)
+            raise
+
+        result_summary = _summarize_tool_result(result)
+        # No "{label} FAILED"-prefix check here (fix-pass item 8, confirmed dead): that text is
+        # only ever produced by `_task_failure_handler`, `_task_dispatch_guard`'s
+        # `ToolErrorMiddleware.on_error` callback, which sits OUTSIDE this middleware in the
+        # chain and crafts its substitute ToolMessage after this middleware's own `except`
+        # branch above has already fired and re-raised -- deepagents' `task`/`atask` never
+        # catches a subgraph crash and returns it as a normal string either (it lets the
+        # exception propagate). A non-exception return here is therefore always a success.
+        self._sink.finish_call(call_id, result_summary)
+        if reader_id is not None:
+            self._sink.finish_reader(reader_id, failed=False)
+        return result
+
+
 def _register_no_shell_profile(model: BaseChatModel) -> None:
     """Register the no-shell HarnessProfile under `model`'s resolved profile key.
 
@@ -231,6 +378,7 @@ def _reader_spec(
     reader_model: BaseChatModel,
     reader_tools: list[BaseTool],
     backend: BackendProtocol,
+    sink: ActivitySink,
 ) -> SubAgent:
     """Build the declared `reader` `SubAgent` spec (D1): the researcher's only route to
     `fetch_pages` (Step 3 nested this one level deeper — the lead never dispatches it directly).
@@ -251,6 +399,9 @@ def _reader_spec(
     injected stack. Mirrors only the `backend`/`model` arguments from that site: this harness
     never sets `tool_description_overrides` or per-subagent `permissions`, so the other
     `FilesystemMiddleware` kwargs there are always `None` and add nothing here.
+
+    `_ToolActivityMiddleware(sink)` is appended last (Phase 6, D-C): this is the ONLY tier
+    where `fetch_pages` is observable, since the reader is the only tier that calls it.
     """
     # Explicitly typed, matching `_middleware`'s own convention: `FilesystemMiddleware`'s state
     # type param is fixed to `FilesystemState`, and an unannotated list literal here infers that
@@ -260,6 +411,7 @@ def _reader_spec(
         FilesystemMiddleware(backend=backend),
         create_summarization_middleware(reader_model, backend),
         PatchToolCallsMiddleware(),
+        _ToolActivityMiddleware(sink),
     ]
     return SubAgent(
         name="reader",
@@ -286,6 +438,7 @@ def _researcher_spec(
     backend: BackendProtocol,
     registry: SourceRegistry,
     run_log: RunLog,
+    sink: ActivitySink,
 ) -> SubAgent:
     """Build the declared `researcher` `SubAgent` spec (Step 3): the lead's only route to
     `search_web` and (through its own nested `reader` declaration) page reading.
@@ -295,9 +448,11 @@ def _researcher_spec(
 
     `middleware`: `SubAgentMiddleware` nests the reader tier under THIS researcher's own
     `task` tool; `_task_dispatch_guard` guards a crashed (or aborted, Drift C) reader
-    dispatch, the same shared pair as the lead's own guard on dispatching a researcher; and
+    dispatch, the same shared pair as the lead's own guard on dispatching a researcher;
     `_ReaderDigestMiddleware` marks a source `digested` only when a reader's digest actually
-    reaches this researcher (R7's mechanism moved, not broken).
+    reaches this researcher (R7's mechanism moved, not broken); and `_ToolActivityMiddleware`
+    (Phase 6, D-C) is appended LAST (innermost) so a retried `task` dispatch to the reader
+    arrives as a second start for the same `tool_call["id"]`.
     """
     return SubAgent(
         name="researcher",
@@ -316,12 +471,16 @@ def _researcher_spec(
             SubAgentMiddleware(backend=backend, subagents=[reader_spec]),
             *_task_dispatch_guard(run_log),
             _ReaderDigestMiddleware(registry),
+            _ToolActivityMiddleware(sink),
         ],
     )
 
 
 def build_agent(
-    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    run_log: RunLog | None = None,
+    sink: ActivitySink | None = None,
 ) -> Runnable:
     """Compile the lead research agent, driven with `ainvoke`/`astream` (substrate D1).
 
@@ -332,6 +491,9 @@ def build_agent(
 
     `run_log` collects the tools' degraded-coverage incidents; the caller shares one instance
     between this agent and the report so disclosure sees everything (best-effort + disclose).
+    `sink` (Phase 6, D-C) collects the researcher/reader tiers' observed tool calls for the
+    running pane's structured log and reader strip -- the lead tier is deliberately not
+    instrumented, so `_middleware` below is unchanged.
     """
     model = models.build_chat_model(config, "head")
     _register_no_shell_profile(model)
@@ -356,9 +518,19 @@ def build_agent(
     )
 
     shared_log = or_default(run_log)
-    reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
+    # The SAME sink goes to both specs (D-D): reader-tier attribution needs the reader's own
+    # middleware updating the very `ReaderState` the researcher's middleware created.
+    shared_sink = activity.or_default(sink)
+    reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend, shared_sink)
     researcher_spec = _researcher_spec(
-        config, researcher_model, tool_sets.researcher, reader_spec, backend, registry, shared_log
+        config,
+        researcher_model,
+        tool_sets.researcher,
+        reader_spec,
+        backend,
+        registry,
+        shared_log,
+        shared_sink,
     )
 
     return create_deep_agent(

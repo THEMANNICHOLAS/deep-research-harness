@@ -17,8 +17,10 @@ import pytest
 from deepagents.backends.protocol import SandboxBackendProtocol
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import Interrupt
+from pydantic import PrivateAttr
 
 import harness.__main__ as main_module
+from harness.activity import ActivitySink, active_reader
 from harness.agent import build_agent
 from harness.config import AgentSettings, HarnessConfig, run_workspace_dir
 from harness.display import PlainRenderer, StageTracker
@@ -260,7 +262,7 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
         SummarizationMiddleware as DeepagentsSummarizationMiddleware,
     )
 
-    from harness.agent import _reader_spec
+    from harness.agent import _reader_spec, _ToolActivityMiddleware
     from harness.prompts import render
     from harness.tools import build_tools
 
@@ -269,7 +271,7 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
     reader_tools = build_tools(config, SourceRegistry()).reader
     backend = FilesystemBackend(root_dir=tmp_path / "workspace")
 
-    spec = _reader_spec(config, reader_model, reader_tools, backend)
+    spec = _reader_spec(config, reader_model, reader_tools, backend, ActivitySink())
 
     assert spec["name"] == "reader"
     assert spec["model"] is reader_model
@@ -287,6 +289,9 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
     assert any(isinstance(m, FilesystemMiddleware) for m in spec["middleware"])
     assert any(isinstance(m, DeepagentsSummarizationMiddleware) for m in spec["middleware"])
     assert any(isinstance(m, PatchToolCallsMiddleware) for m in spec["middleware"])
+    # Phase 6 (D-C): the reader tier is the ONLY place `fetch_pages` is observable, so its
+    # activity middleware is part of this spec's contract, not an incidental extra.
+    assert any(isinstance(m, _ToolActivityMiddleware) for m in spec["middleware"])
     # The reader has no checkpointer forwarded and cannot interrupt — inheriting the lead's
     # `ask_user` interrupt entry would register an interrupt that can never fire.
     # R4 regression (Phase 5): `interrupt_on` stays confined to the lead alone.
@@ -302,7 +307,7 @@ def test_researcher_spec_has_no_interrupt_on(make_config, scripted_model, tmp_pa
     """
     from deepagents.backends.filesystem import FilesystemBackend
 
-    from harness.agent import _reader_spec, _researcher_spec
+    from harness.agent import _reader_spec, _researcher_spec, _ToolActivityMiddleware
     from harness.tools import build_tools
 
     config = make_config()
@@ -310,7 +315,8 @@ def test_researcher_spec_has_no_interrupt_on(make_config, scripted_model, tmp_pa
     researcher_model = scripted_model([AIMessage(content="done")])
     tool_sets = build_tools(config, SourceRegistry())
     backend = FilesystemBackend(root_dir=tmp_path / "workspace")
-    reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
+    sink = ActivitySink()
+    reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend, sink)
 
     spec = _researcher_spec(
         config,
@@ -320,9 +326,13 @@ def test_researcher_spec_has_no_interrupt_on(make_config, scripted_model, tmp_pa
         backend,
         SourceRegistry(),
         RunLog(),
+        sink,
     )
 
     assert "interrupt_on" not in spec
+    # Phase 6 (D-C): registered LAST, so `ToolRetryMiddleware` (outside it) re-invokes the
+    # inner handler with the same tool-call id and a retried dispatch is observable as one.
+    assert isinstance(spec["middleware"][-1], _ToolActivityMiddleware)
 
 
 async def test_build_agent_resolves_each_role_from_its_own_key(
@@ -357,10 +367,10 @@ async def test_build_agent_resolves_each_role_from_its_own_key(
     original_reader_spec = agent_module._reader_spec
 
     def _spy_reader_spec(
-        config: Any, reader_model_arg: Any, reader_tools: Any, backend: Any
+        config: Any, reader_model_arg: Any, reader_tools: Any, backend: Any, sink: Any
     ) -> Any:
         captured["reader_model"] = reader_model_arg
-        return original_reader_spec(config, reader_model_arg, reader_tools, backend)
+        return original_reader_spec(config, reader_model_arg, reader_tools, backend, sink)
 
     monkeypatch.setattr(agent_module, "_reader_spec", _spy_reader_spec)
 
@@ -500,12 +510,20 @@ def build_researcher(make_config, tmp_path):
         reader_model: Any,
         registry: SourceRegistry | None = None,
         run_log: RunLog | None = None,
+        sink: ActivitySink | None = None,
     ):
         config = make_config()
         registry = registry if registry is not None else SourceRegistry()
         backend = FilesystemBackend(root_dir=tmp_path / "workspace")
         tool_sets = build_tools(config, registry)
-        reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend)
+        # `sink` defaults internally rather than on the parameter itself (Contracts:
+        # `_reader_spec`/`_researcher_spec` take it keyword-or-positional with NO default,
+        # so no call site silently forgets one) -- callers that don't care about tool
+        # activity, i.e. every pre-Phase-6 test using this fixture, need not pass one. The
+        # SAME instance goes to both specs: reader-tier attribution (D-D) needs the reader's
+        # own middleware updating the very `ReaderState` the researcher's middleware created.
+        shared_sink = sink if sink is not None else ActivitySink()
+        reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend, shared_sink)
         researcher_spec = _researcher_spec(
             config,
             researcher_model,
@@ -514,6 +532,7 @@ def build_researcher(make_config, tmp_path):
             backend,
             registry,
             run_log if run_log is not None else RunLog(),
+            shared_sink,
         )
         return create_sub_agent(researcher_spec), registry
 
@@ -689,6 +708,306 @@ async def test_an_empty_digest_leaves_the_fetched_source_unread(
     source = registry.get("S1")
     assert source is not None
     assert source.read_mode == "unread"
+
+
+# --- Phase 6: `_ToolActivityMiddleware` / `ActivitySink` (reader/researcher tiers) --------
+
+
+class _FailOnceChatModel(ScriptedChatModel):
+    """Raises on its very first call only, then defers to the real scripted script.
+
+    Drives the "crash then succeed on retry" path -- as opposed to `_RaisingChatModel`
+    above, which fails every call. Does not touch `_call_count` on the failing branch, so
+    the eventual successful call still reads `self._script[0]`.
+    """
+
+    _failed_once: bool = PrivateAttr(default=False)
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        if not self._failed_once:
+            self._failed_once = True
+            self._received_messages.append(list(messages))
+            raise RuntimeError("boom")
+        return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+async def test_two_parallel_reader_dispatches_get_distinct_ids_and_terminal_transitions(
+    build_researcher, scripted_model
+):
+    """N parallel reader dispatches produce N distinct reader ids, each with a start and a
+    terminal transition. Verified BOTH ways (plan `## Discoveries`, Phase 5): against an
+    implementation whose reader id is a constant `"reader/1"`, or keyed off the tool name,
+    `len(ids) == 2` fails -- so this is a real test of the risk, not a vacuous one.
+    """
+    from pydantic import SecretStr
+
+    researcher_model = scripted_model(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {"description": "Angle A", "subagent_type": "reader"},
+                        "id": "call_reader_a",
+                    },
+                    {
+                        "name": "task",
+                        "args": {"description": "Angle B", "subagent_type": "reader"},
+                        "id": "call_reader_b",
+                    },
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = ConcurrencyTrackingModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="Reader A report."), AIMessage(content="Reader B report.")])
+    # A real, non-zero yield -- see `ConcurrencyTrackingModel`'s own docstring on why proving
+    # CONCURRENCY (as opposed to disproving it) needs one.
+    reader_model._sleep_seconds = 0.05
+
+    sink = ActivitySink()
+    researcher, _ = build_researcher(researcher_model, reader_model, sink=sink)
+
+    await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    # Empirically confirmed (this phase's implementation notes): two `task(reader)` calls in
+    # one researcher turn genuinely run concurrently under this fixture.
+    assert reader_model._peak_in_flight > 1
+
+    readers = sink.readers()
+    assert len(readers) == 2
+    ids = {r.id for r in readers}
+    assert len(ids) == 2  # distinct, not both "reader/1" or both keyed off the tool name
+    assert all(r.done for r in readers)
+
+    records = sink.records()
+    for call_id in ("call_reader_a", "call_reader_b"):
+        matching = [r for r in records if r.call_id == call_id]
+        assert len(matching) == 2  # one start, one finish
+        assert any(r.result_summary is None for r in matching)
+        assert any(r.result_summary is not None for r in matching)
+
+
+async def test_a_failed_reader_is_a_failed_row_not_a_stuck_live_one(
+    build_researcher, scripted_model
+):
+    """The reader-crash path (existing test above) re-run with a sink attached: the error
+    `ToolMessage` and the `RunLog` `subagent_failed` incident are UNCHANGED, and the reader's
+    own row is `done` with a failed status rather than left `running...` forever -- risk #3's
+    "no change to failure semantics" pin.
+    """
+    from pydantic import SecretStr
+
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = _RaisingChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    run_log = RunLog()
+    sink = ActivitySink()
+    researcher, _ = build_researcher(researcher_model, reader_model, run_log=run_log, sink=sink)
+
+    result = await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    # Unchanged from `test_a_reader_crash_becomes_an_error_task_message_after_one_retry`.
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0].status == "error"
+    assert str(task_messages[0].content).startswith("READER FAILED")
+    # Unchanged from `test_a_swallowed_subagent_crash_records_a_run_log_incident`.
+    incidents = run_log.incidents()
+    assert len(incidents) == 1
+    assert incidents[0].kind == "subagent_failed"
+
+    readers = sink.readers()
+    assert len(readers) == 1
+    assert readers[0].done is True
+    assert "failed" in readers[0].status_text
+
+
+async def test_a_retried_reader_dispatch_is_flagged_in_the_sink_records(
+    build_researcher, scripted_model
+):
+    """A crash-then-succeed script: the researcher's `task` dispatch to the reader fails
+    once and succeeds on retry (`ToolRetryMiddleware` re-invoking with the SAME `call_id`),
+    so the sink shows two records for that one call id -- `retry=False` then `retry=True`.
+    """
+    from pydantic import SecretStr
+
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = _FailOnceChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="Recovered digest.")])
+    sink = ActivitySink()
+    researcher, _ = build_researcher(researcher_model, reader_model, sink=sink)
+
+    await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    records = [r for r in sink.records() if r.call_id == "call_task"]
+    assert len(records) == 4  # start+finish for the failed attempt, start+finish for the retry
+    assert [r.retry for r in records] == [False, False, True, True]
+
+
+async def test_a_reader_tier_tool_call_attributes_to_its_reader(
+    build_researcher, scripted_model, install_crawler
+):
+    """A reader-tier `fetch_pages` call, while live, names itself on its OWN reader's row
+    (D-D's `ContextVar` attribution) -- not some other reader's, and not left generic.
+    """
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = scripted_model(
+        [_reader_fetch_call("https://a.test"), AIMessage(content="Digest of the page.")]
+    )
+    install_crawler(
+        [
+            _FakeResult(
+                "https://a.test",
+                markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body"),
+            )
+        ]
+    )
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
+
+    sink = ActivitySink()
+    # `note_reader_tool` is the exact moment the reader's row gets attributed -- capture a
+    # snapshot right then, since by the time `ainvoke` returns the reader is `done` and its
+    # status text has moved on to a "done"/"failed" shape, not the live "fetch_pages" one.
+    live_snapshots: list[tuple] = []
+    original_note = sink.note_reader_tool
+
+    def _capturing_note(reader_id, tool):
+        original_note(reader_id, tool)
+        live_snapshots.append(sink.readers())
+
+    sink.note_reader_tool = _capturing_note
+
+    researcher, _ = build_researcher(researcher_model, reader_model, registry=registry, sink=sink)
+    await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    assert live_snapshots, "note_reader_tool was never called -- attribution never fired"
+    live_readers = live_snapshots[0]
+    assert len(live_readers) == 1
+    assert live_readers[0].done is False
+    assert "fetch_pages" in live_readers[0].status_text
+
+
+async def test_two_concurrent_readers_attribute_their_own_tool_calls_without_cross_talk(
+    build_researcher, scripted_model, install_crawler
+):
+    """Fix-pass item 6: risk #3's own question is whether the reader scope can leak ACROSS
+    concurrent dispatches -- only a single-reader attribution test existed before. Two
+    `task(reader)` dispatches run concurrently, each making its own distinct reader-tier
+    `fetch_pages` call to a distinct URL; `active_reader()` is captured at the moment each
+    call starts, so each URL must land on its OWN, DIFFERENT reader id -- never the other's,
+    and never `None`. Verified BOTH ways, per this file's report: swapping the ContextVar for
+    a plain shared attribute makes this fail before it is trusted green.
+    """
+    from pydantic import SecretStr
+
+    researcher_model = scripted_model(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {"description": "Angle A", "subagent_type": "reader"},
+                        "id": "call_reader_a",
+                    },
+                    {
+                        "name": "task",
+                        "args": {"description": "Angle B", "subagent_type": "reader"},
+                        "id": "call_reader_b",
+                    },
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = ConcurrencyTrackingModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "fetch_pages",
+                        "args": {"urls": ["https://a.test"]},
+                        "id": "call_fetch_a",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "fetch_pages",
+                        "args": {"urls": ["https://b.test"]},
+                        "id": "call_fetch_b",
+                    }
+                ],
+            ),
+            AIMessage(content="Digest one."),
+            AIMessage(content="Digest two."),
+        ]
+    )
+    # A real, non-zero yield, same reasoning as the parallel-ids test above.
+    reader_model._sleep_seconds = 0.05
+    install_crawler(
+        [
+            _FakeResult(
+                "https://a.test", markdown=_FakeMarkdown(raw_markdown="A", fit_markdown="A")
+            ),
+            _FakeResult(
+                "https://b.test", markdown=_FakeMarkdown(raw_markdown="B", fit_markdown="B")
+            ),
+        ]
+    )
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test", "https://b.test"])
+
+    sink = ActivitySink()
+    attributions: list[tuple[str, str | None]] = []
+    original_start_call = sink.start_call
+
+    def _capturing_start_call(call_id, tool, arg_summary):
+        if tool == "fetch_pages":
+            attributions.append((arg_summary, active_reader()))
+        return original_start_call(call_id, tool, arg_summary)
+
+    sink.start_call = _capturing_start_call
+
+    researcher, _ = build_researcher(researcher_model, reader_model, registry=registry, sink=sink)
+    await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    assert reader_model._peak_in_flight > 1  # genuine concurrency, not a serial fallback
+    assert len(attributions) == 2
+    by_url = dict(attributions)
+    assert set(by_url) == {"https://a.test", "https://b.test"}
+    reader_ids = set(by_url.values())
+    assert None not in reader_ids
+    assert len(reader_ids) == 2  # each call attributed to its OWN reader, never the other's
 
 
 async def test_a_researcher_crash_becomes_an_error_task_message_after_one_retry(
@@ -1875,9 +2194,9 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
     real_build_agent = agent_module.build_agent
 
     def _build_agent_that_interrupts(
-        config: HarnessConfig, registry: Any, run_log: Any = None
+        config: HarnessConfig, registry: Any, run_log: Any = None, sink: Any = None
     ) -> Any:
-        real_agent = real_build_agent(config, registry, run_log)
+        real_agent = real_build_agent(config, registry, run_log, sink)
 
         class _InterruptingAgent:
             def astream(self, *args: Any, **kwargs: Any) -> Any:
@@ -2089,3 +2408,121 @@ async def test_a_clarifying_question_can_arrive_without_a_question_argument(
         "the description fallback never fired, or fired out of order"
     )
     assert [d["message"] for d in decisions] == ["answered", "answered"]
+
+
+async def test_a_display_error_from_the_activity_sink_is_not_retried_or_blamed_on_the_reader(
+    build_researcher, scripted_model
+):
+    """A `DisplayError` out of the sink's `on_change` must escape the `task` dispatch guard.
+
+    The sink pushes from INSIDE `awrap_tool_call`, so without the
+    `_PASS_THROUGH_TASK_FAILURES` exclusion `ToolRetryMiddleware` would re-run the whole
+    subagent once and `ToolErrorMiddleware` would then convert the display's own bug into
+    `"READER FAILED (...)"` plus a `subagent_failed` incident -- the wrong component blamed, at
+    double that subagent's token cost.
+
+    The notify COUNT is what discriminates: the exclusion means the dispatch is attempted once,
+    so `on_change` raises once. Drop `DisplayError` from the exclusion and the retry attempts it
+    a second time, making this 2 and swallowing the raise entirely.
+    """
+    from harness.activity import ActivitySink, DisplayError
+
+    researcher_model = scripted_model(
+        [
+            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = scripted_model([AIMessage(content="reader done")])
+
+    notify_calls = 0
+
+    def _exploding_display() -> None:
+        nonlocal notify_calls
+        notify_calls += 1
+        raise DisplayError("the renderer blew up")
+
+    run_log = RunLog()
+    sink = ActivitySink(on_change=_exploding_display)
+    researcher, _ = build_researcher(researcher_model, reader_model, run_log=run_log, sink=sink)
+
+    with pytest.raises(DisplayError):
+        await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    assert notify_calls == 1, "the dispatch was retried -- DisplayError is not being excluded"
+    assert run_log.incidents() == [], "a display bug was recorded as a subagent failure"
+
+
+async def test_a_renderer_crash_mid_dispatch_fails_the_run_cleanly_and_writes_no_report(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """A plain renderer exception during a pushed `ToolCall` becomes a `DisplayError`, escapes
+    the `task` dispatch guard, and lands on `main()`'s existing hard-error path.
+
+    Pins the whole route the `DisplayError` mechanism exists to create: the run is FAILED
+    (exit 1, no report, error on stderr) rather than a soft "READER FAILED" incident inside a
+    report that got written anyway -- and the terminal is still restored, with no traceback
+    escaping under the alternate screen.
+    """
+    from harness.config import AgentSettings
+    from harness.display import ToolCall as ToolCallEvent
+
+    head_model = scripted_model(
+        [
+            _task_call("Angle A", call_id="call_researcher", subagent_type="researcher"),
+            AIMessage(
+                content="Final answer.",
+                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            ),
+        ]
+    )
+    researcher_model = scripted_model(
+        [
+            _task_call("Read it", call_id="call_reader", subagent_type="reader"),
+            AIMessage(content="researcher done"),
+        ]
+    )
+    reader_model = scripted_model([AIMessage(content="reader done")])
+    models_by_role: dict[str, Any] = {
+        "head": head_model,
+        "researcher": researcher_model,
+        "reader": reader_model,
+        "verifier": head_model,
+    }
+
+    config = make_config(
+        agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
+    )
+    patch_run(monkeypatch, config, head_model)
+    monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: models_by_role[role])
+
+    real_build_renderer = main_module.build_renderer
+
+    def _renderer_that_dies_on_a_tool_call() -> Any:
+        inner = real_build_renderer()
+
+        class _Exploding:
+            def emit(self, event: Any) -> None:
+                if isinstance(event, ToolCallEvent):
+                    # A PLAIN exception, not a DisplayError: the point is that the callback
+                    # boundary converts an ordinary renderer bug into the pass-through type.
+                    raise RuntimeError("the renderer blew up")
+                inner.emit(event)
+
+            def suspend(self) -> Any:
+                return inner.suspend()
+
+            def close(self) -> None:
+                inner.close()
+
+        return _Exploding()
+
+    monkeypatch.setattr(main_module, "build_renderer", _renderer_that_dies_on_a_tool_call)
+
+    exit_code, files, out, err = await _run_main(["a question needing research"], config, capsys)
+
+    assert exit_code == 1
+    assert files == [], f"a report was written for a failed run: {files}"
+    assert any(line.startswith("error:") for line in err.splitlines()), err
+    assert "DisplayError" in err, f"the failure was not attributed to the display: {err}"
+    assert "Traceback" not in err

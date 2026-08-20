@@ -41,6 +41,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.messages.ai import UsageMetadata, add_usage
 from rich.console import Console, RenderableType
 
+from harness.activity import ActivitySink, DisplayError
 from harness.config import ConfigError, load_config
 from harness.display import (
     Activity,
@@ -48,12 +49,15 @@ from harness.display import (
     AnswerDraft,
     Question,
     QuestionAnswered,
+    ReaderItem,
+    ReadersUpdated,
     Renderer,
     RoundsUpdated,
     RunFinished,
     StageTracker,
     TodoItem,
     TodosUpdated,
+    ToolCall,
     WelcomeScreen,
     WelcomeView,
     build_help_panel,
@@ -286,6 +290,36 @@ def _sources_read(registry: SourceRegistry) -> int:
     fetched and read.
     """
     return sum(1 for source in registry.all() if source.read_mode != "unread")
+
+
+def _todo_items(
+    todos: list[dict[str, Any]], registry: SourceRegistry, sink: ActivitySink
+) -> tuple[TodoItem, ...]:
+    """Build the `TodosUpdated` snapshot from the graph's raw todo list (Phase 6).
+
+    Only the ACTIVE (`in_progress`) row carries meta: the mockup shows it beside the task in
+    flight, and repeating one run-level total on every row would read as a per-task number it
+    is not. Prefers `"{n} in flight"` from `sink.live_reader_count()` (the mockup's variant)
+    over the older `"{n} sources"` count, since a reader dispatch in progress is more
+    immediately actionable than a running total of what has been read so far; falls back to
+    the sources count when no reader is currently live, and to `None` when neither applies.
+    """
+    sources_read = _sources_read(registry)
+    live_readers = sink.live_reader_count()
+
+    def _meta(status: str) -> str | None:
+        if status != "in_progress":
+            return None
+        if live_readers:
+            return f"{live_readers} in flight"
+        if sources_read:
+            return f"{sources_read} sources"
+        return None
+
+    return tuple(
+        TodoItem(content=todo["content"], status=todo["status"], meta=_meta(todo["status"]))
+        for todo in todos
+    )
 
 
 def _research_tool_calls(node_update: dict[str, Any]) -> list[dict[str, Any]]:
@@ -605,15 +639,6 @@ async def main(argv: list[str] | None = None) -> int:
     for url in extract_urls(question):
         registry.approve(url)
     run_log = RunLog()
-    # Same close/print/exit-1 shape as the preflight loop: `build_agent` resolves every
-    # role through `build_chat_model`, so a missing or TODO role raises `ModelError` here —
-    # unhandled it would escape as a traceback under the alternate screen (PR #18 review).
-    try:
-        agent = build_agent(config, registry, run_log)
-    except ModelError as exc:
-        renderer.close()
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
 
     # Live disclosure (best-effort + disclose): every incident a tool records is echoed to
     # the terminal as soon as the stream yields control back, and `alerts_emitted` keeps a
@@ -626,6 +651,104 @@ async def main(argv: list[str] | None = None) -> int:
         for incident in incidents[alerts_emitted:]:
             renderer.emit(Alert(incident.detail))
         alerts_emitted = len(incidents)
+
+    # Fix-pass item 1: `ActivitySink` PUSHES via `on_change` rather than being drained from the
+    # stream loop -- the middleware writes from inside the lead's `task` tool NODE, and one node
+    # is one superstep, so no top-level `astream` chunk arrives until the whole
+    # researcher->reader pipeline has finished (measured: `live_reader_count() == 0` at every
+    # chunk of a run whose reader genuinely ran). Hoisted here, before `_on_activity_change` and
+    # the sink itself exist, so the callback's `nonlocal`s resolve to real values from its very
+    # first invocation, which can happen from deep inside `build_agent(...)`'s first dispatch.
+    tool_calls_emitted = 0
+    # `last_readers` is the dedupe: without it every mutation would repaint an unchanged strip
+    # (`ReadersUpdated` is a replacement snapshot, not a delta — Contracts).
+    last_readers: tuple[Any, ...] | None = None
+    last_todos: list[dict[str, Any]] | None = None
+    # The live-reader-count half of the todo meta's freshness (Phase 6): the todo LIST dedupe
+    # (`last_todos`, refreshed from the stream loop below) stays as-is, but the active row's
+    # meta must also refresh when a reader dispatch starts or finishes even though the list
+    # itself did not change shape.
+    last_in_flight: int | None = None
+
+    def _emit_new_tool_calls() -> None:
+        nonlocal tool_calls_emitted
+        records = sink.records()
+        for record in records[tool_calls_emitted:]:
+            renderer.emit(
+                ToolCall(
+                    call_id=record.call_id,
+                    tool=record.tool,
+                    arg_summary=record.arg_summary,
+                    result_summary=record.result_summary,
+                    elapsed_seconds=record.elapsed_seconds,
+                    retry=record.retry,
+                )
+            )
+        tool_calls_emitted = len(records)
+
+    def _emit_readers() -> None:
+        nonlocal last_readers
+        readers = sink.readers()
+        if readers == last_readers:
+            return
+        renderer.emit(
+            ReadersUpdated(
+                tuple(
+                    ReaderItem(
+                        id=reader.id,
+                        brief=reader.brief,
+                        status_text=reader.status_text,
+                        done=reader.done,
+                    )
+                    for reader in readers
+                )
+            )
+        )
+        last_readers = readers
+
+    def _on_activity_change() -> None:
+        """Pushed by the `ActivitySink` the instant it changes (fix-pass item 1) -- the single
+        path from a tool-activity mutation to the renderer; the drain calls this replaced are
+        gone from the stream loop below.
+
+        Nothing is swallowed: a failure to build or emit an event is a real bug. But this runs
+        inside `awrap_tool_call`, so a bare exception on a `task` dispatch would be absorbed by
+        that tier's retry/error guard and reported as `"READER FAILED"` after re-running the
+        whole subagent. Re-raised as `DisplayError`, which `harness/agent.py` excludes from that
+        guard, so a display bug fails the run AS a display bug.
+        """
+        nonlocal last_in_flight
+        try:
+            _push()
+        except DisplayError:
+            raise
+        except Exception as exc:
+            raise DisplayError(f"the display failed while rendering tool activity: {exc}") from exc
+
+    def _push() -> None:
+        """`_on_activity_change`'s body, split out so the wrapper above has one `try` to guard."""
+        nonlocal last_in_flight
+        _emit_new_tool_calls()
+        _emit_readers()
+        # The todo LIST dedupe (`last_todos`) stays untouched -- this only refreshes the ACTIVE
+        # row's meta when the live-reader count moved since the last emit, so a reader
+        # starting/finishing mid-dispatch is reflected without re-emitting on every mutation.
+        if last_todos is not None:
+            in_flight = sink.live_reader_count()
+            if in_flight != last_in_flight:
+                renderer.emit(TodosUpdated(_todo_items(last_todos, registry, sink)))
+                last_in_flight = in_flight
+
+    sink = ActivitySink(on_change=_on_activity_change)
+    # Same close/print/exit-1 shape as the preflight loop: `build_agent` resolves every
+    # role through `build_chat_model`, so a missing or TODO role raises `ModelError` here —
+    # unhandled it would escape as a traceback under the alternate screen (PR #18 review).
+    try:
+        agent = build_agent(config, registry, run_log, sink)
+    except ModelError as exc:
+        renderer.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     # One stable thread for the whole run: the checkpointer requires an id, and the
     # interrupt/resume loop below must keep resuming the SAME thread.
@@ -646,7 +769,6 @@ async def main(argv: list[str] | None = None) -> int:
     }
     stream_input: Any = {"messages": [HumanMessage(content=question)]}
 
-    last_todos: list[dict[str, Any]] | None = None
     final_state: dict[str, Any] | None = None
     clock_armed = False
     cut_short: CutShortReason | None = None
@@ -730,30 +852,9 @@ async def main(argv: list[str] | None = None) -> int:
                                     continue
                                 todos = node_update.get("todos")
                                 if todos is not None and todos != last_todos:
-                                    sources_read = _sources_read(registry)
-                                    renderer.emit(
-                                        TodosUpdated(
-                                            tuple(
-                                                TodoItem(
-                                                    content=todo["content"],
-                                                    status=todo["status"],
-                                                    # Only the ACTIVE row carries the count:
-                                                    # the mockup shows meta beside the task in
-                                                    # flight, and repeating one run-level total
-                                                    # on every row would read as a per-task
-                                                    # number it is not.
-                                                    meta=(
-                                                        f"{sources_read} sources"
-                                                        if todo["status"] == "in_progress"
-                                                        and sources_read
-                                                        else None
-                                                    ),
-                                                )
-                                                for todo in todos
-                                            )
-                                        )
-                                    )
+                                    renderer.emit(TodosUpdated(_todo_items(todos, registry, sink)))
                                     last_todos = todos
+                                    last_in_flight = sink.live_reader_count()
                                 calls = _research_tool_calls(node_update)
                                 if calls:
                                     tracker.advance("researching")
@@ -766,6 +867,9 @@ async def main(argv: list[str] | None = None) -> int:
                                         )
                                         clock_armed = True
                                 _note_model_turns(node_update)
+                            # Tool-call/reader-strip/todo-meta refreshes are no longer polled
+                            # here (fix-pass item 1): `_on_activity_change` pushes them the
+                            # instant the sink changes, from inside the tool dispatch itself.
                             _emit_new_alerts()
                             if overrun or (cap_hit and not awaiting_tool_ids):
                                 break
