@@ -1,0 +1,252 @@
+"""Behavioral tests for the welcome screen loop in harness.__main__ (Phase 2)."""
+
+from io import StringIO
+from pathlib import Path
+
+import pytest
+from rich.console import Console
+
+import harness.__main__ as main_module
+from harness.config import RoleConfig
+from harness.input import KeyEvent
+
+_HARNESS_TOML = Path(__file__).resolve().parent.parent / "harness.toml"
+
+
+def _console() -> Console:
+    return Console(file=StringIO())
+
+
+def _type(text: str) -> list[KeyEvent]:
+    return [KeyEvent("char", ch) for ch in text]
+
+
+def test_typing_a_question_then_enter_returns_it(make_config):
+    config = make_config()
+    keys = [*_type("hi"), KeyEvent("enter")]
+
+    result = main_module._run_welcome(config, keys=keys, console=_console())
+
+    assert result == "hi"
+
+
+def test_word_backspace_deletes_the_trailing_word_before_submit(make_config):
+    config = make_config()
+    keys = [
+        *_type("solar tariffs"),
+        KeyEvent("word_backspace"),
+        *_type("prices"),
+        KeyEvent("enter"),
+    ]
+
+    result = main_module._run_welcome(config, keys=keys, console=_console())
+
+    assert result == "solar prices"
+
+
+def test_interrupt_returns_none(make_config):
+    config = make_config()
+    keys = [*_type("something"), KeyEvent("interrupt")]
+
+    result = main_module._run_welcome(config, keys=keys, console=_console())
+
+    assert result is None
+
+
+def test_the_key_source_is_closed_before_the_live_screen_is_torn_down(make_config, monkeypatch):
+    """Risk #1's ordering guarantee, pinned so it does not rest on a manual terminal check.
+
+    `read_keys()` restores `termios` in its `finally`, which runs when the generator is
+    closed. That close must happen BEFORE `Live` leaves the alternate screen, so a Ctrl+C
+    mid-loop cannot leave the terminal in raw mode.
+    """
+    config = make_config()
+    order: list[str] = []
+
+    def _generator_keys():
+        try:
+            yield KeyEvent("interrupt")
+        finally:
+            order.append("keys closed")
+
+    real_screen = main_module.WelcomeScreen
+
+    class _RecordingScreen(real_screen):
+        def __exit__(self, *exc_info):
+            order.append("screen exited")
+            return super().__exit__(*exc_info)
+
+    monkeypatch.setattr(main_module, "WelcomeScreen", _RecordingScreen)
+
+    main_module._run_welcome(config, keys=_generator_keys(), console=_console())
+
+    assert order == ["keys closed", "screen exited"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_kind"),
+    [
+        ("", "empty"),
+        ("   ", "empty"),
+        ("/help", "command"),
+        ("/model", "command"),
+        ("/nope", "unknown"),
+        ("/sources", "unknown"),  # pins the amendment: /sources is dropped, not registered
+        ("what is x", "question"),
+        ("a/b", "question"),
+    ],
+)
+def test_classify_submission_table(text, expected_kind):
+    submission = main_module._classify_submission(text)
+
+    assert submission.kind == expected_kind
+
+
+def test_model_flow_opens_picker_and_applies_the_highlighted_choice(make_config):
+    config = make_config()
+    config.roles["head"] = RoleConfig(
+        provider="opencode", model="glm-5.2", choices=["glm-5.2", "glm-5.3", "kimi-k3", "hy3"]
+    )
+    before = _HARNESS_TOML.read_bytes()
+    keys = [
+        *_type("/model"),
+        KeyEvent("enter"),  # opens the picker, starting on the current model
+        KeyEvent("down"),
+        KeyEvent("down"),
+        KeyEvent("enter"),  # applies the highlighted choice
+        KeyEvent("interrupt"),  # end the loop; nothing left to submit
+    ]
+
+    result = main_module._run_welcome(config, keys=keys, console=_console())
+
+    assert result is None
+    assert config.roles["head"].model == "kimi-k3"  # choices[2], two downs from choices[0]
+    assert _HARNESS_TOML.read_bytes() == before
+
+
+def test_model_picker_clamps_at_both_ends(make_config):
+    config = make_config()
+    config.roles["head"] = RoleConfig(
+        provider="opencode", model="glm-5.2", choices=["glm-5.2", "glm-5.3", "kimi-k3"]
+    )
+    keys = [
+        *_type("/model"),
+        KeyEvent("enter"),  # picker index starts at 0 (current model)
+        KeyEvent("up"),  # must clamp at 0, not wrap to the last entry
+        KeyEvent("down"),
+        KeyEvent("down"),  # now at the last index (2)
+        KeyEvent("down"),  # must clamp at the last index, not wrap to 0
+        KeyEvent("enter"),
+        KeyEvent("interrupt"),
+    ]
+
+    main_module._run_welcome(config, keys=keys, console=_console())
+
+    assert config.roles["head"].model == "kimi-k3"
+
+
+def test_unknown_command_sets_a_notice_and_does_not_exit_the_loop(make_config):
+    config = make_config()
+    keys = [
+        *_type("/nope"),
+        KeyEvent("enter"),
+        *_type("hi"),
+        KeyEvent("enter"),
+    ]
+
+    result = main_module._run_welcome(config, keys=keys, console=_console())
+
+    # The unknown command did not end the loop — a later real question still gets through.
+    assert result == "hi"
+
+
+def test_unknown_command_notice_names_the_command(make_config, monkeypatch):
+    config = make_config()
+    notices: list[str] = []
+
+    class _FakeScreen:
+        def __init__(self, console):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def update(self, view):
+            if view.notice:
+                notices.append(view.notice)
+
+    monkeypatch.setattr(main_module, "WelcomeScreen", _FakeScreen)
+    keys = [*_type("/nope"), KeyEvent("enter"), KeyEvent("interrupt")]
+
+    main_module._run_welcome(config, keys=keys, console=_console())
+
+    assert notices
+    assert "/nope" in notices[0]
+
+
+async def test_main_with_a_question_on_argv_never_enters_the_welcome_loop(make_config, monkeypatch):
+    from harness.models import ModelError
+
+    monkeypatch.setattr(main_module, "load_config", lambda: make_config())
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("_run_welcome must not be called when argv already has a question")
+
+    monkeypatch.setattr(main_module, "_run_welcome", _boom)
+
+    async def _fake_preflight(*args, **kwargs):
+        raise ModelError("stop here — this test only checks _run_welcome was not called")
+
+    # Deferred `from harness.models import preflight` inside `main` rebinds to this patched
+    # attribute at call time, matching the existing pattern in tests/test_agent.py.
+    monkeypatch.setattr("harness.models.preflight", _fake_preflight)
+
+    exit_code = await main_module.main(["a question"])
+
+    assert exit_code == 1
+
+
+async def test_main_with_no_argv_question_reaches_the_welcome_loop(make_config, monkeypatch):
+    monkeypatch.setattr(main_module, "load_config", lambda: make_config())
+    # An interactive terminal is a precondition for the welcome screen: without a tty there
+    # is nothing to drive it, so `main` falls back to argparse's usage error instead (see
+    # the non-tty test below). pytest's captured stdin is not a tty, so say so explicitly.
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    calls = {"count": 0}
+
+    def _fake_run_welcome(config, *, keys, console):
+        calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(main_module, "_run_welcome", _fake_run_welcome)
+
+    exit_code = await main_module.main([])
+
+    assert calls["count"] == 1
+    assert exit_code == 0
+
+
+async def test_no_argv_question_without_a_tty_errors_instead_of_reading_raw_keys(
+    make_config, monkeypatch
+):
+    """Piped stdin / cron / nohup must not reach `read_keys()`.
+
+    Before the welcome screen existed, argparse rejected a missing positional. Entering raw
+    mode on a non-tty raises `termios.error` instead, so the non-interactive path keeps the
+    old usage error.
+    """
+    monkeypatch.setattr(main_module, "load_config", lambda: make_config())
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("_run_welcome must not be called without a tty")
+
+    monkeypatch.setattr(main_module, "_run_welcome", _boom)
+
+    with pytest.raises(SystemExit) as excinfo:
+        await main_module.main([])
+
+    assert excinfo.value.code == 2

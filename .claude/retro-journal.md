@@ -33,3 +33,12 @@
 - dead-end: `langchain-sandbox` / PyodideSandbox — sandboxes code execution in WASM, README states file access is not supported, repo archived and deprecated 2026-01-14 at 0.0.6.
 - gotcha: `deepagents` and `langgraph` are NOT installed in this repo's `.venv` (only `langchain_core` 1.5.3), so library API facts can only be confirmed against GitHub `main`, never the pinned version.
 - decision: restart-after-crash means true mid-run resume via `langgraph-checkpoint-sqlite`'s `SqliteSaver`, not directory reuse — chosen over the cheaper option that reuses captured pages with a fresh agent.
+
+## 2026-08-20 10:49 — /handoff — /implement PLAN-tui-redesign — Phases 4-5 of 6
+- gotcha: CONTRADICTS plan handoff log — `UV_PROJECT_ENVIRONMENT=C:/Users/sting/...` does not exist on this machine; plain `uv run` resolves the worktree `.venv`. Never brief subagents with it.
+- gotcha: `Console.print(some_str, style=...)` loses the style to Rich's `ReprHighlighter`, platform-dependently (POSIX paints paths magenta, Windows only partially) — always `Text(value, style=...)` for dynamic text.
+- gotcha: `assert "38;2;r;g;b" in raw` is too weak to prove a style applied; a shredded line still contains the escape. Assert the whole value in ONE span.
+- gotcha: mypy does not check untyped test bodies, so a test calling a function with a wrong positional argument passes all four quality gates.
+- gotcha: `implement-commit-guard.sh` reads `.claude/implement-state.json` at PreToolUse, before the command runs — setting `commit_allowed` and committing in one compound Bash call is always blocked.
+- dead-end: Bash heredoc (`<<'PY'`) for multi-line Python/markdown fails with `unexpected EOF while looking for matching \`''\`` despite the quoted delimiter; use the Write tool then `uv run python <path>`.
+- decision: a test asserting a flagged risk's outer symptom is not a test of the risk — verify concurrency regression tests BOTH ways (must fail against a deliberately broken implementation) before trusting them.

@@ -474,6 +474,86 @@ def test_guard_settings_model_defaults_enabled():
     assert GuardSettings().enabled is True
 
 
+# --- Phase 2: RoleConfig.choices (/model picker) ----------------------------------------
+
+
+def test_role_choices_defaults_to_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+
+    config = load_config(path)
+
+    assert config.roles["head"].choices is None
+
+
+def test_role_choices_loads_from_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML.replace(
+        '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\n',
+        '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\n'
+        'choices = ["glm-5.2", "glm-5.3", "kimi-k3"]\n',
+    )
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.roles["head"].choices == ["glm-5.2", "glm-5.3", "kimi-k3"]
+
+
+def test_role_choices_empty_list_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML.replace(
+        '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\n',
+        '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\nchoices = []\n',
+    )
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "choices" in str(excinfo.value)
+
+
+# `3` is here deliberately alongside the blank strings: it is rejected by pydantic's own
+# `list[str]` type check, not by `_validate_choices`, and both rejections have to keep
+# surfacing as a `ConfigError` to the operator. Naming which layer catches which is the point
+# -- the previous version of this test read as though the validator handled both (PR #25 review).
+@pytest.mark.parametrize(
+    ("bad_choices", "rejected_by"),
+    [
+        (["glm-5.2", ""], "_validate_choices"),
+        (["glm-5.2", "   "], "_validate_choices"),
+        (["glm-5.2", 3], "pydantic's list[str] type check"),
+    ],
+)
+def test_role_choices_rejects_blank_or_non_string_entries(
+    tmp_path, monkeypatch, bad_choices, rejected_by
+):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML.replace(
+        '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\n',
+        f'[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\nchoices = {bad_choices!r}\n',
+    )
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_shipped_harness_toml_head_role_has_choices_including_current_model(monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "any")
+
+    config = load_config()
+
+    assert config.roles["head"].choices is not None
+    assert config.roles["head"].model in config.roles["head"].choices
+    assert len(config.roles["head"].choices) >= 2
+
+
 def test_dotenv_value_containing_an_equals_sign_survives_intact(tmp_path, monkeypatch):
     """Split on the FIRST `=` only — base64 and URL-shaped secrets routinely contain more."""
     monkeypatch.delenv("OPENCODE_API_KEY", raising=False)

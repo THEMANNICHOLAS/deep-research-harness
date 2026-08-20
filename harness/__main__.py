@@ -26,28 +26,45 @@ import argparse
 import asyncio
 import sys
 import threading
+import tomllib
+from collections.abc import Callable, Iterable
 from contextlib import aclosing
+from dataclasses import dataclass
 from datetime import datetime
 from functools import reduce
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.messages.ai import UsageMetadata, add_usage
+from rich.console import Console, RenderableType
 
+from harness.activity import ActivitySink, DisplayError, brief_summary
 from harness.config import ConfigError, load_config
 from harness.display import (
     Activity,
     Alert,
+    AnswerDraft,
     Question,
+    QuestionAnswered,
+    ReaderItem,
+    ReadersUpdated,
     Renderer,
+    RoundsUpdated,
     RunFinished,
     StageTracker,
     TodoItem,
     TodosUpdated,
+    ToolCall,
+    WelcomeScreen,
+    WelcomeView,
+    build_help_panel,
+    build_model_picker,
     build_renderer,
 )
+from harness.input import KeyEvent, LineBuffer, read_keys, restore_terminal, scoped_keys
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
 from harness.runlog import RunLog
@@ -63,6 +80,8 @@ if TYPE_CHECKING:
 
     from langchain_core.runnables import RunnableConfig
     from langgraph.types import Interrupt
+
+    from harness.config import HarnessConfig
 
 _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -152,48 +171,157 @@ def _final_answer(messages: list[BaseMessage]) -> str:
     return ""
 
 
-async def _read_answer(prompt: str = "> ") -> str:
-    """Read one clarification answer from the terminal without blocking the event loop.
+async def _read_answer(renderer: Renderer, prompt: str = "> ") -> str:
+    """Read one clarification answer without blocking the event loop (risk #2).
 
-    A daemon thread feeding an `asyncio.Future`, not `asyncio.to_thread`: the default
-    executor's workers are NOT daemons, so the timeout fires on schedule but `asyncio.run()`
-    then blocks at interpreter shutdown joining a worker still parked in `input()` — the run
-    would print its cut-short report and hang at an already-dead `> ` prompt.
+    Non-TTY (`not sys.stdin.isatty()`): unchanged from before this phase, byte-for-byte -- a
+    daemon thread feeding an `asyncio.Future`, not `asyncio.to_thread`: the default executor's
+    workers are NOT daemons, so the timeout fires on schedule but `asyncio.run()` then blocks
+    at interpreter shutdown joining a worker still parked in `input()` — the run would print
+    its cut-short report and hang at an already-dead `> ` prompt. The prompt goes to STDERR,
+    not through `input`'s own argument, which writes it with no trailing newline and so put a
+    pending `> ` on the same stdout line as the report path, breaking the frozen "path is the
+    last line of stdout" contract. This is the path CI and piped/scripted runs take — raw mode
+    requires a real tty.
 
-    The prompt goes to STDERR, not through `input`'s own argument, which writes it with no
-    trailing newline and so put a pending `> ` on the same stdout line as the report path,
-    breaking the frozen "path is the final line of stdout" contract.
+    TTY: the `ask_user` overlay is the prompt (no `suspend()`, nothing written to stderr — a
+    write during a `screen=True` Live lands on the alternate screen anyway). A daemon thread
+    runs the blocking `read_keys()` generator and forwards each event through an
+    `asyncio.Queue` via `call_soon_threadsafe`; the async side only ever `await`s that queue,
+    which is what keeps the loop thread free so the wall clock (`asyncio.timeout` in `main`)
+    can still fire while a question is pending.
     """
+    if not sys.stdin.isatty():
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+
+        def _worker() -> None:
+            try:
+                print(prompt, end="", file=sys.stderr, flush=True)
+                answer = input()
+            except (EOFError, OSError):
+                # stdin is closed or unreadable (piped from /dev/null, run under a service
+                # manager). Resolve with nothing rather than dying before `_resolve` is
+                # scheduled, which left `await future` pending forever with no report at all.
+                # `_answer_questions` turns "" into `_NO_ANSWER_GIVEN`, so the model is told
+                # the question went unanswered and the run proceeds to a report like any other.
+                answer = ""
+
+            def _resolve() -> None:
+                # The wall clock may already have cancelled this future — setting a result on
+                # a done future raises `InvalidStateError`.
+                if not future.done():
+                    future.set_result(answer)
+
+            try:
+                loop.call_soon_threadsafe(_resolve)
+            except RuntimeError:
+                # The loop is already closed — nothing left to resolve, and this must not
+                # raise out of a daemon thread.
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return await future
+
     loop = asyncio.get_running_loop()
-    future: asyncio.Future[str] = loop.create_future()
+    queue: asyncio.Queue[KeyEvent] = asyncio.Queue()
 
-    def _worker() -> None:
+    def _key_worker() -> None:
+        with scoped_keys(read_keys()) as keys:
+            for event in keys:
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, event)
+                except RuntimeError:
+                    # The loop is already closed — nothing left to forward.
+                    return
+                if event.kind in ("enter", "interrupt"):
+                    # Return (rather than break) so this happens INSIDE the `with`, letting
+                    # `scoped_keys`' close probe run the generator's own `finally` teardown on
+                    # this, the happy, path.
+                    return
+        # The generator ended without an `enter`/`interrupt` (EOF): forward a synthetic
+        # `enter` so the async side is never left awaiting forever — `_answer_questions`
+        # turns an empty answer into `_NO_ANSWER_GIVEN`.
         try:
-            print(prompt, end="", file=sys.stderr, flush=True)
-            answer = input()
-        except (EOFError, OSError):
-            # stdin is closed or unreadable (piped from /dev/null, run under a service
-            # manager). Resolve with nothing rather than dying before `_resolve` is
-            # scheduled, which left `await future` pending forever with no report at all.
-            # `_answer_questions` turns "" into `_NO_ANSWER_GIVEN`, so the model is told the
-            # question went unanswered and the run proceeds to a report like any other.
-            answer = ""
-
-        def _resolve() -> None:
-            # The wall clock may already have cancelled this future — setting a result on a
-            # done future raises `InvalidStateError`.
-            if not future.done():
-                future.set_result(answer)
-
-        try:
-            loop.call_soon_threadsafe(_resolve)
+            loop.call_soon_threadsafe(queue.put_nowait, KeyEvent("enter"))
         except RuntimeError:
-            # The loop is already closed — nothing left to resolve, and this must not raise
-            # out of a daemon thread.
             pass
 
-    threading.Thread(target=_worker, daemon=True).start()
-    return await future
+    threading.Thread(target=_key_worker, daemon=True).start()
+
+    buffer = LineBuffer()
+    try:
+        while True:
+            # The await is what keeps the wall clock alive: the loop thread stays free while
+            # this is pending, so `asyncio.timeout` can fire even with a question open.
+            event = await queue.get()
+            if event.kind == "enter":
+                break
+            if event.kind == "interrupt":
+                raise KeyboardInterrupt  # R6 -- `main()`'s existing Ctrl+C teardown runs.
+            if event.kind == "char" and event.char is not None:
+                buffer.insert(event.char)
+            elif event.kind == "newline":
+                buffer.newline()
+            elif event.kind == "backspace":
+                buffer.backspace()
+            elif event.kind == "word_backspace":
+                buffer.word_backspace()
+            elif event.kind == "left":
+                buffer.move_left()
+            elif event.kind == "right":
+                buffer.move_right()
+            elif event.kind == "up":
+                buffer.move_up()
+            elif event.kind == "down":
+                buffer.move_down()
+            renderer.emit(AnswerDraft(buffer.text(), buffer.cursor_row, buffer.cursor_col))
+        return buffer.text()
+    finally:
+        # Runs on submit, on `KeyboardInterrupt` above, and on `CancelledError` when the wall
+        # clock expires with the overlay open — the one restore path is idempotent (step 1)
+        # regardless of which of those three ways this is left.
+        restore_terminal()
+
+
+def _sources_read(registry: SourceRegistry) -> int:
+    """How many sources have actually been READ so far — the ledger's per-task meta count (R2).
+
+    `read_mode != "unread"` rather than `len(registry.all())`: a URL is registered the moment
+    it is seen in search results, so the raw count would climb far ahead of anything actually
+    fetched and read.
+    """
+    return sum(1 for source in registry.all() if source.read_mode != "unread")
+
+
+def _todo_items(
+    todos: list[dict[str, Any]], registry: SourceRegistry, sink: ActivitySink
+) -> tuple[TodoItem, ...]:
+    """Build the `TodosUpdated` snapshot from the graph's raw todo list (Phase 6).
+
+    Only the ACTIVE (`in_progress`) row carries meta: the mockup shows it beside the task in
+    flight, and repeating one run-level total on every row would read as a per-task number it
+    is not. Prefers `"{n} in flight"` from `sink.live_reader_count()` (the mockup's variant)
+    over the older `"{n} sources"` count, since a reader dispatch in progress is more
+    immediately actionable than a running total of what has been read so far; falls back to
+    the sources count when no reader is currently live, and to `None` when neither applies.
+    """
+    sources_read = _sources_read(registry)
+    live_readers = sink.live_reader_count()
+
+    def _meta(status: str) -> str | None:
+        if status != "in_progress":
+            return None
+        if live_readers:
+            return f"{live_readers} in flight"
+        if sources_read:
+            return f"{sources_read} sources"
+        return None
+
+    return tuple(
+        TodoItem(content=todo["content"], status=todo["status"], meta=_meta(todo["status"]))
+        for todo in todos
+    )
 
 
 def _research_tool_calls(node_update: dict[str, Any]) -> list[dict[str, Any]]:
@@ -215,13 +343,18 @@ def _research_tool_calls(node_update: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _describe_tool_call(call: dict[str, Any]) -> str:
-    """One activity line describing a researcher-dispatch proposal."""
+    """One activity line describing a researcher-dispatch proposal.
+
+    `brief_summary`, not the raw description: this renders as a wrapping `Activity` line with
+    no render-time truncation, so the model's full delegation prompt painted a paragraph-sized
+    blob that pushed the frame past the terminal height (PR #25 review).
+    """
     args = call.get("args") or {}
-    return f'task(researcher): "{args.get("description", "")}"'
+    return f'task(researcher): "{brief_summary(str(args.get("description", "")))}"'
 
 
 async def _answer_questions(
-    interrupt: Interrupt, renderer: Renderer, registry: SourceRegistry
+    interrupt: Interrupt, renderer: Renderer, registry: SourceRegistry, tracker: StageTracker
 ) -> list[dict[str, Any]]:
     """Render each pending `ask_user` question and collect one answer per action request.
 
@@ -231,14 +364,24 @@ async def _answer_questions(
     An answer is user-supplied text exactly like the initial question, so any URL pasted into
     it is approved here (Phase 4, D2/R2) — the natural reply to "which page do you mean?" is
     the URL itself, and without this it stayed provenance-rejected for the rest of the run.
+
+    The overlay is in-frame now (Phase 5): no `suspend()`. `tracker.pause()`/`resume()` and
+    the `QuestionAnswered` emit sit around `_read_answer` in a `finally`, so a `KeyboardInterrupt`
+    or a wall-clock cancellation mid-question cannot leave the displayed clock paused and the
+    overlay stuck open. The WALL clock (`asyncio.timeout` in `main`) is a different clock
+    entirely (risk #2) and nothing here touches it.
     """
     decisions: list[dict[str, Any]] = []
     for request in interrupt.value["action_requests"]:
         args = request.get("args", {})
         question = args.get("question") or request.get("description") or str(args)
         renderer.emit(Question(question))
-        with renderer.suspend():
-            answer = await _read_answer()
+        tracker.pause()
+        try:
+            answer = await _read_answer(renderer)
+        finally:
+            tracker.resume()
+            renderer.emit(QuestionAnswered())
         for url in extract_urls(answer):
             registry.approve(url)
         # Best-effort + disclose: a bare Enter must not reach the model as an empty tool
@@ -247,12 +390,195 @@ async def _answer_questions(
     return decisions
 
 
+# --- Welcome screen (Phase 2, PLAN-tui-redesign) --------------------------------------------
+#
+# `python -m harness` with no argv `question` drops into an interactive welcome screen instead
+# of erroring on a missing positional (D2 — argv mode itself is unchanged, see `main`).
+
+
+@dataclass
+class _WelcomeState:
+    """Mutable welcome-loop state, separate from the pure `WelcomeView` it renders into."""
+
+    mode: Literal["normal", "model_picker"] = "normal"
+    picker_index: int = 0
+    notice: str | None = None
+    panel: RenderableType | None = None
+
+
+@dataclass(frozen=True)
+class _Command:
+    name: str
+    summary: str
+    handler: Callable[[_WelcomeState, HarnessConfig], None]
+
+
+def _handle_help(state: _WelcomeState, config: HarnessConfig) -> None:
+    rows = [(command.name, command.summary) for command in _COMMANDS.values()]
+    state.panel = build_help_panel(rows)
+
+
+def _handle_model(state: _WelcomeState, config: HarnessConfig) -> None:
+    head = config.roles["head"]
+    choices = head.choices or []
+    state.mode = "model_picker"
+    state.picker_index = choices.index(head.model) if head.model in choices else 0
+    state.panel = build_model_picker(choices, state.picker_index, head.model)
+
+
+# A DATA structure (name -> `_Command`), not an if/elif chain (Contracts): adding `/sources`
+# later is one entry here plus its handler, no change to `_run_welcome`'s loop.
+#
+# That holds for a command that only paints a panel. A command needing its OWN key handling
+# does not get off as cheaply: `_run_welcome`'s `up`/`down`/`enter` branches test
+# `state.mode == "model_picker"` inline, so a second interactive command means a second mode
+# branch in that shared loop. Give `_Command` an optional key handler before adding one,
+# rather than growing the chain this table exists to avoid (PR #25 review).
+_COMMANDS: dict[str, _Command] = {
+    "/help": _Command("/help", "Show available commands and key hints.", _handle_help),
+    "/model": _Command("/model", "Pick the head model for this session.", _handle_model),
+}
+
+
+@dataclass(frozen=True)
+class _Submission:
+    kind: Literal["question", "command", "unknown", "empty"]
+    text: str
+
+
+def _classify_submission(text: str) -> _Submission:
+    """Pure classification of one submitted buffer, table-driven off `_COMMANDS`.
+
+    Rules: empty/whitespace -> `empty`; leading `/` -> looked up in `_COMMANDS` -> `command`
+    or `unknown`; anything else -> `question` (leading non-slash text is a question even if
+    it contains a `/` later, e.g. `"a/b"`).
+    """
+    stripped = text.strip()
+    if not stripped:
+        return _Submission("empty", stripped)
+    if stripped.startswith("/"):
+        if stripped in _COMMANDS:
+            return _Submission("command", stripped)
+        return _Submission("unknown", stripped)
+    return _Submission("question", stripped)
+
+
+def _package_version() -> str:
+    """The version shown in the welcome screen's status bar, read from `pyproject.toml`.
+
+    Not `importlib.metadata.version`: `[tool.uv] package = false` means this project is never
+    actually installed as a package, so that lookup would raise `PackageNotFoundError`.
+    """
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        data = tomllib.load(f)
+    return str(data["project"]["version"])
+
+
+def _run_welcome(
+    config: HarnessConfig, *, keys: Iterable[KeyEvent], console: Console
+) -> str | None:
+    """Drive the welcome screen until a question is submitted or the user aborts.
+
+    `keys`/`console` are the testability seam: tests feed a list of `KeyEvent`s and a
+    `StringIO`-backed `Console`, no terminal involved. Production passes `read_keys()` and a
+    fresh `Console`.
+    """
+    buffer = LineBuffer()
+    state = _WelcomeState()
+    head = config.roles["head"]
+    roles = (
+        ("researcher", config.roles["researcher"].model),
+        ("reader", config.roles["reader"].model),
+        ("verifier", config.roles["verifier"].model),
+    )
+    budget = f"{config.agent.max_rounds} rounds / {config.agent.wall_clock_seconds // 60} min"
+    status_left = f"{Path.cwd()}:searxng@{urlsplit(config.search.base_url).netloc}"
+    status_right = _package_version()
+
+    def _view() -> WelcomeView:
+        panel = state.panel
+        if state.mode == "model_picker" and head.choices:
+            panel = build_model_picker(head.choices, state.picker_index, head.model)
+        return WelcomeView(
+            question=buffer.text(),
+            cursor_col=buffer.cursor_col,
+            cursor_row=buffer.cursor_row,
+            head_model=head.model,
+            roles=roles,
+            budget=budget,
+            status_left=status_left,
+            status_right=status_right,
+            notice=state.notice,
+            panel=panel,
+        )
+
+    # `scoped_keys` (harness/input.py) owns releasing raw mode — the close probe lives once,
+    # next to the generator that sets raw mode, rather than at each call site. Nesting it
+    # INSIDE `WelcomeScreen` is what gives the risk #1 ordering: the key source's `termios`
+    # restore runs BEFORE `WelcomeScreen` leaves the alternate screen, so a Ctrl+C or
+    # exception mid-loop cannot leave the terminal raw. Do not reorder these.
+    with WelcomeScreen(console) as screen, scoped_keys(keys) as key_source:
+        screen.update(_view())
+        for event in key_source:
+            if event.kind == "interrupt":
+                return None
+            elif event.kind == "char" and event.char is not None:
+                buffer.insert(event.char)
+            elif event.kind == "backspace":
+                buffer.backspace()
+            elif event.kind == "word_backspace":
+                buffer.word_backspace()
+            elif event.kind == "left":
+                buffer.move_left()
+            elif event.kind == "right":
+                buffer.move_right()
+            elif event.kind == "newline":
+                buffer.newline()
+            elif event.kind == "up":
+                if state.mode == "model_picker":
+                    state.picker_index = max(0, state.picker_index - 1)
+                else:
+                    buffer.move_up()
+            elif event.kind == "down":
+                if state.mode == "model_picker":
+                    choices = head.choices or []
+                    if choices:
+                        state.picker_index = min(len(choices) - 1, state.picker_index + 1)
+                else:
+                    buffer.move_down()
+            elif event.kind == "enter":
+                if state.mode == "model_picker":
+                    if head.choices:
+                        head.model = head.choices[state.picker_index]
+                    state.mode = "normal"
+                    state.panel = None
+                else:
+                    submission = _classify_submission(buffer.text())
+                    if submission.kind == "question":
+                        return submission.text
+                    if submission.kind == "command":
+                        state.notice = None
+                        _COMMANDS[submission.text].handler(state, config)
+                        buffer = LineBuffer()
+                    elif submission.kind == "unknown":
+                        state.notice = f"unknown command: {submission.text}"
+                        state.panel = None
+                        buffer = LineBuffer()
+                    # empty -> ignore, nothing submitted
+            screen.update(_view())
+    return None
+
+
 async def main(argv: list[str] | None = None) -> int:
     """Run one research question end to end. Returns the process exit code."""
     parser = argparse.ArgumentParser(
         prog="python -m harness", description="Answer one research question with cited sources."
     )
-    parser.add_argument("question", help="The research question to answer.")
+    # `nargs="?"`: `python -m harness "<question>"` still parses identically to before this
+    # phase — only an ABSENT question now falls through to the welcome screen below, rather
+    # than argparse itself erroring on a missing required positional (D2).
+    parser.add_argument("question", nargs="?", help="The research question to answer.")
     args = parser.parse_args(argv)
 
     try:
@@ -260,6 +586,22 @@ async def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    question = args.question
+    if not question and not sys.stdin.isatty():
+        # No question AND no interactive terminal (piped stdin, cron, nohup): the welcome
+        # screen cannot be driven, and `read_keys()` would raise a bare `termios.error`
+        # putting stdin in raw mode. Restore the pre-welcome behavior for this case — the
+        # same usage message argparse produced when `question` was a required positional.
+        parser.error("the following arguments are required: question")
+    if not question:
+        # Production passes the raw `read_keys()` generator and a fresh `Console` — see
+        # `_run_welcome`'s own docstring for the testability seam and the terminal-teardown
+        # ordering this relies on.
+        question = _run_welcome(config, keys=read_keys(), console=Console())
+        if question is None:
+            # Ctrl+C or EOF out of the welcome screen: a clean exit, no run started, no report.
+            return 0
 
     # The renderer starts BEFORE the heavy imports and the preflight call: together they are
     # several silent seconds, and a terminal that shows nothing through them reads as hung.
@@ -309,18 +651,9 @@ async def main(argv: list[str] | None = None) -> int:
     # Phase 4 strict provenance (D2/R2): a pasted "read this page" URL is the only other
     # sanctioned way a URL becomes fetchable (no `--url` flag) — approved here, before the
     # agent runs, so it is fetchable from the run's very first tool call.
-    for url in extract_urls(args.question):
+    for url in extract_urls(question):
         registry.approve(url)
     run_log = RunLog()
-    # Same close/print/exit-1 shape as the preflight loop: `build_agent` resolves every
-    # role through `build_chat_model`, so a missing or TODO role raises `ModelError` here —
-    # unhandled it would escape as a traceback under the alternate screen (PR #18 review).
-    try:
-        agent = build_agent(config, registry, run_log)
-    except ModelError as exc:
-        renderer.close()
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
 
     # Live disclosure (best-effort + disclose): every incident a tool records is echoed to
     # the terminal as soon as the stream yields control back, and `alerts_emitted` keeps a
@@ -333,6 +666,104 @@ async def main(argv: list[str] | None = None) -> int:
         for incident in incidents[alerts_emitted:]:
             renderer.emit(Alert(incident.detail))
         alerts_emitted = len(incidents)
+
+    # Fix-pass item 1: `ActivitySink` PUSHES via `on_change` rather than being drained from the
+    # stream loop -- the middleware writes from inside the lead's `task` tool NODE, and one node
+    # is one superstep, so no top-level `astream` chunk arrives until the whole
+    # researcher->reader pipeline has finished (measured: `live_reader_count() == 0` at every
+    # chunk of a run whose reader genuinely ran). Hoisted here, before `_on_activity_change` and
+    # the sink itself exist, so the callback's `nonlocal`s resolve to real values from its very
+    # first invocation, which can happen from deep inside `build_agent(...)`'s first dispatch.
+    tool_calls_emitted = 0
+    # `last_readers` is the dedupe: without it every mutation would repaint an unchanged strip
+    # (`ReadersUpdated` is a replacement snapshot, not a delta — Contracts).
+    last_readers: tuple[Any, ...] | None = None
+    last_todos: list[dict[str, Any]] | None = None
+    # The live-reader-count half of the todo meta's freshness (Phase 6): the todo LIST dedupe
+    # (`last_todos`, refreshed from the stream loop below) stays as-is, but the active row's
+    # meta must also refresh when a reader dispatch starts or finishes even though the list
+    # itself did not change shape.
+    last_in_flight: int | None = None
+
+    def _emit_new_tool_calls() -> None:
+        nonlocal tool_calls_emitted
+        records = sink.records()
+        for record in records[tool_calls_emitted:]:
+            renderer.emit(
+                ToolCall(
+                    call_id=record.call_id,
+                    tool=record.tool,
+                    arg_summary=record.arg_summary,
+                    result_summary=record.result_summary,
+                    elapsed_seconds=record.elapsed_seconds,
+                    retry=record.retry,
+                )
+            )
+        tool_calls_emitted = len(records)
+
+    def _emit_readers() -> None:
+        nonlocal last_readers
+        readers = sink.readers()
+        if readers == last_readers:
+            return
+        renderer.emit(
+            ReadersUpdated(
+                tuple(
+                    ReaderItem(
+                        id=reader.id,
+                        brief=reader.brief,
+                        status_text=reader.status_text,
+                        done=reader.done,
+                    )
+                    for reader in readers
+                )
+            )
+        )
+        last_readers = readers
+
+    def _on_activity_change() -> None:
+        """Pushed by the `ActivitySink` the instant it changes (fix-pass item 1) -- the single
+        path from a tool-activity mutation to the renderer; the drain calls this replaced are
+        gone from the stream loop below.
+
+        Nothing is swallowed: a failure to build or emit an event is a real bug. But this runs
+        inside `awrap_tool_call`, so a bare exception on a `task` dispatch would be absorbed by
+        that tier's retry/error guard and reported as `"READER FAILED"` after re-running the
+        whole subagent. Re-raised as `DisplayError`, which `harness/agent.py` excludes from that
+        guard, so a display bug fails the run AS a display bug.
+        """
+        nonlocal last_in_flight
+        try:
+            _push()
+        except DisplayError:
+            raise
+        except Exception as exc:
+            raise DisplayError(f"the display failed while rendering tool activity: {exc}") from exc
+
+    def _push() -> None:
+        """`_on_activity_change`'s body, split out so the wrapper above has one `try` to guard."""
+        nonlocal last_in_flight
+        _emit_new_tool_calls()
+        _emit_readers()
+        # The todo LIST dedupe (`last_todos`) stays untouched -- this only refreshes the ACTIVE
+        # row's meta when the live-reader count moved since the last emit, so a reader
+        # starting/finishing mid-dispatch is reflected without re-emitting on every mutation.
+        if last_todos is not None:
+            in_flight = sink.live_reader_count()
+            if in_flight != last_in_flight:
+                renderer.emit(TodosUpdated(_todo_items(last_todos, registry, sink)))
+                last_in_flight = in_flight
+
+    sink = ActivitySink(on_change=_on_activity_change)
+    # Same close/print/exit-1 shape as the preflight loop: `build_agent` resolves every
+    # role through `build_chat_model`, so a missing or TODO role raises `ModelError` here —
+    # unhandled it would escape as a traceback under the alternate screen (PR #18 review).
+    try:
+        agent = build_agent(config, registry, run_log, sink)
+    except ModelError as exc:
+        renderer.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     # One stable thread for the whole run: the checkpointer requires an id, and the
     # interrupt/resume loop below must keep resuming the SAME thread.
@@ -351,9 +782,8 @@ async def main(argv: list[str] | None = None) -> int:
             config.agent.max_rounds * _BACKSTOP_SUPERSTEPS_PER_ROUND + _BACKSTOP_FLOOR
         ),
     }
-    stream_input: Any = {"messages": [HumanMessage(content=args.question)]}
+    stream_input: Any = {"messages": [HumanMessage(content=question)]}
 
-    last_todos: list[dict[str, Any]] | None = None
     final_state: dict[str, Any] | None = None
     clock_armed = False
     cut_short: CutShortReason | None = None
@@ -388,6 +818,7 @@ async def main(argv: list[str] | None = None) -> int:
                     continue
                 counted_turn_ids.add(message.id)
             rounds_used += 1
+            renderer.emit(RoundsUpdated(rounds_used, max_rounds))
             if rounds_used > max_rounds:
                 overrun = True
             elif rounds_used == max_rounds:
@@ -436,17 +867,9 @@ async def main(argv: list[str] | None = None) -> int:
                                     continue
                                 todos = node_update.get("todos")
                                 if todos is not None and todos != last_todos:
-                                    renderer.emit(
-                                        TodosUpdated(
-                                            tuple(
-                                                TodoItem(
-                                                    content=todo["content"], status=todo["status"]
-                                                )
-                                                for todo in todos
-                                            )
-                                        )
-                                    )
+                                    renderer.emit(TodosUpdated(_todo_items(todos, registry, sink)))
                                     last_todos = todos
+                                    last_in_flight = sink.live_reader_count()
                                 calls = _research_tool_calls(node_update)
                                 if calls:
                                     tracker.advance("researching")
@@ -459,6 +882,9 @@ async def main(argv: list[str] | None = None) -> int:
                                         )
                                         clock_armed = True
                                 _note_model_turns(node_update)
+                            # Tool-call/reader-strip/todo-meta refreshes are no longer polled
+                            # here (fix-pass item 1): `_on_activity_change` pushes them the
+                            # instant the sink changes, from inside the tool dispatch itself.
                             _emit_new_alerts()
                             if overrun or (cap_hit and not awaiting_tool_ids):
                                 break
@@ -483,7 +909,9 @@ async def main(argv: list[str] | None = None) -> int:
                     # fanning several into one decisions list would mis-pair them.
                     stream_input = Command(
                         resume={
-                            "decisions": await _answer_questions(interrupts[0], renderer, registry)
+                            "decisions": await _answer_questions(
+                                interrupts[0], renderer, registry, tracker
+                            )
                         }
                     )
                     continue
@@ -585,7 +1013,7 @@ async def main(argv: list[str] | None = None) -> int:
             )
 
     outcome = RunOutcome(
-        question=args.question,
+        question=question,
         answer=answer,
         registry=registry,
         usage=usage,
@@ -623,6 +1051,7 @@ async def main(argv: list[str] | None = None) -> int:
                 cut_short=cut_short,
                 verification_failures=len(verification.check_failures) if verification else 0,
                 incidents=len(run_log.incidents()),
+                report_path=path,
             )
         )
     finally:
@@ -631,14 +1060,13 @@ async def main(argv: list[str] | None = None) -> int:
     # terminal — stderr included, it shares the device — while the Live runs lands on the
     # alternate screen and is discarded with it. Down here the normal buffer is restored, so
     # the detail survives the run (Phase 4's "the no-report error message becomes visible").
-    if path is not None:
-        print(path)
-    elif cut_short == "wall_clock":
-        # The wall clock fired before a final answer existed (risk #2's blank/whitespace-answer
-        # case lands here too, via `has_answer`).
-        print("error: the wall clock expired before a final answer existed", file=sys.stderr)
-    else:
-        print(f"error: {cut_short_detail}", file=sys.stderr)
+    if path is None:
+        if cut_short == "wall_clock":
+            # The wall clock fired before a final answer existed (risk #2's blank/whitespace-answer
+            # case lands here too, via `has_answer`).
+            print("error: the wall clock expired before a final answer existed", file=sys.stderr)
+        else:
+            print(f"error: {cut_short_detail}", file=sys.stderr)
     return 0 if should_write_report else 1
 
 

@@ -4,13 +4,21 @@ Every test driving a real graph does so via `build_agent`: nothing about deepage
 only the model and — for the `__main__` tests — config loading, `preflight` and `_read_answer`.
 """
 
+import asyncio
+import threading
+import time
+
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 import harness.__main__ as main_module
 from harness.agent import build_agent
+from harness.config import AgentSettings
+from harness.display import PlainRenderer
+from harness.input import KeyEvent
 from harness.sources import SourceRegistry
 from harness.tools.ask_user import build_ask_user_tool
-from tests.conftest import drain_stdout, patch_model, patch_run
+from tests.conftest import drain_stdout, install_search_transport, patch_model, patch_run
 
 _THREAD = {"configurable": {"thread_id": "test-thread"}}
 
@@ -30,7 +38,10 @@ def _patch_main(monkeypatch, config, model, answers=None):
 
     queued = list(answers or [])
 
-    async def _fake_read_answer(prompt: str = "> ") -> str:
+    # `*_args, **_kwargs`, not `prompt: str = "> "` (Phase 5, step 12): `_read_answer` gains a
+    # leading `renderer` positional argument, and this fake must accept whatever shape the call
+    # site passes without caring — the assertions in every test below stay exactly as they are.
+    async def _fake_read_answer(*_args: object, **_kwargs: object) -> str:
         if answers is None:
             raise AssertionError("_read_answer was called, but this run should never ask")
         if not queued:
@@ -260,3 +271,178 @@ def test_the_ask_user_tool_is_shaped_like_the_other_harness_tools(make_config):
     assert tool.description
     assert tool.response_format == "content_and_artifact"
     assert "question" in tool.args_schema.model_json_schema()["properties"]
+
+
+# --- Phase 5: in-place overlay, the two clocks (risk #2) -----------------------------------
+
+
+async def test_wall_clock_fires_while_a_question_is_pending(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """The risk #2 test. The wall clock (`asyncio.timeout` in `main`) must keep running while
+    `ask_user` is awaiting an answer — nothing about answering a question may pause, reschedule,
+    or extend it. `_read_answer` is patched with a fake that outlives the bound but never blocks
+    the event loop (a plain `asyncio.sleep`), isolating exactly that property: the outer timeout
+    scope around `_answer_questions` must still fire on schedule with the question pending
+    inside it, not only after `_read_answer` eventually returns on its own.
+    """
+    agent = AgentSettings(
+        wall_clock_seconds=1,
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+
+    task_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": "Research widgets", "subagent_type": "researcher"},
+                "id": "call_task",
+            }
+        ],
+    )
+    search_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
+    )
+    researcher_report = AIMessage(content="Researcher report (no citations yet).")
+    ask = AIMessage(content="", tool_calls=[_ask("Narrower scope?", "call_ask")])
+    model = scripted_model([task_call, search_call, researcher_report, ask])
+    patch_run(monkeypatch, config, model)
+
+    async def _fast_search(request):
+        import httpx
+
+        return httpx.Response(200, json={"query": "widgets", "results": []})
+
+    install_search_transport(monkeypatch, _fast_search)
+
+    # Without this flag the test passes vacuously: if the scripted graph stops reaching the
+    # `ask_user` interrupt, the wall clock still fires and `elapsed` is still small, while the
+    # test no longer exercises "fired WHILE a question was pending" at all.
+    asked: list[None] = []
+
+    async def _slow_answer(*_args: object, **_kwargs: object) -> str:
+        asked.append(None)
+        await asyncio.sleep(3)
+        return "Narrower."
+
+    monkeypatch.setattr(main_module, "_read_answer", _slow_answer)
+
+    started = time.monotonic()
+    exit_code = await main_module.main(["Research widgets"])
+    elapsed = time.monotonic() - started
+
+    captured = capsys.readouterr()
+    assert asked, "the run never reached the ask_user interrupt -- this test proved nothing"
+    assert exit_code == 1
+    assert "wall clock" in captured.err, captured.err
+    # Well under the full 3s sleep: the timeout must have fired near the 1s bound WHILE the
+    # question was pending, not merely after `_read_answer` returned on its own.
+    assert elapsed < 2.5, f"run took {elapsed}s -- the wall clock did not fire while pending"
+
+
+async def test_ctrl_c_while_the_overlay_is_open_restores_the_terminal(monkeypatch):
+    """R6: an interrupt key while `_read_answer`'s TTY branch is reading must propagate as
+    `KeyboardInterrupt` (so `main()`'s existing Ctrl+C teardown runs) and must restore the
+    terminal on the way out, via `harness.input.restore_terminal` (step 1) rather than a raw
+    mode left dangling on a parked daemon thread.
+    """
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    # Stands in for real terminal input on the (should-be-unused, TTY branch) daemon thread of
+    # the non-TTY fallback path, so this test cannot hang waiting on the real stdin if the
+    # implementation has not yet branched on `isatty()`.
+    def _unreachable_input() -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _unreachable_input)
+
+    def _fake_read_keys():
+        yield KeyEvent("interrupt")
+
+    monkeypatch.setattr(main_module, "read_keys", _fake_read_keys)
+
+    import harness.input as input_module
+
+    restore_calls: list[None] = []
+    monkeypatch.setattr(input_module, "_restore", lambda: restore_calls.append(None), raising=False)
+
+    with pytest.raises(KeyboardInterrupt):
+        await main_module._read_answer(PlainRenderer())
+
+    assert restore_calls == [None], "the terminal restore did not run"
+
+
+async def test_the_overlay_key_loop_leaves_the_event_loop_free(monkeypatch):
+    """Risk #2's actual content, and the property no other test pins: the TTY key path must read
+    keys OFF the loop thread.
+
+    The wall-clock tripwire above patches `_read_answer` away wholesale, and the Ctrl+C test's
+    fake key source yields immediately -- both stay GREEN against a rewrite that iterated
+    `read_keys()` synchronously on the loop thread, which would stop `asyncio.timeout` from ever
+    firing while a question is pending. That is the regression this test exists to catch.
+
+    The fake key source BLOCKS without yielding, standing in for a human who has not typed yet.
+    Read on a worker thread, the loop stays free and `wait_for` times out -- what we assert.
+    Read on the loop thread, the loop is wedged, the timer cannot fire, and the coroutine instead
+    runs to completion and returns an answer, so `pytest.raises` fails. The watchdog releases the
+    block either way, so a blocking implementation fails the suite rather than hanging it.
+    """
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    # Belt-and-braces, as in the Ctrl+C test: if the implementation ever stopped branching on
+    # `isatty()`, this makes the non-TTY path fail loudly instead of parking on real stdin.
+    def _unreachable_input() -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _unreachable_input)
+
+    blocked = threading.Event()
+
+    def _fake_read_keys():
+        blocked.wait()
+        yield KeyEvent("enter")
+
+    monkeypatch.setattr(main_module, "read_keys", _fake_read_keys)
+
+    watchdog = threading.Timer(2.0, blocked.set)
+    watchdog.start()
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(main_module._read_answer(PlainRenderer()), 0.2)
+    finally:
+        watchdog.cancel()
+        blocked.set()
+
+
+async def test_read_answer_non_tty_falls_back_to_the_input_bridge(monkeypatch):
+    """Non-TTY runs (CI, piped/scripted invocations) must keep taking the `input()` bridge
+    byte-for-byte, never the raw-mode key loop — so the eight existing `ask_user` tests above
+    pass by design, not by accident of the test environment.
+    """
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    input_calls: list[None] = []
+
+    def _fake_input() -> str:
+        input_calls.append(None)
+        return "an answer"
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    read_keys_calls: list[None] = []
+
+    def _fake_read_keys():
+        read_keys_calls.append(None)
+        yield KeyEvent("interrupt")
+
+    monkeypatch.setattr(main_module, "read_keys", _fake_read_keys)
+
+    answer = await main_module._read_answer(PlainRenderer())
+
+    assert answer == "an answer"
+    assert input_calls == [None]
+    assert read_keys_calls == [], "the raw-mode key loop ran on a non-TTY path"

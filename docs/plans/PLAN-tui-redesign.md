@@ -1,6 +1,6 @@
 # PLAN: TUI Redesign
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-17
 **Type:** Single plan
 
@@ -27,9 +27,11 @@ without changing the loop's reasoning, stage semantics, or verification behavior
   current free-text activity tail), and a reader-subagent strip present only while
   reader tasks are in flight.
 - **R3** — The welcome screen accepts the research question interactively (arrow-key
-  line editing, Enter runs it) and supports exactly `/help`, `/sources`, `/model`
+  line editing, Enter runs it) and supports exactly `/help`, ~~`/sources`,~~ `/model`
   (an up/down-navigable picker over `roles.head.choices` in `harness.toml`, session-
-  only — never written to disk). Invoking with a question already on argv
+  only — never written to disk). ~~`/sources`~~ dropped 2026-08-19 — see
+  `## Reconciliations`; the command dispatch table must stay trivially extensible so it
+  can be added later without reshaping the welcome loop. Invoking with a question already on argv
   (`python -m harness "<question>"`) skips the welcome screen entirely — the existing
   scripted/CI path is unchanged.
 - **R4** — `ask_user` renders as an in-place cyan overlay inside the running frame
@@ -208,7 +210,10 @@ Inherits every `## Intent` non-goal — not re-listed.
   run (existing `_reader_failure_message` behavior is unchanged).
 
 ### D5: `/sources` reads a new small per-run manifest, not raw capture files
-- **Chosen:** at run end, write `<workspace_dir>/<run_id>/sources.json`
+**MOOT as of 2026-08-19 — `/sources` dropped from scope; see `## Reconciliations`. The
+entire decision below is struck and NOT implemented. No `sources.json` is written and
+`report.py`'s `_is_usable` stays report-private.**
+- ~~**Chosen:** at run end, write `<workspace_dir>/<run_id>/sources.json`~~
   (`{run_id, question, sources: [{id, url, title, outcome}], usable, unusable}`)
   alongside the existing `sources/S<n>.md` captures; `/sources` reads the newest
   run's manifest by directory mtime.
@@ -222,20 +227,20 @@ Inherits every `## Intent` non-goal — not re-listed.
 | ID | Outcome | Covered by |
 |----|---------|------------|
 | R1 | Five screens faithful to mockup | Phase 2 (welcome), Phase 3 (running pane), Phase 5 (overlay), Phase 1/existing (finished) |
-| R2 | Task meta, round/elapsed, tool-call log, reader strip | Phase 3 (ledger/stage/log), Phase 6 (reader strip) |
-| R3 | Interactive welcome + 3 commands | Phase 1 (input foundation), Phase 2 (welcome+commands) |
+| R2 | Task meta, round/elapsed, tool-call log, reader strip | Phase 3 (ledger/stage), Phase 6 (reader strip + tool-call log) |
+| R3 | Interactive welcome + ~~3~~ 2 commands (`/sources` dropped) | Phase 1 (input foundation), Phase 2 (welcome+commands) |
 | R4 | ask_user in-place overlay | Phase 5 |
 | R5 | Finished summary + inline report path | Phase 4 |
 | R6 | Clean exit on new input paths | Phase 1 (foundation), Phase 5 (overlay Ctrl+C) |
 | R7 | Modern truecolor terminals | Final verification (manual, WezTerm) |
 
 ## Progress
-- [ ] Phase 1: Raw-key input foundation
-- [ ] Phase 2: Welcome screen and slash commands
-- [ ] Phase 3: Running pane — task meta, stage round/elapsed, structured tool log
-- [ ] Phase 4: Finished summary — inline report path
-- [ ] Phase 5: ask_user in-place overlay
-- [ ] Phase 6: Reader-strip visibility hook
+- [x] Phase 1: Raw-key input foundation
+- [x] Phase 2: Welcome screen and slash commands
+- [x] Phase 3: Running pane — task meta, stage round/elapsed (~~structured tool log~~ → Phase 6)
+- [x] Phase 4: Finished summary — inline report path
+- [x] Phase 5: ask_user in-place overlay
+- [x] Phase 6: Reader-strip visibility hook + structured tool-call log
 - [ ] Final verification
 
 ## Phases
@@ -275,14 +280,14 @@ beyond the contract (Home/End/Delete/history are not in any R).
    existing coverage posture — see `## Notes`) and `LineBuffer`.
 3. Run the tests; confirm they PASS (green).
 **Acceptance criteria:**
-- [ ] `uv run mypy .` clean on the new module.
+- [x] `uv run mypy .` clean on the new module.
 
 ### Phase 2: Welcome screen and slash commands
 **Risk:** flagged (!#2)
 **Test-first:** required
 **Goal:** The welcome screen per the mockup (wordmark, styled input box, hints, roles
 line, tip, status bar), driven by Phase 1's `LineBuffer`/key reader; `/help`,
-`/sources`, `/model` (up/down picker over `roles.head.choices`) dispatch; argv
+~~`/sources`,~~ `/model` (up/down picker over `roles.head.choices`) dispatch; argv
 invocation still skips it entirely (D2).
 **Requirements:** R1, R3
 **Assumes:**
@@ -314,8 +319,9 @@ in `display.py`; `_StrictModel`/`ConfigDict(extra="forbid")` convention in `conf
 editing; any other slash command; writing `harness.toml`; changing what argv-mode
 invocation does.
 **Tests (write first, confirm red):**
-- [ ] Slash parsing: `/help`, `/sources`, `/model` dispatch; unknown `/x` renders an
-  error hint; leading non-slash text is a question.
+- [ ] Slash parsing: `/help`, ~~`/sources`,~~ `/model` dispatch; unknown `/x` renders an
+  error hint; leading non-slash text is a question. Add: an unregistered-but-reserved
+  name is treated as unknown, proving the dispatch table is data, not branches.
 - [ ] `/model` picker: up/down moves the highlight through `roles.head.choices` with
   boundary clamping; Enter applies the highlighted model to the session config only.
 - [ ] Welcome renderable contains hints, roles line, and the CURRENT head model name
@@ -336,35 +342,42 @@ invocation does.
 **Risk:** none
 **Test-first:** required
 **Goal:** Extend the existing running screen: task items carry optional meta text
-(e.g. "14 sources"), the stage line shows elapsed time and `round N/max_rounds`, and
+(e.g. "14 sources"), the stage line shows elapsed time and `round N/max_rounds`, ~~and
 the free-text activity tail becomes a structured tool-call log (tool / arg summary /
-result / timing, retry rows styled distinctly).
+result / timing, retry rows styled distinctly)~~ — the tool-call log MOVED TO PHASE 6
+on 2026-08-19 (see `## Reconciliations`); it needs data this top-level stream cannot
+see.
 **Requirements:** R1, R2
 **Assumes:**
-- None beyond what already exists on `development`.
+- ~~None beyond what already exists on `development`.~~ FALSE for the tool log — see
+  `## Reconciliations`. True for the remaining scope (task meta + stage line), which
+  needs nothing new.
 **Files:**
 - `harness/display.py` — modify: `TodoItem` gains optional `meta: str | None`; stage
-  line rendering gains elapsed+round; new `ToolCall` event (tool, arg_summary,
+  line rendering gains elapsed+round; ~~new `ToolCall` event (tool, arg_summary,
   result_summary, elapsed_seconds, retry: bool) replacing free-text `Activity` for
-  tool invocations (`Activity` stays for non-tool-call activity lines, if any remain).
-- `harness/__main__.py` — modify: emit `ToolCall` events from the existing
+  tool invocations~~ (moved to Phase 6). `Activity` is UNCHANGED and keeps its five
+  existing non-tool-call emission sites.
+- `harness/__main__.py` — modify: ~~emit `ToolCall` events from the existing
   `node_update` parsing (where `_RESEARCH_TOOLS`/tool-call proposals are already
-  read) instead of collapsing them to text; pass `rounds_used`/`max_rounds` alongside
+  read) instead of collapsing them to text;~~ pass `rounds_used`/`max_rounds` alongside
   `StageStarted`/existing stage tracking so the stage line can show them.
 - `tests/test_display.py`, `tests/test_agent.py` (or equivalent stream-parsing tests)
   — modify.
-**Diff budget:** ~400-600 lines across 3 files
+**Diff budget:** ~~~400-600~~ ~200-320 lines across 3 files (tool log moved out)
 **Reuse:** `StageTracker` (extend, don't fork); existing `Console(record=True)`-style
 assertion pattern in `tests/test_display.py`.
 **Contracts:** none new external — purely internal event/rendering extension.
-**Out of scope:** Reader strip (Phase 6); ask_user overlay (Phase 5); any change to
-what tools exist or how they're invoked.
+**Out of scope:** Reader strip (Phase 6); the structured tool-call log (MOVED to Phase 6
+2026-08-19 — it requires the `agent.py` middleware Phase 6 already owns); ask_user
+overlay (Phase 5); any change to what tools exist or how they're invoked.
 **Tests (write first, confirm red):**
 - [ ] Task ledger renders per-task meta when present, omits it when absent.
 - [ ] Stage line renders `HH:MM · round N/max_rounds` alongside the existing spinner
   and stage name.
-- [ ] Tool-call log renders tool/arg/result/timing columns; a retried call is styled
-  distinctly; overlong arg/result text truncates with ellipsis instead of wrapping.
+- [ ] ~~Tool-call log renders tool/arg/result/timing columns; a retried call is styled
+  distinctly; overlong arg/result text truncates with ellipsis instead of wrapping.~~
+  MOVED to Phase 6.
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
 2. Implement the event/model extensions and `__main__.py` wiring.
@@ -385,22 +398,27 @@ single reportpath unit; no other change to finished-screen content.
   `_summary_lines`/`RichRenderer`/`PlainRenderer` render it as one trailing block.
 - `harness/__main__.py` — modify: pass the report path into the existing
   `RunFinished` emission instead of a separate `print`.
-- `tests/test_display.py`, `tests/test_main_*.py` — modify (existing "report path is
-  the last line of stdout" pinned test must still pass unchanged for argv mode).
+- `tests/test_display.py`, ~~`tests/test_main_*.py`~~ — modify (existing "report path is
+  the last line of stdout" pinned test must still pass unchanged for argv mode). The
+  `test_main_*.py` glob is struck 2026-08-20 — no such file holds the pin; see
+  `## Reconciliations` for where it actually lives and what it actually asserts.
 **Diff budget:** ~120-200 lines across 3 files
 **Reuse:** existing `_summary_lines` helper (extend, don't fork).
 **Contracts:** none new — additive field on an existing event.
 **Out of scope:** Any change to report content or the frozen stdout-last-line
 contract itself.
 **Tests (write first, confirm red):**
-- [ ] `RunFinished` with a `report_path` renders it inline in both renderers.
-- [ ] Existing "report path is the last line of stdout" test still passes unchanged.
+- [x] `RunFinished` with a `report_path` renders it inline in both renderers.
+- [x] Existing "report path is the last line of stdout" test still passes unchanged.
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
 2. Implement the field and wiring.
 3. Run the tests; confirm they PASS (green).
 **Acceptance criteria:**
-- [ ] `uv run pytest tests/test_display.py tests/test_main_*.py` green.
+- [x] ~~`uv run pytest tests/test_display.py tests/test_main_*.py` green.~~ Amended
+  2026-08-20 (`## Reconciliations`): `uv run pytest tests/test_display.py
+  tests/test_ask_user.py tests/test_agent.py` green — the files that actually pin the
+  last-line contract.
 
 ### Phase 5: ask_user in-place overlay
 **Risk:** flagged (!#2)
@@ -421,20 +439,25 @@ via Phase 1's line editor, retracting on submit.
   `input()` bridge with Phase 1's raw-key loop feeding the overlay's `LineBuffer`
   (D3); preserve the existing behavior that the wall clock keeps running while
   answering.
-- `tests/test_display.py`, `tests/test_main_*.py` — modify.
-**Diff budget:** ~350-500 lines across 3 files
-**Reuse:** Phase 1 `LineBuffer`/key reader (D3); existing `StageTracker`.
+- `harness/input.py` — modify: ADDED to this phase 2026-08-20, developer-approved; gains an
+  idempotent `restore_terminal()`. See `## Reconciliations`.
+- `tests/test_display.py`, `tests/test_input.py`, `tests/test_ask_user.py`,
+  `tests/test_agent.py` — modify. (~~`tests/test_main_*.py`~~ struck: that glob matches only
+  Phase 2's unrelated welcome-screen tests, as Phase 4 already established.)
+**Diff budget:** ~350-500 lines across ~~3~~ 4 source files (source came in at 397)
+**Reuse:** Phase 1 `LineBuffer`/key reader (D3); existing `StageTracker`; Phase 2's per-row
+cursor placement, extracted to a shared `_build_cursor_rows`.
 **Contracts:** none new external.
 **Out of scope:** Multi-question queuing (one pending question at a time, as today);
 overlay fade animation beyond appear/retract; any change to WHEN `ask_user` may be
 called (still clarifying-stage-only, per the existing `interrupt_on` registration).
 **Tests (write first, confirm red):**
-- [ ] With a question pending, the running-screen render shows the cyan overlay in
+- [x] With a question pending, the running-screen render shows the cyan overlay in
   place of the log region while ledger and stage line remain, and typed characters
   echo inline.
-- [ ] After submit, the overlay retracts and the log/stage line resume; the stage
+- [x] After submit, the overlay retracts and the log/stage line resume; the stage
   clock elapsed time excludes the paused interval.
-- [ ] Ctrl+C while the overlay is open still restores the terminal cleanly (R6).
+- [x] Ctrl+C while the overlay is open still restores the terminal cleanly (R6).
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
 2. Implement the overlay, pause/resume, and the raw-key answer path.
@@ -460,10 +483,15 @@ narrow, additive middleware mirroring the existing `_ReaderDigestMiddleware` pat
   `SourceRegistry`/`RunLog` already are (D4).
 - `harness/display.py` — modify: `ReadersUpdated(readers: tuple[ReaderItem, ...])`
   event, `ReaderItem(id, brief, status_text, done: bool)`; strip renderable, present
-  only when non-empty.
+  ~~only when non-empty~~ only while at least one reader is LIVE. Struck 2026-08-20:
+  "non-empty" contradicted this phase's own test bullet and R2 ("present only while
+  reader tasks are in flight") and was implemented literally the first time round —
+  see `## Reconciliations`.
 - `harness/__main__.py` — modify: build and pass the shared reader-activity sink into
   `build_agent` alongside the existing `SourceRegistry`/`RunLog`.
-- `tests/test_agent.py`, `tests/test_display.py` — modify.
+- `harness/activity.py` — new: ADDED to this phase 2026-08-20, developer-approved at the
+  plan-review gate. The sink itself, mirroring `harness/runlog.py`. See `## Reconciliations`.
+- `tests/test_agent.py`, `tests/test_display.py`, `tests/test_activity.py` (new) — modify/new.
 **Diff budget:** ~350-500 lines across 4 files
 **Reuse:** `_ReaderDigestMiddleware`'s exact wrapping pattern (`harness/agent.py`) —
 the phase's named reuse target; existing reader-failure handling
@@ -473,14 +501,27 @@ the phase's named reuse target; existing reader-failure handling
   surfaces via the EXISTING `_reader_failure_message`/incident path, not duplicated
   here.
 **Out of scope:** Nested reader→reader visibility; any change to reader dispatch
-concurrency, retry, or failure semantics; researcher-tier visibility (only the
+concurrency, ~~retry, or failure semantics~~ retry or failure semantics — AMENDED
+2026-08-20, developer-approved: one narrow change was made, adding `DisplayError` to the
+`task` guard's pass-through failures so a renderer bug is not reported as a reader failure.
+See `## Reconciliations`; researcher-tier visibility (only the
 reader tier gets a strip, per the mockup).
+**ABSORBED FROM PHASE 3 (2026-08-19 — see `## Reconciliations`):** the structured
+tool-call log. The same middleware that reports reader dispatch must also report every
+tool call from the nested tiers (tool name, argument summary, result summary, elapsed,
+retry flag) as a `ToolCall` event, replacing the free-text activity tail for tool
+invocations. This is why the log lives here and not in Phase 3: the nested tiers' tool
+calls never reach `__main__.py`'s top-level stream, so the log needs the very hook this
+phase adds. `Activity` keeps its five non-tool-call emission sites. Add to this phase's
+tests: tool/arg/result/timing columns render, a retried call is styled distinctly, and
+overlong arg/result text truncates with an ellipsis rather than wrapping. Revised diff
+budget: ~550-750 lines across 4 files.
 **Tests (write first, confirm red):**
-- [ ] N reader dispatches (scripted researcher tool calls) each produce a start and
+- [x] N reader dispatches (scripted researcher tool calls) each produce a start and
   a done/failed `ReadersUpdated` transition without ID collisions.
-- [ ] The strip renders only while at least one reader is live; renders nothing
+- [x] The strip renders only while at least one reader is live; renders nothing
   otherwise (R2's presence rule).
-- [ ] A reader that fails still completes the run (existing `_reader_failure_message`
+- [x] A reader that fails still completes the run (existing `_reader_failure_message`
   behavior unchanged) and is reflected as a failed, not stuck-live, strip row.
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -491,10 +532,13 @@ reader tier gets a strip, per the mockup).
   filling and clearing as readers complete, matching the mockup's fan-out screen.
 
 ## Verification
-- [ ] `uv run pytest` green (CI enforces the 90% floor on `harness/`).
-- [ ] `uv run ruff check .` && `uv run ruff format --check .` && `uv run mypy .` clean.
+- [x] `uv run pytest` green (CI enforces the 90% floor on `harness/`). 650 passed, coverage
+  96% — 2026-08-20.
+- [x] `uv run ruff check .` && `uv run ruff format --check .` && `uv run mypy .` clean —
+  2026-08-20.
 - [ ] Manual on WezTerm (dev) AND over SSH on the homelab: full walkthrough —
-  `python -m harness` (welcome, `/help`, `/sources`, `/model`) → a real question →
+  `python -m harness` (welcome, `/help`, ~~`/sources`,~~ `/model` — `/sources` was dropped
+  2026-08-19, see `## Reconciliations`) → a real question →
   clarify overlay (answer it) → researching with visible readers → finished summary
   with inline report path; separately, `python -m harness "<question>"` still runs
   argv-mode unchanged with its stdout contract intact.
@@ -544,9 +588,464 @@ reader tier gets a strip, per the mockup).
   (`harness/agent.py`, 7 phases, each with a recorded live-check) that meets or
   exceeds what that plan proposed to build. This plan was rewritten from scratch
   against `development`'s real code rather than patched.
+- 2026-08-19 — Phase 2: R3 bound "exactly `/help`, `/sources`, `/model`", but the plan
+  assigned `/sources` a data source (D5's per-run `sources.json`) that NO phase's file
+  list ever writes — `/sources` would have read a manifest nothing produced. Raised as a
+  plan gap rather than improvised. **Developer decision: drop `/sources` entirely — "not
+  needed yet" — and instead require that command dispatch be extensible enough to add it
+  later without reshaping the welcome loop.** Amendment, authoritative over the struck
+  text above: Phase 2 ships exactly TWO commands, `/help` and `/model`. D5 is MOOT and
+  not implemented — no `sources.json` is written, and `report.py`'s `_is_usable` stays
+  report-private (so Phase 2 no longer touches `report.py` at all). Command dispatch must
+  be a DATA structure (name → handler mapping), not an if/elif chain, so adding
+  `/sources` later is one table entry plus its handler; a test asserts an unregistered
+  name falls through to the unknown-command hint. Consequence for the mockup: the
+  welcome tip line "Run /sources to see what the last run captured" would advertise a
+  command that does not exist, so it renders the `/help` tip instead — a Preference-level
+  deviation from R1's mockup fidelity, permitted by `## Intent`'s Preferences clause.
+- 2026-08-19 — Phase 3: the phase's step "emit `ToolCall` events from the existing
+  `node_update` parsing (where `_RESEARCH_TOOLS`/tool-call proposals are already read)"
+  rests on a premise this plan contradicts elsewhere. There is no `_RESEARCH_TOOLS`
+  constant, and the tool calls the mockup's log shows (`search_web`, `fetch_pages`,
+  retry rows) execute inside the researcher/reader subgraphs and NEVER reach
+  `harness/__main__.py`'s top-level `astream` — exactly as this plan's own
+  `## Codebase Map` records for `agent.py` ("which this top-level stream never sees").
+  Only `task(subagent_type="researcher")` dispatches are observable there, so Phase 3's
+  `**Assumes:** None beyond what already exists` was false and the log could not be built
+  as written. **Developer decision: split Phase 3 — ship task meta + stage round/elapsed
+  now, and MOVE the structured tool-call log to Phase 6**, whose already-sanctioned
+  `agent.py` middleware (D4) is the only place the nested tiers' tool calls are visible.
+  Deciding axis: whether the log must show real nested tool activity (it must, for R1/R2
+  fidelity), which forces it behind an `agent.py` hook. This keeps the plan's
+  one-`agent.py`-touch constraint intact — one middleware, one flagged review — instead of
+  adding a second instrumentation point ahead of Phase 6. R2 is now covered by Phase 3
+  (ledger/stage) plus Phase 6 (reader strip + tool log); Phase 3's diff budget drops to
+  ~200-320 lines and Phase 6's rises to ~550-750.
+- 2026-08-19 — Phase 2: the mockup's roles line (`subagent … · verifier … · budget …`)
+  encodes the stale two-role model that `## Constraints` already overrides with the real
+  four roles. Developer decision: the roles line renders `researcher · reader ·
+  verifier · budget`, all read from config — the head model is omitted there because the
+  input box's mode row already shows it. Same four-slot shape as the mockup, no
+  duplication, no hidden role.
+- 2026-08-20 — Phase 4: two premises in the phase spec were false, one of them
+  constraining the design. (1) `**Files:**` named `tests/test_main_*.py` as the home of the
+  "report path is the last line of stdout" pin; the only matching file is
+  `tests/test_main_welcome.py` (Phase 2's welcome-screen tests, unrelated). The pin actually
+  lives in `tests/test_display.py` (4 sites), `tests/test_ask_user.py` (3 sites) and
+  `tests/test_agent.py` (1 site), so the acceptance command as written would have run the
+  welcome tests and MISSED every file this phase endangers. (2) The pin is STRONGER than the
+  plan's paraphrase: `tests/test_agent.py:1128-1132` does not merely check
+  `endswith(".md")` — it takes `lines[-1].strip()` as a path, asserts `Path(...).exists()`
+  and that its parent is `reports_dir`. So the last stdout line must stay a BARE, existing
+  path; any label prefix (`report: <path>`) on that line breaks it, and so does anything
+  printed to stdout after the summary. **Developer decision (deciding axis: whether mockup
+  fidelity may cost a frozen machine-readable contract — it may not):** render the mockup's
+  `reportpath` block as a dim `report written` label line followed by the bare path on its
+  OWN line in the accent color, as the summary's trailing lines; drop the mockup's accent
+  LEFT-BORDER on the path line rather than imitate it, since the border character would sit
+  exactly where the bare path must start. This is a Preference-level mockup deviation,
+  permitted by `## Intent`'s Preferences clause. The mockup's dim explanatory sentence BELOW
+  the reportpath block stays out of scope (it would also take the last-line slot).
+  `harness/__main__.py`'s bare `print(path)` is removed as the phase spec directs; both
+  renderers' `close()` print nothing, so the summary genuinely becomes the last stdout
+  output. Amended file list and acceptance command are struck in place above.
+- 2026-08-20 — Phase 5: the phase's `**Files:**` list covered only `display.py`,
+  `__main__.py` and tests, but the overlay's key reader has to run on a daemon thread (the async
+  side must only ever `await`, or the event loop is blocked and the `asyncio.timeout` wall clock
+  can never fire — risk #2's failure mode reached from an unexpected direction). Raw mode is
+  process-global state owned by whoever set it, and a thread parked in a blocking read cannot be
+  made to give it back: `read_keys()`'s generator is EXECUTING, so it cannot be closed from the
+  main thread, and a wall-clock cancellation abandons that daemon with its `finally` unrun —
+  leaving the operator's shell in raw mode with no echo. **Developer decision (deciding axis:
+  whether Phase 5 may widen its file list to make terminal restore structural — it may):** add
+  `harness/input.py` to the phase, with a module-level registered restore closure and an
+  idempotent `restore_terminal()` that `read_keys()`' own `finally` and the overlay's `finally`
+  both call. One restore path, safe to call twice and from either thread. The rejected
+  alternative — accept a raw tty on wall-clock expiry and log it — was declined; pausing the
+  wall clock while the overlay is open was never on the table, being forbidden by the phase
+  spec.
+
+- 2026-08-20 — Phase 6: three amendments, two of them developer decisions at the plan-review
+  gate and one a contradiction the 3F review caught after implementation.
+  (1) **File list widened, developer-approved:** the sink lives in a NEW `harness/activity.py`
+  (plus `tests/test_activity.py`) rather than inside `harness/agent.py`. Deciding axis: whether
+  the sink's import and test path may stay free of `deepagents`. D4 says to thread it "like
+  `SourceRegistry`/`RunLog` already are", and both of those live in their own module precisely
+  so producer and consumer need not import each other; `agent.py`'s docstring claims to be the
+  only module importing `deepagents` (a documented ~2s import cost), so a plain data collector
+  there would route `__main__.py` and its tests through the framework. Same class of widening
+  as Phase 5's `harness/input.py`.
+  (2) **Middleware registers on the researcher and reader tiers ONLY, not the lead,**
+  developer-approved. Deciding axis: whether the whole log comes from one code path or the
+  lead's dispatch keeps its existing line. Consequence: `harness/__main__.py`'s
+  `Activity(_describe_tool_call(call))` and its pinned assertion in `tests/test_display.py`
+  stay untouched, so one free-text row sits alongside the structured rows; the mockup's
+  lead-tier `write_file:` rows are absent (Preference-level deviation, permitted by
+  `## Intent`). `_middleware()` is not touched at all, which keeps the `agent.py` surface for
+  risk #3 smaller than planned.
+  (3) **The sink cannot be DRAINED from the top-level stream — it must PUSH.** The first
+  implementation followed this plan's D4 analogy to `RunLog` all the way, including how
+  `RunLog` is consumed: a high-water-mark drain beside `_emit_new_alerts()` in the stream
+  loop. Measured with a throwaway probe (a lead dispatching a researcher that dispatches a
+  0.5s reader, recording `sink.live_reader_count()` at every top-level chunk): the reader
+  dispatch demonstrably happened (1 reader, 2 records) yet the live count was **0 at all 12
+  chunks**, as were in-flight tool calls. Cause: the middleware writes from inside the lead's
+  `task` tool NODE, and one node is one superstep — the entire researcher->reader pipeline
+  runs within it, so no top-level chunk arrives until every reader has already finished. Every
+  live behaviour this phase adds (`running...`, `waiting on N readers`, `{n} in flight` task
+  meta, and the strip "filling and clearing") was therefore unreachable at runtime, and R2's
+  presence rule could never be exercised. **Developer decision (deciding axis: whether the
+  display is updated by whoever writes the sink, or the top-level stream stays the only thing
+  that talks to the renderer):** `ActivitySink` gains an `on_change` callback; `__main__.py`
+  passes one that emits `ToolCall`/`ReadersUpdated`/`TodosUpdated` to the renderer directly, so
+  a frame repaints when the middleware writes. D4 is otherwise intact — same shared sink,
+  same threading, same events; only who drives the repaint changed. Rejected: `subgraphs=True`
+  on `astream` (nested AIMessages would reach `_note_model_turns` and inflate `rounds_used`,
+  breaking the tested round cap unless filtered by namespace — more risk, in the file the round
+  budget lives in); and accepting a post-hoc-only log (gives up most of the phase's purpose).
+  **The general lesson, for any future nested-tier visibility work: `RunLog`'s drain works only
+  because an incident needs to be EVENTUALLY visible. Anything that must be visible LIVE cannot
+  be read from the top-level stream at all.**
+- 2026-08-20 — Phase 6, fourth amendment: **the phase's `**Out of scope:**` ban on changing
+  retry/failure semantics is narrowed, developer-approved.** Consequence of amendment (3): the
+  sink now pushes from inside `awrap_tool_call`, so an exception out of the display callback
+  lands inside `_task_dispatch_guard` — `ToolRetryMiddleware` re-runs the whole subagent once and
+  `ToolErrorMiddleware` then converts it to `"READER FAILED (...)"` plus a `subagent_failed`
+  incident. A display bug would masquerade as a reader failure at double that subagent's token
+  cost. Deciding axis: whether the phase's own no-change-to-failure-semantics constraint may be
+  narrowed to stop the display being blamed on the reader — the developer's call was that it may.
+  Implemented as `harness/activity.py`'s `DisplayError` plus a single
+  `_PASS_THROUGH_TASK_FAILURES = (SearchUnavailableError, DisplayError)` tuple in
+  `harness/agent.py`, so the retry predicate and the error handler cannot drift into disagreeing
+  about which failures are the subagent's fault. `harness/__main__.py`'s callback re-raises any
+  ordinary exception as `DisplayError`; `main()`'s existing broad `except Exception` then treats
+  it as a hard error, which the fail-fast invariant already turns into no report, exit 1, and a
+  restored terminal via `finally: renderer.close()` — so nothing new was needed there. Pinned
+  BOTH ways: dropping `DisplayError` from the tuple makes the run swallow the error entirely
+  ("DID NOT RAISE"), which was verified before the test was trusted. `DisplayError` lives in
+  `activity.py`, not `display.py`, so `agent.py` can name it without importing the display
+  layer — that dependency would point the wrong way.
+
+- 2026-08-20 — Phase 3/R1: the running pane's footer renders `Ctrl+C to exit` alone, while
+  the mockup (`docs/design/deep-research-tui.html:338`, `:437`) puts a muted right-hand span
+  opposite it on BOTH running screens — `run 2f41 - 14 usable - 2 unusable`, and
+  `- 17 sources captured`. Surfaced by the PR #25 review as an UNDISCLOSED deviation: the
+  other three mockup trims are recorded here, this one was not, and `## Intent`'s Preferences
+  clause scopes its status-bar allowance to the welcome screen. Recorded rather than built:
+  the counts exist (`partition_sources`), but `RichRenderer` holds no `SourceRegistry` today,
+  so rendering them means giving the renderer a data dependency on the source registry — a
+  design change, not a fidelity touch-up. **Deviation, Preference-level: the running footer
+  ships without run stats.** Revisit if the registry is ever plumbed into the renderer for
+  another reason; it is not worth that wiring on its own.
+
+- 2026-08-20 — second PR #25 review pass (screenshot-driven), five fixes: (1) the stage
+  spinner is now ONE renderer-held `Spinner` updated per frame — a fresh instance per
+  `_build_renderable` call rendered frame 0 forever and never rotated; (2) `build_welcome`
+  returns a `Layout` — hero (wordmark/entry/tip) centered on both axes, status bar pinned
+  to the bottom row — instead of a top-stacked `Group`, matching `#screen-welcome`'s
+  `justify-content` rules; the entry column is capped at `_ENTRY_WIDTH` (the mockup's
+  `width:min(760px,100%)`); (3+4) model-authored `task` descriptions are summarized at the
+  emit layer by `harness/activity.py`'s new `brief_summary` (first sentence, 80-char cap) —
+  applied in `ActivitySink.start_reader`, `_summarize_tool_args`' task branch, and
+  `_describe_tool_call`, since render-time ellipsis never protected the plain renderer or
+  the wrapping `Activity` line; (5) `decode_windows` maps `\x7f` (Ctrl+Backspace), which
+  previously inserted a literal DEL char into the buffer. Ctrl+Backspace is wired as
+  word-delete on both platforms: new `word_backspace` key kind, `LineBuffer.word_backspace`
+  (spaces then word, joins lines at col 0), handled in both key loops. On POSIX `\x08` now
+  decodes as `word_backspace` rather than plain backspace — a terminal sending `^H` for
+  plain Backspace deletes a word instead of a character there (accepted; xterm-likes send
+  `\x7f` for Backspace and `\x08` for Ctrl+Backspace).
 
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution. Append-only. -->
+- 2026-08-19 — Phase 1: `## Notes`' coverage-policy line says Phase 1's `# pragma: no
+  cover` "match[es] how the repo already treats similarly thin I/O". It does not — a
+  repo-wide grep finds ZERO `pragma` occurrences in `harness/` and no
+  `[tool.coverage.report] exclude_lines` in `pyproject.toml`. Phase 1 introduces the
+  FIRST pragma in the codebase. The directive itself is unchanged and was followed as
+  written (inline pragma + one-line reason, no coverage-config `omit`, no broad
+  exclusion); only the "already exists" justification was false. Noted so a later phase
+  does not cite Phase 1's pragma as long-standing precedent.
+- 2026-08-19 — Phase 1 review, DEFERRED to Phases 2/5: `read_keys()` is a bare
+  generator, so tty restore runs in its `finally` only when the consumer closes the
+  iterator (loop exit or GC). A consumer that parks the iterator on an object and keeps
+  running leaves the terminal raw — exactly risk #1's failure mode, left as a consumer
+  obligation rather than made structurally impossible. Deferred deliberately: the plan's
+  own risk #1 mitigation assigns terminal-restore proof to Phases 2 and 5's Ctrl+C
+  acceptance checks. Preferred fix when Phase 2 wires it: wrap `read_keys` in a
+  `contextlib.contextmanager` so raw mode is scoped by `with`, not by GC.
+- 2026-08-19 — Phase 1 review, SIMPLIFY (deferred, behavior-changing): `read_keys`'
+  POSIX branch builds a per-keystroke `pending` list and a nested `read_char` closure
+  purely so the loop can peek for EOF before decoding. Now that both decoders return
+  `None` on `""`, the loop could pass `sys.stdin.read(1)` directly and drop the closure —
+  but only if the loop no longer needs to distinguish "EOF, stop iterating" from "ignore
+  this key", which today it does. Not mechanical; revisit if Phase 2's contextmanager
+  rework touches this loop anyway.
+- 2026-08-19 — Phase 2 review, DEFERRED (developer chose to defer): `/model` on a role
+  whose config omits `choices` enters picker mode before checking it, so the user sees an
+  empty "Select model" panel with inert up/down and a silent Enter, and no notice saying
+  why. Unreachable from the shipped `harness.toml` (which now defines 19 choices) but
+  reachable from any config omitting the key, which `RoleConfig`'s validator deliberately
+  permits. Fix when touched: check `choices` BEFORE setting `mode="model_picker"` and set a
+  notice instead.
+- 2026-08-19 — Phase 2 review, SIMPLIFY (deferred): `harness/display.py`'s `_OK` / `_CYAN`
+  palette constants are defined but unused this phase. Kept deliberately — the palette is
+  transcribed from the mockup once so it lives in exactly one place (CLAUDE.md), and
+  Phases 3/5/6 render the ok/cyan states. Drop them if those phases land without using
+  them. Second item: `state.panel = build_model_picker(...)` in `_run_welcome` is
+  recomputed by `_view()` on every path where `choices` is non-empty, so the picker is
+  built twice per keystroke; the eager assignment only matters in the empty-choices case
+  above, and both should be resolved together.
+- 2026-08-19 — Phase 3 review, DEFERRED: `RoundsUpdated` is emitted BEFORE the round-overrun
+  check in `harness/__main__.py`, so an overrun turn paints `round 51/50` in the stage line
+  for one frame. Harmless, but reads as a bug to an operator. Fix when that area is touched:
+  emit after the check.
+- 2026-08-19 — Phase 3, KNOWN LIMITATION of the task-meta wiring: `meta` is recomputed only
+  when the todo list itself changes (the `todos != last_todos` dedupe), so the `N sources`
+  count can lag behind reality between todo updates. Re-emitting `TodosUpdated` on every
+  stream chunk would spam the frame, so the dedupe stays. Phase 6 owns the mockup's other
+  meta variant (`3 in flight`, which needs reader visibility) and will need live-updating
+  meta anyway — resolve both together there.
+- 2026-08-20 — Phase 4 review, FIXED (recorded because Phases 5 and 6 will hit it):
+  `Console.print(some_str, style=...)` does NOT reliably apply that style. Rich runs a raw
+  string through console MARKUP parsing (a `[` in the text raises `MarkupError` from inside
+  `emit`) and through `ReprHighlighter`, whose per-token colours OVERRIDE the `style=`
+  argument. For a filesystem path this is platform-dependent: on POSIX the highlighter claims
+  the whole path and paints it magenta, so the requested colour never appears; on Windows the
+  backslash form does not match its path pattern, so the colour survives on the separators
+  while the date digits come out repr-number cyan. The Phase 4 accent test passed on the
+  Windows dev box against exactly that bug and would have gone RED on the Linux CI runner.
+  Two lessons: (1) render any dynamic, styled string as `Text(value, style=...)` — the
+  convention `harness/display.py` already uses at its `Question` and `Alert` sites — and add
+  `soft_wrap=True` when the value must stay on one copy-pasteable line; (2) an
+  `assert "38;2;r;g;b" in raw` style assertion is too weak to catch this, because a shredded
+  line still contains the escape somewhere. Assert the whole value inside ONE span:
+  `f"[38;2;{r};{g};{b}m{value}[0m" in raw`. Phase 5's overlay and Phase 6's tool-call
+  log and reader strip all render dynamic text with explicit styles.
+- 2026-08-20 — Phase 5: `Renderer.suspend()` / `RichRenderer._suspend()` are now
+  PRODUCTION-UNREACHABLE. `_answer_questions` was their only caller and the overlay replaced it.
+  Deliberately kept: `suspend` is a `Renderer` protocol member and four tests still pin its
+  Live start/stop behavior, so removing it plus its tests is scope creep inside a flagged phase.
+  Delete it in a later cleanup if nothing claims it.
+- 2026-08-20 — Phase 5 review, SIMPLIFY (report, correctly deferred): the
+  `KeyEvent` -> `LineBuffer` dispatch chain now exists TWICE — the overlay's key loop in
+  `_read_answer` and Phase 2's welcome loop. That is the second occurrence, and CLAUDE.md's rule
+  is to factor out when the same lines are about to appear a THIRD time, so both stay inline for
+  now. A shared `_apply_key(buffer, event)` collapses them when a third consumer appears.
+- 2026-08-20 — Phase 5 review, FIXED, and the lesson generalises: a test asserting the flagged
+  risk's OUTER symptom is not a test of the risk. The wall-clock tripwire patches `_read_answer`
+  away wholesale and the Ctrl+C test's fake key source yields immediately, so BOTH stayed green
+  against a rewrite that read keys synchronously on the loop thread — the exact regression risk
+  #2 names. The test that actually discriminates blocks the fake key source on a
+  `threading.Event` and asserts `asyncio.wait_for(..., 0.2)` raises `TimeoutError`, i.e. the loop
+  was alive to time out, with a watchdog releasing the block so a blocking implementation fails
+  rather than hangs. It was verified BOTH ways before being trusted: it passes against the
+  shipped shape and fails against a deliberately blocking one. Phase 6's middleware is also
+  concurrency-shaped — hold its tests to the same standard.
+- 2026-08-20 — Phase 5, KNOWN OPERATOR HAZARD (accepted, disclosed on screen): the clock the
+  overlay freezes is RUN elapsed, while the WALL clock that terminates the run keeps counting.
+  A run can therefore be cut short at a wall time the visible `MM:SS` never displayed. R4 and the
+  mockup both require the pause, so it stays; the overlay's note line reads `clock paused while
+  the agent waits` rather than the mockup's `stage clock paused ...`, because what freezes is not
+  a per-stage timer.
+
+- 2026-08-20 — Phase 6: the phase's `**Reuse:**`/`**Contracts:**` name `_reader_failure_message`
+  as the existing reader-crash path. NO SUCH FUNCTION EXISTS anywhere in `harness/` (repo-wide
+  grep). The real mechanism is a `"READER FAILED (...)"`-prefixed `status="error"` `ToolMessage`
+  built by `_task_failure_handler` through `ToolErrorMiddleware`, plus a `RunLog` incident of
+  kind `subagent_failed`, pinned by two existing tests. The instruction it encoded — leave that
+  path untouched — was executable as written and was followed, so this is a stale symbol name
+  rather than a contradiction. Noted so a later phase does not go looking for the function.
+- 2026-08-20 — Phase 6, KNOWN LIMITATION of the tool log's `retry` flag: `_task_dispatch_guard`
+  scopes its `ToolRetryMiddleware` to `tools=["task"]`, so the only retries this middleware can
+  observe are SUBAGENT DISPATCH retries. The mockup shows a retry row for `search_web`; search's
+  own retry lives inside the tool and is invisible here, so that row shape exists but only ever
+  renders for a retried `task`.
+- 2026-08-20 — Phase 6 review, FIXED: `note_reader_source`/`_reader_sources` were written by
+  NOTHING in the whole diff, so the mockup's `done · 4 sources · 38s` status could never be
+  produced by a real run — only a hand-built `ReaderItem` in a display test made it look
+  exercised. Deleted rather than given an invented producer (the only candidate was parsing a
+  count out of a result summary, which is guessing). Reader status is now `done · {elapsed}`: a
+  Preference-level mockup deviation, permitted by `## Intent`. If a real source count is wanted
+  later, the honest producer is the registry, which `_ReaderDigestMiddleware` already holds.
+- 2026-08-20 — Phase 6 review, FIXED, and it generalises to any future push-based event source:
+  `RichRenderer.emit` honored no `_closed` flag. Harmless while the stream loop was the only
+  emitter, but the activity sink now pushes from inside middleware, so a dispatch unwinding under
+  cancellation can emit AFTER `close()` — and every branch calls `_start_live()` when
+  `_live is None`, which would re-enter the alternate screen and hide the cursor with nothing
+  left to stop it. `emit` now returns early when closed, the same guard `_suspend` already had.
+  Verified both ways (disabling the guard fails the new test).
 
 ## Phase Handoff Log
 <!-- Written by /implement at each phase gate. Append-only. MUST remain the LAST section. -->
+
+### 2026-08-19 — Phase 1: Raw-key input foundation
+- Done: New `harness/input.py` (`KeyEvent`/`KeyKind`, `decode_posix`, `decode_windows`,
+  `read_keys`, `LineBuffer`) and `tests/test_input.py` (42 tests, three parametrized
+  tables). Contracts landed exactly as pinned. Both decoders return `None` on the `""`
+  EOF sentinel — a review fix applied before commit, since Phases 2 and 5 call them
+  directly. 554 tests pass; ruff/format/mypy clean; `harness/input.py` at 91%, package
+  total 97% against CI's 90% floor.
+- Learned: (1) The stale-worktree warning in `## Notes` is RESOLVED — commit `de4c18f`
+  merged `development` in, and `git diff development -- harness/` is empty, so this
+  worktree is a valid implementation base after all. (2) `uv` cannot create a `.venv`
+  inside this worktree — Windows Application Control blocks it. Every `uv` command must
+  run with `UV_PROJECT_ENVIRONMENT=C:/Users/sting/Documents/ai-harness-fun-project/.venv`
+  (developer-approved 2026-08-19); brief every implementation subagent with this or its
+  first command fails. (3) `harness/` uses frozen dataclasses + `Literal` aliases, never
+  pydantic, for small value types; tests use tuple-form `@pytest.mark.parametrize`.
+- Drift: none. Two `## Discoveries` entries logged (false pragma precedent in `## Notes`;
+  deferred `read_keys` teardown + simplify).
+- Watch-next: Phase 2 wires `read_keys()` for the first time. Wrap it in a
+  `contextlib.contextmanager` so raw-mode restore is scoped by `with` rather than by the
+  consumer closing the generator — that is the deferred half of risk #1, and Phase 2's
+  Ctrl+C acceptance check is where it must be proven. Also: Phase 2's `harness.toml`
+  `choices` list of 19 model display names is marked UNCONFIRMED in the plan and must be
+  confirmed with the developer before implementing, not invented.
+
+### 2026-08-19 — Phase 2: Welcome screen and slash commands
+- Done: Welcome screen per the mockup (verbatim block-glyph wordmark, accent-bar input box
+  with reverse-video cursor, hints, roles line, tip, status bar), `_COMMANDS` dispatch
+  TABLE with `/help` + `/model`, `RoleConfig.choices` + 19 slug IDs under `[roles.head]`,
+  and `nargs="?"` so argv mode is untouched. `/model` mutates the session config only —
+  a test asserts `harness.toml` is byte-identical after a pick. 589 tests pass; all four
+  gates clean; coverage 97% (display 99%, config 100%, `__main__` 94%).
+- Learned: (1) The implementation subagent DIED on an API error mid-verification; all six
+  files were already written, so I finished the gates myself rather than respawning —
+  check `git status` before assuming a dead worker did nothing. (2) The review caught a
+  Major the whole green gate missed: `cursor_col` is a PER-ROW column, and rendering it
+  against the newline-joined text drew the cursor on the wrong line. Fixed by returning
+  one `Text` per line (`_build_ask_rows`); the regression guard that actually catches it
+  through the public API is the accent-bar count test. (3) A non-tty stdin now gets
+  argparse's usage error instead of a `termios` traceback — so any test exercising the
+  welcome loop must `monkeypatch.setattr("sys.stdin.isatty", lambda: True)`.
+- Drift: YES — `/sources` dropped and D5 made MOOT by developer decision; two
+  `## Reconciliations` entries are authoritative over the struck text. Phase 2 ships TWO
+  commands, not three, and never touches `report.py`.
+- Watch-next: Phase 3 renders the running pane. Reuse the palette constants already in
+  `harness/display.py` (`_OK`/`_CYAN` are defined and waiting) rather than adding literal
+  colors — if Phase 3 ends up not using them, drop them per the logged SIMPLIFY item.
+  `harness/input.py` now exports `scoped_keys`, which Phase 5 must use for the overlay's
+  key source instead of writing its own teardown.
+
+### 2026-08-19 — Phase 3: Running pane (task meta + stage round/elapsed)
+- Done: `TodoItem.meta` (defaulted, rendered in `_MUTED`, wired from a new `_sources_read`
+  helper counting registry sources with `read_mode != "unread"`, attached to the
+  `in_progress` row only), a `RoundsUpdated` event, and the stage line's right-aligned
+  `MM:SS · round N/max_rounds`. Palette gained `_ACCENT_2`/`_FG_2`/`_RULE`/`_PENDING`, and
+  the checklist/rule/panel/heading styles moved off raw Rich strings onto those constants.
+  601 tests pass; all four gates clean; coverage 97%.
+- Learned: (1) The tool-call log was SPLIT OUT to Phase 6 — the nested tiers' tool calls
+  never reach `__main__.py`'s top-level `astream`, which the plan's own Codebase Map already
+  recorded. Check that map before planning anything that reads tool activity from the lead's
+  stream. (2) `Live` redraws whatever renderable it HOLDS, so a pre-built `Group` freezes any
+  render-time value — the elapsed clock only advanced when an event arrived. `Live` must be
+  constructed with `get_renderable=<builder>` and callers must use `_live.refresh()`, never
+  `_live.update(...)`, which would silently reintroduce the freeze. (3) A green gate proved
+  nothing about either defect: no test repainted without an event, and no test checked that
+  anything in production actually SETS `meta`. Both were caught by review, not by tests.
+- Drift: YES — Phase 3 split, tool-call log moved to Phase 6 (`## Reconciliations`,
+  developer-approved). Phase 3's diff budget dropped to ~200-320 lines; Phase 6 rose to
+  ~550-750 and absorbed the log.
+- Watch-next: Phase 4 (finished summary, inline report path) is small and unflagged — the
+  pinned "report path is the last line of stdout" test must keep passing UNCHANGED for argv
+  mode. Then Phase 5 (overlay) needs `harness/input.py`'s `scoped_keys` and must preserve the
+  wall-clock-while-answering behavior named in risk #2. Phase 6 now owns THREE things, not
+  one: reader strip, tool-call log, and live-updating task meta.
+
+### 2026-08-20 — Phase 4: Finished summary (inline report path)
+- Done: `RunFinished` gained `report_path: Path | None`, `_summary_lines` appends a
+  zero-indent `report written` label plus the bare path as the summary's trailing two lines,
+  and `harness/__main__.py`'s standalone `print(path)` is gone (its two stderr branches
+  preserved by inverting the condition to `if path is None:`). The path line renders as
+  `Text(line, style=_ACCENT)` with `soft_wrap=True`. 609 tests pass; all four gates clean.
+- Learned: (1) The "report path is the last line of stdout" contract is STRONGER than the
+  plan said — `tests/test_agent.py:1128-1132` constructs a `Path` from `lines[-1]` and asserts
+  it exists under `reports_dir`, so that line must stay bare. That is why the mockup's accent
+  left-border on the path line was dropped rather than imitated. (2) A styled raw string
+  handed to `Console.print` loses its style to Rich's `ReprHighlighter`, platform-dependently
+  — see the `## Discoveries` entry; this cost a Blocker that the green gate could not see
+  because the test asserted the escape appeared ANYWHERE rather than around the whole value.
+  (3) The plan's file globs are not trustworthy: `tests/test_main_*.py` matches only Phase 2's
+  unrelated welcome-screen tests.
+- Drift: YES — 2026-08-20 entry in `## Reconciliations`: Phase 4's `**Files:**` named the wrong
+  test file for the last-line pin and understated what the pin asserts; the file list and the
+  acceptance command are struck in place and amended, and the render design (bare accent path
+  line, no left border) was approved off that.
+- Watch-next: Phase 5 (ask_user overlay) is flagged (!#2) — the wall clock must keep running
+  while a question is being answered, which is the behavior the daemon-thread `input()` bridge
+  in `_answer_questions` exists for; assert it, do not rediscover it. Use
+  `harness/input.py`'s `scoped_keys` for the overlay's key source rather than writing new
+  teardown, and render every dynamic overlay string through `Text(...)` per the new
+  `## Discoveries` entry.
+
+### 2026-08-20 — Phase 5: ask_user in-place overlay
+- Done: The question now renders as a cyan `ask_user` panel INSIDE the running `Live` frame,
+  replacing the activity lines only — checklist, timeline and stage line stay visible (R4).
+  New `AnswerDraft`/`QuestionAnswered` events; a shared `_PausableClock` freezing both the
+  displayed `MM:SS` and `StageTracker`'s recorded timings while the overlay is open; Phase 2's
+  per-row cursor placement extracted to `_build_cursor_rows` and reused; `harness/input.py`
+  gained an idempotent `restore_terminal()`. `_read_answer(renderer, prompt)` now branches on
+  `sys.stdin.isatty()` — non-TTY keeps the old `input()` bridge byte-for-byte, TTY runs
+  `read_keys()` on a daemon thread forwarding through an `asyncio.Queue`. 619 tests pass; all
+  four gates clean; source diff 397 lines against a ~350-500 budget.
+- Learned: (1) The three time concepts are NOT interchangeable and only two may pause — wall
+  clock (`asyncio.timeout`) never, displayed `MM:SS` and recorded stage timings both. (2) The
+  wall clock's real failure mode is STRUCTURAL: a key loop that blocks the event loop thread
+  stops the timeout from firing at all, which no amount of "don't call reschedule" discipline
+  prevents. The async side must only ever `await`. (3) Green tests asserting a risk's symptom
+  can leave the risk itself unpinned — see the `## Discoveries` entry; the replacement test was
+  verified to fail against a deliberately blocking implementation before being trusted. (4) The
+  review caught a 7th `_read_answer` call site the implementor missed, passing only because the
+  non-TTY branch ignores `renderer` and `prompt` defaults to the same string; mypy does not
+  check untyped test bodies, so no gate would ever have caught it.
+- Drift: YES — 2026-08-20 entry in `## Reconciliations`: `harness/input.py` added to the phase's
+  file list, developer-approved, so terminal restore is structural rather than dependent on a
+  daemon thread's unrun `finally`.
+- Watch-next: Phase 6 is flagged (!#3) and now owns THREE deliverables, not one — reader strip,
+  the structured tool-call log absorbed from Phase 3, AND live-updating task meta (Phase 3's
+  logged limitation). It is the plan's only `harness/agent.py` touch: mirror
+  `_ReaderDigestMiddleware`'s existing `awrap_tool_call` shape, do not invent a new one, and keep
+  reader dispatch/retry/failure semantics untouched. Its tests are concurrency-shaped like Phase
+  5's — hold them to the same "verified to fail against the broken shape" standard. The manual
+  WezTerm acceptance criteria for Phases 2, 3 and 5 are all still unticked and need a real
+  terminal.
+
+### 2026-08-20 — Phase 6: Reader-strip visibility hook + structured tool-call log
+- Done: All three deliverables. One `_ToolActivityMiddleware` (mirroring
+  `_ReaderDigestMiddleware`'s `awrap_tool_call` shape) registered innermost on the researcher and
+  reader tiers ONLY — the lead is uninstrumented by developer decision, so `__main__.py`'s
+  `Activity(_describe_tool_call(call))` line and its pinned assertion are untouched. New
+  `harness/activity.py` holds `ActivitySink`/`ToolCallRecord`/`ReaderState`/`reader_scope`/
+  `DisplayError`; new `ToolCall` (emitted twice per call, keyed by `call_id` so the renderer
+  replaces the running row) and `ReadersUpdated` (a snapshot, like `TodosUpdated`) display
+  events; reader strip between the stage line and the log, present only while a reader is LIVE;
+  `waiting on N readers` on the stage line; live-updating `{n} in flight` task meta. 650 tests
+  pass (619 at session start), all four gates clean, coverage 96% against CI's 90% floor. Source
+  diff 690 lines against a ~550-750 budget — inside it, even carrying the extra module.
+- Learned: (1) THE BIG ONE — a shared sink cannot be DRAINED from the top-level stream for
+  anything that must be visible live. The middleware writes from inside the lead's `task` tool
+  NODE and one node is one superstep, so no chunk arrives until the whole researcher->reader
+  pipeline has finished. Measured, not reasoned: `live_reader_count() == 0` at every one of 12
+  chunks of a run whose reader genuinely ran 0.5s. `RunLog`'s drain works ONLY because an
+  incident merely needs to be eventually visible. The sink pushes via `on_change` instead.
+  (2) Pushing from inside middleware has two consequences that are easy to miss and both bit:
+  an emit can now arrive after `close()` (guard `emit` on `_closed`), and an exception from the
+  display now lands inside the `task` retry/error guard, which would re-run a whole subagent and
+  report a display bug as `READER FAILED` (hence `DisplayError` in
+  `_PASS_THROUGH_TASK_FAILURES`). (3) A review's line-count Major is worth re-deriving: 1573
+  "added lines" was source+tests; this project budgets SOURCE, per Phase 5's own entry.
+  (4) The plan's `_reader_failure_message` does not exist — see `## Discoveries`.
+- Drift: YES — four amendments in `## Reconciliations`, all dated 2026-08-20: the
+  `harness/activity.py` file-list widening; researcher+reader-only registration; the
+  drain->push redesign; and the narrowing of this phase's own no-change-to-failure-semantics
+  constraint for `DisplayError`. The first, second and fourth were developer decisions at a
+  gate; the third was a 3F finding, confirmed by probe before being acted on.
+- Watch-next: ONLY `Final verification` remains, and its automated half is already green
+  (`uv run pytest`, ruff check/format, mypy — all clean this session). What is left genuinely
+  cannot be done from a non-interactive session: the manual WezTerm/SSH walkthrough, and the
+  Ctrl+C-at-three-places check. The manual acceptance criteria for Phases 2, 3, 5 and 6 are all
+  still unticked for the same reason. Note the plan's `## Verification` walkthrough still names
+  `/sources`, a command dropped on 2026-08-19 — expect `/help` and `/model` only. Also still
+  pending: push `worktree-mossy-imagining-scroll` and rewrite PR #25's body to cover Phases 1-6
+  in ONE pass; its body currently claims Phases 4-6 are not included.
