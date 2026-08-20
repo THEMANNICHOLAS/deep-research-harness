@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
+from rich.align import Align
 from rich.console import Console, Group, RenderableType
+from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.rule import Rule
@@ -382,6 +384,11 @@ class RichRenderer:
         self._overlay_question: str | None = None
         self._answer_draft: AnswerDraft | None = None
         self._closed = False
+        # ONE spinner for the renderer's lifetime, never rebuilt per frame: `Spinner.render`
+        # derives the animation frame from elapsed time since ITS OWN first render, so a fresh
+        # instance per `_build_renderable` call rendered frame 0 forever and the glyph never
+        # rotated (PR #25 review). `_build_stage_header` only updates its text.
+        self._spinner = Spinner("dots", style=_FG_2)
         self._elapsed = _PausableClock(clock)
         # RUN elapsed, not stage elapsed: this sits beside a run-level round budget, and
         # per-stage timings are already shown in the completed-stage timeline (Step 3).
@@ -407,8 +414,9 @@ class RichRenderer:
 
     def _build_stage_header(self) -> RenderableType:
         if self._stage is None:
-            return Spinner("dots", text=f"[bold]{self._PRE_STAGE_LABEL}[/bold]", style=_FG_2)
-        spinner = Spinner("dots", text=f"[bold]{self._stage}[/bold]", style=_FG_2)
+            self._spinner.update(text=f"[bold]{self._PRE_STAGE_LABEL}[/bold]")
+            return self._spinner
+        self._spinner.update(text=f"[bold]{self._stage}[/bold]")
         elapsed = _format_elapsed(self._elapsed.now() - self._started_at)
         if self._rounds is not None:
             rounds_used, max_rounds = self._rounds
@@ -420,7 +428,7 @@ class RichRenderer:
         grid = Table.grid(expand=True)
         grid.add_column()
         grid.add_column(justify="right")
-        grid.add_row(spinner, Text(elapsed, style=_MUTED))
+        grid.add_row(self._spinner, Text(elapsed, style=_MUTED))
         return grid
 
     def _build_tool_log(self) -> Table | None:
@@ -764,6 +772,11 @@ _HINTS: tuple[tuple[str, str], ...] = (
 # today) gets `…` affordances above/below instead of blowing up the frame.
 _PICKER_WINDOW = 12
 
+# The mockup's `.entry{width:min(760px,100%)}`: the input box and its hint/roles lines are
+# capped to this many columns so centering is visible on a wide terminal instead of the box
+# stretching edge to edge.
+_ENTRY_WIDTH = 80
+
 
 @dataclass(frozen=True)
 class WelcomeView:
@@ -943,18 +956,34 @@ def _build_status_bar(view: WelcomeView) -> Table:
     return grid
 
 
-def build_welcome(view: WelcomeView) -> Group:
-    """Render the welcome screen top-to-bottom, per the mockup's `#screen-welcome`."""
-    parts: list[RenderableType] = [_build_wordmark(), _build_input_box(view)]
+def build_welcome(view: WelcomeView) -> Layout:
+    """Render the welcome screen per the mockup's `#screen-welcome`: the hero block
+    (wordmark over the entry box and its hint lines, then the tip) centered on both axes
+    (`.welcome-stage{align-items:center;justify-content:center}`), the status bar pinned
+    to the bottom row (`justify-content:space-between`) — NOT stacked top-to-bottom, which
+    crammed the whole screen against the top of the terminal (PR #25 review)."""
+    entry = Table.grid(padding=0)
+    entry.add_column(width=_ENTRY_WIDTH)
+    entry.add_row(_build_input_box(view))
     if view.notice:
-        parts.append(Text(view.notice, style=_WARN))
+        entry.add_row(Text(view.notice, style=_WARN))
     if view.panel is not None:
-        parts.append(view.panel)
-    parts.append(_build_hints_line())
-    parts.append(_build_roles_line(view))
-    parts.append(_build_tip_line())
-    parts.append(_build_status_bar(view))
-    return Group(*parts)
+        entry.add_row(view.panel)
+    entry.add_row(_build_hints_line())
+    entry.add_row(_build_roles_line(view))
+    hero = Group(
+        Align.center(_build_wordmark()),
+        Text(""),
+        Align.center(entry),
+        Text(""),
+        Align.center(_build_tip_line()),
+    )
+    layout = Layout()
+    layout.split_column(
+        Layout(Align.center(hero, vertical="middle"), name="stage"),
+        Layout(_build_status_bar(view), name="statusbar", size=1),
+    )
+    return layout
 
 
 def build_help_panel(commands: Sequence[tuple[str, str]]) -> Panel:

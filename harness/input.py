@@ -9,7 +9,16 @@ from dataclasses import dataclass
 from typing import Literal
 
 KeyKind = Literal[
-    "char", "enter", "newline", "backspace", "left", "right", "up", "down", "interrupt"
+    "char",
+    "enter",
+    "newline",
+    "backspace",
+    "word_backspace",
+    "left",
+    "right",
+    "up",
+    "down",
+    "interrupt",
 ]
 
 # Set by `read_keys()`'s POSIX branch to the closure that restores the saved `termios` mode,
@@ -60,8 +69,14 @@ def decode_posix(
         return KeyEvent("enter")
     if c == "\n":
         return KeyEvent("newline")
-    if c in ("\x7f", "\x08"):
+    if c == "\x7f":
         return KeyEvent("backspace")
+    if c == "\x08":
+        # Ctrl+Backspace on the terminals that distinguish it (xterm-likes send `\x7f` for
+        # plain Backspace and `\x08` for Ctrl+Backspace). A terminal configured to send
+        # `\x08` for plain Backspace deletes a word instead of a character here -- accepted:
+        # word-delete is the requested behavior and both keys still delete.
+        return KeyEvent("word_backspace")
     if c == "\x03":
         return KeyEvent("interrupt")
     if c == "\x1b":
@@ -95,6 +110,11 @@ def decode_windows(read_char: Callable[[], str]) -> KeyEvent | None:
         return KeyEvent("newline")
     if c == "\x08":
         return KeyEvent("backspace")
+    if c == "\x7f":
+        # `msvcrt.getwch()` returns `\x7f` for Ctrl+Backspace (plain Backspace is `\x08`).
+        # Unmapped, it slipped past the extended-key branch, and ord 127 passes the `< 32`
+        # guard below, so a literal DEL character landed in `LineBuffer` (PR #25 review).
+        return KeyEvent("word_backspace")
     if c == "\x03":
         return KeyEvent("interrupt")
     if c in ("\xe0", "\x00"):
@@ -223,6 +243,21 @@ class LineBuffer:
             del self._lines[self.cursor_row]
             self.cursor_row -= 1
             self.cursor_col = prev_len
+
+    def word_backspace(self) -> None:
+        """Delete back to the start of the previous word -- trailing spaces first, then the
+        word itself. At the start of a row it joins lines, exactly like `backspace`."""
+        if self.cursor_col == 0:
+            self.backspace()
+            return
+        line = self._lines[self.cursor_row]
+        col = self.cursor_col
+        while col > 0 and line[col - 1] == " ":
+            col -= 1
+        while col > 0 and line[col - 1] != " ":
+            col -= 1
+        self._lines[self.cursor_row] = line[:col] + line[self.cursor_col :]
+        self.cursor_col = col
 
     def move_left(self) -> None:
         if self.cursor_col > 0:

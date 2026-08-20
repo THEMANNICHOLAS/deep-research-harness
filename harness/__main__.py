@@ -41,7 +41,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.messages.ai import UsageMetadata, add_usage
 from rich.console import Console, RenderableType
 
-from harness.activity import ActivitySink, DisplayError
+from harness.activity import ActivitySink, DisplayError, brief_summary
 from harness.config import ConfigError, load_config
 from harness.display import (
     Activity,
@@ -265,6 +265,8 @@ async def _read_answer(renderer: Renderer, prompt: str = "> ") -> str:
                 buffer.newline()
             elif event.kind == "backspace":
                 buffer.backspace()
+            elif event.kind == "word_backspace":
+                buffer.word_backspace()
             elif event.kind == "left":
                 buffer.move_left()
             elif event.kind == "right":
@@ -341,9 +343,14 @@ def _research_tool_calls(node_update: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _describe_tool_call(call: dict[str, Any]) -> str:
-    """One activity line describing a researcher-dispatch proposal."""
+    """One activity line describing a researcher-dispatch proposal.
+
+    `brief_summary`, not the raw description: this renders as a wrapping `Activity` line with
+    no render-time truncation, so the model's full delegation prompt painted a paragraph-sized
+    blob that pushed the frame past the terminal height (PR #25 review).
+    """
     args = call.get("args") or {}
-    return f'task(researcher): "{args.get("description", "")}"'
+    return f'task(researcher): "{brief_summary(str(args.get("description", "")))}"'
 
 
 async def _answer_questions(
@@ -520,6 +527,8 @@ def _run_welcome(
                 buffer.insert(event.char)
             elif event.kind == "backspace":
                 buffer.backspace()
+            elif event.kind == "word_backspace":
+                buffer.word_backspace()
             elif event.kind == "left":
                 buffer.move_left()
             elif event.kind == "right":

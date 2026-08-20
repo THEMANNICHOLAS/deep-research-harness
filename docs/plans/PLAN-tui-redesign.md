@@ -738,6 +738,24 @@ budget: ~550-750 lines across 4 files.
   ships without run stats.** Revisit if the registry is ever plumbed into the renderer for
   another reason; it is not worth that wiring on its own.
 
+- 2026-08-20 — second PR #25 review pass (screenshot-driven), five fixes: (1) the stage
+  spinner is now ONE renderer-held `Spinner` updated per frame — a fresh instance per
+  `_build_renderable` call rendered frame 0 forever and never rotated; (2) `build_welcome`
+  returns a `Layout` — hero (wordmark/entry/tip) centered on both axes, status bar pinned
+  to the bottom row — instead of a top-stacked `Group`, matching `#screen-welcome`'s
+  `justify-content` rules; the entry column is capped at `_ENTRY_WIDTH` (the mockup's
+  `width:min(760px,100%)`); (3+4) model-authored `task` descriptions are summarized at the
+  emit layer by `harness/activity.py`'s new `brief_summary` (first sentence, 80-char cap) —
+  applied in `ActivitySink.start_reader`, `_summarize_tool_args`' task branch, and
+  `_describe_tool_call`, since render-time ellipsis never protected the plain renderer or
+  the wrapping `Activity` line; (5) `decode_windows` maps `\x7f` (Ctrl+Backspace), which
+  previously inserted a literal DEL char into the buffer. Ctrl+Backspace is wired as
+  word-delete on both platforms: new `word_backspace` key kind, `LineBuffer.word_backspace`
+  (spaces then word, joins lines at col 0), handled in both key loops. On POSIX `\x08` now
+  decodes as `word_backspace` rather than plain backspace — a terminal sending `^H` for
+  plain Backspace deletes a word instead of a character there (accepted; xterm-likes send
+  `\x7f` for Backspace and `\x08` for Ctrl+Backspace).
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution. Append-only. -->
 - 2026-08-19 — Phase 1: `## Notes`' coverage-policy line says Phase 1's `# pragma: no

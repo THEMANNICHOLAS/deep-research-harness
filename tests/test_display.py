@@ -69,7 +69,9 @@ def _span(hex_color: str, value: str) -> str:
     return f"\x1b[38;2;{r};{g};{b}m{value}\x1b[0m"
 
 
-def _make_console(*, width: int = 80) -> tuple[Console, StringIO]:
+def _make_console(
+    *, width: int = 80, get_time: Callable[[], float] | None = None
+) -> tuple[Console, StringIO]:
     buffer = StringIO()
     # `legacy_windows=False` (rather than relying on auto-detection): the alternate-screen
     # codes `RichRenderer` now relies on (D1/R5) are suppressed by Rich whenever
@@ -87,6 +89,9 @@ def _make_console(*, width: int = 80) -> tuple[Console, StringIO]:
         legacy_windows=False,
         color_system="truecolor",
         _environ={},
+        # `get_time` drives `Spinner.render`'s animation frame — injectable so the spinner
+        # rotation test can advance render time deterministically (None keeps Rich's default).
+        get_time=get_time,
     )
     return console, buffer
 
@@ -1232,6 +1237,41 @@ def test_build_welcome_shows_typed_text_when_question_is_non_empty():
 
     assert "what does Acme charge" in text
     assert "Ask anything" not in text
+
+
+def test_the_stage_spinner_advances_its_frame_across_renders():
+    """PR #25 review: a fresh `Spinner` per `_build_stage_header` call re-rendered frame 0
+    forever (`Spinner.render` derives the frame from elapsed time since its OWN first render),
+    so the glyph never rotated. One renderer-held spinner animates across frames."""
+    now = {"value": 0.0}
+    console, buffer = _make_console(get_time=lambda: now["value"])
+    renderer = RichRenderer(console=console, auto_refresh=False)
+
+    console.print(renderer._build_stage_header())
+    first = _strip_ansi(buffer.getvalue())
+    buffer.truncate(0)
+    buffer.seek(0)
+    now["value"] = 0.4  # five "dots" frames later (80ms per frame)
+    console.print(renderer._build_stage_header())
+    second = _strip_ansi(buffer.getvalue())
+
+    assert first != second
+
+
+def test_build_welcome_centers_the_hero_and_pins_the_status_bar_to_the_bottom():
+    """The mockup's `#screen-welcome`: hero centered on both axes, status bar on the bottom
+    row — not the whole screen stacked against the top of the terminal (PR #25 review)."""
+    text = _render(build_welcome(_welcome_view()))
+    lines = text.splitlines()
+
+    assert "0.1.0" in lines[-1]
+    assert "~/deep-research:searxng@localhost:8080" in lines[-1]
+    wordmark_row = next(i for i, line in enumerate(lines) if "█" in line)
+    # Vertical centering: blank rows precede the wordmark instead of it sitting on row 0.
+    assert wordmark_row > 0
+    assert all(not lines[i].strip() for i in range(wordmark_row))
+    # Horizontal centering: the wordmark is indented off the left edge.
+    assert lines[wordmark_row].startswith(" ")
 
 
 def test_build_welcome_tip_line_names_help_and_never_sources():

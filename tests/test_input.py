@@ -26,7 +26,8 @@ def _reader(sequence: str) -> Callable[[], str]:
         ("\r", KeyEvent("enter", None)),
         ("\n", KeyEvent("newline", None)),
         ("\x7f", KeyEvent("backspace", None)),
-        ("\x08", KeyEvent("backspace", None)),
+        # Ctrl+Backspace on xterm-likes (plain Backspace sends \x7f there) — word delete.
+        ("\x08", KeyEvent("word_backspace", None)),
         ("\x03", KeyEvent("interrupt", None)),
         ("\x1b[A", KeyEvent("up", None)),
         ("\x1b[B", KeyEvent("down", None)),
@@ -50,6 +51,9 @@ def test_decode_posix(byte_sequence: str, expected: KeyEvent | None):
         ("\r", KeyEvent("enter", None)),
         ("\n", KeyEvent("newline", None)),
         ("\x08", KeyEvent("backspace", None)),
+        # Ctrl+Backspace: `getwch()` returns \x7f, which previously slipped past every branch
+        # and inserted a literal DEL character into the buffer (PR #25 review).
+        ("\x7f", KeyEvent("word_backspace", None)),
         ("\x03", KeyEvent("interrupt", None)),
         ("\xe0H", KeyEvent("up", None)),
         ("\xe0P", KeyEvent("down", None)),
@@ -150,6 +154,50 @@ def test_line_buffer_backspace_at_start_of_buffer_is_noop():
     buf.backspace()
 
     assert (buf.text(), buf.cursor_row, buf.cursor_col) == ("", 0, 0)
+
+
+def test_line_buffer_word_backspace_deletes_back_to_the_previous_word_boundary():
+    buf = LineBuffer()
+    for ch in "ab cd":
+        buf.insert(ch)
+
+    buf.word_backspace()
+
+    assert (buf.text(), buf.cursor_row, buf.cursor_col) == ("ab ", 0, 3)
+
+
+def test_line_buffer_word_backspace_eats_trailing_spaces_before_the_word():
+    buf = LineBuffer()
+    for ch in "ab cd  ":
+        buf.insert(ch)
+
+    buf.word_backspace()
+
+    assert (buf.text(), buf.cursor_row, buf.cursor_col) == ("ab ", 0, 3)
+
+
+def test_line_buffer_word_backspace_at_start_of_row_joins_lines_like_backspace():
+    buf = LineBuffer()
+    for ch in "ab":
+        buf.insert(ch)
+    buf.newline()
+
+    buf.word_backspace()
+
+    assert (buf.text(), buf.cursor_row, buf.cursor_col) == ("ab", 0, 2)
+
+
+def test_line_buffer_word_backspace_deletes_only_within_the_cursor_word():
+    """Text AFTER the cursor is untouched — mid-line word delete behaves like a textbox."""
+    buf = LineBuffer()
+    for ch in "ab cd ef":
+        buf.insert(ch)
+    for _ in range(3):
+        buf.move_left()
+
+    buf.word_backspace()
+
+    assert (buf.text(), buf.cursor_row, buf.cursor_col) == ("ab  ef", 0, 3)
 
 
 def test_line_buffer_move_left_at_position_zero_is_noop():

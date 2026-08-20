@@ -30,6 +30,20 @@ def test_typing_a_question_then_enter_returns_it(make_config):
     assert result == "hi"
 
 
+def test_word_backspace_deletes_the_trailing_word_before_submit(make_config):
+    config = make_config()
+    keys = [
+        *_type("solar tariffs"),
+        KeyEvent("word_backspace"),
+        *_type("prices"),
+        KeyEvent("enter"),
+    ]
+
+    result = main_module._run_welcome(config, keys=keys, console=_console())
+
+    assert result == "solar prices"
+
+
 def test_interrupt_returns_none(make_config):
     config = make_config()
     keys = [*_type("something"), KeyEvent("interrupt")]

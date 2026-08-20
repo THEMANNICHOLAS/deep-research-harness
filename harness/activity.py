@@ -40,7 +40,7 @@ class ToolCallRecord:
 @dataclass(frozen=True)
 class ReaderState:
     id: str  # "reader/1", assigned in dispatch order
-    brief: str  # the task call's `description` arg
+    brief: str  # one-line summary of the task call's `description` arg (`brief_summary`)
     status_text: str
     done: bool
 
@@ -58,6 +58,28 @@ class DisplayError(Exception):
     importing the display layer, which would point the dependency the wrong way. Raised by
     whoever supplies `on_change`; the sink itself never raises it.
     """
+
+
+def brief_summary(text: str, limit: int = 80) -> str:
+    """First sentence of `text`'s first line, capped at `limit` characters with an ellipsis.
+
+    The one summarizer for model-authored task descriptions shown as one-line display rows
+    (reader briefs, researcher-dispatch activity lines). The cap lives HERE, at the emit
+    layer, not in the renderer: render-time `overflow="ellipsis"` only helps the Rich grid
+    columns -- the plain renderer and the wrapping `Activity` line print the string verbatim,
+    so an uncapped multi-hundred-word delegation prompt painted paragraphs into a one-line
+    slot (PR #25 review).
+    """
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    first_line = stripped.splitlines()[0].strip()
+    ends = [index for mark in (". ", "! ", "? ") if (index := first_line.find(mark)) != -1]
+    if ends:
+        first_line = first_line[: min(ends) + 1]
+    if len(first_line) > limit:
+        return first_line[:limit].rstrip() + "…"
+    return first_line
 
 
 def _format_status_elapsed(seconds: float) -> str:
@@ -144,8 +166,10 @@ class ActivitySink:
         self._reader_seq += 1
         reader_id = f"reader/{self._reader_seq}"
         self._started[reader_id] = self._clock()
+        # Summarized at the point of record, not at render: every consumer (Rich strip, plain
+        # renderer, tests) then sees the same one-line brief (PR #25 review).
         self._readers[reader_id] = ReaderState(
-            id=reader_id, brief=brief, status_text="dispatched", done=False
+            id=reader_id, brief=brief_summary(brief), status_text="dispatched", done=False
         )
         self._notify()
         return reader_id

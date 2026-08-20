@@ -2541,6 +2541,17 @@ async def test_a_renderer_crash_mid_dispatch_fails_the_run_cleanly_and_writes_no
         ("task", {"subagent_type": "reader", "description": "Read S3"}, "reader -- Read S3"),
         # A missing/blank subagent_type still names the tool rather than rendering "-- ...".
         ("task", {"description": "Read S3"}, "task -- Read S3"),
+        # A full delegation prompt collapses to its first sentence — the plain renderer
+        # prints this string verbatim, with no render-time ellipsis (PR #25 review).
+        (
+            "task",
+            {
+                "subagent_type": "researcher",
+                "description": "Research the current state of X. I need a source-cited report"
+                " covering definitions, adoption rates, and benchmarks.",
+            },
+            "researcher -- Research the current state of X.",
+        ),
         ("search_web", {"query": "solar tariffs"}, "solar tariffs"),
         ("fetch_pages", {"urls": ["https://a.example"]}, "https://a.example"),
         (

@@ -2,7 +2,7 @@
 
 import pytest
 
-from harness.activity import ActivitySink, active_reader, reader_scope
+from harness.activity import ActivitySink, active_reader, brief_summary, reader_scope
 
 
 def _clock_from(*values: float):
@@ -15,6 +15,39 @@ def _clock_from(*values: float):
         return values[-1]
 
     return _clock
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Read S3", "Read S3"),
+        ("", ""),
+        ("   \n\n  ", ""),
+        # First sentence only: the rest of a multi-sentence delegation prompt is dropped.
+        ("Read the OpenAI post. Extract every claim with its marker.", "Read the OpenAI post."),
+        ("Any URLs left? Then fetch them next.", "Any URLs left?"),
+        # First line only: a multi-line prompt's body never reaches a one-line row.
+        ("Read these pages:\n1. https://a.example\n2. https://b.example", "Read these pages:"),
+        # A first sentence past the cap is truncated with an ellipsis, not shown whole.
+        ("x" * 100, "x" * 80 + "…"),
+    ],
+)
+def test_brief_summary_reduces_a_task_description_to_one_short_line(text, expected):
+    assert brief_summary(text) == expected
+
+
+def test_start_reader_stores_the_brief_summarized_not_the_full_description():
+    """PR #25 review: the reader strip showed the model's whole multi-hundred-word delegation
+    prompt (saved only by render-time ellipsis in ONE consumer); the sink now summarizes at
+    the point of record so every consumer sees a one-line brief."""
+    sink = ActivitySink()
+    long_description = "Read the Anthropic engineering posts. " + "Extract everything. " * 30
+
+    reader_id = sink.start_reader(long_description)
+
+    (reader,) = sink.readers()
+    assert reader.id == reader_id
+    assert reader.brief == "Read the Anthropic engineering posts."
 
 
 def test_start_call_marks_a_repeat_call_id_as_retry():

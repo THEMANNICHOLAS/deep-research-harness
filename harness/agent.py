@@ -47,7 +47,13 @@ from langgraph.types import Command
 # module-local name each test would have to patch separately. Attribute lookup at call time
 # means patching `harness.models.build_chat_model` covers every caller (see PR #4 review).
 from harness import activity, models
-from harness.activity import ActivitySink, DisplayError, active_reader, reader_scope
+from harness.activity import (
+    ActivitySink,
+    DisplayError,
+    active_reader,
+    brief_summary,
+    reader_scope,
+)
 from harness.config import HarnessConfig, run_workspace_dir
 from harness.prompts import render
 from harness.runlog import RunLog, or_default
@@ -219,7 +225,9 @@ def _summarize_tool_args(name: str, args: dict[str, Any]) -> str:
     """
     if name == "task":
         subagent_type = str(args.get("subagent_type") or "")
-        return f"{subagent_type or 'task'} -- {args.get('description', '')}"
+        # `brief_summary`, not the raw description: a `task` description is the model's full
+        # delegation prompt, and this string reaches the plain renderer verbatim (PR #25 review).
+        return f"{subagent_type or 'task'} -- {brief_summary(str(args.get('description', '')))}"
     if name == "search_web":
         return str(args.get("query", ""))
     if name in ("fetch_pages", "fetch_raw"):
