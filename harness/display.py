@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Protocol
 
 from rich.console import Console, Group, RenderableType
@@ -66,6 +67,7 @@ class RunFinished:
     cut_short: str | None
     verification_failures: int
     incidents: int = 0
+    report_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,9 @@ def _summary_lines(event: RunFinished) -> list[str]:
         lines.append(f"  verification failures: {event.verification_failures}")
     if event.incidents > 0:
         lines.append(f"  tool failures: {event.incidents}")
+    if event.report_path is not None:
+        lines.append("report written")
+        lines.append(str(event.report_path))
     return lines
 
 
@@ -378,9 +383,19 @@ class RichRenderer:
                 self._live.stop()
                 self._live = None
             lines = _summary_lines(event)
+            path_str = str(event.report_path) if event.report_path is not None else None
             self._console.print(lines[0], style="bold")
             for line in lines[1:]:
-                self._console.print(line, style="dim")
+                if line == path_str:
+                    # `Text`, not a raw string: `Console.print` would run the path through
+                    # markup parsing (a `[` in `reports_dir` then raises inside `emit`, after
+                    # the report was already written) and through `ReprHighlighter`, whose
+                    # per-token colours override `_ACCENT` — on POSIX it claims the whole path
+                    # as magenta, losing the accent entirely. `soft_wrap` keeps a path longer
+                    # than the terminal on one copy-pasteable line.
+                    self._console.print(Text(line, style=_ACCENT), soft_wrap=True)
+                else:
+                    self._console.print(line, style="dim")
         else:  # Activity
             self._activities = (self._activities + [event.text])[-self._ACTIVITY_TAIL :]
             # Starts the region if no stage has begun yet: the first stage is `clarifying` or

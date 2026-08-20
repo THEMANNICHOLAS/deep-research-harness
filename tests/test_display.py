@@ -685,6 +685,109 @@ def test_run_finished_omits_empty_sections(kind, capsys):
     assert not any("tool failures:" in line for line in lines)
 
 
+@pytest.mark.parametrize("kind", ["plain", "rich"])
+def test_run_finished_renders_the_report_path_as_the_trailing_block(kind, capsys):
+    # `str(Path(...))` renders with the platform's native separator, so the expected value is
+    # derived from the same `Path` rather than hardcoded — this test still asserts EQUALITY on
+    # the whole stripped line, not `endswith`.
+    report_path = pathlib.Path("/tmp/reports/2026-08-20-120000-q.md")
+    event = RunFinished(
+        stage_timings=(),
+        usable_sources=1,
+        unusable_sources=0,
+        cut_short=None,
+        verification_failures=0,
+        report_path=report_path,
+    )
+
+    lines = _render_lines(kind, event, capsys)
+
+    assert lines[-2].strip() == "report written"
+    assert lines[-1].strip() == str(report_path)
+
+
+@pytest.mark.parametrize("kind", ["plain", "rich"])
+def test_run_finished_omits_the_report_block_when_no_report_was_written(kind, capsys):
+    event = RunFinished(
+        stage_timings=(),
+        usable_sources=1,
+        unusable_sources=0,
+        cut_short=None,
+        verification_failures=0,
+        report_path=None,
+    )
+
+    lines = _render_lines(kind, event, capsys)
+
+    assert not any("report written" in line for line in lines)
+    assert lines[-1].strip().startswith("sources:")
+
+
+def test_the_report_path_line_is_accent_coloured():
+    event = RunFinished(
+        stage_timings=(),
+        usable_sources=1,
+        unusable_sources=0,
+        cut_short=None,
+        verification_failures=0,
+        report_path=pathlib.Path("/tmp/reports/2026-08-20-120000-q.md"),
+    )
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(event)
+    renderer.close()
+
+    raw = buffer.getvalue()
+    accent = harness.display._ACCENT.lstrip("#")
+    r, g, b = (int(accent[i : i + 2], 16) for i in (0, 2, 4))
+    # The WHOLE path in ONE accent span, not merely the escape appearing somewhere: Rich's
+    # `ReprHighlighter` shreds any raw `str` handed to `Console.print` into per-token colours,
+    # and on POSIX it claims the whole path as magenta so the accent never appears at all. The
+    # weaker `in raw` form passed on Windows against exactly that bug.
+    assert f"\x1b[38;2;{r};{g};{b}m{event.report_path}\x1b[0m" in raw
+
+
+def test_a_report_path_containing_markup_brackets_still_renders():
+    """`reports_dir` comes from `harness.toml`, so the path may contain `[` — which would raise
+    `MarkupError` inside `emit` if the line were printed as a raw string, failing a run whose
+    report was already written."""
+    event = RunFinished(
+        stage_timings=(),
+        usable_sources=1,
+        unusable_sources=0,
+        cut_short=None,
+        verification_failures=0,
+        report_path=pathlib.Path("/tmp/re[po]rts/q.md"),
+    )
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(event)
+    renderer.close()
+
+    assert str(event.report_path) in _strip_ansi(buffer.getvalue())
+
+
+def test_a_long_report_path_is_not_wrapped_across_lines():
+    """The block exists to hand the operator one copy-pasteable path; soft-wrapping it into
+    fragments at the terminal width defeats that."""
+    report_path = pathlib.Path("/tmp/" + "d" * 90 + "/q.md")
+    event = RunFinished(
+        stage_timings=(),
+        usable_sources=1,
+        unusable_sources=0,
+        cut_short=None,
+        verification_failures=0,
+        report_path=report_path,
+    )
+    renderer, buffer = _rich_renderer()  # 80 columns, far narrower than the path
+
+    renderer.emit(event)
+    renderer.close()
+
+    lines = [line for line in _strip_ansi(buffer.getvalue()).splitlines() if line.strip()]
+    assert lines[-1].strip() == str(report_path)
+
+
 def test_rich_renderer_run_finished_summary_prints_on_the_normal_screen_after_the_tui():
     """R5: the alternate screen vanishes on `RunFinished`, so the post-run summary must be
     visible AFTER leaving it, on the normal terminal, not trapped inside the alt-screen pair.
@@ -1007,6 +1110,28 @@ async def test_a_full_run_prints_a_summary_above_the_report_path(
     assert "summary:" in out
     assert any(line.strip().startswith("sources:") for line in lines)
     assert lines[-1].strip().endswith(".md")
+
+
+async def test_a_full_run_prints_the_report_block_with_the_bare_path_last(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    config = make_config()
+    final = AIMessage(
+        content="Final answer.",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    model = scripted_model([final])
+    patch_run(monkeypatch, config, model)
+
+    await main_module.main(["a question with no tool calls"])
+
+    out, lines = drain_stdout(capsys)
+    assert "report written" in out
+    assert lines[-2].strip() == "report written"
+    report_path = pathlib.Path(lines[-1].strip())
+    assert report_path.exists()
+    assert report_path.parent == config.agent.reports_dir
+    assert out.count(lines[-1].strip()) == 1
 
 
 async def test_the_summary_counts_real_usable_and_unusable_sources(

@@ -238,7 +238,7 @@ entire decision below is struck and NOT implemented. No `sources.json` is writte
 - [x] Phase 1: Raw-key input foundation
 - [x] Phase 2: Welcome screen and slash commands
 - [x] Phase 3: Running pane — task meta, stage round/elapsed (~~structured tool log~~ → Phase 6)
-- [ ] Phase 4: Finished summary — inline report path
+- [x] Phase 4: Finished summary — inline report path
 - [ ] Phase 5: ask_user in-place overlay
 - [ ] Phase 6: Reader-strip visibility hook + structured tool-call log
 - [ ] Final verification
@@ -398,22 +398,27 @@ single reportpath unit; no other change to finished-screen content.
   `_summary_lines`/`RichRenderer`/`PlainRenderer` render it as one trailing block.
 - `harness/__main__.py` — modify: pass the report path into the existing
   `RunFinished` emission instead of a separate `print`.
-- `tests/test_display.py`, `tests/test_main_*.py` — modify (existing "report path is
-  the last line of stdout" pinned test must still pass unchanged for argv mode).
+- `tests/test_display.py`, ~~`tests/test_main_*.py`~~ — modify (existing "report path is
+  the last line of stdout" pinned test must still pass unchanged for argv mode). The
+  `test_main_*.py` glob is struck 2026-08-20 — no such file holds the pin; see
+  `## Reconciliations` for where it actually lives and what it actually asserts.
 **Diff budget:** ~120-200 lines across 3 files
 **Reuse:** existing `_summary_lines` helper (extend, don't fork).
 **Contracts:** none new — additive field on an existing event.
 **Out of scope:** Any change to report content or the frozen stdout-last-line
 contract itself.
 **Tests (write first, confirm red):**
-- [ ] `RunFinished` with a `report_path` renders it inline in both renderers.
-- [ ] Existing "report path is the last line of stdout" test still passes unchanged.
+- [x] `RunFinished` with a `report_path` renders it inline in both renderers.
+- [x] Existing "report path is the last line of stdout" test still passes unchanged.
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
 2. Implement the field and wiring.
 3. Run the tests; confirm they PASS (green).
 **Acceptance criteria:**
-- [ ] `uv run pytest tests/test_display.py tests/test_main_*.py` green.
+- [x] ~~`uv run pytest tests/test_display.py tests/test_main_*.py` green.~~ Amended
+  2026-08-20 (`## Reconciliations`): `uv run pytest tests/test_display.py
+  tests/test_ask_user.py tests/test_agent.py` green — the files that actually pin the
+  last-line contract.
 
 ### Phase 5: ask_user in-place overlay
 **Risk:** flagged (!#2)
@@ -606,6 +611,28 @@ budget: ~550-750 lines across 4 files.
   verifier · budget`, all read from config — the head model is omitted there because the
   input box's mode row already shows it. Same four-slot shape as the mockup, no
   duplication, no hidden role.
+- 2026-08-20 — Phase 4: two premises in the phase spec were false, one of them
+  constraining the design. (1) `**Files:**` named `tests/test_main_*.py` as the home of the
+  "report path is the last line of stdout" pin; the only matching file is
+  `tests/test_main_welcome.py` (Phase 2's welcome-screen tests, unrelated). The pin actually
+  lives in `tests/test_display.py` (4 sites), `tests/test_ask_user.py` (3 sites) and
+  `tests/test_agent.py` (1 site), so the acceptance command as written would have run the
+  welcome tests and MISSED every file this phase endangers. (2) The pin is STRONGER than the
+  plan's paraphrase: `tests/test_agent.py:1128-1132` does not merely check
+  `endswith(".md")` — it takes `lines[-1].strip()` as a path, asserts `Path(...).exists()`
+  and that its parent is `reports_dir`. So the last stdout line must stay a BARE, existing
+  path; any label prefix (`report: <path>`) on that line breaks it, and so does anything
+  printed to stdout after the summary. **Developer decision (deciding axis: whether mockup
+  fidelity may cost a frozen machine-readable contract — it may not):** render the mockup's
+  `reportpath` block as a dim `report written` label line followed by the bare path on its
+  OWN line in the accent color, as the summary's trailing lines; drop the mockup's accent
+  LEFT-BORDER on the path line rather than imitate it, since the border character would sit
+  exactly where the bare path must start. This is a Preference-level mockup deviation,
+  permitted by `## Intent`'s Preferences clause. The mockup's dim explanatory sentence BELOW
+  the reportpath block stays out of scope (it would also take the last-line slot).
+  `harness/__main__.py`'s bare `print(path)` is removed as the phase spec directs; both
+  renderers' `close()` print nothing, so the summary genuinely becomes the last stdout
+  output. Amended file list and acceptance command are struck in place above.
 
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution. Append-only. -->
@@ -657,6 +684,22 @@ budget: ~550-750 lines across 4 files.
   stream chunk would spam the frame, so the dedupe stays. Phase 6 owns the mockup's other
   meta variant (`3 in flight`, which needs reader visibility) and will need live-updating
   meta anyway — resolve both together there.
+- 2026-08-20 — Phase 4 review, FIXED (recorded because Phases 5 and 6 will hit it):
+  `Console.print(some_str, style=...)` does NOT reliably apply that style. Rich runs a raw
+  string through console MARKUP parsing (a `[` in the text raises `MarkupError` from inside
+  `emit`) and through `ReprHighlighter`, whose per-token colours OVERRIDE the `style=`
+  argument. For a filesystem path this is platform-dependent: on POSIX the highlighter claims
+  the whole path and paints it magenta, so the requested colour never appears; on Windows the
+  backslash form does not match its path pattern, so the colour survives on the separators
+  while the date digits come out repr-number cyan. The Phase 4 accent test passed on the
+  Windows dev box against exactly that bug and would have gone RED on the Linux CI runner.
+  Two lessons: (1) render any dynamic, styled string as `Text(value, style=...)` — the
+  convention `harness/display.py` already uses at its `Question` and `Alert` sites — and add
+  `soft_wrap=True` when the value must stay on one copy-pasteable line; (2) an
+  `assert "38;2;r;g;b" in raw` style assertion is too weak to catch this, because a shredded
+  line still contains the escape somewhere. Assert the whole value inside ONE span:
+  `f"[38;2;{r};{g};{b}m{value}[0m" in raw`. Phase 5's overlay and Phase 6's tool-call
+  log and reader strip all render dynamic text with explicit styles.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each phase gate. Append-only. MUST remain the LAST section. -->
@@ -735,3 +778,28 @@ budget: ~550-750 lines across 4 files.
   wall-clock-while-answering behavior named in risk #2. Phase 6 now owns THREE things, not
   one: reader strip, tool-call log, and live-updating task meta.
 
+### 2026-08-20 — Phase 4: Finished summary (inline report path)
+- Done: `RunFinished` gained `report_path: Path | None`, `_summary_lines` appends a
+  zero-indent `report written` label plus the bare path as the summary's trailing two lines,
+  and `harness/__main__.py`'s standalone `print(path)` is gone (its two stderr branches
+  preserved by inverting the condition to `if path is None:`). The path line renders as
+  `Text(line, style=_ACCENT)` with `soft_wrap=True`. 609 tests pass; all four gates clean.
+- Learned: (1) The "report path is the last line of stdout" contract is STRONGER than the
+  plan said — `tests/test_agent.py:1128-1132` constructs a `Path` from `lines[-1]` and asserts
+  it exists under `reports_dir`, so that line must stay bare. That is why the mockup's accent
+  left-border on the path line was dropped rather than imitated. (2) A styled raw string
+  handed to `Console.print` loses its style to Rich's `ReprHighlighter`, platform-dependently
+  — see the `## Discoveries` entry; this cost a Blocker that the green gate could not see
+  because the test asserted the escape appeared ANYWHERE rather than around the whole value.
+  (3) The plan's file globs are not trustworthy: `tests/test_main_*.py` matches only Phase 2's
+  unrelated welcome-screen tests.
+- Drift: YES — 2026-08-20 entry in `## Reconciliations`: Phase 4's `**Files:**` named the wrong
+  test file for the last-line pin and understated what the pin asserts; the file list and the
+  acceptance command are struck in place and amended, and the render design (bare accent path
+  line, no left border) was approved off that.
+- Watch-next: Phase 5 (ask_user overlay) is flagged (!#2) — the wall clock must keep running
+  while a question is being answered, which is the behavior the daemon-thread `input()` bridge
+  in `_answer_questions` exists for; assert it, do not rediscover it. Use
+  `harness/input.py`'s `scoped_keys` for the overlay's key source rather than writing new
+  teardown, and render every dynamic overlay string through `Text(...)` per the new
+  `## Discoveries` entry.

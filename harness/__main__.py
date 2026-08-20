@@ -851,6 +851,7 @@ async def main(argv: list[str] | None = None) -> int:
                 cut_short=cut_short,
                 verification_failures=len(verification.check_failures) if verification else 0,
                 incidents=len(run_log.incidents()),
+                report_path=path,
             )
         )
     finally:
@@ -859,14 +860,13 @@ async def main(argv: list[str] | None = None) -> int:
     # terminal — stderr included, it shares the device — while the Live runs lands on the
     # alternate screen and is discarded with it. Down here the normal buffer is restored, so
     # the detail survives the run (Phase 4's "the no-report error message becomes visible").
-    if path is not None:
-        print(path)
-    elif cut_short == "wall_clock":
-        # The wall clock fired before a final answer existed (risk #2's blank/whitespace-answer
-        # case lands here too, via `has_answer`).
-        print("error: the wall clock expired before a final answer existed", file=sys.stderr)
-    else:
-        print(f"error: {cut_short_detail}", file=sys.stderr)
+    if path is None:
+        if cut_short == "wall_clock":
+            # The wall clock fired before a final answer existed (risk #2's blank/whitespace-answer
+            # case lands here too, via `has_answer`).
+            print("error: the wall clock expired before a final answer existed", file=sys.stderr)
+        else:
+            print(f"error: {cut_short_detail}", file=sys.stderr)
     return 0 if should_write_report else 1
 
 
