@@ -3,6 +3,7 @@
 import pathlib
 import re
 import sys
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from io import StringIO
 from typing import Any
@@ -22,6 +23,7 @@ from harness.display import (
     PlainRenderer,
     Question,
     RichRenderer,
+    RoundsUpdated,
     RunFinished,
     StageCompleted,
     StageStarted,
@@ -56,9 +58,9 @@ def _make_console(*, width: int = 80) -> tuple[Console, StringIO]:
     # codes `RichRenderer` now relies on (D1/R5) are suppressed by Rich whenever
     # `legacy_windows` is true, which it auto-detects as True on this platform even over a
     # `StringIO` file — leaving the alt-screen behavior untestable on Windows otherwise.
-    # `color_system="truecolor"` (rather than "auto"): the `#207d99` pending style (R6) only
-    # emits its literal `38;2;...` truecolor escape under truecolor; "auto" resolves to
-    # 16-color "standard" here, downgrading the hex style to a named ANSI color instead.
+    # `color_system="truecolor"` (rather than "auto"): the `_PENDING` (`#474747`) pending
+    # style (R6) only emits its literal `38;2;...` truecolor escape under truecolor; "auto"
+    # resolves to 16-color "standard" here, downgrading the hex style to a named ANSI color.
     # `_environ={}`: an ambient NO_COLOR in the invoking shell would strip color styles
     # even under force_terminal, making the truecolor assertions env-dependent.
     console = Console(
@@ -72,9 +74,21 @@ def _make_console(*, width: int = 80) -> tuple[Console, StringIO]:
     return console, buffer
 
 
-def _rich_renderer() -> tuple[RichRenderer, StringIO]:
+def _rich_renderer(*, clock: Callable[[], float] | None = None) -> tuple[RichRenderer, StringIO]:
     console, buffer = _make_console()
-    return RichRenderer(console=console, auto_refresh=False), buffer
+    kwargs: dict[str, Any] = {} if clock is None else {"clock": clock}
+    return RichRenderer(console=console, auto_refresh=False, **kwargs), buffer
+
+
+def _fixed_elapsed_clock(elapsed_seconds: float) -> Callable[[], float]:
+    """A clock returning 0 on its first call (`RichRenderer.__init__`'s `_started_at`) and
+    `elapsed_seconds` on every call after (each render-time `clock() - self._started_at`)."""
+    calls = iter([0.0])
+
+    def clock() -> float:
+        return next(calls, elapsed_seconds)
+
+    return clock
 
 
 @pytest.mark.parametrize(
@@ -480,8 +494,8 @@ def test_rich_renderer_todos_updated_renders_checklist_and_replaces_on_next_upda
     assert "[x] Draft outline" in text
     assert "> Search for sources" in text
     assert "[ ] Write summary" in text
-    # `#207d99` as `Console(force_terminal=True)` truecolor: 0x20, 0x7d, 0x99 = 32, 125, 153.
-    assert "38;2;32;125;153" in raw
+    # `_PENDING` (`#474747`) as `Console(force_terminal=True)` truecolor: 0x47,0x47,0x47 = 71,71,71.
+    assert "38;2;71;71;71" in raw
     # in_progress is visually distinct from both completed and pending — distinct markers.
     assert "[x] Search for sources" not in text
     assert "[ ] Search for sources" not in text
@@ -695,6 +709,119 @@ def test_rich_renderer_run_finished_summary_prints_on_the_normal_screen_after_th
     assert last_exit_index < summary_index
     # No FURTHER alt-screen entry after the summary — it stays on the normal screen.
     assert "\x1b[?1049h" not in raw[summary_index:]
+
+
+# --- Phase 3: running pane (task meta, stage elapsed/round) ------------------------------
+
+
+def test_rich_renderer_todo_item_renders_meta_when_present():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(
+        TodosUpdated((TodoItem(content="Find sources", status="completed", meta="14 sources"),))
+    )
+    text = _strip_ansi(buffer.getvalue())
+    renderer.close()
+
+    assert "Find sources" in text
+    assert "14 sources" in text
+
+
+def test_rich_renderer_todo_item_omits_meta_fragment_when_absent():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(TodosUpdated((TodoItem(content="Find sources", status="pending"),)))
+    text = _strip_ansi(buffer.getvalue())
+    renderer.close()
+
+    lines = [line for line in text.splitlines() if "Find sources" in line]
+    assert lines[0].strip() == "[ ] Find sources"
+
+
+def test_rich_renderer_stage_line_shows_round_after_rounds_updated():
+    renderer, buffer = _rich_renderer(clock=_fixed_elapsed_clock(252))
+
+    renderer.emit(StageStarted("researching"))
+    before = len(buffer.getvalue())
+    renderer.emit(RoundsUpdated(9, 50))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "04:12 · round 9/50" in frame
+
+
+def test_rich_renderer_elapsed_advances_on_refresh_without_any_new_event():
+    """The clock must tick between events, not only when one arrives.
+
+    `Live` redraws whatever renderable it holds, so handing it a pre-built `Group` froze
+    `MM:SS` until the next event (one `RoundsUpdated` per model turn, tens of seconds
+    apart). Passing the builder as `get_renderable` is what makes a bare refresh repaint a
+    newly computed elapsed — this test fails against a static frame.
+    """
+    # A settable "now" rather than a fixed sequence: the number of `clock()` reads per frame
+    # is Rich's business, and the point being pinned is that a REPAINT re-reads it at all.
+    now = [0.0]
+    renderer, buffer = _rich_renderer(clock=lambda: now[0])
+
+    renderer.emit(StageStarted("researching"))
+
+    # Advance the clock and repaint with NO new event — exactly what auto-refresh does on a
+    # live terminal between model turns.
+    now[0] = 60.0
+    before = len(buffer.getvalue())
+    renderer._live.refresh()
+    first = _strip_ansi(buffer.getvalue()[before:])
+
+    now[0] = 252.0
+    before = len(buffer.getvalue())
+    renderer._live.refresh()
+    second = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "01:00" in first
+    assert "04:12" in second
+
+
+def test_rich_renderer_stage_line_shows_elapsed_only_before_rounds_updated():
+    renderer, buffer = _rich_renderer(clock=_fixed_elapsed_clock(252))
+
+    renderer.emit(StageStarted("researching"))
+    text = _strip_ansi(buffer.getvalue())
+    renderer.close()
+
+    assert "04:12" in text
+    assert "round" not in text
+
+
+def test_plain_renderer_rounds_updated_produces_no_output(capsys):
+    renderer = PlainRenderer()
+
+    renderer.emit(RoundsUpdated(rounds_used=3, max_rounds=50))
+
+    out, lines = drain_stdout(capsys)
+    assert lines == []
+    assert out == ""
+
+
+@pytest.mark.parametrize(
+    ("elapsed_seconds", "expected"),
+    [
+        (0, "00:00"),
+        (5, "00:05"),
+        (65, "01:05"),
+        (252, "04:12"),
+        (3600, "60:00"),
+        (3661, "61:01"),
+    ],
+)
+def test_rich_renderer_stage_line_elapsed_formatting_table(elapsed_seconds, expected):
+    renderer, buffer = _rich_renderer(clock=_fixed_elapsed_clock(elapsed_seconds))
+
+    renderer.emit(StageStarted("researching"))
+    text = _strip_ansi(buffer.getvalue())
+    renderer.close()
+
+    assert expected in text
 
 
 # --- Phase 2: welcome screen (build_welcome, build_help_panel, build_model_picker) -------

@@ -32,6 +32,15 @@ class StageCompleted:
 
 
 @dataclass(frozen=True)
+class RoundsUpdated:
+    """Rounds advance WITHIN a stage, so this cannot ride on `StageStarted` — a separate
+    event carries the run-level round budget to the running pane's stage line."""
+
+    rounds_used: int
+    max_rounds: int
+
+
+@dataclass(frozen=True)
 class Activity:
     text: str
 
@@ -63,6 +72,7 @@ class RunFinished:
 class TodoItem:
     content: str
     status: str
+    meta: str | None = None
 
 
 @dataclass(frozen=True)
@@ -73,7 +83,14 @@ class TodosUpdated:
 
 
 DisplayEvent = (
-    StageStarted | StageCompleted | Activity | Question | Alert | RunFinished | TodosUpdated
+    StageStarted
+    | StageCompleted
+    | Activity
+    | Question
+    | Alert
+    | RunFinished
+    | TodosUpdated
+    | RoundsUpdated
 )
 
 
@@ -126,6 +143,11 @@ class PlainRenderer:
         elif isinstance(event, TodosUpdated):
             for item in event.todos:
                 print(f"  [{item.status}] {item.content}", file=stream)
+        elif isinstance(event, RoundsUpdated):
+            # The only event this renderer drops. It is pure live-frame decoration (D2), and
+            # a line per model turn would spam the non-TTY CI logs; every other event carries
+            # a real, one-time textual meaning worth printing.
+            pass
         else:  # Activity
             print(f"  {event.text}", file=stream)
 
@@ -177,6 +199,14 @@ class StageTracker:
         return tuple(self._timings)
 
 
+def _format_elapsed(seconds: float) -> str:
+    """`MM:SS`, minutes uncapped past 59 (e.g. `61:01`) — a deliberate choice for runs past
+    an hour rather than an accidental one, since nothing here rolls over into an hours field."""
+    total = int(seconds)
+    minutes, secs = divmod(total, 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
 class RichRenderer:
     """Full-screen TUI (D1/R5): a pinned checklist over a gray rule over the activity feed
     (R1), collapsing stage completions to a timeline line (R2), with a one-line exit-hint
@@ -195,7 +225,13 @@ class RichRenderer:
 
     _FOOTER_HINT = "Ctrl+C to exit"
 
-    def __init__(self, console: Console | None = None, *, auto_refresh: bool = True) -> None:
+    def __init__(
+        self,
+        console: Console | None = None,
+        *,
+        auto_refresh: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._console = console or Console()
         self._auto_refresh = auto_refresh
         self._live: Live | None = None
@@ -206,37 +242,66 @@ class RichRenderer:
         self._todos: tuple[TodoItem, ...] = ()
         self._pending_question: str | None = None
         self._closed = False
+        self._clock = clock
+        # RUN elapsed, not stage elapsed: this sits beside a run-level round budget, and
+        # per-stage timings are already shown in the completed-stage timeline (Step 3).
+        self._started_at = clock()
+        self._rounds: tuple[int, int] | None = None
 
     def _build_checklist(self) -> Group:
-        heading = Text("Tasks", style="bold blue")
+        heading = Text("Tasks", style=f"bold {_ACCENT_2}")
         if not self._todos:
             return Group(heading, Text("  (none yet)", style="dim"))
         lines: list[Text] = []
         for item in self._todos:
             if item.status == "completed":
-                lines.append(Text(f"  [x] {item.content}", style="green"))
+                row = Text(f"  [x] {item.content}", style=_OK)
             elif item.status == "in_progress":
-                lines.append(Text(f"  > {item.content}", style="bold bright_blue"))
+                row = Text(f"  > {item.content}", style=_ACCENT_2)
             else:  # pending
-                lines.append(Text(f"  [ ] {item.content}", style="#207d99"))
+                row = Text(f"  [ ] {item.content}", style=_PENDING)
+            if item.meta:
+                row.append(f"  {item.meta}", style=_MUTED)
+            lines.append(row)
         return Group(heading, *lines)
 
+    def _build_stage_header(self) -> RenderableType:
+        if self._stage is None:
+            return Spinner("dots", text=f"[bold]{self._PRE_STAGE_LABEL}[/bold]", style=_FG_2)
+        spinner = Spinner("dots", text=f"[bold]{self._stage}[/bold]", style=_FG_2)
+        elapsed = _format_elapsed(self._clock() - self._started_at)
+        if self._rounds is not None:
+            rounds_used, max_rounds = self._rounds
+            elapsed = f"{elapsed} · round {rounds_used}/{max_rounds}"
+        grid = Table.grid(expand=True)
+        grid.add_column()
+        grid.add_column(justify="right")
+        grid.add_row(spinner, Text(elapsed, style=_MUTED))
+        return grid
+
     def _build_activity_group(self) -> Group:
-        header = Spinner("dots", text=f"[bold]{self._stage or self._PRE_STAGE_LABEL}[/bold]")
+        header = self._build_stage_header()
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
         return Group(*self._timeline, *self._alerts, header, *activity_lines)
 
     def _build_renderable(self) -> Group:
         return Group(
             self._build_checklist(),
-            Rule(style="grey50"),
-            Panel(self._build_activity_group(), border_style="blue"),
+            Rule(style=_RULE),
+            Panel(self._build_activity_group(), border_style=_FG_2),
             Text(self._FOOTER_HINT, style="dim"),
         )
 
     def _start_live(self) -> None:
+        # `get_renderable=` (a callable), NOT a pre-built renderable: `Live` redraws whatever
+        # it was handed on each auto-refresh, so a static `Group` would freeze the stage
+        # line's elapsed clock between events — it would only advance when an event happened
+        # to arrive (one `RoundsUpdated` per model turn, tens of seconds apart). Passing the
+        # builder makes every refresh recompute it, which is what "computed at render time"
+        # requires. Callers therefore use `_live.refresh()`, never `_live.update(...)`:
+        # `update()` would replace this callable with a static frame and reintroduce the bug.
         self._live = Live(
-            self._build_renderable(),
+            get_renderable=self._build_renderable,
             console=self._console,
             refresh_per_second=4,
             screen=True,
@@ -255,7 +320,7 @@ class RichRenderer:
             if self._live is None:
                 self._start_live()
             else:
-                self._live.update(self._build_renderable(), refresh=True)
+                self._live.refresh()
         elif isinstance(event, StageCompleted):
             self._stage = None
             self._activities = []
@@ -270,7 +335,7 @@ class RichRenderer:
                 )
             )
             if self._live is not None:
-                self._live.update(self._build_renderable(), refresh=True)
+                self._live.refresh()
         elif isinstance(event, Question):
             # Held, not printed: while the Live owns the alternate screen a print would land
             # there and be discarded when `suspend()` exits it — the question must appear on
@@ -287,7 +352,7 @@ class RichRenderer:
             warning = Text(f"warning: {event.text}", style="yellow")
             self._alerts.append(warning)
             if self._live is not None:
-                self._live.update(self._build_renderable(), refresh=True)
+                self._live.refresh()
             else:
                 # No Live owns the screen yet (an incident before the first stage, or a run
                 # whose feed never started): print it straight to the normal terminal, where
@@ -298,7 +363,14 @@ class RichRenderer:
             if self._live is None:
                 self._start_live()
             else:
-                self._live.update(self._build_renderable(), refresh=True)
+                self._live.refresh()
+        elif isinstance(event, RoundsUpdated):
+            # Pure live-frame decoration (Step 3): does not start the Live region on its
+            # own — it only repaints an already-running frame, since a round only advances
+            # once a stage (and so the frame) exists.
+            self._rounds = (event.rounds_used, event.max_rounds)
+            if self._live is not None:
+                self._live.refresh()
         elif isinstance(event, RunFinished):
             # Leave the alternate screen FIRST: the summary belongs on the normal terminal
             # (R5), and a later `close()` must then be a safe no-op (idempotent).
@@ -318,7 +390,7 @@ class RichRenderer:
             if self._live is None:
                 self._start_live()
             else:
-                self._live.update(self._build_renderable(), refresh=True)
+                self._live.refresh()
 
     def suspend(self) -> AbstractContextManager[None]:
         return self._suspend()
@@ -370,6 +442,13 @@ _WORDMARK_BACK = "#7a7a7a"
 _WARN = "#d9a33a"
 _OK = "#3fd15a"
 _CYAN = "#56b6c2"
+
+# Running-pane palette (Phase 3, PLAN-tui-redesign): `.tasks-head`, `.panel`/stage spinner,
+# the checklist/panel divider, and pending task rows respectively.
+_ACCENT_2 = "#6b8cff"
+_FG_2 = "#c8ccd1"
+_RULE = "#4a4f55"
+_PENDING = "#474747"
 
 # Glyph rows taken VERBATIM from docs/design/deep-research-tui.html's `.wordmark` `<pre>`
 # blocks — not hand-drawn letterforms.

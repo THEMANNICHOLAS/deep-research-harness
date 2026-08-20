@@ -227,7 +227,7 @@ entire decision below is struck and NOT implemented. No `sources.json` is writte
 | ID | Outcome | Covered by |
 |----|---------|------------|
 | R1 | Five screens faithful to mockup | Phase 2 (welcome), Phase 3 (running pane), Phase 5 (overlay), Phase 1/existing (finished) |
-| R2 | Task meta, round/elapsed, tool-call log, reader strip | Phase 3 (ledger/stage/log), Phase 6 (reader strip) |
+| R2 | Task meta, round/elapsed, tool-call log, reader strip | Phase 3 (ledger/stage), Phase 6 (reader strip + tool-call log) |
 | R3 | Interactive welcome + ~~3~~ 2 commands (`/sources` dropped) | Phase 1 (input foundation), Phase 2 (welcome+commands) |
 | R4 | ask_user in-place overlay | Phase 5 |
 | R5 | Finished summary + inline report path | Phase 4 |
@@ -237,10 +237,10 @@ entire decision below is struck and NOT implemented. No `sources.json` is writte
 ## Progress
 - [x] Phase 1: Raw-key input foundation
 - [x] Phase 2: Welcome screen and slash commands
-- [ ] Phase 3: Running pane — task meta, stage round/elapsed, structured tool log
+- [x] Phase 3: Running pane — task meta, stage round/elapsed (~~structured tool log~~ → Phase 6)
 - [ ] Phase 4: Finished summary — inline report path
 - [ ] Phase 5: ask_user in-place overlay
-- [ ] Phase 6: Reader-strip visibility hook
+- [ ] Phase 6: Reader-strip visibility hook + structured tool-call log
 - [ ] Final verification
 
 ## Phases
@@ -342,35 +342,42 @@ invocation does.
 **Risk:** none
 **Test-first:** required
 **Goal:** Extend the existing running screen: task items carry optional meta text
-(e.g. "14 sources"), the stage line shows elapsed time and `round N/max_rounds`, and
+(e.g. "14 sources"), the stage line shows elapsed time and `round N/max_rounds`, ~~and
 the free-text activity tail becomes a structured tool-call log (tool / arg summary /
-result / timing, retry rows styled distinctly).
+result / timing, retry rows styled distinctly)~~ — the tool-call log MOVED TO PHASE 6
+on 2026-08-19 (see `## Reconciliations`); it needs data this top-level stream cannot
+see.
 **Requirements:** R1, R2
 **Assumes:**
-- None beyond what already exists on `development`.
+- ~~None beyond what already exists on `development`.~~ FALSE for the tool log — see
+  `## Reconciliations`. True for the remaining scope (task meta + stage line), which
+  needs nothing new.
 **Files:**
 - `harness/display.py` — modify: `TodoItem` gains optional `meta: str | None`; stage
-  line rendering gains elapsed+round; new `ToolCall` event (tool, arg_summary,
+  line rendering gains elapsed+round; ~~new `ToolCall` event (tool, arg_summary,
   result_summary, elapsed_seconds, retry: bool) replacing free-text `Activity` for
-  tool invocations (`Activity` stays for non-tool-call activity lines, if any remain).
-- `harness/__main__.py` — modify: emit `ToolCall` events from the existing
+  tool invocations~~ (moved to Phase 6). `Activity` is UNCHANGED and keeps its five
+  existing non-tool-call emission sites.
+- `harness/__main__.py` — modify: ~~emit `ToolCall` events from the existing
   `node_update` parsing (where `_RESEARCH_TOOLS`/tool-call proposals are already
-  read) instead of collapsing them to text; pass `rounds_used`/`max_rounds` alongside
+  read) instead of collapsing them to text;~~ pass `rounds_used`/`max_rounds` alongside
   `StageStarted`/existing stage tracking so the stage line can show them.
 - `tests/test_display.py`, `tests/test_agent.py` (or equivalent stream-parsing tests)
   — modify.
-**Diff budget:** ~400-600 lines across 3 files
+**Diff budget:** ~~~400-600~~ ~200-320 lines across 3 files (tool log moved out)
 **Reuse:** `StageTracker` (extend, don't fork); existing `Console(record=True)`-style
 assertion pattern in `tests/test_display.py`.
 **Contracts:** none new external — purely internal event/rendering extension.
-**Out of scope:** Reader strip (Phase 6); ask_user overlay (Phase 5); any change to
-what tools exist or how they're invoked.
+**Out of scope:** Reader strip (Phase 6); the structured tool-call log (MOVED to Phase 6
+2026-08-19 — it requires the `agent.py` middleware Phase 6 already owns); ask_user
+overlay (Phase 5); any change to what tools exist or how they're invoked.
 **Tests (write first, confirm red):**
 - [ ] Task ledger renders per-task meta when present, omits it when absent.
 - [ ] Stage line renders `HH:MM · round N/max_rounds` alongside the existing spinner
   and stage name.
-- [ ] Tool-call log renders tool/arg/result/timing columns; a retried call is styled
-  distinctly; overlong arg/result text truncates with ellipsis instead of wrapping.
+- [ ] ~~Tool-call log renders tool/arg/result/timing columns; a retried call is styled
+  distinctly; overlong arg/result text truncates with ellipsis instead of wrapping.~~
+  MOVED to Phase 6.
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
 2. Implement the event/model extensions and `__main__.py` wiring.
@@ -481,6 +488,16 @@ the phase's named reuse target; existing reader-failure handling
 **Out of scope:** Nested reader→reader visibility; any change to reader dispatch
 concurrency, retry, or failure semantics; researcher-tier visibility (only the
 reader tier gets a strip, per the mockup).
+**ABSORBED FROM PHASE 3 (2026-08-19 — see `## Reconciliations`):** the structured
+tool-call log. The same middleware that reports reader dispatch must also report every
+tool call from the nested tiers (tool name, argument summary, result summary, elapsed,
+retry flag) as a `ToolCall` event, replacing the free-text activity tail for tool
+invocations. This is why the log lives here and not in Phase 3: the nested tiers' tool
+calls never reach `__main__.py`'s top-level stream, so the log needs the very hook this
+phase adds. `Activity` keeps its five non-tool-call emission sites. Add to this phase's
+tests: tool/arg/result/timing columns render, a retried call is styled distinctly, and
+overlong arg/result text truncates with an ellipsis rather than wrapping. Revised diff
+budget: ~550-750 lines across 4 files.
 **Tests (write first, confirm red):**
 - [ ] N reader dispatches (scripted researcher tool calls) each produce a start and
   a done/failed `ReadersUpdated` transition without ID collisions.
@@ -565,6 +582,24 @@ reader tier gets a strip, per the mockup).
   welcome tip line "Run /sources to see what the last run captured" would advertise a
   command that does not exist, so it renders the `/help` tip instead — a Preference-level
   deviation from R1's mockup fidelity, permitted by `## Intent`'s Preferences clause.
+- 2026-08-19 — Phase 3: the phase's step "emit `ToolCall` events from the existing
+  `node_update` parsing (where `_RESEARCH_TOOLS`/tool-call proposals are already read)"
+  rests on a premise this plan contradicts elsewhere. There is no `_RESEARCH_TOOLS`
+  constant, and the tool calls the mockup's log shows (`search_web`, `fetch_pages`,
+  retry rows) execute inside the researcher/reader subgraphs and NEVER reach
+  `harness/__main__.py`'s top-level `astream` — exactly as this plan's own
+  `## Codebase Map` records for `agent.py` ("which this top-level stream never sees").
+  Only `task(subagent_type="researcher")` dispatches are observable there, so Phase 3's
+  `**Assumes:** None beyond what already exists` was false and the log could not be built
+  as written. **Developer decision: split Phase 3 — ship task meta + stage round/elapsed
+  now, and MOVE the structured tool-call log to Phase 6**, whose already-sanctioned
+  `agent.py` middleware (D4) is the only place the nested tiers' tool calls are visible.
+  Deciding axis: whether the log must show real nested tool activity (it must, for R1/R2
+  fidelity), which forces it behind an `agent.py` hook. This keeps the plan's
+  one-`agent.py`-touch constraint intact — one middleware, one flagged review — instead of
+  adding a second instrumentation point ahead of Phase 6. R2 is now covered by Phase 3
+  (ledger/stage) plus Phase 6 (reader strip + tool log); Phase 3's diff budget drops to
+  ~200-320 lines and Phase 6's rises to ~550-750.
 - 2026-08-19 — Phase 2: the mockup's roles line (`subagent … · verifier … · budget …`)
   encodes the stale two-role model that `## Constraints` already overrides with the real
   four roles. Developer decision: the roles line renders `researcher · reader ·
@@ -612,6 +647,16 @@ reader tier gets a strip, per the mockup).
   recomputed by `_view()` on every path where `choices` is non-empty, so the picker is
   built twice per keystroke; the eager assignment only matters in the empty-choices case
   above, and both should be resolved together.
+- 2026-08-19 — Phase 3 review, DEFERRED: `RoundsUpdated` is emitted BEFORE the round-overrun
+  check in `harness/__main__.py`, so an overrun turn paints `round 51/50` in the stage line
+  for one frame. Harmless, but reads as a bug to an operator. Fix when that area is touched:
+  emit after the check.
+- 2026-08-19 — Phase 3, KNOWN LIMITATION of the task-meta wiring: `meta` is recomputed only
+  when the todo list itself changes (the `todos != last_todos` dedupe), so the `N sources`
+  count can lag behind reality between todo updates. Re-emitting `TodosUpdated` on every
+  stream chunk would spam the frame, so the dedupe stays. Phase 6 owns the mockup's other
+  meta variant (`3 in flight`, which needs reader visibility) and will need live-updating
+  meta anyway — resolve both together there.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each phase gate. Append-only. MUST remain the LAST section. -->
@@ -664,4 +709,29 @@ reader tier gets a strip, per the mockup).
   colors — if Phase 3 ends up not using them, drop them per the logged SIMPLIFY item.
   `harness/input.py` now exports `scoped_keys`, which Phase 5 must use for the overlay's
   key source instead of writing its own teardown.
+
+### 2026-08-19 — Phase 3: Running pane (task meta + stage round/elapsed)
+- Done: `TodoItem.meta` (defaulted, rendered in `_MUTED`, wired from a new `_sources_read`
+  helper counting registry sources with `read_mode != "unread"`, attached to the
+  `in_progress` row only), a `RoundsUpdated` event, and the stage line's right-aligned
+  `MM:SS · round N/max_rounds`. Palette gained `_ACCENT_2`/`_FG_2`/`_RULE`/`_PENDING`, and
+  the checklist/rule/panel/heading styles moved off raw Rich strings onto those constants.
+  601 tests pass; all four gates clean; coverage 97%.
+- Learned: (1) The tool-call log was SPLIT OUT to Phase 6 — the nested tiers' tool calls
+  never reach `__main__.py`'s top-level `astream`, which the plan's own Codebase Map already
+  recorded. Check that map before planning anything that reads tool activity from the lead's
+  stream. (2) `Live` redraws whatever renderable it HOLDS, so a pre-built `Group` freezes any
+  render-time value — the elapsed clock only advanced when an event arrived. `Live` must be
+  constructed with `get_renderable=<builder>` and callers must use `_live.refresh()`, never
+  `_live.update(...)`, which would silently reintroduce the freeze. (3) A green gate proved
+  nothing about either defect: no test repainted without an event, and no test checked that
+  anything in production actually SETS `meta`. Both were caught by review, not by tests.
+- Drift: YES — Phase 3 split, tool-call log moved to Phase 6 (`## Reconciliations`,
+  developer-approved). Phase 3's diff budget dropped to ~200-320 lines; Phase 6 rose to
+  ~550-750 and absorbed the log.
+- Watch-next: Phase 4 (finished summary, inline report path) is small and unflagged — the
+  pinned "report path is the last line of stdout" test must keep passing UNCHANGED for argv
+  mode. Then Phase 5 (overlay) needs `harness/input.py`'s `scoped_keys` and must preserve the
+  wall-clock-while-answering behavior named in risk #2. Phase 6 now owns THREE things, not
+  one: reader strip, tool-call log, and live-updating task meta.
 

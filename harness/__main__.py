@@ -47,6 +47,7 @@ from harness.display import (
     Alert,
     Question,
     Renderer,
+    RoundsUpdated,
     RunFinished,
     StageTracker,
     TodoItem,
@@ -206,6 +207,16 @@ async def _read_answer(prompt: str = "> ") -> str:
 
     threading.Thread(target=_worker, daemon=True).start()
     return await future
+
+
+def _sources_read(registry: SourceRegistry) -> int:
+    """How many sources have actually been READ so far — the ledger's per-task meta count (R2).
+
+    `read_mode != "unread"` rather than `len(registry.all())`: a URL is registered the moment
+    it is seen in search results, so the raw count would climb far ahead of anything actually
+    fetched and read.
+    """
+    return sum(1 for source in registry.all() if source.read_mode != "unread")
 
 
 def _research_tool_calls(node_update: dict[str, Any]) -> list[dict[str, Any]]:
@@ -591,6 +602,7 @@ async def main(argv: list[str] | None = None) -> int:
                     continue
                 counted_turn_ids.add(message.id)
             rounds_used += 1
+            renderer.emit(RoundsUpdated(rounds_used, max_rounds))
             if rounds_used > max_rounds:
                 overrun = True
             elif rounds_used == max_rounds:
@@ -639,11 +651,24 @@ async def main(argv: list[str] | None = None) -> int:
                                     continue
                                 todos = node_update.get("todos")
                                 if todos is not None and todos != last_todos:
+                                    sources_read = _sources_read(registry)
                                     renderer.emit(
                                         TodosUpdated(
                                             tuple(
                                                 TodoItem(
-                                                    content=todo["content"], status=todo["status"]
+                                                    content=todo["content"],
+                                                    status=todo["status"],
+                                                    # Only the ACTIVE row carries the count:
+                                                    # the mockup shows meta beside the task in
+                                                    # flight, and repeating one run-level total
+                                                    # on every row would read as a per-task
+                                                    # number it is not.
+                                                    meta=(
+                                                        f"{sources_read} sources"
+                                                        if todo["status"] == "in_progress"
+                                                        and sources_read
+                                                        else None
+                                                    ),
                                                 )
                                                 for todo in todos
                                             )
