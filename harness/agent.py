@@ -238,18 +238,19 @@ def _summarize_tool_args(name: str, args: dict[str, Any]) -> str:
 def _summarize_tool_result(result: ToolMessage | Command[Any]) -> str:
     """A short, honest description of one tool call's result for the activity log (D-C).
 
-    Reuses `_digest_text` to pull the message text out however the tool wrapped it. Prefers
-    a leading count when the text already starts with one (e.g. a results count) -- that
-    first line already IS the brevity this needs -- else the first line, truncated to ~60
-    chars: the renderer truncates for display too, so this only has to be short and honest,
-    not a full summary.
+    Reuses `_digest_text` to pull the message text out however the tool wrapped it. Takes the
+    first line, truncated to ~60 chars: the renderer truncates for display too, so this only
+    has to be short and honest, not a full summary.
+
+    The cap is unconditional. A leading-digit line used to be returned whole, on the
+    assumption that a line starting with a count is already brief -- but a `task` result is
+    free model prose, and a digest opening "1. ..." or "2024 ..." hit that branch and put an
+    arbitrarily long string on a one-line log row (PR #25 review).
     """
     text = _digest_text(result)
     if not text:
         return ""
     first_line = text.splitlines()[0].strip()
-    if first_line and first_line[0].isdigit():
-        return first_line
     if len(first_line) > 60:
         return first_line[:60].rstrip() + "…"
     return first_line

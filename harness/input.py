@@ -39,8 +39,20 @@ class KeyEvent:
     char: str | None = None
 
 
-def decode_posix(read_char: Callable[[], str]) -> KeyEvent | None:
-    """Decode one POSIX raw-mode key. `\\r` is Enter, `\\n` is Ctrl+J — do not collapse them."""
+def decode_posix(
+    read_char: Callable[[], str],
+    has_pending: Callable[[], bool] | None = None,
+    unread: Callable[[str], None] | None = None,
+) -> KeyEvent | None:
+    """Decode one POSIX raw-mode key. `\\r` is Enter, `\\n` is Ctrl+J — do not collapse them.
+
+    `has_pending` reports whether another byte is already buffered, and `unread` pushes an
+    unconsumed byte back for the next decode. Both exist for the ESC branch alone: on a raw
+    fd `read_char` BLOCKS, so a bare Escape (which sends `\\x1b` and nothing else) would
+    otherwise swallow whatever the user typed next, and an Alt+key (`\\x1b` then the letter)
+    would swallow the letter. `read_keys` supplies both; the pure decoder tests may omit
+    them, in which case the lookahead stays blocking and an unrecognized byte is dropped.
+    """
     c = read_char()
     if c == "":
         return None
@@ -53,8 +65,12 @@ def decode_posix(read_char: Callable[[], str]) -> KeyEvent | None:
     if c == "\x03":
         return KeyEvent("interrupt")
     if c == "\x1b":
+        if has_pending is not None and not has_pending():
+            return None
         nxt = read_char()
         if nxt != "[":
+            if unread is not None and nxt != "":
+                unread(nxt)
             return None
         arrow = read_char()
         return {
@@ -89,6 +105,11 @@ def decode_windows(read_char: Callable[[], str]) -> KeyEvent | None:
             "K": KeyEvent("left"),
             "M": KeyEvent("right"),
         }.get(nxt)
+    # Same guard as `decode_posix`, for the same reason: `msvcrt.getwch()` returns Escape as
+    # a bare `\x1b` and Tab as `\t`, neither of which is an `\xe0`/`\x00` extended-key pair,
+    # so without this they reach `LineBuffer` as insertable text.
+    if ord(c) < 32:
+        return None
     return KeyEvent("char", c)
 
 
@@ -102,6 +123,7 @@ def read_keys() -> Iterator[KeyEvent]:
             if event is not None:
                 yield event
     else:
+        import select
         import termios
         import tty
 
@@ -115,19 +137,32 @@ def read_keys() -> Iterator[KeyEvent]:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
         _restore = _do_restore
+
+        # Outside the loop, not rebuilt per iteration: `decode_posix`'s ESC branch pushes an
+        # unconsumed byte back here, and it has to survive into the NEXT decode to be read.
+        pending: list[str] = []
+
+        def read_char() -> str:
+            if pending:
+                return pending.pop(0)
+            return sys.stdin.read(1)
+
+        def has_pending() -> bool:
+            # A zero timeout makes this a probe, never a wait: it answers "did the terminal
+            # send more of this sequence already", which is what separates a real arrow key
+            # from a bare Escape.
+            return bool(pending) or bool(select.select([fd], [], [], 0)[0])
+
+        def unread(ch: str) -> None:
+            pending.insert(0, ch)
+
         try:
             while True:  # pragma: no cover -- blocking terminal read loop, no unit-testable seam
-                first = sys.stdin.read(1)
+                first = read_char()
                 if first == "":
                     break
-                pending = [first]
-
-                def read_char() -> str:
-                    if pending:
-                        return pending.pop(0)
-                    return sys.stdin.read(1)
-
-                event = decode_posix(read_char)
+                unread(first)
+                event = decode_posix(read_char, has_pending, unread)
                 if event is not None:
                     yield event
         finally:

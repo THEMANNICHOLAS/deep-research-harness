@@ -82,8 +82,11 @@ class RoleConfig(_StrictModel):
             return self
         if not self.choices:
             raise ValueError("choices, if set, must be non-empty")
+        # Blankness only: `choices: list[str] | None` already makes pydantic reject a
+        # non-string entry before this `mode="after"` validator runs, so an `isinstance`
+        # guard here would be a branch nothing can take.
         for entry in self.choices:
-            if not isinstance(entry, str) or not entry.strip():
+            if not entry.strip():
                 raise ValueError(f"choices entries must be non-empty strings, got {entry!r}")
         return self
 

@@ -421,6 +421,12 @@ def _handle_model(state: _WelcomeState, config: HarnessConfig) -> None:
 
 # A DATA structure (name -> `_Command`), not an if/elif chain (Contracts): adding `/sources`
 # later is one entry here plus its handler, no change to `_run_welcome`'s loop.
+#
+# That holds for a command that only paints a panel. A command needing its OWN key handling
+# does not get off as cheaply: `_run_welcome`'s `up`/`down`/`enter` branches test
+# `state.mode == "model_picker"` inline, so a second interactive command means a second mode
+# branch in that shared loop. Give `_Command` an optional key handler before adding one,
+# rather than growing the chain this table exists to avoid (PR #25 review).
 _COMMANDS: dict[str, _Command] = {
     "/help": _Command("/help", "Show available commands and key hints.", _handle_help),
     "/model": _Command("/model", "Pick the head model for this session.", _handle_model),

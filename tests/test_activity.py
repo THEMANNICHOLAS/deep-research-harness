@@ -122,6 +122,25 @@ def test_reopen_reader_brings_a_failed_row_back_to_live():
     assert "failed" not in readers[0].status_text
 
 
+def test_reopen_reader_restarts_the_rows_elapsed_clock():
+    """PR #25 review, Minor: the row's elapsed time must measure THIS attempt.
+
+    Leaving the original stamp in place made a just-retried reader display the failed
+    attempt's accumulated time, so a reader that had only just restarted read as stuck --
+    and disagreed with `start_call`, which re-stamps per attempt for the tool log.
+    """
+    # Dispatch at t=0, fail at t=100, retry at t=100, then report at t=103.
+    sink = ActivitySink(clock=_clock_from(0.0, 100.0, 100.0, 103.0))
+    reader_id = sink.start_reader("Angle A")
+    sink.finish_reader(reader_id, failed=True)
+
+    sink.reopen_reader(reader_id)
+    sink.note_reader_tool(reader_id, "fetch_pages")
+
+    # 3s into the retry, not 103s since the original dispatch.
+    assert sink.readers()[0].status_text == "fetch_pages · 3s"
+
+
 def test_on_change_fires_as_the_last_action_of_every_mutating_method():
     """Fix-pass item 1: the sink PUSHES rather than being drained -- every mutation must call
     `on_change` after its own state update is visible, not before."""

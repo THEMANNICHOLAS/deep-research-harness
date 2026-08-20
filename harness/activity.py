@@ -123,7 +123,10 @@ class ActivitySink:
     def finish_call(self, call_id: str, result_summary: str) -> None:
         """Record the completion of `call_id`, carrying the same `retry` flag as its start."""
         tool, arg_summary, retry = self._pending.get(call_id, ("", "", False))
-        started_at = self._started[call_id] if call_id in self._started else self._clock()
+        # Indexed, not `.get`-with-a-default: `start_call` is the only writer and every caller
+        # starts before it finishes, so a miss is a real pairing bug and should raise rather
+        # than be dressed up as a 0-second call.
+        started_at = self._started[call_id]
         self._records.append(
             ToolCallRecord(
                 call_id=call_id,
@@ -158,6 +161,10 @@ class ActivitySink:
         current = self._readers.get(reader_id)
         if current is None:
             return
+        # Re-stamped, exactly as `start_call` re-stamps on a retried call: the row's elapsed
+        # time measures THIS attempt. Leaving the original stamp made a just-retried reader
+        # display the failed attempt's accumulated time and read as stuck (PR #25 review).
+        self._started[reader_id] = self._clock()
         self._readers[reader_id] = ReaderState(
             id=current.id, brief=current.brief, status_text="dispatched", done=False
         )
@@ -165,7 +172,9 @@ class ActivitySink:
 
     def _reader_elapsed(self, reader_id: str) -> str:
         """This reader's formatted elapsed time -- one home for both status shapes."""
-        started = self._started.get(reader_id, self._clock())
+        # Indexed for the same reason as `finish_call`: `start_reader` writes `_readers` and
+        # `_started` together, and both callers already guard on the `_readers` lookup.
+        started = self._started[reader_id]
         return _format_status_elapsed(self._clock() - started)
 
     def note_reader_tool(self, reader_id: str, tool: str) -> None:

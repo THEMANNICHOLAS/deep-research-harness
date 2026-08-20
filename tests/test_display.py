@@ -1826,3 +1826,94 @@ def test_rich_renderer_ignores_an_event_emitted_after_close():
 
     assert buffer.getvalue()[before:] == ""
     assert renderer._live is None
+
+
+# --- PR #25 review fixes -----------------------------------------------------------------
+
+
+def test_the_tool_log_never_evicts_a_still_running_call():
+    """PR #25 review, Minor: eviction by insertion order dropped live rows.
+
+    A `task(reader)` row stays `running...` for its whole nested subgraph, so with several
+    researchers in flight more than `_TOOL_LOG_TAIL` calls really are open at once. Evicting
+    the long-running one meant its completion emit re-inserted it as a NEW key -- at the
+    BOTTOM of the log, out of order, which is exactly what keying by `call_id` exists to
+    prevent.
+    """
+    renderer, buffer = _rich_renderer()
+    renderer.emit(StageStarted("researching"))
+
+    renderer.emit(ToolCall(call_id="reader-1", tool="task", arg_summary="reader -- Angle A"))
+    # Enough finished calls to overflow the tail several times over.
+    for index in range(renderer._TOOL_LOG_TAIL * 2):
+        renderer.emit(
+            ToolCall(
+                call_id=f"c{index}",
+                tool="search_web",
+                arg_summary=f"query {index}",
+                result_summary="3 results",
+                elapsed_seconds=0.5,
+            )
+        )
+
+    assert "reader-1" in renderer._tool_calls, "the live task row was evicted"
+    # Still the FIRST row, not re-inserted at the tail.
+    assert list(renderer._tool_calls)[0] == "reader-1"
+    # The trim still bounds the dict rather than letting it grow with the run.
+    assert len(renderer._tool_calls) == renderer._TOOL_LOG_TAIL
+    renderer.close()
+    assert "running..." in _strip_ansi(buffer.getvalue())
+
+
+def test_the_tool_log_trim_still_bounds_the_dict_when_every_call_has_finished():
+    renderer, _ = _rich_renderer()
+    renderer.emit(StageStarted("researching"))
+
+    for index in range(renderer._TOOL_LOG_TAIL * 3):
+        renderer.emit(
+            ToolCall(
+                call_id=f"c{index}",
+                tool="search_web",
+                arg_summary=f"query {index}",
+                result_summary="3 results",
+                elapsed_seconds=0.5,
+            )
+        )
+    renderer.close()
+
+    assert len(renderer._tool_calls) == renderer._TOOL_LOG_TAIL
+
+
+def test_the_welcome_screen_forces_a_repaint_on_every_update():
+    """PR #25 review, Minor: `Live.update` defaults to refresh=False.
+
+    Without the flag a keystroke waited for the 4 Hz auto-tick, so typing lagged by up to
+    250ms -- and this was the one live-region mutation in the module not forcing a repaint.
+    """
+    screen = harness.display.WelcomeScreen(console=Console(file=StringIO(), force_terminal=True))
+    calls: list[bool] = []
+
+    class _RecordingLive:
+        def update(self, renderable: Any, refresh: bool = False) -> None:
+            calls.append(refresh)
+
+    screen._live = _RecordingLive()
+    screen.update(_welcome_view(question="a", cursor_col=1))
+
+    assert calls == [True]
+
+
+def test_the_ask_overlay_marks_the_draft_line_with_an_answer_prompt():
+    """PR #25 review, Nit: the mockup's `answer >` prompt marks which line is the input."""
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(Question("Which region should I focus on?"))
+    renderer.emit(harness.display.AnswerDraft("euro", 0, 4))
+    frame = _strip_ansi(buffer.getvalue())
+    renderer.close()
+
+    assert "answer >" in frame
+    draft_lines = [line for line in frame.splitlines() if "euro" in line]
+    assert draft_lines, frame
+    assert all("answer >" in line for line in draft_lines)

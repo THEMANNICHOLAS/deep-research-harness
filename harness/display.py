@@ -483,13 +483,7 @@ class RichRenderer:
             # would be parsed as an unknown style and silently dropped from the question the
             # developer is answering.
             Text(self._overlay_question),
-            *_build_cursor_rows(
-                draft.text,
-                draft.cursor_row,
-                draft.cursor_col,
-                style=_FG,
-                cursor_style=f"{_SURFACE} on {_FG}",
-            ),
+            *_build_answer_rows(draft),
             Text("Enter to submit", style=_MUTED),
             # "clock", not the mockup's "stage clock": what freezes is the RUN elapsed time
             # shown on the stage line, not a per-stage timer. Worth being exact, because the
@@ -639,8 +633,20 @@ class RichRenderer:
             self._tool_calls[event.call_id] = event
             # Trimmed to the tail on every emit, not just at render time, so the dict cannot
             # grow unboundedly across a long run.
+            #
+            # STILL-RUNNING calls are never evicted, however old: evicting one only to have
+            # its completion emit re-insert it as a new key put the row at the BOTTOM of the
+            # log, out of order, breaking the in-place replacement this dict exists for. A
+            # `task(reader)` runs for its whole nested subgraph, so with 3 researchers each
+            # allowed several searches and reader dispatches, more than `_TOOL_LOG_TAIL`
+            # calls really are in flight at once (PR #25 review).
             if len(self._tool_calls) > self._TOOL_LOG_TAIL:
-                for stale_id in list(self._tool_calls)[: -self._TOOL_LOG_TAIL]:
+                finished = [
+                    call_id
+                    for call_id, call in self._tool_calls.items()
+                    if call.result_summary is not None
+                ]
+                for stale_id in finished[: len(self._tool_calls) - self._TOOL_LOG_TAIL]:
                     del self._tool_calls[stale_id]
             # A tool call can precede the first stage, exactly as `Activity` already handles.
             if self._live is None:
@@ -744,6 +750,8 @@ _WORDMARK_FRONT_LINE2 = "█▀▄ ██▄ ▄█ ██▄ █▀█ █▀�
 
 _EXAMPLE_QUESTION = '"How does DeepSeek V4 Pro price long-context runs?"'
 _PLACEHOLDER = "Ask anything… "
+# The `ask_user` overlay's input prompt (docs/design/deep-research-tui.html's `answer >`).
+_ANSWER_PROMPT = "answer > "
 
 _HINTS: tuple[tuple[str, str], ...] = (
     ("enter", "run"),
@@ -818,6 +826,32 @@ def _build_cursor_rows(
         row.append(line[col + 1 :], style=style)
         rows.append(row)
     return rows
+
+
+def _build_answer_rows(draft: AnswerDraft) -> list[Text]:
+    """The `ask_user` overlay's draft rows, behind the mockup's `answer >` prompt.
+
+    The prompt is what marks which line of the panel is the input; without it the draft sits
+    under the question prose as more text (PR #25 review). Continuation rows (Ctrl+J) are
+    padded to the same width so the typed text stays in one column.
+    """
+    rows = _build_cursor_rows(
+        draft.text,
+        draft.cursor_row,
+        draft.cursor_col,
+        style=_FG,
+        cursor_style=f"{_SURFACE} on {_FG}",
+    )
+    prefixed: list[Text] = []
+    for index, row in enumerate(rows):
+        out = Text()
+        if index == 0:
+            out.append(_ANSWER_PROMPT, style=_CYAN)
+        else:
+            out.append(" " * len(_ANSWER_PROMPT))
+        out.append_text(row)
+        prefixed.append(out)
+    return prefixed
 
 
 def _build_ask_rows(view: WelcomeView) -> list[Text]:
@@ -991,4 +1025,7 @@ class WelcomeScreen:
 
     def update(self, view: WelcomeView) -> None:
         if self._live is not None:
-            self._live.update(build_welcome(view))
+            # `refresh=True`, matching every other live-region mutation in this module:
+            # `Live.update` defaults to refresh=False, so without it a keystroke waited for
+            # the 4 Hz auto-tick and typing visibly lagged by up to 250ms (PR #25 review).
+            self._live.update(build_welcome(view), refresh=True)

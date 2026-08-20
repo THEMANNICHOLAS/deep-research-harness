@@ -21,7 +21,7 @@ from pydantic import PrivateAttr
 
 import harness.__main__ as main_module
 from harness.activity import ActivitySink, active_reader
-from harness.agent import build_agent
+from harness.agent import _summarize_tool_args, _summarize_tool_result, build_agent
 from harness.config import AgentSettings, HarnessConfig, run_workspace_dir
 from harness.display import PlainRenderer, StageTracker
 from harness.report import (
@@ -2526,3 +2526,68 @@ async def test_a_renderer_crash_mid_dispatch_fails_the_run_cleanly_and_writes_no
     assert any(line.startswith("error:") for line in err.splitlines()), err
     assert "DisplayError" in err, f"the failure was not attributed to the display: {err}"
     assert "Traceback" not in err
+
+
+# --- Tool-call summarizers (PR #25 review) -------------------------------------------------
+#
+# These feed the running pane's structured tool-call log. Every branch below was previously
+# reachable only through a full agent run, so only the single-URL `fetch_pages` shape was
+# exercised and the rest could be rewritten with nothing failing.
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "expected"),
+    [
+        ("task", {"subagent_type": "reader", "description": "Read S3"}, "reader -- Read S3"),
+        # A missing/blank subagent_type still names the tool rather than rendering "-- ...".
+        ("task", {"description": "Read S3"}, "task -- Read S3"),
+        ("search_web", {"query": "solar tariffs"}, "solar tariffs"),
+        ("fetch_pages", {"urls": ["https://a.example"]}, "https://a.example"),
+        (
+            "fetch_pages",
+            {"urls": ["https://a.example", "https://b.example"]},
+            "https://a.example +1",
+        ),
+        (
+            "fetch_raw",
+            {"urls": ["https://a.example", "https://b.example", "https://c.example"]},
+            "https://a.example +2",
+        ),
+        ("fetch_pages", {"urls": []}, ""),
+        # Unrecognized tool: first string-valued arg, skipping non-strings.
+        ("write_file", {"limit": 5, "path": "notes.md"}, "notes.md"),
+        ("write_file", {"limit": 5}, ""),
+    ],
+)
+def test_summarize_tool_args_covers_every_shape(name, args, expected):
+    assert _summarize_tool_args(name, args) == expected
+
+
+def test_summarize_tool_result_truncates_at_sixty_characters():
+    long_line = "x" * 80
+    summary = _summarize_tool_result(ToolMessage(content=long_line, tool_call_id="c1"))
+
+    assert summary == "x" * 60 + "…"
+
+
+def test_summarize_tool_result_truncates_a_leading_digit_line_too():
+    """PR #25 review, Minor: the leading-digit branch used to return the line whole.
+
+    A `task` result is free model prose, so a digest opening with a numbered list item or a
+    year reached that branch and put an unbounded string on a one-line log row.
+    """
+    long_line = "2024 " + "y" * 100
+    summary = _summarize_tool_result(ToolMessage(content=long_line, tool_call_id="c1"))
+
+    assert len(summary) == 61  # 60 chars plus the ellipsis
+    assert summary.endswith("…")
+
+
+def test_summarize_tool_result_takes_only_the_first_line_and_strips_it():
+    message = ToolMessage(content="  first line  \nsecond line\n", tool_call_id="c1")
+
+    assert _summarize_tool_result(message) == "first line"
+
+
+def test_summarize_tool_result_of_empty_content_is_empty():
+    assert _summarize_tool_result(ToolMessage(content="", tool_call_id="c1")) == ""

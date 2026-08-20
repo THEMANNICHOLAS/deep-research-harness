@@ -517,8 +517,21 @@ def test_role_choices_empty_list_is_rejected(tmp_path, monkeypatch):
     assert "choices" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("bad_choices", [["glm-5.2", ""], ["glm-5.2", "   "], ["glm-5.2", 3]])
-def test_role_choices_rejects_blank_or_non_string_entries(tmp_path, monkeypatch, bad_choices):
+# `3` is here deliberately alongside the blank strings: it is rejected by pydantic's own
+# `list[str]` type check, not by `_validate_choices`, and both rejections have to keep
+# surfacing as a `ConfigError` to the operator. Naming which layer catches which is the point
+# -- the previous version of this test read as though the validator handled both (PR #25 review).
+@pytest.mark.parametrize(
+    ("bad_choices", "rejected_by"),
+    [
+        (["glm-5.2", ""], "_validate_choices"),
+        (["glm-5.2", "   "], "_validate_choices"),
+        (["glm-5.2", 3], "pydantic's list[str] type check"),
+    ],
+)
+def test_role_choices_rejects_blank_or_non_string_entries(
+    tmp_path, monkeypatch, bad_choices, rejected_by
+):
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
     toml_content = VALID_TOML.replace(

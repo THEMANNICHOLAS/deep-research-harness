@@ -57,6 +57,12 @@ def test_decode_posix(byte_sequence: str, expected: KeyEvent | None):
         ("\xe0M", KeyEvent("right", None)),
         ("\x00H", KeyEvent("up", None)),
         ("\xe0S", None),
+        # Control bytes are ignored, not inserted: `getwch()` returns Escape and Tab as bare
+        # control characters outside the `\xe0`/`\x00` pair, and without a guard they reached
+        # `LineBuffer` as text and corrupted the submitted string (PR #25 review).
+        ("\x1b", None),
+        ("\t", None),
+        ("\x01", None),
         # An exhausted reader decodes to None, never to an empty-char event: both
         # decoders must agree on the "" EOF sentinel their callable contract names,
         # since Phases 2 and 5 consume them directly (PR review, Phase 1).
@@ -65,6 +71,46 @@ def test_decode_posix(byte_sequence: str, expected: KeyEvent | None):
 )
 def test_decode_windows(byte_sequence: str, expected: KeyEvent | None):
     assert decode_windows(_reader(byte_sequence)) == expected
+
+
+def test_a_bare_escape_does_not_consume_the_next_keystroke():
+    """PR #25 review, Major.
+
+    On a raw fd `read_char` blocks, so the old unconditional lookahead ate whatever the user
+    typed after a bare Escape -- typing Esc then "hi" rendered "i". `has_pending` reports
+    that nothing followed the ESC, so the decoder gives up without reading.
+    """
+    read_char = _reader("\x1bhi")
+    reads: list[str] = []
+
+    def counting_read() -> str:
+        ch = read_char()
+        reads.append(ch)
+        return ch
+
+    assert decode_posix(counting_read, lambda: False) is None
+    # The ESC and nothing else: "h" is still queued for the next decode.
+    assert reads == ["\x1b"]
+    assert decode_posix(counting_read, lambda: True) == KeyEvent("char", "h")
+
+
+def test_an_escape_sequence_that_is_not_a_csi_pushes_its_byte_back():
+    """PR #25 review, Major (Alt+key half).
+
+    Alt+b sends ESC then "b" together, so a byte IS pending -- but it is not `[`, and the old
+    code dropped it. The letter is now unread and decodes on the next call instead.
+    """
+    read_char = _reader("\x1bb")
+    pushed: list[str] = []
+
+    assert decode_posix(read_char, lambda: True, pushed.append) is None
+    assert pushed == ["b"]
+
+
+def test_the_escape_lookahead_stays_blocking_when_no_probe_is_supplied():
+    """The pure-decoder default is unchanged, so `decode_posix(read_char)` keeps one meaning."""
+    assert decode_posix(_reader("\x1b")) is None
+    assert decode_posix(_reader("\x1b[A")) == KeyEvent("up", None)
 
 
 def test_line_buffer_insert_into_empty_buffer():

@@ -726,6 +726,18 @@ budget: ~550-750 lines across 4 files.
   `activity.py`, not `display.py`, so `agent.py` can name it without importing the display
   layer — that dependency would point the wrong way.
 
+- 2026-08-20 — Phase 3/R1: the running pane's footer renders `Ctrl+C to exit` alone, while
+  the mockup (`docs/design/deep-research-tui.html:338`, `:437`) puts a muted right-hand span
+  opposite it on BOTH running screens — `run 2f41 - 14 usable - 2 unusable`, and
+  `- 17 sources captured`. Surfaced by the PR #25 review as an UNDISCLOSED deviation: the
+  other three mockup trims are recorded here, this one was not, and `## Intent`'s Preferences
+  clause scopes its status-bar allowance to the welcome screen. Recorded rather than built:
+  the counts exist (`partition_sources`), but `RichRenderer` holds no `SourceRegistry` today,
+  so rendering them means giving the renderer a data dependency on the source registry — a
+  design change, not a fidelity touch-up. **Deviation, Preference-level: the running footer
+  ships without run stats.** Revisit if the registry is ever plumbed into the renderer for
+  another reason; it is not worth that wiring on its own.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution. Append-only. -->
 - 2026-08-19 — Phase 1: `## Notes`' coverage-policy line says Phase 1's `# pragma: no
