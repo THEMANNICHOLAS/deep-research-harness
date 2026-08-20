@@ -532,10 +532,13 @@ budget: ~550-750 lines across 4 files.
   filling and clearing as readers complete, matching the mockup's fan-out screen.
 
 ## Verification
-- [ ] `uv run pytest` green (CI enforces the 90% floor on `harness/`).
-- [ ] `uv run ruff check .` && `uv run ruff format --check .` && `uv run mypy .` clean.
+- [x] `uv run pytest` green (CI enforces the 90% floor on `harness/`). 650 passed, coverage
+  96% — 2026-08-20.
+- [x] `uv run ruff check .` && `uv run ruff format --check .` && `uv run mypy .` clean —
+  2026-08-20.
 - [ ] Manual on WezTerm (dev) AND over SSH on the homelab: full walkthrough —
-  `python -m harness` (welcome, `/help`, `/sources`, `/model`) → a real question →
+  `python -m harness` (welcome, `/help`, ~~`/sources`,~~ `/model` — `/sources` was dropped
+  2026-08-19, see `## Reconciliations`) → a real question →
   clarify overlay (answer it) → researching with visible readers → finished summary
   with inline report path; separately, `python -m harness "<question>"` still runs
   argv-mode unchanged with its stdout contract intact.
