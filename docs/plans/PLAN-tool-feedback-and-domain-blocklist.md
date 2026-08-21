@@ -1,6 +1,6 @@
 # PLAN: Tool Feedback and Domain Blocklist
 
-**Status:** In Progress
+**Status:** Complete (code); the two live checks below are outstanding
 **Created:** 2026-08-20
 **Type:** Single plan
 
@@ -529,10 +529,11 @@ stream loop triggers the existing bounded synthesis pass at the margin.
   report whose disclosures name the margin, not a dead run — NOT RUN (needs `.env` + SearXNG)
 
 ## Verification
-- [ ] `uv run pytest` (CI adds `--cov-fail-under=90` — keep new modules covered)
-- [ ] `uv run ruff check .` && `uv run ruff format --check .`
-- [ ] `uv run mypy .`
-- [ ] End-to-end live run (needs `.env` + SearXNG, see docs/guides/setup.md): a question known
+- [x] `uv run pytest` (CI adds `--cov-fail-under=90` — keep new modules covered) — 778 passed,
+  total coverage 96.30% measured under the CI floor
+- [x] `uv run ruff check .` && `uv run ruff format --check .`
+- [x] `uv run mypy .`
+- [ ] End-to-end live run — NOT RUN (needs `.env` + SearXNG) (needs `.env` + SearXNG, see docs/guides/setup.md): a question known
   to surface walled domains (e.g. anthropic.com sources) finishes under the wall clock with a
   synthesized answer; `blocked-domains.json` gains entries; the report's
   `## Gaps and disclosures` names the rejections the model never saw reasons for
@@ -764,8 +765,7 @@ reserve left" and disclosing that instead of starting a synthesis pass the clock
 exceeds both D7's accepted design and Phase 5's `## Out of scope`, so it would need its own
 reconciliation. Two smaller variants worth weighing first: bound the overshoot by checking the
 margin inside the dispatch path rather than only at turn boundaries, or record the shortfall so the
-report can at least say the reserve arrived too late. Belongs in docs/backlog.md if it is not taken
-up in a follow-up plan.
+report can at least say the reserve arrived too late. Routed to docs/backlog.md (2026-08-21).
 
 Also deferred from the same review, both cosmetic: the 4-line `search_web` `AIMessage` literal is
 pasted five times in `tests/test_agent.py` while a `_search_call` helper already exists nested
@@ -792,7 +792,7 @@ history the summarizer points it at -- noted in `reader.md` and the spec docstri
 Deferred, not acted on: whether the reader should keep an eviction path (e.g. re-adding
 `FilesystemMiddleware` with `permissions` restricted to reads, or lowering
 `per_page_char_cap` for the reader tier) is a design question this phase's R6 does not settle.
-Belongs in docs/backlog.md if it is not taken up in Phase 5.
+Routed to docs/backlog.md (2026-08-21).
 
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate. Append-only, empty at plan creation. MUST remain the LAST section of this file. -->

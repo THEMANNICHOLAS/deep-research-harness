@@ -209,3 +209,41 @@ not observed failures — none has been reproduced against a live run.
   no config override (D2, deliberate). Every rejection is disclosed as a `provenance_rejected`
   incident, so starvation is observable in reports. If reach measurably suffers, the remedy is
   a config-gated link-following mode (sanitized or approval-based) — never a silent widening.
+
+- **The synthesis margin can fire with no reserve left.** `harness/__main__.py` compares only
+  `elapsed >= threshold` and never asks how much of the reserve actually remains, and the
+  margin is only checked between lead turns (risk #4, accepted). A single researcher dispatch
+  that overshoots `wall_clock_seconds` therefore fires the margin with no usable reserve: the
+  hard clock kills the bounded synthesis pass, the `TimeoutError` handler overwrites
+  `cut_short` with `"wall_clock"`, and with no answer the run writes no report — the exact R7
+  failure mode, with nothing recording that the reserve fired too late. Deferred by developer
+  decision 2026-08-21. To address, in rising cost: record the shortfall so the report can say
+  the reserve arrived too late; check the margin inside the dispatch path instead of only at
+  turn boundaries; or detect "fired with no reserve" and disclose instead of starting a
+  doomed pass. The last exceeds D7 and Phase 5's `## Out of scope`, so it needs its own
+  reconciliation. Full evidence in the Phase 5 entry of
+  @docs/plans/PLAN-tool-feedback-and-domain-blocklist.md `## Discoveries`, which also carries
+  two cosmetic test-hygiene items from the same review.
+
+- **The reader tier has no large-tool-result eviction path.** Dropping `FilesystemMiddleware`
+  from `_reader_spec` (R6, @harness/agent.py) removed the scratch workspace and, incidentally,
+  its eviction of oversized tool results to the backend (`tool_token_limit_before_evict`
+  default 20000 x `NUM_CHARS_PER_TOKEN = 4`, so ~80,000 chars; `fetch_pages` is not in
+  `TOOLS_EXCLUDED_FROM_EVICTION`). At the real `per_page_char_cap` default of 120000
+  (@harness/config.py, @harness.toml) a single fetched page can clear that threshold by 40k
+  chars, so the gap is live at stock settings, not only if an operator raises the cap. Not
+  breakage — `create_summarization_middleware` still triggers on context pressure with a
+  `ContextOverflowError` retry, so an oversized digest degrades to summarization instead of
+  eviction, but the reader can no longer `read_file` the offloaded history the summarizer
+  points it at. To address: re-add `FilesystemMiddleware` with read-only `permissions`, or
+  give the reader tier its own lower `per_page_char_cap`. Whether the reader should have an
+  eviction path at all is a design question R6 does not settle. Evidence in the Phase 4 entry
+  of @docs/plans/PLAN-tool-feedback-and-domain-blocklist.md `## Discoveries`.
+
+- **No in-run `/`-command to tune the research knobs.** Every parameter added by
+  @docs/plans/PLAN-tool-feedback-and-domain-blocklist.md (`max_reader_dispatches`,
+  `synthesis_margin_seconds`, the blocklist path) lands in `harness.toml` specifically so a
+  picker command has a config surface to drive, but the command itself was a declared non-goal
+  of that plan. Today changing any of them means editing the file between runs. To address: a
+  `/`-command in the CLI's input layer (@harness/input.py) that reads and rewrites the
+  `[agent]`/`[blocklist]` keys, or an in-run override that applies to the current run only.
