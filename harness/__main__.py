@@ -964,9 +964,12 @@ async def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — never `BaseException`; KeyboardInterrupt has its own clause below
         cut_short = "error"
         cut_short_detail = f"{type(exc).__name__}: {exc}"
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         # D2: a user abort maps onto the existing hard-error path (no new outcome kind) — its
-        # own clause because `KeyboardInterrupt` is a `BaseException`, not caught by `Exception`.
+        # own clause because both are `BaseException`s, not caught by `Exception`. A Ctrl+C
+        # raised inside a model/tool call has been observed to surface here as
+        # `CancelledError` rather than `KeyboardInterrupt` — see the `keyboard_interrupt` and
+        # `cancelled_error` tests in tests/test_agent.py.
         cut_short = "error"
         cut_short_detail = "user abort (Ctrl+C)"
 
