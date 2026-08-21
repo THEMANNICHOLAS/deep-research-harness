@@ -4,7 +4,8 @@ from pathlib import Path
 
 from langchain_core.tools import BaseTool
 
-from harness.config import AgentSettings
+from harness.blocklist import load_blocklist
+from harness.config import AgentSettings, BlocklistSettings
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
 from harness.tools import fallback, fetch
@@ -335,3 +336,28 @@ async def test_fetch_raw_renders_an_opaque_rejection_for_an_unapproved_url(
     assert fake_cls.calls == []
     assert message.artifact == []
     assert message.content == fetch._rejection_block("https://never-approved.test")
+
+
+# --- Phase 3: persistent domain blocklist (R3/R4) -----------------------------------------
+
+
+async def test_fetch_raw_hits_the_pre_crawl_blocklist_backstop_with_zero_crawler_calls(
+    install_crawler, make_config, tmp_path
+):
+    """`fetch_raw` shares `_fetch`, so a blocklisted hostname hits the same pre-crawl
+    backstop through `fetch_raw` as through `fetch_pages`, with zero crawler calls."""
+    blocklist_path = tmp_path / "blocked-domains.json"
+    load_blocklist(blocklist_path).add("walled.test", "403")
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://walled.test/page"])
+    fake_cls = install_crawler([])
+    fetch_raw = fallback.build_fallback_tool(config, registry)
+
+    message = await fetch_raw.ainvoke(
+        _tool_call(["https://walled.test/page"], "some reason", "call-1")
+    )
+
+    assert fake_cls.calls == []
+    assert message.artifact == []
+    assert message.content == fetch._rejection_block("https://walled.test/page")

@@ -120,6 +120,14 @@ class GuardSettings(_StrictModel):
     enabled: bool = True
 
 
+class BlocklistSettings(_StrictModel):
+    # R3/D3: the one cross-session file. HOME-relative like workspace_dir/reports_dir, not
+    # repo-relative, and overridable per-key from [blocklist].
+    path: Path = Field(
+        default_factory=lambda: Path.home() / "deep-research" / "blocked-domains.json"
+    )
+
+
 class AgentSettings(_StrictModel):
     max_rounds: int = Field(default=50, gt=0)  # hard cap on agent-loop rounds
     wall_clock_seconds: int = Field(default=1800, gt=0)  # wall-clock budget, in seconds
@@ -143,6 +151,7 @@ class HarnessConfig(_StrictModel):
     search: SearchSettings
     agent: AgentSettings = Field(default_factory=AgentSettings)
     guard: GuardSettings = Field(default_factory=GuardSettings)
+    blocklist: BlocklistSettings = Field(default_factory=BlocklistSettings)
 
     @model_validator(mode="after")
     def _cross_check_roles(self) -> "HarnessConfig":

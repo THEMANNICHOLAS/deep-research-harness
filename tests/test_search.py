@@ -7,11 +7,11 @@ import httpx
 import pytest
 from langchain_core.tools import BaseTool
 
-from harness.config import GuardSettings
+from harness.config import BlocklistSettings, GuardSettings
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from harness.tools import search
-from tests.conftest import install_search_transport
+from tests.conftest import _seed_blocklist_file, install_search_transport
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
 
@@ -775,3 +775,162 @@ async def test_a_guard_blocked_results_url_is_not_approved(monkeypatch, make_con
     await search._search("x", 10, config, registry, RunLog())
 
     assert registry.is_approved("https://evil.test") is False
+
+
+# --- Phase 3: persistent domain blocklist filtering (R3/R4) -------------------------------
+
+
+async def test_a_blocklisted_result_is_dropped_unapproved_and_disclosed(
+    monkeypatch, make_config, tmp_path
+):
+    blocklist_path = tmp_path / "blocked-domains.json"
+    _seed_blocklist_file(blocklist_path, "walled.test")
+    payload = {
+        "query": "x",
+        "results": [
+            {
+                "url": "https://walled.test/page",
+                "title": "Walled",
+                "content": "body",
+                "engine": "e",
+            },
+            {"url": "https://ok.test", "title": "OK", "content": "good", "engine": "e"},
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    run_log = RunLog()
+
+    content, artifact = await search._search("x", 10, config, registry, run_log)
+
+    assert isinstance(artifact, list)
+    assert [r.url for r in artifact] == ["https://ok.test"]
+    assert "https://walled.test/page" not in content
+    assert registry.is_approved("https://walled.test/page") is False
+
+    incidents = [i for i in run_log.incidents() if i.kind == "domain_blocklisted"]
+    assert len(incidents) == 1
+    assert "https://walled.test/page" in incidents[0].detail
+    assert "walled.test" in incidents[0].detail
+
+
+async def test_the_aggregate_disclosure_line_names_the_count_not_the_hostnames(
+    monkeypatch, make_config, tmp_path
+):
+    blocklist_path = tmp_path / "blocked-domains.json"
+    _seed_blocklist_file(blocklist_path, "walled.test")
+    payload = {
+        "query": "x",
+        "results": [
+            {
+                "url": "https://walled.test/page",
+                "title": "Walled",
+                "content": "body",
+                "engine": "e",
+            },
+            {"url": "https://ok.test", "title": "OK", "content": "good", "engine": "e"},
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+
+    content, _ = await search._search("x", 10, config, registry, RunLog())
+
+    expected_line = (
+        "1 further result withheld — those domains are unavailable and will not load; "
+        "do not look for them again."
+    )
+    assert content.count(expected_line) == 1
+    assert "walled.test" not in content
+
+
+async def test_a_clean_search_renders_no_disclosure_line(monkeypatch, make_config, tmp_path):
+    blocklist_path = tmp_path / "blocked-domains.json"  # never seeded — nothing blocklisted
+    payload = {
+        "query": "x",
+        "results": [{"url": "https://ok.test", "title": "OK", "content": "good", "engine": "e"}],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+
+    content, _ = await search._search("x", 10, config, registry, RunLog())
+
+    assert "withheld" not in content
+    assert "further" not in content
+
+
+async def test_all_results_blocklisted_renders_the_withheld_message_not_no_results(
+    monkeypatch, make_config, tmp_path
+):
+    blocklist_path = tmp_path / "blocked-domains.json"
+    _seed_blocklist_file(blocklist_path, "walled-a.test")
+    payload = {
+        "query": "x",
+        "results": [
+            {"url": "https://walled-a.test/one", "title": "A", "content": "a", "engine": "e"},
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+
+    content, artifact = await search._search("x", 10, config, registry, RunLog())
+
+    assert artifact == []
+    assert "returned no results" not in content
+    assert "withheld" in content
+
+
+async def test_guard_blocked_and_blocklisted_together_renders_the_mixed_withheld_message(
+    monkeypatch, make_config, tmp_path
+):
+    """`_render`'s third empty-results branch: guard-blocked AND blocklisted in the same
+    search, no survivors — must render the mixed `... all withheld.` line, not either of the
+    single-cause messages."""
+    blocklist_path = tmp_path / "blocked-domains.json"
+    _seed_blocklist_file(blocklist_path, "walled.test")
+    attack_text = _attack_text()
+    payload = {
+        "query": "x",
+        "results": [
+            {
+                "url": "https://walled.test/page",
+                "title": "Walled",
+                "content": "body",
+                "engine": "e",
+            },
+            {"url": "https://evil.test", "title": "Evil", "content": attack_text, "engine": "e"},
+        ],
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=payload)
+
+    install_search_transport(monkeypatch, handler)
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+
+    content, artifact = await search._search("x", 10, config, registry, RunLog())
+
+    assert artifact == []
+    assert "returned no results" not in content
+    assert "2 results, all withheld." in content

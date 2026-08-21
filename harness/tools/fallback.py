@@ -10,6 +10,7 @@ reader — it is the lead reading raw page text directly, not the reader's [Sn]-
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
+from harness.blocklist import Blocklist, resolve_blocklist
 from harness.config import HarnessConfig
 from harness.runlog import RunLog, or_default
 from harness.sources import SourceRegistry, normalize_url, sources_dir
@@ -22,15 +23,21 @@ from harness.tools.fetch import (
 
 
 async def _fetch_raw(
-    urls: list[str], reason: str, config: HarnessConfig, registry: SourceRegistry, run_log: RunLog
+    urls: list[str],
+    reason: str,
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    run_log: RunLog,
+    blocklist: Blocklist | None = None,
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL via the shared `_fetch`, wrapping each successful page in the marker.
 
     Only a successful (`fetched`) page is wrapped and marked `"fallback"` — a failed fetch's
     stub is rendered exactly like `fetch_pages` renders it and stays `"unread"`, since nothing
-    was actually captured for the lead to read raw.
+    was actually captured for the lead to read raw. `_fetch` is shared, so a blocklisted URL
+    hits the same pre-crawl backstop here as through `fetch_pages` (R4).
     """
-    _, pages = await _fetch(urls, config, registry, run_log)
+    _, pages = await _fetch(urls, config, registry, run_log, blocklist)
 
     # `"` is escaped rather than stripped: the reason is model-supplied prose that may
     # legitimately quote something, and dropping the quote marks would lose that context.
@@ -73,7 +80,10 @@ async def _fetch_raw(
 
 
 def build_fallback_tool(
-    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    run_log: RunLog | None = None,
+    blocklist: Blocklist | None = None,
 ) -> BaseTool:
     """Build the `fetch_raw` tool, closing over `config`, the shared `registry` and `run_log`.
 
@@ -84,6 +94,7 @@ def build_fallback_tool(
     sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
     log = or_default(run_log)
+    domain_blocklist = resolve_blocklist(blocklist, config.blocklist.path)
     max_urls = config.fetch.max_urls_per_call
 
     class FetchRawInput(BaseModel):
@@ -108,6 +119,6 @@ def build_fallback_tool(
         or returned an empty digest. Each successfully fetched page is wrapped in an
         `<undigested>` marker so the run's report can disclose it as raw, undigested content.
         """
-        return await _fetch_raw(urls, reason, config, registry, log)
+        return await _fetch_raw(urls, reason, config, registry, log, domain_blocklist)
 
     return _install_url_limit_contract(fetch_raw, max_urls)

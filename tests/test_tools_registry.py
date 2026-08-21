@@ -14,9 +14,9 @@ def test_build_tools_returns_the_frozen_tool_set(make_config, monkeypatch):
     calls = []
     real_build_fetch_tool = harness.tools.build_fetch_tool
 
-    def _spy(cfg, reg, log):
+    def _spy(cfg, reg, log, blocklist):
         calls.append((cfg, reg, log))
-        return real_build_fetch_tool(cfg, reg, log)
+        return real_build_fetch_tool(cfg, reg, log, blocklist)
 
     monkeypatch.setattr("harness.tools.build_fetch_tool", _spy)
 
@@ -67,7 +67,7 @@ async def test_build_tools_wires_the_callers_registry_into_the_fetch_tool(make_c
     registry = SourceRegistry()
     seen = []
 
-    async def _spy(urls, cfg, reg, log):
+    async def _spy(urls, cfg, reg, log, blocklist):
         seen.append(reg)
         return "", []
 
@@ -107,7 +107,10 @@ def test_one_run_log_instance_reaches_every_tool_builder(make_config, monkeypatc
         real = getattr(harness.tools, name)
 
         def _spy(*args, _name=name, _real=real, **kwargs):
-            seen[_name] = args[-1]
+            # Selected by type, not by position: this captured `args[-1]` until Phase 3 added
+            # a fourth builder argument and made the run_log no longer last, breaking three
+            # tests over a detail none of them is about.
+            seen[_name] = next((arg for arg in args if isinstance(arg, RunLog)), None)
             return _real(*args, **kwargs)
 
         monkeypatch.setattr(f"harness.tools.{name}", _spy)

@@ -20,6 +20,7 @@ from pydantic import PrivateAttr, SecretStr
 
 from harness.config import (
     AgentSettings,
+    BlocklistSettings,
     FetchSettings,
     GuardSettings,
     HarnessConfig,
@@ -29,6 +30,8 @@ from harness.config import (
     run_workspace_dir,
 )
 from harness.sources import sources_dir
+
+CHALLENGE_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "challenge"
 
 
 class _FakeMarkdown:
@@ -381,6 +384,23 @@ def drain_stdout(capsys: pytest.CaptureFixture[str]) -> tuple[str, list[str]]:
     return out, [line for line in out.splitlines() if line.strip()]
 
 
+def _challenge_fixtures() -> list[Path]:
+    """Every `challenge_*.txt` fixture, sorted — shared by test_blocklist.py and test_fetch.py."""
+    return sorted(CHALLENGE_FIXTURES_DIR.glob("challenge_*.txt"))
+
+
+def _seed_blocklist_file(path: Path, hostname: str, reason: str = "403") -> None:
+    """Pre-write a blocklist JSON file directly, bypassing `Blocklist.add`.
+
+    Shared by test_fetch.py and test_search.py, which were byte-identical copies of this.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({hostname: {"reason": reason, "first_seen": "2026-01-01T00:00:00+00:00"}}),
+        encoding="utf-8",
+    )
+
+
 def approve_all(registry: Any, urls: list[str]) -> None:
     """Approve every URL in `urls` on `registry` (Phase 4 strict provenance, R2).
 
@@ -442,9 +462,10 @@ def scripted_model():
 def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
     """Return a factory building a valid HarnessConfig from pydantic models (no TOML).
 
-    Defaults `agent.workspace_dir`/`reports_dir` under pytest's `tmp_path`, because
-    `AgentSettings()`'s own defaults are HOME-relative and would write into the developer's real
-    output directory. A caller-supplied `agent=` wins untouched.
+    Defaults `agent.workspace_dir`/`reports_dir` and `blocklist.path` under pytest's
+    `tmp_path`, because `AgentSettings()`'s and `BlocklistSettings()`'s own defaults are
+    HOME-relative and would write into the developer's real `~/deep-research/`. A
+    caller-supplied `agent=`/`blocklist=` wins untouched.
 
     `head_model`/`researcher_model`/`reader_model`/`verifier_model` default to the same string;
     pass distinct values when a test must prove the roles are read from different places.
@@ -461,6 +482,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         max_consecutive_failures: int = 3,
         agent: AgentSettings | None = None,
         guard: GuardSettings | None = None,
+        blocklist: BlocklistSettings | None = None,
         head_model: str = "test-model",
         researcher_model: str = "test-model",
         reader_model: str = "test-model",
@@ -471,6 +493,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
             agent = AgentSettings(
                 workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
             )
+        if blocklist is None:
+            blocklist = BlocklistSettings(path=tmp_path / "blocked-domains.json")
         return HarnessConfig(
             providers={
                 "opencode": ProviderConfig(
@@ -496,6 +520,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
             ),
             agent=agent,
             guard=guard or GuardSettings(),
+            blocklist=blocklist,
         )
 
     return _make

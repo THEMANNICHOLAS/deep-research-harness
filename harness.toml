@@ -68,6 +68,12 @@ max_consecutive_failures = 3  # R2: consecutive connection-level search failures
 # sanitization of survivor markdown always runs.
 enabled = true
 
+[blocklist]
+# R3/R4: cross-session hostname blocklist fed by deliberate anti-bot refusals
+# (401/403/challenge page) — see docs/plans/PLAN-tool-feedback-and-domain-blocklist.md.
+# path defaults to ~/deep-research/blocked-domains.json; set the key below to override.
+# path = "custom-blocked-domains.json"
+
 [agent]
 # Frozen surface for the agent loop (Phase 3) and its workspace/report capture
 # (Phase 2) — see docs/plans/PLAN-research-loop.md.

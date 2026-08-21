@@ -31,7 +31,10 @@ invisible failures and produced an unusable report.
     openai.com — all blocked in run `172105` for zero-width chars in prose/markup/KaTeX.
 - **R3** — A blocked-domain set persists across all sessions, keyed by exact hostname (never
   registrable domain), fed only by deliberate anti-bot refusals: HTTP 401, HTTP 403, or a
-  detected Cloudflare-style challenge page. Timeouts, 429, and 503 never persist. Each entry
+  detected Cloudflare-style challenge page. ~~Timeouts, 429, and 503 never persist.~~
+  (Amended 2026-08-20 — see `## Reconciliations`: a *status* of 429/503/timeout never
+  persists, but a 503 or 429 whose body fires a challenge marker does, because that is the
+  "detected challenge page" clause of this same requirement.) Each entry
   carries the reason and a timestamp, and the set is operator-editable by hand.
   - Guard verdicts and provenance rejections never feed the set — they are policy verdicts,
     not site refusals.
@@ -244,7 +247,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 - [x] Phase 1: Visible, sticky fetch failures
 - [x] Phase 2: Guard strip-then-rescan
-- [ ] Phase 3: Persistent domain blocklist
+- [x] Phase 3: Persistent domain blocklist
 - [ ] Phase 4: Enforced caps and reader tool trim
 - [ ] Phase 5: Synthesis reserve
 - [ ] Final verification
@@ -387,22 +390,33 @@ rejected instantly at fetch.
 - `hostname_of(url: str) -> str | None` — the one shared URL→hostname definition
 - Search disclosure line (aggregate, end of results): names the count; the run-log incident
   names the hostnames
-- 429/503/timeouts NEVER call `Blocklist.add`
+- ~~429/503/timeouts NEVER call `Blocklist.add`~~ → a 429/503/timeout STATUS never calls
+  `Blocklist.add`; a non-`fetched` page whose body fires a challenge marker does, whatever
+  its status (2026-08-20 reconciliation)
+- Challenge markers are checked ONLY when `outcome == "blocked"` (i.e. the status is in
+  `_BLOCKED_STATUSES`), so they can never fire on real page content; no body-length threshold
+  exists (developer decision 2026-08-20, tightened from `!= "fetched"` after the Phase 3
+  judgment review — see `## Reconciliations`)
 
 **Out of scope:**
 - No TTL/expiry; no blocklist UI; no widening of `classify` beyond adding 401 to
   `_BLOCKED_STATUSES`; no change to guard scanning of results; no researcher-prose scanning
 
 **Tests (write first, confirm red):**
-- [ ] Round-trip: add → file on disk → fresh load → contains (and a hand-edited unknown key
+- [x] Round-trip: add → file on disk → fresh load → contains (and a hand-edited unknown key
   survives a rewrite)
-- [ ] Feed matrix: 401, 403, and each challenge fixture add the hostname; 429/503/timeout/
-  guard-block/provenance-rejection do NOT
-- [ ] Search: a blocklisted-hostname result is dropped, unapproved, and the disclosure line
+- [x] Feed matrix: 401, 403, and each challenge fixture add the hostname; ~~429/503/timeout/~~
+  ~~guard-block/provenance-rejection do NOT~~ a bare 429/503/timeout (no marker in the body),
+  a guard block and a provenance rejection do NOT; a 503 whose body fires a challenge marker
+  DOES (2026-08-20 reconciliation)
+- [x] A `fetched` page containing a marker phrase in real prose does NOT add its hostname, and
+  neither does a `non_html` one (the `outcome == "blocked"` scoping is what makes the
+  length-threshold-free design safe)
+- [x] Search: a blocklisted-hostname result is dropped, unapproved, and the disclosure line
   appears; a clean search has no disclosure line
-- [ ] Fetch backstop: a blocklisted URL renders the Phase-1 opaque block with zero crawler
+- [x] Fetch backstop: a blocklisted URL renders the Phase-1 opaque block with zero crawler
   invocations
-- [ ] A 401 response classifies `blocked` (new status)
+- [x] A 401 response classifies `blocked` (new status)
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -410,7 +424,7 @@ rejected instantly at fetch.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `uv run pytest` green
+- [x] `uv run pytest` green
 - [ ] Manual: run the setup-guide fetch live-check against `https://httpbin.org/status/403`
   twice — first run adds the hostname to `blocked-domains.json`, second run rejects it
   pre-crawl (zero browser work), and the file is human-readable
@@ -567,6 +581,46 @@ Noted for later, not acted on: restoring the other reading — one sanctioned re
 URL, reachable only via `fetch_raw` — is the cheapest available mitigation for risk #1 if the
 live check shows reach suffering.
 
+### 2026-08-20 — Phase 3: R3 forbids persisting a 503 that IS a challenge page
+
+R3 and Phase 3's Contracts both state flatly that 429/503/timeouts never persist, while the
+same requirement asks the set to be fed by "a detected Cloudflare-style challenge page".
+Those collide: Cloudflare serves managed challenges with **403**, and under-attack-mode
+challenges historically with **503**, so the literal 503 exclusion would discard the single
+case where marker detection earns its keep — a 503 body that is a wall rather than an
+overload. A 200-status interstitial exists too but is the minority shape.
+
+**Shipped (developer decision 2026-08-20):** the feed is
+- `status in {401, 403}` → `add(hostname, str(status))`, unconditional; and
+- `outcome != "fetched"` **and** the body fires a challenge marker → `add(hostname, "challenge")`,
+  whatever the status.
+
+So a *bare* 429/503/timeout still never persists — what persists is a challenge page, which is
+what R3 asked for. Read R3's struck sentence as being about statuses alone.
+
+**Scoping (risk #2, confirmed at 3C as the risk asks, then tightened):** markers are checked
+ONLY on a `blocked` outcome — `status_code in _BLOCKED_STATUSES` ({401, 403, 429, 503}), which
+is refusal-shaped by construction. That is what makes the design safe with **no body-length
+threshold**.
+
+Confirmed at 3C as `outcome != "fetched"` and tightened to `== "blocked"` after the Phase 3
+judgment review, which found the looser form unsafe: `classify` also returns `non_html` for ANY
+non-HTML content type and `error`/`timeout` whenever a result carries an error message, and all
+three can carry genuine extracted page text. A `text/plain` RFC, changelog or mailing-list
+archive containing the ordinary English phrase "just a moment" would have been walled
+permanently. The tightening costs nothing: 401/403 already feed by status, so the marker's only
+remaining job is a 429/503 carrying a challenge body — the case this entry exists for — and an
+empty-extraction page has no marker text to match. It also lands the code back on risk #2's own
+words, "alongside a refusal-shaped response".
+
+The residual gap is accepted: a 200 interstitial whose challenge text DOES extract classifies
+`fetched`, so it is never blocklisted and renders as a junk source.
+
+The false positive that actually bites is not the one risk #2 describes (legit prose quoting a
+marker) — it is a **rate-triggered** challenge: Turnstile walls a host you hit hard, and the
+entry outlives the burst that caused it. The hand-editable JSON and the per-report disclosure
+are the mitigation; no TTL (Non-Goals).
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution. Append-only, empty at plan creation. -->
 
@@ -634,3 +688,33 @@ outcome and status per R1; the line is separate text from `_REJECTION_LINE`'s op
   backstop placement relative to the provenance check BEFORE wiring it. Risk #2 also asks that
   challenge-marker scoping be confirmed at 3C: markers must only be checked alongside a
   refusal-shaped response, never on every fetched page.
+
+### 2026-08-20 — Phase 3: Persistent domain blocklist
+- Done: new `harness/blocklist.py` (`hostname_of`, `fires_challenge_marker`, `Blocklist`,
+  `load_blocklist`, `resolve_blocklist`) persisting `{hostname: {reason, first_seen}}` via
+  read-merge-`os.replace`; `[blocklist]` config section + `harness.toml`; 401 added to
+  `_BLOCKED_STATUSES`; `_feed_blocklist` post-classify in both fetch batches; pre-crawl backstop
+  placed AFTER the provenance check; `_drop_blocklisted` in search ahead of the guard and
+  `_approve_survivors`; one shared `Blocklist` loaded once in `build_tools`. 757 tests green,
+  four gates clean. Diff ran ~2.3x the plan's band (~1030 lines/18 files vs ~300-450/9) —
+  ~60% of it the tests and fixtures the phase's own test list demanded, i.e. band mis-sizing,
+  not scope creep.
+- Learned: (a) The plan's `outcome != "fetched"` marker scoping was UNSAFE and is now
+  `outcome == "blocked"` — `classify` returns `non_html` for any non-HTML content type and
+  `error`/`timeout` on any error message, all of which carry real page text, so a `text/plain`
+  RFC saying "just a moment" would have been walled permanently. See `## Reconciliations`.
+  (b) `tests/test_tools_registry.py` had three spies pinned to the old builder arity, and one
+  captured the run_log as `args[-1]`; the last now selects it by type. Neither worker caught
+  this because the plan's verification scope named only five test modules — a signature change
+  needs a full-suite run, not a targeted one. (c) Run-log kinds are free-form strings with no
+  registry, so a new kind needs no `report.py`/`runlog.py` change.
+- Drift: one `## Reconciliations` entry — R3 and the Phase 3 Contracts both said 429/503/timeouts
+  never persist, but a challenge-bearing 503 is exactly R3's "detected challenge page"; a bare
+  429/503/timeout still never persists. Amended and developer-approved, then tightened again
+  after the judgment review (same entry).
+- Watch-next: Phase 4 (flagged !#3) drops `FilesystemMiddleware` from `_reader_spec`. Risk #3
+  says to verify against the INSTALLED deepagents that its summarization wrapper really grants
+  no tools — architecture.md notes a nested subagent gets no auto-injected middleware, so every
+  remaining entry is load-bearing. Also note Phase 3 did NOT run its manual live-check
+  (`https://httpbin.org/status/403` twice); that acceptance box is still open and needs `.env`
+  + SearXNG.

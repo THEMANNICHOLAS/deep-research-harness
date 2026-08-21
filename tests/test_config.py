@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.config import ConfigError, GuardSettings, load_config
+from harness.config import BlocklistSettings, ConfigError, GuardSettings, load_config
 
 VALID_TOML = """
 [providers.opencode]
@@ -472,6 +472,57 @@ def test_guard_section_rejects_unknown_key(tmp_path, monkeypatch):
 
 def test_guard_settings_model_defaults_enabled():
     assert GuardSettings().enabled is True
+
+
+# --- Phase 3: BlocklistSettings / [blocklist] -------------------------------------------
+
+
+def test_blocklist_path_defaults_to_the_home_relative_location(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+
+    config = load_config(path)
+
+    assert config.blocklist.path == Path.home() / "deep-research" / "blocked-domains.json"
+
+
+def test_empty_blocklist_section_parses_and_keeps_the_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + "\n[blocklist]\n"
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.blocklist.path == Path.home() / "deep-research" / "blocked-domains.json"
+
+
+def test_blocklist_section_is_parsed_from_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + '\n[blocklist]\npath = "custom-blocked-domains.json"\n'
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.blocklist.path == Path("custom-blocked-domains.json")
+
+
+def test_blocklist_section_rejects_unknown_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + '\n[blocklist]\ntypo_key = "oops"\n'
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "typo_key" in str(excinfo.value)
+
+
+def test_blocklist_settings_model_defaults_path():
+    assert BlocklistSettings().path == Path.home() / "deep-research" / "blocked-domains.json"
 
 
 # --- Phase 2: RoleConfig.choices (/model picker) ----------------------------------------

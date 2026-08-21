@@ -1,0 +1,12 @@
+Anti-bot interstitials have become a fact of life for anyone who scrapes the web for a
+living. The most recognizable one greets you with a plain "just a moment" message and a
+small spinner, and disappears again a second or two later once the browser check clears.
+
+Researchers who study these systems note that the wording varies little between vendors:
+most pages ask you to wait, some render a puzzle, and a few simply stall the response.
+For a human visitor the delay is barely noticeable, and browsing continues normally with
+no further action required.
+
+This piece is about the engineering behind that pause, not about defeating it: rate
+limits, JA3 fingerprints, and behavioral heuristics all feed the same decision of whether
+to let a request through immediately or hold it for one extra round trip.
