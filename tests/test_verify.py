@@ -605,6 +605,42 @@ async def test_a_reply_wrapped_on_either_side_is_still_parsed(
     assert result.check_failures == []
 
 
+async def test_a_reply_with_a_stray_brace_pair_in_trailing_prose_is_still_parsed(
+    make_config, scripted_model, monkeypatch
+):
+    """The trailing prose itself may contain a brace pair (e.g. the model citing an example
+    schema after its real answer). The naive "first `{` to last `}`" heuristic slices across
+    that stray pair too, producing invalid JSON and silently downgrading a genuine verdict to
+    `not_verified` — `raw_decode` stops at the end of the first complete object instead.
+    """
+    from langchain_core.messages import AIMessage
+
+    config = make_config()
+    registry = SourceRegistry()
+    source_id = registry.add("https://example.test/page")
+    write_source_capture(config, registry, source_id, "The vendor quoted $4.20.")
+    paragraph = _paragraph(f"The vendor quoted $4.20 [{source_id}].", [source_id])
+
+    model = scripted_model(
+        [
+            AIMessage(
+                content=(
+                    f"{_OBJECT}\n"
+                    'For reference, the schema looks like {"verdict": "...", "detail": "..."}.'
+                )
+            ),
+            AIMessage(content="Reviewer prose."),
+        ]
+    )
+    monkeypatch.setattr("harness.models.build_chat_model", lambda config, role: model)
+
+    result = await verify_paragraphs([paragraph], config, registry)
+
+    assert result.verdicts[0].verdict == "supported"
+    assert result.verdicts[0].detail == "The capture quotes $4.20."
+    assert result.check_failures == []
+
+
 async def test_a_reply_omitting_unsupported_items_defaults_to_empty(
     make_config, scripted_model, monkeypatch
 ):

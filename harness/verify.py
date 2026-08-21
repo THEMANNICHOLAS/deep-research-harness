@@ -72,13 +72,13 @@ def _parse_reply(content: str) -> tuple[Verdict, str, bool, list[int]]:
     Raises `VerifyError` (or lets a `json.JSONDecodeError` propagate) on anything malformed —
     the caller treats both as a per-paragraph failure, never a pass-ending one.
     """
-    # First `{` to last `}`, which absorbs every wrapper shape at once: a markdown fence,
-    # prose before the object, prose after it. Unconditional on purpose — gating it on a
-    # leading `{` let a reply that OPENED with the object and then trailed prose reach
-    # `json.loads` whole, where "Extra data" turned a genuine verdict into `not_verified`. A
-    # reply with no `{` raises `ValueError`, already handled as a per-paragraph failure.
-    text = content[content.index("{") : content.rindex("}") + 1]
-    data = json.loads(text)
+    # Anchor on the first `{` and decode only the first complete object from there —
+    # absorbs every wrapper shape at once: a markdown fence, prose before the object, prose
+    # after it, even prose that itself contains a stray brace pair (an earlier `rindex("}")`
+    # heuristic sliced across such a pair, producing invalid JSON and silently downgrading a
+    # genuine verdict to `not_verified`). A reply with no `{` raises `ValueError` from
+    # `.index`, already handled as a per-paragraph failure.
+    data, _ = json.JSONDecoder().raw_decode(content[content.index("{") :])
     verdict = data["verdict"]
     detail = data["detail"]
     if verdict not in MODEL_VERDICTS:
