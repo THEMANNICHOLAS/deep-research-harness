@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.guard import FENCE_LINE_RE, fence, sanitize_for_report, scan
+from harness.guard import FENCE_LINE_RE, fence, sanitize_for_report, scan, strip_invisibles
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
 
@@ -85,6 +85,37 @@ def test_multi_family_attack_sample_lists_each_fired_family_once() -> None:  # R
     result = scan(combined)
     assert result.signals.count("instruction_override") == 1
     assert result.signals.count("role_spoofing") == 1
+
+
+# --- Phase 2: strip-then-rescan (D5) --- R2 ---
+
+
+def test_benign_zero_width_prose_is_not_blocked() -> None:  # R2
+    # Mirrors the measured false positives (run 2026-08-20-172105): ordinary technical prose
+    # carrying incidental zero-width characters in prose/markup/KaTeX, no attack content.
+    text = (
+        "This guide covers​ authentication‌ flows and API‌ keys﻿, with examples in\n"
+        "Python and curl. See the﻿ reference docs for rate‌ limiting details.\n"
+    )
+    result = scan(text)
+    assert result.blocked is False
+    assert result.signals == []
+
+
+def test_zero_width_obfuscated_override_fixture_blocks_via_instruction_override() -> None:  # R2
+    # D5's core claim: stripping reassembles the split phrase, so detection survives via the
+    # honest family instead of a presence-only obfuscation rule.
+    text = _load("attack_instruction_override_zerowidth.txt")
+    result = scan(text)
+    assert "instruction_override" in result.signals
+    assert "obfuscation" not in result.signals
+
+
+def test_scan_is_invariant_to_pre_stripping() -> None:  # R2
+    # Replaces the old "scan must see raw text" order freeze: scan now strips for itself, so
+    # pre-stripping a caller's text changes nothing about the verdict.
+    text = _load("attack_instruction_override_zerowidth.txt")
+    assert scan(text) == scan(strip_invisibles(text))
 
 
 # --- Phase 5: spotlighting (fence) and report hygiene (sanitize_for_report) --- R3/R4 ---

@@ -1402,12 +1402,13 @@ async def test_a_page_whose_injection_lives_only_in_its_title_is_blocked(  # R1
 async def test_a_fetched_page_title_is_stripped_of_invisibles_in_page_and_capture(  # R3
     install_crawler, make_config, tmp_path
 ):
-    """`_write_source_file` writes `page.title`, not the registry's already-stripped copy,
-    so the page object itself must carry the cleaned title (guard off: hygiene is
-    unconditional, detection is not — and the zero-width chars would otherwise block)."""
-    config = make_config(
-        guard=GuardSettings(enabled=False), agent=AgentSettings(workspace_dir=tmp_path)
-    )
+    """`_write_source_file` writes `page.title`, not the registry's already-stripped copy, so
+    the page object itself must carry the cleaned title.
+
+    Runs with the guard ON: since D5 a zero-width-laden title no longer blocks, so this proves
+    hygiene on a page that genuinely fetched rather than on one the guard was switched off for.
+    """
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
     approve_all(registry, ["https://titled.test"])
     run_log = RunLog()
@@ -1484,15 +1485,13 @@ async def test_guard_disabled_bypasses_scanning_and_the_attack_page_fetches_norm
     assert [i for i in run_log.incidents() if i.kind == "guard_blocked"] == []
 
 
-async def test_survivor_markdown_zero_width_chars_stripped_when_guard_disabled(  # D5/D3
+async def test_survivor_markdown_zero_width_chars_stripped(  # D5/D3
     install_crawler, make_config, tmp_path
 ):
-    """The obfuscation family blocks on zero-width chars, so proving the sanitize-still-runs
-    invariant (guard toggles detection, not hygiene) needs the guard OFF for THIS variant.
+    """After D5, the guard no longer blocks on zero-width chars alone, so this page fetches
+    normally with the guard ON; it proves byte hygiene (D3) still strips them from the capture.
     """
-    config = make_config(
-        agent=AgentSettings(workspace_dir=tmp_path), guard=GuardSettings(enabled=False)
-    )
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
     approve_all(registry, ["https://zerowidth.test"])
     dirty_markdown = "wo​rd"

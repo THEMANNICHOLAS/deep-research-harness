@@ -26,10 +26,11 @@ FAMILY_ORDER = [
     "exfil_markup",
 ]
 
-# The zero-width set (U+200B, U+200C, U+FEFF) shared by the obfuscation rule (detection)
-# and `_INVISIBLE_RE` (stripping). One constant, not two hand-copied char classes: the sets
-# already drifted once (ZWJ, added and removed per the plan's Discoveries log), and nothing
-# but this constant enforces that what the scanner flags is also what the stripper removes.
+# The zero-width set (U+200B, U+200C, U+FEFF) consumed by `_INVISIBLE_RE` (stripping) alone
+# now (Phase 2 D5): `scan` strips invisibles before matching, so a separate detection rule over
+# this same set would never fire — stripping is what defeats zero-width obfuscation, not a
+# regex over its presence. One constant either way, since the sets already drifted once (ZWJ,
+# added and removed per the plan's Discoveries log).
 _ZERO_WIDTH_CHARS = "​‌﻿"
 
 _FAMILY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
@@ -57,8 +58,6 @@ _FAMILY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         re.compile(r"if you are an? (llm|language model)", re.IGNORECASE),
     ],
     "obfuscation": [
-        # attack_obfuscation_zerowidth.txt — zero-width chars used to split flagged phrases
-        re.compile(f"[{_ZERO_WIDTH_CHARS}]"),
         # attack_obfuscation_base64.txt
         re.compile(r"decode and execute", re.IGNORECASE),
     ],
@@ -73,9 +72,9 @@ _FAMILY_PATTERNS: dict[str, list[re.Pattern[str]]] = {
 }
 
 
-# `_ZERO_WIDTH_CHARS` (the same set the obfuscation rule matches), plus C0 control chars
-# other than \n and \t — \r is stripped too, since captures are normalized markdown (and a
-# surviving \r let a CRLF-terminated fence-shaped line slip past `FENCE_LINE_RE`'s `$`).
+# `_ZERO_WIDTH_CHARS`, plus C0 control chars other than \n and \t — \r is stripped too, since
+# captures are normalized markdown (and a surviving \r let a CRLF-terminated fence-shaped line
+# slip past `FENCE_LINE_RE`'s `$`).
 # Byte hygiene, not detection: this runs on survivor markdown regardless of whether
 # `[guard] enabled` bypassed the scan (Phase 3 D3/D5).
 _INVISIBLE_RE = re.compile(f"[{_ZERO_WIDTH_CHARS}\x00-\x08\x0b-\x1f\x7f]")
@@ -84,8 +83,8 @@ _INVISIBLE_RE = re.compile(f"[{_ZERO_WIDTH_CHARS}\x00-\x08\x0b-\x1f\x7f]")
 def strip_invisibles(text: str) -> str:
     """Strip zero-width chars and C0 control chars (except `\\n`/`\\t`) from `text`.
 
-    Mechanical byte hygiene only — never called before `scan`, which must see raw text
-    (see harness/tools/fetch.py's frozen pipeline order).
+    Mechanical byte hygiene. `scan` calls this itself, first, so callers may strip before or
+    after calling `scan` with no effect on the verdict (Phase 2 D5) — order no longer matters.
     """
     return _INVISIBLE_RE.sub("", text)
 
@@ -102,11 +101,22 @@ class ScanResult(BaseModel):
 def scan(text: str) -> ScanResult:
     """Scan `text` for injection signals across the five stable families.
 
+    The verdict is computed on invisible-stripped text (Phase 2 D5): `text` is passed through
+    `strip_invisibles` before any family matches, so zero-width character presence alone can
+    never block a page. An attack phrase split by zero-width characters to dodge substring
+    matching reassembles under stripping and is caught by whichever family its plain text
+    belongs to (e.g. `attack_instruction_override_zerowidth.txt` fires `instruction_override`,
+    not a presence-only obfuscation rule — the fixture is filed under the family it actually
+    fires). This replaces block-on-presence, which produced measured
+    false positives on ordinary technical pages (anthropic.com/engineering, docs.langchain.com,
+    openai.com prose/markup/KaTeX) in run `2026-08-20-172105`.
+
     Every family runs; a family is added to `signals` at most once, in the stable
     family order, the first time any of its rules fires. Any signal firing blocks —
     no scoring thresholds or weights (see module docstring: false precision without
     measured rates).
     """
+    text = strip_invisibles(text)
     signals = [
         family
         for family in FAMILY_ORDER

@@ -406,12 +406,13 @@ async def _fetch(
             markdown = _markdown_of(result)
             title = _title_of(result)
 
-            # D5: scan raw markdown AND title BEFORE classify/mint/capture — nothing blocked
-            # ever reaches disk. The title rides along because it is page-controlled content
-            # exactly like the body (search.py scans title+snippet the same way), and
-            # `_write_source_file` puts it on the capture's first line where verify.py reads
-            # it. A blocked page vanishes entirely: no FetchedPage, no Sn, no capture file —
-            # it now renders an opaque, reason-free rejection block instead (D1).
+            # D5: scan markdown AND title BEFORE classify/mint/capture — nothing blocked
+            # ever reaches disk. (`scan` strips invisibles for itself, so what it sees is the
+            # stripped text, not the raw fetch.) The title rides along because it is
+            # page-controlled content exactly like the body (search.py scans title+snippet the
+            # same way), and `_write_source_file` puts it on the capture's first line where
+            # verify.py reads it. A blocked page vanishes entirely: no FetchedPage, no Sn, no
+            # capture file — it now renders an opaque, reason-free rejection block instead (D1).
             if config.guard.enabled:
                 scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
                 if scan_result.blocked:
@@ -478,9 +479,10 @@ async def _fetch(
             markdown = _markdown_of(result)
             title = _title_of(result)
 
-            # D5: same guard site as the HTML batch — scan raw markdown and title before
-            # classify/mint. A blocked page vanishes entirely and now renders an opaque,
-            # reason-free rejection block instead (D1).
+            # D5: same guard site as the HTML batch — scan markdown and title (stripped, not
+            # raw — `scan` strips invisibles for itself) before classify/mint. A blocked page
+            # vanishes entirely and now renders an opaque, reason-free rejection block instead
+            # (D1).
             if config.guard.enabled:
                 scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
                 if scan_result.blocked:

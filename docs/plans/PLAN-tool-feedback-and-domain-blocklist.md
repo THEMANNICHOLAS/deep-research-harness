@@ -243,7 +243,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Visible, sticky fetch failures
-- [ ] Phase 2: Guard strip-then-rescan
+- [x] Phase 2: Guard strip-then-rescan
 - [ ] Phase 3: Persistent domain blocklist
 - [ ] Phase 4: Enforced caps and reader tool trim
 - [ ] Phase 5: Synthesis reserve
@@ -333,9 +333,10 @@ caught because stripping reassembles them before the scan.
   of any other family
 
 **Tests (write first, confirm red):**
-- [ ] A benign page containing only ZWSP/ZWNJ/BOM is not blocked
-- [ ] `attack_obfuscation_zerowidth.txt` still blocks — now via `instruction_override`
-- [ ] `strip_invisibles` before `scan` and after produce the same downstream bytes (order
+- [x] A benign page containing only ZWSP/ZWNJ/BOM is not blocked
+- [x] `attack_obfuscation_zerowidth.txt` still blocks — now via `instruction_override`
+  (renamed to `attack_instruction_override_zerowidth.txt`; see the handoff log)
+- [x] `strip_invisibles` before `scan` and after produce the same downstream bytes (order
   freeze replaced, not weakened)
 
 **Steps:**
@@ -344,7 +345,7 @@ caught because stripping reassembles them before the scan.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `uv run pytest tests/test_guard.py` green; full suite green (fixture expectation
+- [x] `uv run pytest tests/test_guard.py` green; full suite green (fixture expectation
   changes contained)
 
 ### Phase 3: Persistent domain blocklist
@@ -616,3 +617,20 @@ outcome and status per R1; the line is separate text from `_REJECTION_LINE`'s op
 - Watch-next: Phase 2 is the only unflagged phase and is self-contained (guard strip-then-rescan).
   Phase 3 is where the Phase 1 invariant can be broken — read the `## Discoveries` warning about
   placing the blocklist backstop relative to the provenance check before wiring it.
+
+### 2026-08-20 — Phase 2: Guard strip-then-rescan
+- Done: `scan` strips invisibles as its first statement, so the verdict is computed on stripped
+  text; the presence-only zero-width regex left the `obfuscation` family (which keeps
+  `decode and execute` and its base64 fixture). Four stale "scan must see raw text" comments
+  rewritten across guard.py and fetch.py. 709 tests green, four gates clean.
+- Learned: `tests/test_guard.py::test_each_family_blocks_its_attack_fixtures` globs fixtures by
+  `attack_{family}_*`, so a fixture that changes which family it fires MUST be renamed —
+  `attack_obfuscation_zerowidth.txt` became `attack_instruction_override_zerowidth.txt`. Three
+  separate tests carried `guard=GuardSettings(enabled=False)` purely to dodge zero-width
+  blocking; all three now run with the guard ON and are stronger for it.
+- Drift: none.
+- Watch-next: Phase 3 is the big one (~300-450 lines, 9 files, flagged !#2) and is where Phase
+  1's `approve()`-clears invariant can be broken — read the `## Discoveries` entry on blocklist
+  backstop placement relative to the provenance check BEFORE wiring it. Risk #2 also asks that
+  challenge-marker scoping be confirmed at 3C: markers must only be checked alongside a
+  refusal-shaped response, never on every fetched page.
