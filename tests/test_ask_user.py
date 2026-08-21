@@ -288,6 +288,10 @@ async def test_wall_clock_fires_while_a_question_is_pending(
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
+        # Disables the synthesis margin -- see
+        # test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer's comment
+        # (tests/test_agent.py).
+        synthesis_margin_seconds=0,
         workspace_dir=tmp_path / "workspace",
         reports_dir=tmp_path / "reports",
     )

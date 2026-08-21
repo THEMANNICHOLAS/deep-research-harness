@@ -225,8 +225,8 @@ Inherits every `## Intent` non-goal — not re-listed.
 ### D7: The synthesis reserve mirrors the round cap
 - **Chosen:** `__main__`'s stream loop checks elapsed research time between lead turns;
   crossing `wall_clock_seconds - synthesis_margin_seconds` (margin default 240) triggers the
-  existing `_SYNTHESIZE_NOW` bounded synthesis pass and a run-log incident, exactly as the
-  round cap does.
+  existing `_SYNTHESIZE_NOW` bounded synthesis pass ~~and a run-log incident~~, exactly as the
+  round cap does (which records NO incident -- see `## Reconciliations` 2026-08-21).
 - **Rejected:** Dispatch-middleware rejection — fires mid-turn (tighter) but moves run
   lifecycle policy into framework middleware and adds a second stop mechanism beside the one
   that exists.
@@ -250,7 +250,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 2: Guard strip-then-rescan
 - [x] Phase 3: Persistent domain blocklist
 - [x] Phase 4: Enforced caps and reader tool trim
-- [ ] Phase 5: Synthesis reserve
+- [x] Phase 5: Synthesis reserve
 - [ ] Final verification
 
 ## Phases
@@ -489,7 +489,8 @@ stream loop triggers the existing bounded synthesis pass at the margin.
 **Requirements:** R7
 **Files:**
 - `harness/__main__.py` — elapsed-time check between lead turns; trigger `_SYNTHESIZE_NOW`;
-  run-log incident + cut-short disclosure naming the margin
+  ~~run-log incident +~~ cut-short disclosure naming the margin
+- `harness/report.py` — new `CutShortReason` value + its disclosure text constant
 - `harness/config.py` — `synthesis_margin_seconds` (default 240) on `AgentSettings`,
   validated `< wall_clock_seconds`
 - `harness.toml` — the new key
@@ -512,10 +513,10 @@ stream loop triggers the existing bounded synthesis pass at the margin.
   cancellation; no new stop mechanism beyond the mirrored one
 
 **Tests (write first, confirm red):**
-- [ ] Crossing the margin between turns triggers exactly one bounded synthesis pass and the
+- [x] Crossing the margin between turns triggers exactly one bounded synthesis pass and the
   report discloses the margin cut (mirror the round-cap test)
-- [ ] A run finishing inside the margin is untouched (no incident, no synthesis injection)
-- [ ] `synthesis_margin_seconds >= wall_clock_seconds` fails config validation; `0` disables
+- [x] A run finishing inside the margin is untouched (no incident, no synthesis injection)
+- [x] `synthesis_margin_seconds >= wall_clock_seconds` fails config validation; `0` disables
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -523,9 +524,9 @@ stream loop triggers the existing bounded synthesis pass at the margin.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `uv run pytest` green
+- [x] `uv run pytest` green
 - [ ] Manual: a live run with `wall_clock_seconds=300, synthesis_margin_seconds=120` writes a
-  report whose disclosures name the margin, not a dead run
+  report whose disclosures name the margin, not a dead run — NOT RUN (needs `.env` + SearXNG)
 
 ## Verification
 - [ ] `uv run pytest` (CI adds `--cov-fail-under=90` — keep new modules covered)
@@ -565,6 +566,34 @@ stream loop triggers the existing bounded synthesis pass at the margin.
 
 ## Reconciliations
 <!-- Drift amendments written by /implement during execution. Append-only. Empty at plan creation. -->
+### 2026-08-21 -- Phase 5: D7 asks for a run-log incident the round cap does not record
+
+**Contradiction.** D7 says crossing the margin triggers `_SYNTHESIZE_NOW` "and a run-log
+incident, exactly as the round cap does", and Phase 5's `## Files` repeats it. The round cap
+does not do that. `harness/__main__.py` contains NO `run_log.record` call at all -- verified by
+grep: every call site in the project is in `harness/agent.py`, `harness/tools/search.py` and
+`harness/tools/fetch.py`. The round cap and the wall clock set a local
+`cut_short: CutShortReason | None` flag, and the ONLY disclosure is `report.py`'s
+`_cut_short_section`, which renders `_ROUND_CAP_TEXT` / `_WALL_CLOCK_TEXT` with the configured
+value. So "mirror the round cap end to end" (Phase 5 `## Reuse`) and "a run-log incident"
+cannot both be satisfied.
+
+**Amendment.** Mirror the round cap; drop the incident. Phase 5 adds a `"synthesis_margin"`
+value to `CutShortReason`, a `_SYNTHESIS_MARGIN_TEXT` constant beside the existing two in
+`harness/report.py` naming the configured margin, extends the `_SYNTHESIZE_NOW` trigger
+condition from `cut_short == "round_cap"` to include the margin, and adds the margin to
+`__main__`'s `should_write_report` gate so a margin-cut run still writes its report. No
+`RunLog` incident is recorded, which preserves `__main__.py`'s current property of never
+touching the incident stream.
+
+**Why this is still "answered and disclosed"** (CLAUDE.md invariant): the incident stream
+carries things that thinned coverage DURING research (a blocked fetch, a rate-limited search);
+the cut-short section carries how the run ENDED. A margin trip is the second kind, and it is
+disclosed there with the configured margin named. Recording it in both places would also leave
+the round cap inconsistent with the margin, since changing the round cap is outside this phase.
+
+Developer-approved 2026-08-21.
+
 ### 2026-08-21 -- Phase 4: D6's contextvar scope cannot cover a researcher attempt
 
 **Contradiction.** D6 specifies the reader-dispatch cap as "a middleware on the researcher
@@ -720,6 +749,30 @@ non-`fetched` page — on the FIRST failure, not just the replay, since a model 
 the retry to learn the retry is futile has already looped once. Genuine failures keep their
 outcome and status per R1; the line is separate text from `_REJECTION_LINE`'s opaque one.
 
+### 2026-08-21 -- Phase 5: the margin's overshoot is unbounded and undisclosed
+
+Risk #4 accepted that the margin only fires between lead turns, so a long researcher dispatch can
+overshoot into the reserve. The 3F review sharpened what that costs. `harness/__main__.py` compares
+only `elapsed >= threshold` and never asks how much reserve actually remains. A single dispatch that
+runs past `wall_clock_seconds` outright fires the margin with no usable reserve left; the hard clock
+then kills the bounded synthesis pass, the `TimeoutError` handler overwrites `cut_short` with
+`"wall_clock"`, and with no answer the run writes no report -- the R7 failure mode, with nothing
+anywhere recording that the reserve had fired and been too late.
+
+Deferred by developer decision (2026-08-21), not dropped. Fixing it means detecting "fired with no
+reserve left" and disclosing that instead of starting a synthesis pass the clock will kill, which
+exceeds both D7's accepted design and Phase 5's `## Out of scope`, so it would need its own
+reconciliation. Two smaller variants worth weighing first: bound the overshoot by checking the
+margin inside the dispatch path rather than only at turn boundaries, or record the shortfall so the
+report can at least say the reserve arrived too late. Belongs in docs/backlog.md if it is not taken
+up in a follow-up plan.
+
+Also deferred from the same review, both cosmetic: the 4-line `search_web` `AIMessage` literal is
+pasted five times in `tests/test_agent.py` while a `_search_call` helper already exists nested
+inside one test (CLAUDE.md's third-repetition rule), and one `tests/test_config.py` assertion
+(`max_reader_dispatches == 6`) migrated into a differently-named test where its coverage now
+survives only incidentally.
+
 ### 2026-08-21 -- Phase 4: the FilesystemMiddleware drop also removed large-tool-result eviction
 
 Dropping `FilesystemMiddleware` from `_reader_spec` (R6) removed more than the scratch
@@ -839,3 +892,36 @@ Belongs in docs/backlog.md if it is not taken up in Phase 5.
   `wall_clock_seconds=300, synthesis_margin_seconds=120` run. Also open: one `## Discoveries`
   entry says the reader lost large-tool-result eviction at stock config — decide in Phase 5 or
   push to docs/backlog.md.
+
+### 2026-08-21 — Phase 5: Synthesis reserve
+- Done: `[agent].synthesis_margin_seconds` (default 240, `ge=0`, `0` disables) with the first
+  cross-field validator on `AgentSettings` rejecting `>= wall_clock_seconds`; new
+  `"synthesis_margin"` `CutShortReason` + `_SYNTHESIS_MARGIN_TEXT` disclosure in `report.py`;
+  `__main__` captures `research_started_at` at the same point the wall clock arms and, at a turn
+  boundary past the threshold, fires the SAME bounded `_SYNTHESIZE_NOW` pass the round cap uses;
+  margin added to `should_write_report`. 778 tests green, four gates clean.
+- Learned: (a) The margin's first cut copied the round cap's BREAK CONDITION without its
+  BOOKKEEPING — `awaiting_tool_ids` is populated only in the `rounds_used == max_rounds` branch,
+  so `margin_hit and not awaiting_tool_ids` was trivially true and a margin trip abandoned
+  in-flight research. Fixed by mirroring the cap's id collection. Note the reviewer PREDICTED a
+  provider 400 and a dead run; the actual behavior is milder — LangGraph auto-heals a dangling
+  `tool_calls` by synthesizing a "cancelled" `ToolMessage`, so a malformed-sequence assertion
+  would have passed on the buggy code. The honest assertion is that the dispatch is silently
+  discarded. (b) The `synthesis_margin_seconds > 0` guard is NOT testable through a full run: at
+  that boundary asyncio's timeout cancellation always wins, so the run reports `wall_clock`
+  with or without the guard. Resolved by extracting `_margin_reached(elapsed, wall_clock,
+  margin)` and unit-testing the boundary; the extraction exists for testability alone and says
+  so. Verified it fails when the guard is removed (3 of 9 cases red), then restored.
+  (c) `_SYNTHESIZE_NOW` hardcoded "the research round cap has been reached", so a margin trip
+  told the lead a falsehood; now a shared instruction body with two reason-specific variants.
+- Drift: one `## Reconciliations` entry — D7 asked for a run-log incident "exactly as the round
+  cap does", but the round cap records none and `__main__.py` has no `run_log.record` call at
+  all. Struck; disclosure is the cut-short section only. Developer-approved.
+- Watch-next: ALL FIVE PHASES ARE BUILT AND COMMITTED; only closing bookkeeping remains. The
+  plan's `## Verification` boxes are deliberately still unticked — this session verified
+  `uv run pytest` (778), `ruff check`, `ruff format --check` and `mypy` all clean, but did NOT
+  measure the 90% coverage floor CI applies, and did NOT run the end-to-end live check. Two live
+  checks are outstanding and both need `.env` + SearXNG: this plan's end-to-end run, and Phase
+  3's `httpbin.org/status/403` double-run from the previous session. Also open: two
+  `## Discoveries` entries (the reader's lost large-tool-result eviction at stock config; the
+  margin's unbounded, undisclosed overshoot) — route to docs/backlog.md if not taken up.

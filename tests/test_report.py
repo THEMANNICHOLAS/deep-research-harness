@@ -373,6 +373,10 @@ def test_write_report_discloses_the_wall_clock_bound(make_config, tmp_path):
     """Same shape as the round-cap test, for the other bound."""
     agent = AgentSettings(
         wall_clock_seconds=93,
+        # Disables the synthesis margin -- see
+        # test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer's comment
+        # (tests/test_agent.py).
+        synthesis_margin_seconds=0,
         workspace_dir=tmp_path / "workspace",
         reports_dir=tmp_path / "reports",
     )

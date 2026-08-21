@@ -131,6 +131,10 @@ class BlocklistSettings(_StrictModel):
 class AgentSettings(_StrictModel):
     max_rounds: int = Field(default=50, gt=0)  # hard cap on agent-loop rounds
     wall_clock_seconds: int = Field(default=1800, gt=0)  # wall-clock budget, in seconds
+    # R7: reserve measured back from `wall_clock_seconds` at which a bounded synthesis pass
+    # fires instead of running out the hard clock. `ge=0`, NOT `gt=0` — `0` is the documented
+    # disable value (skip the check entirely), not "a threshold equal to the wall clock".
+    synthesis_margin_seconds: int = Field(default=240, ge=0)
     # Harness-enforced (R5): refused past this count, not merely advised in prompt prose.
     max_reader_dispatches: int = Field(default=6, gt=0)
     # Under the user's home dir, not the repo root; overridable per-key from [agent].
@@ -144,6 +148,19 @@ class AgentSettings(_StrictModel):
     # already applies bounded exponential backoff with jitter — there is no separate knob.
     max_retries: int = Field(default=2, ge=0)
     request_timeout_seconds: float = Field(default=120.0, gt=0)  # per-request timeout, seconds
+
+    @model_validator(mode="after")
+    def _cross_check_margin(self) -> "AgentSettings":
+        # `0` (disabled) is exempt: the reserve is skipped entirely, never computed against the
+        # wall clock, so it can never fire at or after it.
+        if self.synthesis_margin_seconds != 0 and (
+            self.synthesis_margin_seconds >= self.wall_clock_seconds
+        ):
+            raise ValueError(
+                f"synthesis_margin_seconds ({self.synthesis_margin_seconds}) must be less than "
+                f"wall_clock_seconds ({self.wall_clock_seconds})"
+            )
+        return self
 
 
 class HarnessConfig(_StrictModel):

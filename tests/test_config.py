@@ -358,6 +358,7 @@ def test_agent_section_loads_declared_values(tmp_path, monkeypatch):
 [agent]
 max_rounds = 12
 wall_clock_seconds = 600
+synthesis_margin_seconds = 200
 workspace_dir = "custom-workspace"
 reports_dir = "custom-reports"
 max_retries = 4
@@ -370,6 +371,7 @@ request_timeout_seconds = 30.0
 
     assert config.agent.max_rounds == 12
     assert config.agent.wall_clock_seconds == 600
+    assert config.agent.synthesis_margin_seconds == 200
     assert config.agent.workspace_dir == Path("custom-workspace")
     assert config.agent.reports_dir == Path("custom-reports")
     assert config.agent.max_retries == 4
@@ -385,10 +387,45 @@ def test_agent_section_omitted_falls_back_to_documented_defaults(tmp_path, monke
 
     assert config.agent.max_rounds == 50
     assert config.agent.wall_clock_seconds == 1800
+    assert config.agent.synthesis_margin_seconds == 240
     assert config.agent.workspace_dir == Path.home() / "deep-research" / "workspace"
     assert config.agent.reports_dir == Path.home() / "deep-research" / "reports"
     assert config.agent.max_retries == 2
     assert config.agent.request_timeout_seconds == 120.0
+
+
+def test_synthesis_margin_at_or_above_the_wall_clock_is_rejected(tmp_path, monkeypatch):
+    """R7 (parent plan Phase 5): the reserve is measured back from the wall clock, so a margin
+    equal to (or larger than) `wall_clock_seconds` would fire at or after the clock has already
+    expired -- diagnosed at load time, not discovered mid-run.
+    """
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = (
+        VALID_TOML + "\n[agent]\nwall_clock_seconds = 100\nsynthesis_margin_seconds = 100\n"
+    )
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    message = str(excinfo.value)
+    assert "synthesis_margin_seconds" in message
+    assert "wall_clock_seconds" in message
+
+
+def test_synthesis_margin_seconds_zero_is_accepted(tmp_path, monkeypatch):
+    """Contracts: `0` is the documented disable value, not a violation of `synthesis_margin_seconds
+    < wall_clock_seconds` -- it must load cleanly regardless of `wall_clock_seconds`.
+    """
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + "\n[agent]\nsynthesis_margin_seconds = 0\n"
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.agent.synthesis_margin_seconds == 0
     assert config.agent.max_reader_dispatches == 6
 
 

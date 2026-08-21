@@ -28,6 +28,7 @@ from harness.report import (
     _CUT_SHORT_HEADING,
     _NO_ANSWER_TEXT,
     _ROUND_CAP_TEXT,
+    _SYNTHESIS_MARGIN_TEXT,
     _WALL_CLOCK_TEXT,
 )
 from harness.runlog import RunLog
@@ -2121,6 +2122,10 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
+        # Disables the synthesis margin (new default 240s would otherwise exceed this tiny
+        # wall clock and fail AgentSettings validation) -- this test is about the wall clock
+        # itself, not the margin.
+        synthesis_margin_seconds=0,
         workspace_dir=tmp_path / "workspace",
         reports_dir=tmp_path / "reports",
     )
@@ -2162,6 +2167,9 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
+        # Disables the synthesis margin -- see
+        # test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer's comment.
+        synthesis_margin_seconds=0,
         workspace_dir=tmp_path / "workspace",
         reports_dir=tmp_path / "reports",
     )
@@ -2204,6 +2212,386 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
 
 
+# --- Phase 5 (parent plan): synthesis reserve (synthesis_margin_seconds) --------------
+
+
+async def test_main_synthesizes_when_the_synthesis_margin_is_crossed(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """R7's reserve: once elapsed research time crosses `wall_clock_seconds -
+    synthesis_margin_seconds`, the run gets the SAME bounded `_SYNTHESIZE_NOW` pass the round
+    cap uses — synthesizing instead of running out the clock. `wall_clock_seconds=4,
+    synthesis_margin_seconds=3` puts the trigger at 1s elapsed; the ~2s slow search crosses it
+    while leaving 2s of wall clock unspent, so the margin — not the hard clock — must be what
+    ends the run.
+    """
+    agent = AgentSettings(
+        wall_clock_seconds=4,
+        synthesis_margin_seconds=3,
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+
+    task_call = _task_call("Research widgets")
+    search_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
+    )
+    # The researcher's own final turn, completing the `task` call with no further tool use, so
+    # the ToolMessage it produces is the next thing the LEAD's own top-level stream sees.
+    researcher_done = AIMessage(content="Widgets found at $4.20/unit.")
+    # The injected `_SYNTHESIZE_NOW` turn reaches the LEAD, not the researcher.
+    synthesis_answer = AIMessage(content="Widgets cost about four dollars per unit.")
+    # No citation in the answer above, so verification's consolidation call is its only call.
+    consolidation = AIMessage(content="Nothing was cited, so nothing was checked.")
+    model = scripted_model(
+        [task_call, search_call, researcher_done, synthesis_answer, consolidation]
+    )
+    patch_run(monkeypatch, config, model)
+    _install_slow_search(monkeypatch, delay_seconds=2)
+
+    started = time.monotonic()
+    exit_code, files, out, err = await _run_main(
+        ["a question that starts researching"], config, capsys
+    )
+    elapsed = time.monotonic() - started
+
+    assert exit_code == 0
+    assert len(files) == 1
+    body = files[0].read_text(encoding="utf-8")
+    assert _CUT_SHORT_HEADING in body
+    # Names the SYNTHESIS MARGIN specifically, not the wall clock or the round cap.
+    assert _SYNTHESIS_MARGIN_TEXT in body
+    assert _WALL_CLOCK_TEXT not in body
+    assert _ROUND_CAP_TEXT not in body
+    assert "Widgets cost about four dollars per unit." in body
+    # Exactly the LEAD's dispatch turn, the researcher's two turns, the injected synthesis
+    # turn, and the verification consolidation call — nothing extra, nothing dropped.
+    assert len(model._received_messages) == 5
+    # The synthesis instruction actually reached the model as the resumed thread's last human
+    # message (the same technique `test_max_rounds_counts_model_turns_not_supersteps` uses for
+    # the round cap), rather than the answer arriving by script-order coincidence.
+    synthesis_call = model._received_messages[3]
+    # The MARGIN's own wording (G3, 3F review), not the round cap's — a margin trip must never
+    # tell the lead "the round cap has been reached".
+    assert any(
+        main_module._SYNTHESIZE_NOW_MARGIN in str(getattr(message, "content", ""))
+        for message in synthesis_call
+    )
+    assert not any(
+        main_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
+        for message in synthesis_call
+    )
+    # Well under the 4s wall clock: cut off near the ~2s search, not the hard clock.
+    assert elapsed < 3.5, (
+        f"run took {elapsed}s — should have cut short at the margin, not the wall clock"
+    )
+
+
+async def test_main_completes_normally_when_finishing_inside_the_synthesis_margin(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """A run that finishes well inside the reserve is untouched by it: no margin disclosure, no
+    extra `_SYNTHESIZE_NOW` turn, ordinary completion.
+    """
+    agent = AgentSettings(
+        wall_clock_seconds=10,
+        synthesis_margin_seconds=1,
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+
+    task_call = _task_call("Research widgets")
+    search_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
+    )
+    researcher_done = AIMessage(content="Widgets found at $4.20/unit.")
+    # The LEAD's own natural second turn — reached normally, never via a synthesis injection.
+    final_answer = AIMessage(content="Widgets found at $4.20/unit, per the research above.")
+    consolidation = AIMessage(content="Nothing was cited, so nothing was checked.")
+    model = scripted_model([task_call, search_call, researcher_done, final_answer, consolidation])
+    patch_run(monkeypatch, config, model)
+    _install_slow_search(monkeypatch, delay_seconds=0)
+
+    exit_code, files, out, err = await _run_main(
+        ["a question that finishes quickly"], config, capsys
+    )
+
+    assert exit_code == 0
+    assert len(files) == 1
+    body = files[0].read_text(encoding="utf-8")
+    assert _CUT_SHORT_HEADING not in body
+    assert _SYNTHESIS_MARGIN_TEXT not in body
+    assert "Widgets found at $4.20/unit, per the research above." in body
+    assert not any(
+        main_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
+        or main_module._SYNTHESIZE_NOW_MARGIN in str(getattr(message, "content", ""))
+        for batch in model._received_messages
+        for message in batch
+    ), "the synthesis pass fired despite finishing well inside the reserve"
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "wall_clock", "margin", "expected"),
+    [
+        # margin 0 DISABLES the reserve. These are the cases a full-run test cannot
+        # distinguish: at this boundary asyncio's timeout cancellation always wins the race,
+        # so the run reports a wall-clock cut whether or not the disable guard exists.
+        # `wall_clock - 0` would be a threshold of 1, which every elapsed here meets.
+        (1.0, 1, 0, False),
+        (5.0, 1, 0, False),
+        (0.0, 1, 0, False),
+        # A negative margin is nonsense config-side (`ge=0`) but must not invert the rule.
+        (5.0, 4, -1, False),
+        # Enabled: threshold is wall_clock - margin, crossed at or past it.
+        (1.0, 4, 3, True),
+        (0.9, 4, 3, False),
+        (2.0, 4, 3, True),
+        # Exactly AT the threshold counts as reached (`>=`), so the reserve is not skipped by
+        # a run that lands precisely on it.
+        (1560.0, 1800, 240, True),
+        (1559.9, 1800, 240, False),
+    ],
+)
+def test_margin_reached_boundaries(elapsed, wall_clock, margin, expected):
+    """R7's threshold decision, isolated. Pins the two things the full-run margin tests
+    cannot: that `margin == 0` means DISABLED rather than "a threshold equal to the wall
+    clock" (which would race the hard clock for the same run), and that the comparison is
+    `>=` so landing exactly on the threshold still triggers the reserve.
+    """
+    assert main_module._margin_reached(elapsed, wall_clock, margin) is expected
+
+
+async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_the_wall_clock(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """Contracts: `synthesis_margin_seconds = 0` disables the reserve entirely. The naive
+    threshold `wall_clock_seconds - 0` equals the wall clock itself, which would make a margin
+    cut fire at the same instant the clock expires — instead, a disabled reserve must let the
+    run reach the HARD wall clock exactly as it did before this phase (mirrors
+    `test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer` with the
+    new field pinned to its disable value).
+    """
+    agent = AgentSettings(
+        wall_clock_seconds=1,
+        synthesis_margin_seconds=0,
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+
+    partial_then_task = AIMessage(
+        content="Partial finding: Acme quoted $4.20/unit.",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": "Research widgets", "subagent_type": "researcher"},
+                "id": "call_task",
+            }
+        ],
+    )
+    search_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
+    )
+    model = scripted_model([partial_then_task, search_call])
+    patch_run(monkeypatch, config, model)
+    _install_slow_search(monkeypatch, delay_seconds=3)
+
+    started = time.monotonic()
+    exit_code, files, out, err = await _run_main(
+        ["a question that starts researching"], config, capsys
+    )
+    elapsed = time.monotonic() - started
+
+    assert exit_code == 0
+    assert len(files) == 1
+    body = files[0].read_text(encoding="utf-8")
+    assert _CUT_SHORT_HEADING in body
+    assert _WALL_CLOCK_TEXT in body
+    assert _SYNTHESIS_MARGIN_TEXT not in body
+    assert _ROUND_CAP_TEXT not in body
+    # Well under the full 3s sleep: cut off near the 1s bound rather than completed and mislabeled.
+    assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire"
+
+
+async def test_the_synthesis_margin_defers_its_break_until_a_crossing_turns_tool_calls_answer(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """G1 (3F review): `margin_hit and not awaiting_tool_ids` (the margin's break guard) is
+    trivially true unless the CROSSING turn's own tool calls get added to `awaiting_tool_ids`,
+    mirroring the round cap's bookkeeping (`rounds_used == max_rounds`'s branch). Without that,
+    a margin trip on a turn that ALSO proposes more research work breaks the stream immediately
+    with those calls unanswered, and the injected synthesis message lands after an `AIMessage`
+    carrying unanswered `tool_calls` — a sequence a real provider rejects.
+
+    The crossing turn here is a SLOW LEAD MODEL TURN (not a slow search, unlike the other margin
+    tests above): the defect is specifically about the LEAD's OWN turn proposing a second `task`
+    dispatch right as the margin trips, which is the realistic failure case (the threshold is
+    crossed mid-research while the lead is dispatching researchers). `synthesis_margin_seconds=8`
+    against `wall_clock_seconds=10` puts the threshold at a comfortable 2s, far from the 10s hard
+    clock, so this is not a photo-finish against the real wall clock the way the `0`-disables
+    boundary is — no flakiness risk from racing the real deadline.
+    """
+    agent = AgentSettings(
+        wall_clock_seconds=10,
+        synthesis_margin_seconds=8,
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+
+    task_call = _task_call("Research widgets", call_id="call_task_1")
+    researcher_one_done = AIMessage(content="Widgets found at $4.20/unit.")
+    # The LEAD's own second turn: proposing MORE tool work is what makes a margin trip here
+    # dangerous without G1's fix (the crossing turn itself carries unanswered tool_calls).
+    task_call_2 = _task_call("Research pricing further", call_id="call_task_2")
+    researcher_two_done = AIMessage(content="Pricing confirmed at $4.10/unit this week.")
+    synthesis_answer = AIMessage(content="Widgets cost about four dollars per unit.")
+    consolidation = AIMessage(content="Nothing was cited, so nothing was checked.")
+    model = scripted_model(
+        [
+            task_call,
+            researcher_one_done,
+            task_call_2,
+            researcher_two_done,
+            synthesis_answer,
+            consolidation,
+        ]
+    )
+    patch_run(monkeypatch, config, model)
+
+    original_generate = ScriptedChatModel._generate
+
+    def _slow_second_lead_turn(self, messages, stop=None, run_manager=None, **kwargs):
+        # The third scripted call (`_call_count == 2`, checked before it increments) is the
+        # LEAD's own second turn, proposing `task_call_2` — a genuinely slow MODEL call, not a
+        # slow search, so the crossing is observed on a turn the top-level stream sees directly.
+        if self._call_count == 2:
+            time.sleep(2.5)
+        return original_generate(self, messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    monkeypatch.setattr(ScriptedChatModel, "_generate", _slow_second_lead_turn)
+
+    exit_code, files, out, err = await _run_main(
+        ["a question that starts researching"], config, capsys
+    )
+
+    assert exit_code == 0
+    assert len(files) == 1
+    body = files[0].read_text(encoding="utf-8")
+    assert _CUT_SHORT_HEADING in body
+    assert _SYNTHESIS_MARGIN_TEXT in body
+
+    def _has_dangling_tool_calls(messages) -> bool:
+        answered_ids = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
+        return any(
+            isinstance(m, AIMessage)
+            and any(call.get("id") not in answered_ids for call in m.tool_calls)
+            for m in messages
+        )
+
+    # The shared phrase, not a specific constant: whichever synthesis-instruction wording
+    # reaches the model (round-cap's or the margin's own, per G3), this is the injected
+    # `HumanMessage` that must never follow an `AIMessage` with unanswered `tool_calls`.
+    synthesis_calls = [
+        received
+        for received in model._received_messages
+        if received and "Stop researching now" in str(getattr(received[-1], "content", ""))
+    ]
+    assert synthesis_calls, "no synthesis pass was ever triggered"
+    synthesis_thread = synthesis_calls[-1]
+    assert not _has_dangling_tool_calls(synthesis_thread), (
+        "the synthesis pass was injected after an AIMessage with unanswered tool_calls"
+    )
+    # The sharper pin: langgraph auto-heals a dangling `tool_calls` entry by synthesizing its
+    # own "cancelled" `ToolMessage` before the next human turn, which satisfies the assertion
+    # above EVEN THOUGH the second dispatch never actually ran — so the real defect (the
+    # crossing turn's own proposed research getting thrown away instead of awaited) shows up
+    # here instead: the second dispatch's `ToolMessage` must carry the RESEARCHER's actual
+    # finding, not langgraph's auto-cancellation text.
+    task_2_results = [
+        m
+        for m in synthesis_thread
+        if isinstance(m, ToolMessage) and m.tool_call_id == "call_task_2"
+    ]
+    assert task_2_results, "the second dispatch's tool call was never answered before synthesis"
+    assert "cancelled" not in str(task_2_results[0].content).lower(), (
+        "the margin trip cancelled the second research dispatch instead of waiting for it to "
+        f"finish: {task_2_results[0].content!r}"
+    )
+
+
+async def test_a_runaway_synthesis_pass_after_the_margin_keeps_the_margin_label(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """G4 (3F review): `except GraphRecursionError` used to set `cut_short = "round_cap"`
+    unconditionally, so a runaway SYNTHESIS PASS triggered by the MARGIN (not the cap) was
+    disclosed as a round-cap cut, naming the wrong bound. A lead that keeps proposing tool
+    calls despite `_SYNTHESIZE_NOW_MARGIN` exhausts `_SYNTHESIS_RECURSION_LIMIT`, and the
+    report must still say the synthesis margin caused the cut.
+
+    Mirrors `test_main_cuts_the_run_short_at_the_round_cap`'s "never stops proposing tool
+    calls" shape, but reaches the SAME `GraphRecursionError` via the margin instead of the cap
+    (`max_rounds` stays at its generous default so the cap never fires first).
+    """
+    agent = AgentSettings(
+        wall_clock_seconds=10,
+        synthesis_margin_seconds=8,  # threshold = 2s, comfortably short of the 10s wall clock
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+
+    task_call = _task_call("Research widgets")
+    # The nested researcher's own (single) turn: a plain final reply, no tool calls -- it does
+    # not have `write_todos` bound (that is a LEAD-only tool), so it must not be handed
+    # `keep_going`.
+    researcher_done = AIMessage(content="Widgets found at $4.20/unit.")
+    keep_going = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_todos",
+                "args": {"todos": [{"content": "Keep researching", "status": "in_progress"}]},
+                "id": "call",
+            }
+        ],
+    )
+    model = scripted_model([task_call, researcher_done, *([keep_going] * 60)])
+    patch_run(monkeypatch, config, model)
+
+    original_generate = ScriptedChatModel._generate
+
+    def _slow_second_lead_turn(self, messages, stop=None, run_manager=None, **kwargs):
+        # The third scripted call (`_call_count == 2`) is the LEAD's own second turn, the
+        # first `keep_going` -- a slow MODEL turn crosses the margin threshold on a turn that
+        # ALSO proposes a tool call, exactly like the G1 test above, so the break defers until
+        # it is answered.
+        if self._call_count == 2:
+            time.sleep(2.5)
+        return original_generate(self, messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    monkeypatch.setattr(ScriptedChatModel, "_generate", _slow_second_lead_turn)
+
+    exit_code = await main_module.main(["question that never settles"])
+
+    out, lines = drain_stdout(capsys)
+    assert exit_code == 0
+    assert lines, "main() printed no report path"
+    report_path = Path(lines[-1].strip())
+    assert report_path.exists()
+    body = report_path.read_text(encoding="utf-8")
+    assert _CUT_SHORT_HEADING in body
+    # The margin's own label, not the round cap's — this is the whole point of G4.
+    assert _SYNTHESIS_MARGIN_TEXT in body
+    assert _ROUND_CAP_TEXT not in body
+    assert _WALL_CLOCK_TEXT not in body
+
+
 async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
@@ -2214,6 +2602,9 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
+        # Disables the synthesis margin -- see
+        # test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer's comment.
+        synthesis_margin_seconds=0,
         workspace_dir=tmp_path / "workspace",
         reports_dir=tmp_path / "reports",
     )
@@ -2269,6 +2660,9 @@ async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clo
     """
     agent = AgentSettings(
         wall_clock_seconds=1,
+        # Disables the synthesis margin -- see
+        # test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer's comment.
+        synthesis_margin_seconds=0,
         workspace_dir=tmp_path / "workspace",
         reports_dir=tmp_path / "reports",
     )

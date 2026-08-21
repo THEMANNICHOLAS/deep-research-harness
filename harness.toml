@@ -79,6 +79,9 @@ enabled = true
 # (Phase 2) — see docs/plans/PLAN-research-loop.md.
 max_rounds = 50
 wall_clock_seconds = 1800
+# R7: reserve measured back from wall_clock_seconds above at which a bounded synthesis pass
+# fires instead of running out the hard clock. 0 disables it.
+synthesis_margin_seconds = 240
 # workspace_dir/reports_dir now default to ~/deep-research/{workspace,reports}; set either
 # key here to override.
 max_retries = 2
