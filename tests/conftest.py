@@ -389,6 +389,16 @@ def _challenge_fixtures() -> list[Path]:
     return sorted(CHALLENGE_FIXTURES_DIR.glob("challenge_*.txt"))
 
 
+def read_blocklist_file(path: Path) -> dict:
+    """Read a blocklist JSON file back, the read side of `_seed_blocklist_file`.
+
+    Shared for the same reason the seed helper is: test_fetch.py had its own private copy and
+    test_blocklist.py pasted the same one-liner inline, so a schema change to the file meant
+    editing assertions in two places that never referenced each other.
+    """
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _seed_blocklist_file(path: Path, hostname: str, reason: str = "403") -> None:
     """Pre-write a blocklist JSON file directly, bypassing `Blocklist.add`.
 
@@ -454,6 +464,34 @@ def scripted_model():
             model="test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
         )
         return model.script(responses)
+
+    return _make
+
+
+@pytest.fixture
+def make_agent_settings(tmp_path):
+    """Factory for `AgentSettings` with the synthesis margin DISABLED and the two output dirs
+    scoped to `tmp_path`.
+
+    Two policies in one place. The margin default (240s) exceeds the tiny `wall_clock_seconds`
+    a wall-clock test needs and fails `AgentSettings`' cross-field validator, so every such
+    test pinned `synthesis_margin_seconds=0` by hand — a comment-and-a-half pasted seven times
+    across three files. And a bare `AgentSettings(...)` reverts `workspace_dir`/`reports_dir`
+    to their HOME-relative defaults, which `build_fetch_tool` eagerly `mkdir`s, leaking run
+    directories into the developer's real `~/deep-research/`.
+
+    `**overrides` passes any other field straight through; pass `synthesis_margin_seconds`
+    explicitly when the margin itself is what a test exercises.
+    """
+
+    def _make(**overrides: object) -> AgentSettings:
+        fields: dict[str, object] = {
+            "synthesis_margin_seconds": 0,
+            "workspace_dir": tmp_path / "workspace",
+            "reports_dir": tmp_path / "reports",
+        }
+        fields.update(overrides)
+        return AgentSettings(**fields)  # type: ignore[arg-type]
 
     return _make
 

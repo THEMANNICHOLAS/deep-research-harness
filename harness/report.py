@@ -255,13 +255,23 @@ def _cut_short_section(outcome: RunOutcome, config: HarnessConfig) -> str:
             f"(configured at {config.agent.wall_clock_seconds} seconds)."
         )
     elif outcome.cut_short == "synthesis_margin":
-        # Not a death — the run reserved this much time and synthesized a final answer from
-        # what it had already read, rather than risking the hard wall clock cutting it off
-        # mid-thought with nothing to show.
+        # Not a death — the run reserved this much time to synthesize from what it had already
+        # read, rather than risking the hard wall clock cutting it off mid-thought with nothing
+        # to show. Whether the reserved pass actually PRODUCED an answer is a separate fact:
+        # a runaway synthesis pass can exhaust its recursion limit with no content, and
+        # `should_write_report` writes the report either way. Claiming an answer unconditionally
+        # would contradict the `## Answer` section three lines below.
+        synthesized = (
+            "and synthesized a final answer from what it had already read."
+            if _answer_section(outcome)
+            else (
+                "but the reserved synthesis pass produced no final answer. Coverage below is "
+                "what the run had read when research stopped."
+            )
+        )
         bound_line = (
             f"The run was cut short by {_SYNTHESIS_MARGIN_TEXT} "
-            f"(configured at {config.agent.synthesis_margin_seconds} seconds) and synthesized "
-            "a final answer from what it had already read."
+            f"(configured at {config.agent.synthesis_margin_seconds} seconds) {synthesized}"
         )
     else:  # "error"
         bound_line = f"The run ended due to {_ERROR_TEXT}: {outcome.cut_short_detail}"

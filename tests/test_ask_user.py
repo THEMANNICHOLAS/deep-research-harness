@@ -13,7 +13,6 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 import harness.__main__ as main_module
 from harness.agent import build_agent
-from harness.config import AgentSettings
 from harness.display import PlainRenderer
 from harness.input import KeyEvent
 from harness.sources import SourceRegistry
@@ -277,7 +276,7 @@ def test_the_ask_user_tool_is_shaped_like_the_other_harness_tools(make_config):
 
 
 async def test_wall_clock_fires_while_a_question_is_pending(
-    make_config, monkeypatch, scripted_model, tmp_path, capsys
+    make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
     """The risk #2 test. The wall clock (`asyncio.timeout` in `main`) must keep running while
     `ask_user` is awaiting an answer — nothing about answering a question may pause, reschedule,
@@ -286,15 +285,7 @@ async def test_wall_clock_fires_while_a_question_is_pending(
     scope around `_answer_questions` must still fire on schedule with the question pending
     inside it, not only after `_read_answer` eventually returns on its own.
     """
-    agent = AgentSettings(
-        wall_clock_seconds=1,
-        # Disables the synthesis margin -- see
-        # test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer's comment
-        # (tests/test_agent.py).
-        synthesis_margin_seconds=0,
-        workspace_dir=tmp_path / "workspace",
-        reports_dir=tmp_path / "reports",
-    )
+    agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
     task_call = AIMessage(

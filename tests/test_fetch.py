@@ -1,6 +1,5 @@
 """Behavioral tests for harness.tools.fetch."""
 
-import json
 import re
 from pathlib import Path
 
@@ -19,13 +18,10 @@ from tests.conftest import (
     _FakeResult,
     _seed_blocklist_file,
     approve_all,
+    read_blocklist_file,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
-
-
-def _read_blocklist(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _attack_markdown() -> str:
@@ -46,14 +42,19 @@ def _rendered(markdown: str, cap: int) -> str:
     return fetch._render(page, cap)
 
 
-async def test_empty_url_list_returns_empty_content_and_artifact(install_crawler, make_config):
+async def test_empty_url_list_says_nothing_was_fetched_rather_than_returning_empty(
+    install_crawler, make_config
+):
+    """R1's floor: a batch never returns empty or silent. The degenerate `urls=[]` call is the
+    one site that still returned `""`, which is exactly the silence R1 forbids."""
     config = make_config()
     registry = SourceRegistry()
     fake_cls = install_crawler([])
 
     content, pages = await fetch._fetch([], config, registry, RunLog())
 
-    assert (content, pages) == ("", [])
+    assert content == "No URLs were requested, so nothing was fetched."
+    assert pages == []
     assert fake_cls.constructed_with == []
 
 
@@ -1852,7 +1853,7 @@ async def test_a_401_response_adds_the_hostname_with_reason_401(
 
     await fetch._fetch(["https://denied.test/page"], config, registry, RunLog())
 
-    data = _read_blocklist(blocklist_path)
+    data = read_blocklist_file(blocklist_path)
     assert data["denied.test"]["reason"] == "401"
 
 
@@ -1875,7 +1876,7 @@ async def test_a_403_response_adds_the_hostname_with_reason_403(
 
     await fetch._fetch(["https://forbidden.test/page"], config, registry, run_log)
 
-    data = _read_blocklist(blocklist_path)
+    data = read_blocklist_file(blocklist_path)
     assert data["forbidden.test"]["reason"] == "403"
 
     # The feed's own disclosure, at its own call site (`_feed_blocklist`), not asserted by any
@@ -1909,8 +1910,101 @@ async def test_a_challenge_marker_body_on_a_non_fetched_response_adds_the_hostna
 
     await fetch._fetch(["https://interstitial.test/page"], config, registry, RunLog())
 
-    data = _read_blocklist(blocklist_path)
+    data = read_blocklist_file(blocklist_path)
     assert data["interstitial.test"]["reason"] == "challenge"
+
+
+async def test_a_challenge_marker_in_the_title_alone_adds_the_hostname_as_challenge(
+    install_crawler, make_config, tmp_path
+):
+    """The marker check must see the same text the guard scan does — title included.
+
+    A real Cloudflare interstitial carries "Just a moment..." as its `<title>`, while the one
+    phrase static in its BODY lives in a `<noscript>` block that `_EXCLUDED_TAGS` strips and
+    `PruningContentFilter` can prune to nothing. Scanning the body alone let exactly the site
+    this feature exists to stop retrying escape the blocklist.
+    """
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://interstitial.test/page"])
+    results = [
+        _FakeResult(
+            "https://interstitial.test/page",
+            status_code=503,
+            metadata={"title": "Just a moment..."},
+            markdown=_FakeMarkdown(raw_markdown="interstitial.test", fit_markdown=""),
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://interstitial.test/page"], config, registry, RunLog())
+
+    data = read_blocklist_file(blocklist_path)
+    assert data["interstitial.test"]["reason"] == "challenge"
+
+
+async def test_a_zero_width_split_challenge_marker_still_adds_the_hostname(
+    install_crawler, make_config, tmp_path
+):
+    """The same strip-then-match discipline `guard.scan` gained in Phase 2: a zero-width char
+    splitting a marker phrase must not defeat the match. The fetch path's own
+    `strip_invisibles` runs only for a `fetched` outcome, never for `blocked`, so the strip has
+    to happen where both policy checks read the page.
+    """
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://interstitial.test/page"])
+    # Written as an escape, not a literal: an invisible character in source is invisible to
+    # the next reader too, and any editor that strips it would quietly gut this test.
+    split = "just a mo\u200bment"
+    results = [
+        _FakeResult(
+            "https://interstitial.test/page",
+            status_code=503,
+            markdown=_FakeMarkdown(raw_markdown=split, fit_markdown=split),
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://interstitial.test/page"], config, registry, RunLog())
+
+    data = read_blocklist_file(blocklist_path)
+    assert data["interstitial.test"]["reason"] == "challenge"
+
+
+async def test_an_extensionless_pdf_reroute_that_is_refused_feeds_the_blocklist_once(
+    install_crawler, make_config, tmp_path
+):
+    """The reroute path deliberately skips the feed on the first pass (a reroute is an internal
+    signal, not an outcome), leaving the PDF batch's own classification to do it. Pin that it
+    happens EXACTLY once there: a dropped call silently stops blocklisting refused
+    PDF-hosting domains, and a call before the `continue` would double-feed.
+    """
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://walled.test/paper"])
+    # First pass: an extensionless URL whose content type reveals a PDF -> rerouted.
+    html_results = [
+        _FakeResult(
+            "https://walled.test/paper",
+            status_code=200,
+            response_headers={"content-type": "application/pdf"},
+            markdown=_FakeMarkdown(raw_markdown="%PDF", fit_markdown="%PDF"),
+        )
+    ]
+    # The reroute lands on the PDF batch and is refused there.
+    pdf_results = [_FakeResult("https://walled.test/paper", status_code=403)]
+    install_crawler(html_results, pdf_results=pdf_results)
+    run_log = RunLog()
+
+    await fetch._fetch(["https://walled.test/paper"], config, registry, run_log)
+
+    data = read_blocklist_file(blocklist_path)
+    assert data["walled.test"]["reason"] == "403"
+    assert len([i for i in run_log.incidents() if i.kind == "domain_blocklisted"]) == 1
 
 
 @pytest.mark.parametrize(

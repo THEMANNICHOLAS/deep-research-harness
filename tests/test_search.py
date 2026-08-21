@@ -904,8 +904,8 @@ async def test_guard_blocked_and_blocklisted_together_renders_the_mixed_withheld
     monkeypatch, make_config, tmp_path
 ):
     """`_render`'s third empty-results branch: guard-blocked AND blocklisted in the same
-    search, no survivors — must render the mixed `... all withheld.` line, not either of the
-    single-cause messages."""
+    search, no survivors — must name BOTH causes and, per R4, must keep the stop-hunting
+    clause that tells the model not to query those hosts again."""
     blocklist_path = tmp_path / "blocked-domains.json"
     _seed_blocklist_file(blocklist_path, "walled.test")
     attack_text = _attack_text()
@@ -933,4 +933,8 @@ async def test_guard_blocked_and_blocklisted_together_renders_the_mixed_withheld
 
     assert artifact == []
     assert "returned no results" not in content
-    assert "2 results, all withheld." in content
+    assert "2 results, all withheld" in content
+    assert "1 by the injection guard" in content
+    # R4's whole point: without this the model is told results existed but not that
+    # re-querying the walled host is futile — the retry loop the blocklist exists to stop.
+    assert "do not look for them again" in content

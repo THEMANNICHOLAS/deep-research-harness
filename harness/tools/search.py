@@ -138,6 +138,14 @@ def _approve_survivors(results: list[SearchResult], registry: SourceRegistry) ->
         registry.approve(result.url)
 
 
+# R4's stop-hunting clause, in one place: every branch of `_render` that withholds a
+# blocklisted result must carry it, or the model keeps querying for a host that will never
+# load. Deliberately count-only — the hostnames stay in the run-log incident (D1 opacity).
+_BLOCKLIST_DISCLOSURE = (
+    "those domains are unavailable and will not load; do not look for them again"
+)
+
+
 def _render(
     query: str,
     outcome: list[SearchResult] | SearchFailure,
@@ -160,8 +168,16 @@ def _render(
         return f'Search for "{query}" failed: {outcome.reason} — {outcome.detail}'
     if not outcome:
         if guard_blocked and blocklisted:
+            # R4's stop-hunting clause has to survive the MIXED case too: a search emptied by
+            # one guard block and one walled host is still a search whose walled hosts must
+            # not be queried again. Naming only the total would tell the model results
+            # existed while withholding the one instruction that stops the retry loop.
             total = guard_blocked + blocklisted
-            return f'Search for "{query}" returned {total} results, all withheld.'
+            return (
+                f'Search for "{query}" returned {total} results, all withheld — '
+                f"{guard_blocked} by the injection guard, {blocklisted} because "
+                f"{_BLOCKLIST_DISCLOSURE}."
+            )
         if guard_blocked:
             noun = "result" if guard_blocked == 1 else "results"
             return (
@@ -171,8 +187,8 @@ def _render(
         if blocklisted:
             noun = "result" if blocklisted == 1 else "results"
             return (
-                f'Search for "{query}" returned {blocklisted} {noun}, all withheld — those '
-                "domains are unavailable and will not load; do not look for them again."
+                f'Search for "{query}" returned {blocklisted} {noun}, all withheld — '
+                f"{_BLOCKLIST_DISCLOSURE}."
             )
         return f'Search for "{query}" returned no results.'
 
@@ -184,10 +200,7 @@ def _render(
     rendered = f'Results for "{query}":\n\n{fence(listing)}'
     if blocklisted:
         noun = "result" if blocklisted == 1 else "results"
-        rendered += (
-            f"\n\n{blocklisted} further {noun} withheld — those domains are unavailable "
-            "and will not load; do not look for them again."
-        )
+        rendered += f"\n\n{blocklisted} further {noun} withheld — {_BLOCKLIST_DISCLOSURE}."
     return rendered
 
 

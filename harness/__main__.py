@@ -135,6 +135,18 @@ _BACKSTOP_SUPERSTEPS_PER_ROUND = 20
 _BACKSTOP_FLOOR = 100
 
 
+def _pending_tool_call_ids(message: AIMessage) -> set[str]:
+    """The string `tool_call` ids `message` proposes — the work a cut must wait out.
+
+    One home for both cut-short bounds: the round cap (`_note_model_turns`) and R7's synthesis
+    margin each defer their break until the crossing turn's own tool calls have answered, or
+    LangGraph auto-heals the dangling entries with synthesized "cancelled" `ToolMessage`s and
+    the in-flight research silently vanishes. Two hand-pasted copies could drift into
+    disagreeing about which calls count.
+    """
+    return {call_id for call in message.tool_calls if isinstance(call_id := call.get("id"), str)}
+
+
 def _margin_reached(elapsed: float, wall_clock_seconds: int, margin_seconds: int) -> bool:
     """Whether elapsed research time has crossed R7's synthesis reserve.
 
@@ -859,11 +871,7 @@ async def main(argv: list[str] | None = None) -> int:
                 # The turn AT the cap may already be the tool-free final answer — only a turn
                 # proposing more tool work owes a synthesis pass, and only after those tools
                 # finish, so the thread never ends on dangling tool calls.
-                call_ids = {
-                    call_id
-                    for call in message.tool_calls
-                    if isinstance(call_id := call.get("id"), str)
-                }
+                call_ids = _pending_tool_call_ids(message)
                 if call_ids:
                     awaiting_tool_ids.update(call_ids)
                     cap_hit = True
@@ -932,8 +940,9 @@ async def main(argv: list[str] | None = None) -> int:
                                         config.agent.synthesis_margin_seconds,
                                     ):
                                         margin_hit = True
-                                        # Mirror the cap's own bookkeeping (`_note_model_turns`
-                                        # above): if THIS crossing update itself carries a
+                                        # Same bookkeeping as the cap, through the shared
+                                        # `_pending_tool_call_ids`: if THIS crossing update
+                                        # itself carries a
                                         # fresh `AIMessage` proposing tool work, rather than,
                                         # say, a `ToolMessage` settling PRIOR work, that work is
                                         # what the break below would otherwise leave dangling —
@@ -941,13 +950,9 @@ async def main(argv: list[str] | None = None) -> int:
                                         # from ending on unanswered `tool_calls`.
                                         for message in node_update.get("messages") or []:
                                             if isinstance(message, AIMessage):
-                                                call_ids = {
-                                                    call_id
-                                                    for call in message.tool_calls
-                                                    if isinstance(call_id := call.get("id"), str)
-                                                }
-                                                if call_ids:
-                                                    awaiting_tool_ids.update(call_ids)
+                                                awaiting_tool_ids.update(
+                                                    _pending_tool_call_ids(message)
+                                                )
                             # Tool-call/reader-strip/todo-meta refreshes are no longer polled
                             # here (fix-pass item 1): `_on_activity_change` pushes them the
                             # instant the sink changes, from inside the tool dispatch itself.

@@ -1,8 +1,10 @@
 """Behavioral tests for harness.tools.build_tools."""
 
+import pytest
 from langchain_core.tools import BaseTool
 
 import harness.tools
+from harness.blocklist import Blocklist
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from harness.tools import build_tools
@@ -93,11 +95,15 @@ def test_tools_are_langchain_base_tools_with_content_and_artifact(make_config):
         assert tool.response_format == "content_and_artifact"
 
 
-def test_one_run_log_instance_reaches_every_tool_builder(make_config, monkeypatch):
-    """The docstring's "ONE `run_log` is shared" claim, asserted rather than trusted.
+@pytest.mark.parametrize("shared_type", [RunLog, Blocklist], ids=["run_log", "blocklist"])
+def test_one_shared_instance_reaches_every_tool_builder(make_config, monkeypatch, shared_type):
+    """The docstring's "ONE `run_log` is shared" / "loaded ONCE here and shared" claims,
+    asserted rather than trusted — for BOTH shared instances, since the docstring makes the
+    same promise about each and only the run_log was ever checked.
 
-    A second `RunLog()` built for any one builder would fragment the incidents the report
-    and terminal disclose, and every existing test would still pass.
+    A second instance built for any one builder would fragment what the report and terminal
+    disclose (`RunLog`) or stop a mid-run walling from filtering `search_web` immediately
+    (`Blocklist`) — and every existing test would still pass.
     """
     config = make_config()
     run_log = RunLog()
@@ -110,7 +116,7 @@ def test_one_run_log_instance_reaches_every_tool_builder(make_config, monkeypatc
             # Selected by type, not by position: this captured `args[-1]` until Phase 3 added
             # a fourth builder argument and made the run_log no longer last, breaking three
             # tests over a detail none of them is about.
-            seen[_name] = next((arg for arg in args if isinstance(arg, RunLog)), None)
+            seen[_name] = next((arg for arg in args if isinstance(arg, shared_type)), None)
             return _real(*args, **kwargs)
 
         monkeypatch.setattr(f"harness.tools.{name}", _spy)
@@ -118,4 +124,6 @@ def test_one_run_log_instance_reaches_every_tool_builder(make_config, monkeypatc
     build_tools(config, SourceRegistry(), run_log)
 
     assert set(seen) == {"build_search_tool", "build_fallback_tool", "build_fetch_tool"}
-    assert all(log is run_log for log in seen.values())
+    instances = list(seen.values())
+    assert all(instance is not None for instance in instances)
+    assert all(instance is instances[0] for instance in instances)

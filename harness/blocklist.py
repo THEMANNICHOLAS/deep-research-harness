@@ -58,6 +58,12 @@ def fires_challenge_marker(text: str) -> bool:
     safe to scan with no body-length threshold; real prose that happens to quote a marker
     phrase always classifies `fetched` (or a non-`blocked` failure) and never reaches this
     check.
+
+    Callers must pass text with invisibles already stripped — a raw substring match is
+    defeated by a zero-width char splitting a marker phrase, the same way it defeated
+    `guard.scan` before Phase 2. `fetch.py`'s `_page_text` is the one caller and strips for
+    both policy checks; this module stays leaf-level (no `harness.*` imports) rather than
+    reaching for `guard.strip_invisibles` itself.
     """
     lowered = text.lower()
     return any(marker in lowered for marker in _CHALLENGE_MARKERS)

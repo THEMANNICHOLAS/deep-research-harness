@@ -217,11 +217,19 @@ class _ReaderDispatchCapMiddleware(AgentMiddleware[Any, Any, Any]):
     deepagents bump to that LangChain-style mutating behavior would evict old dispatch ids,
     reset the count mid-attempt, and silently uncap this dispatch limit. See the parent plan's
     corrected 2026-08-21 `## Reconciliations` entry.
+
+    A refusal thins this angle's coverage DURING research, so it records a `RunLog` incident
+    like every sibling throttle (`guard_blocked`, `domain_blocklisted`, `subagent_failed`) --
+    the plan's own D7 rationale puts mid-research thinning on the incident stream, and the
+    refused ToolMessage alone leaves disclosure to whether the model chooses to mention it.
+    Unlike the round cap and wall clock, this bound is per-angle and has no `CutShortReason`
+    to disclose it, so the incident is the only structural trace it can leave.
     """
 
-    def __init__(self, max_dispatches: int) -> None:
+    def __init__(self, max_dispatches: int, run_log: RunLog | None = None) -> None:
         super().__init__()
         self._max_dispatches = max_dispatches
+        self._run_log = or_default(run_log)
 
     async def awrap_tool_call(
         self,
@@ -248,6 +256,12 @@ class _ReaderDispatchCapMiddleware(AgentMiddleware[Any, Any, Any]):
         call_id = call.get("id")
         position = ids.index(call_id) if call_id in ids else len(ids)
         if position >= self._max_dispatches:
+            self._run_log.record(
+                "reader_budget_exhausted",
+                f"a researcher's reader dispatch was refused after "
+                f"{self._max_dispatches} dispatches; that angle reported "
+                "on what it had already read",
+            )
             return ToolMessage(
                 content=(
                     f"Reader dispatch budget exhausted: {self._max_dispatches} reader "
@@ -546,7 +560,8 @@ def _researcher_spec(
     `middleware`: `SubAgentMiddleware` nests the reader tier under THIS researcher's own
     `task` tool; `_ReaderDispatchCapMiddleware` (R5, Phase 4) sits immediately after it and
     before `_task_dispatch_guard`, so a refused dispatch short-circuits the retry guard, the
-    digest scope, and the activity sink — nothing logs or scopes a reader that never ran;
+    digest scope, and the activity sink — nothing scopes a reader that never ran, and the
+    refusal's own `RunLog` incident is the one trace it leaves;
     `_task_dispatch_guard` guards a crashed (or aborted, Drift C) reader dispatch, the same
     shared pair as the lead's own guard on dispatching a researcher; `_ReaderDigestMiddleware`
     marks a source `digested` only when a reader's digest actually reaches this researcher
@@ -570,7 +585,7 @@ def _researcher_spec(
         tools=researcher_tools,
         middleware=[
             SubAgentMiddleware(backend=backend, subagents=[reader_spec]),
-            _ReaderDispatchCapMiddleware(config.agent.max_reader_dispatches),
+            _ReaderDispatchCapMiddleware(config.agent.max_reader_dispatches, run_log),
             *_task_dispatch_guard(run_log),
             _ReaderDigestMiddleware(registry),
             _ToolActivityMiddleware(sink),

@@ -296,7 +296,18 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
         m for m in spec["middleware"] if isinstance(m, DeepagentsSummarizationMiddleware)
     ]
     assert len(summarization_middlewares) == 1
-    assert summarization_middlewares[0]._backend is backend
+    summarizer = summarization_middlewares[0]
+    # A private attribute, deliberately: deepagents exposes no public accessor for the backend
+    # a summarizer offloads to, and the claim pinned here — the reader's summarizer writes
+    # evicted history to THIS run's backend, independent of the dropped `FilesystemMiddleware`
+    # — has no other observable surface. The `hasattr` guard exists so a deepagents bump that
+    # renames the field fails saying it is an UPSTREAM rename, rather than looking like a
+    # `_reader_spec` regression and costing a debugging detour on every bump.
+    assert hasattr(summarizer, "_backend"), (
+        "deepagents renamed SummarizationMiddleware._backend: an upstream rename, not a "
+        "_reader_spec regression. Find the new accessor and update this assertion."
+    )
+    assert summarizer._backend is backend
     assert any(isinstance(m, PatchToolCallsMiddleware) for m in spec["middleware"])
     # Phase 6 (D-C): the reader tier is the ONLY place `fetch_pages` is observable, so its
     # activity middleware is part of this spec's contract, not an incidental extra.
@@ -679,6 +690,59 @@ async def test_a_dispatch_past_the_cap_is_refused_and_spawns_no_reader(
     assert refused.status != "error"  # a budget verdict, not a failure
     # The surplus dispatch never reached the reader subgraph at all.
     assert reader_model._call_count == cap
+
+
+async def test_a_refused_dispatch_records_a_run_log_incident(build_researcher, scripted_model):
+    """Best-effort + disclose: a refused dispatch thins THIS angle's coverage during research,
+    and the refusal ToolMessage is seen only by the model — which may summarize it away or
+    simply not mention it. The report's `## Gaps and disclosures` is built structurally from
+    `RunLog` incidents alone, so without one the loss is invisible in the written artifact.
+    Unlike the round cap and wall clock, this bound has no `CutShortReason` to disclose it.
+    """
+    cap = 1
+    call_ids = ["call_0", "call_1"]
+    researcher_model = scripted_model(
+        [
+            _multi_task_call(["Fetch and digest facet 0", "Fetch and digest facet 1"], call_ids),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = scripted_model([AIMessage(content="digest 0")])
+    run_log = RunLog()
+    researcher, _ = build_researcher(
+        researcher_model, reader_model, run_log=run_log, max_reader_dispatches=cap
+    )
+
+    await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    incidents = [i for i in run_log.incidents() if i.kind == "reader_budget_exhausted"]
+    assert len(incidents) == 1
+    # The configured cap belongs in the detail: an operator reading the report needs to know
+    # which knob to raise, not merely that something was refused.
+    assert str(cap) in incidents[0].detail
+
+
+async def test_dispatches_within_the_budget_record_no_incident(build_researcher, scripted_model):
+    """The incident marks a REFUSAL, not a dispatch. A researcher that stays inside its budget
+    has thinned nothing, so it must not add noise to `## Gaps and disclosures`.
+    """
+    cap = 2
+    call_ids = ["call_0", "call_1"]
+    researcher_model = scripted_model(
+        [
+            _multi_task_call(["Fetch and digest facet 0", "Fetch and digest facet 1"], call_ids),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = scripted_model([AIMessage(content=f"digest {i}") for i in range(cap)])
+    run_log = RunLog()
+    researcher, _ = build_researcher(
+        researcher_model, reader_model, run_log=run_log, max_reader_dispatches=cap
+    )
+
+    await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    assert [i for i in run_log.incidents() if i.kind == "reader_budget_exhausted"] == []
 
 
 async def test_a_second_researcher_attempt_gets_a_fresh_budget(build_researcher, scripted_model):
@@ -2107,7 +2171,7 @@ async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
 
 
 async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
-    make_config, monkeypatch, scripted_model, tmp_path, capsys
+    make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
     """D2: the wall clock expires while the only model turn is a bare tool-call proposal (no
     prose), so `_final_answer` sees nothing — no report, exit 1, stderr names the wall clock.
@@ -2120,15 +2184,9 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
     call that stalls lives one tier deeper, inside the researcher `patch_run`'s single model
     also plays.
     """
-    agent = AgentSettings(
-        wall_clock_seconds=1,
-        # Disables the synthesis margin (new default 240s would otherwise exceed this tiny
-        # wall clock and fail AgentSettings validation) -- this test is about the wall clock
-        # itself, not the margin.
-        synthesis_margin_seconds=0,
-        workspace_dir=tmp_path / "workspace",
-        reports_dir=tmp_path / "reports",
-    )
+    # `make_agent_settings` disables the margin -- this test is about the wall clock
+    # itself, not the reserve.
+    agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
     task_call = _task_call("Research widgets")
@@ -2156,7 +2214,7 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
 
 
 async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer(
-    make_config, monkeypatch, scripted_model, tmp_path, capsys
+    make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
     """D2's other wall-clock branch: the same expiry, but the interrupted turn already carried
     prose alongside its tool call, so a final answer exists — the report is still written,
@@ -2165,14 +2223,7 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     Step 3 (Drift C): the LEAD's own turn carries the prose AND the `task(researcher)` dispatch
     — the slow `search_web` call that stalls the clock lives one tier deeper.
     """
-    agent = AgentSettings(
-        wall_clock_seconds=1,
-        # Disables the synthesis margin -- see
-        # test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer's comment.
-        synthesis_margin_seconds=0,
-        workspace_dir=tmp_path / "workspace",
-        reports_dir=tmp_path / "reports",
-    )
+    agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
     partial_then_task = AIMessage(
@@ -2366,7 +2417,7 @@ def test_margin_reached_boundaries(elapsed, wall_clock, margin, expected):
 
 
 async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_the_wall_clock(
-    make_config, monkeypatch, scripted_model, tmp_path, capsys
+    make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
     """Contracts: `synthesis_margin_seconds = 0` disables the reserve entirely. The naive
     threshold `wall_clock_seconds - 0` equals the wall clock itself, which would make a margin
@@ -2375,12 +2426,7 @@ async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_th
     `test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer` with the
     new field pinned to its disable value).
     """
-    agent = AgentSettings(
-        wall_clock_seconds=1,
-        synthesis_margin_seconds=0,
-        workspace_dir=tmp_path / "workspace",
-        reports_dir=tmp_path / "reports",
-    )
+    agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
     partial_then_task = AIMessage(
@@ -2593,21 +2639,14 @@ async def test_a_runaway_synthesis_pass_after_the_margin_keeps_the_margin_label(
 
 
 async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
-    make_config, monkeypatch, scripted_model, tmp_path, capsys
+    make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
     """The clock arms at the first `task(subagent_type="researcher")` dispatch (Step 3 Drift C),
     not at process start, so a pre-research `ask_user` wait of any length must not trip it — the
     wait (2s) is longer than the configured clock (1s) and the run must still finish clean.
     Paired with the mid-run test below; neither alone pins where the clock starts.
     """
-    agent = AgentSettings(
-        wall_clock_seconds=1,
-        # Disables the synthesis margin -- see
-        # test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer's comment.
-        synthesis_margin_seconds=0,
-        workspace_dir=tmp_path / "workspace",
-        reports_dir=tmp_path / "reports",
-    )
+    agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
     ask = AIMessage(
         content="",
@@ -2646,7 +2685,7 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
 
 
 async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clock(
-    make_config, monkeypatch, scripted_model, tmp_path, capsys
+    make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
     """Pairs with the pre-research test above: once research has begun (a `task(researcher)`
     dispatch, Step 3 Drift C) the clock runs and is not paused for an interrupt, so an
@@ -2658,14 +2697,7 @@ async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clo
     is the wall-clock NO-answer case — no report, exit 1. The elapsed-time assertion pins the
     timeout to the wait itself.
     """
-    agent = AgentSettings(
-        wall_clock_seconds=1,
-        # Disables the synthesis margin -- see
-        # test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer's comment.
-        synthesis_margin_seconds=0,
-        workspace_dir=tmp_path / "workspace",
-        reports_dir=tmp_path / "reports",
-    )
+    agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
     task_call = _task_call("Research widgets")

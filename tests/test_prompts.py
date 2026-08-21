@@ -188,6 +188,33 @@ def test_subagent_prompt_teaches_reader_delegation_recovery_and_budget():
     assert "$max_reader_dispatches" in raw
 
 
+def test_reader_prompt_names_only_the_tools_the_reader_actually_has(make_config, tmp_path):
+    """R6's prompt half, cross-checked against the REAL bound toolset rather than trusted.
+
+    `subagent.md` got a drift guard for the cap it advertises; `reader.md`'s tool list had
+    none, so re-adding a write-tool bullet after the `FilesystemMiddleware` drop — or dropping
+    `fetch_pages` — would leave the prompt promising a tool the reader does not have. That is
+    the exact class of silent mismatch Phase 4 set out to remove.
+    """
+    from harness.sources import SourceRegistry
+    from harness.tools import build_tools
+
+    config = make_config()
+    rendered = render(
+        "reader", current_date="2026-01-01", max_urls_per_call=config.fetch.max_urls_per_call
+    )
+
+    bound = {tool.name for tool in build_tools(config, SourceRegistry()).reader}
+    assert bound == {"fetch_pages"}
+    for name in bound:
+        assert f"`{name}`" in rendered
+
+    # The write tools `FilesystemMiddleware` used to supply. Named individually rather than as
+    # a blanket "no other backticked tool", so an added READ-only tool does not fail this.
+    for gone in ("write_file", "edit_file", "read_file", "ls", "glob", "grep"):
+        assert f"`{gone}`" not in rendered
+
+
 def test_orchestrator_prompt_teaches_the_full_delegation_protocol():
     """R1's prompt half (Phase 2 Step 3): the lead delegates research angles to the researcher
     subagent rather than researching directly, and knows what to do when that delegation fails.

@@ -5,7 +5,7 @@ import json
 import pytest
 
 from harness.blocklist import fires_challenge_marker, hostname_of, load_blocklist
-from tests.conftest import _challenge_fixtures
+from tests.conftest import _challenge_fixtures, read_blocklist_file
 
 # --- Round trip: load / add / persist ----------------------------------------------------
 
@@ -36,7 +36,7 @@ def test_the_written_file_is_an_object_of_objects_with_reason_and_first_seen(tmp
 
     blocklist.add("walled.test", "403")
 
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = read_blocklist_file(path)
     assert isinstance(data, dict)
     assert set(data) == {"walled.test"}
     entry = data["walled.test"]
@@ -63,7 +63,7 @@ def test_a_hand_edited_unknown_key_survives_an_add_of_a_different_hostname(tmp_p
 
     blocklist.add("new.test", "401")
 
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = read_blocklist_file(path)
     assert data["existing.test"]["note"] == "walled since the API change"
     assert data["new.test"]["reason"] == "401"
 
@@ -78,13 +78,13 @@ def test_a_concurrent_writers_entry_survives_a_later_add(tmp_path):
 
     # A DIFFERENT writer (a concurrent run) appends an entry behind this instance's back, by
     # writing the JSON directly rather than going through this `Blocklist`'s `add`.
-    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    on_disk = read_blocklist_file(path)
     on_disk["second.test"] = {"reason": "401", "first_seen": "2026-01-01T00:00:00+00:00"}
     path.write_text(json.dumps(on_disk), encoding="utf-8")
 
     blocklist.add("third.test", "challenge")
 
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = read_blocklist_file(path)
     assert set(data) == {"first.test", "second.test", "third.test"}
     assert data["second.test"]["reason"] == "401"
     assert data["third.test"]["reason"] == "challenge"
@@ -94,11 +94,11 @@ def test_adding_an_already_present_hostname_does_not_change_its_record(tmp_path)
     path = tmp_path / "blocked-domains.json"
     blocklist = load_blocklist(path)
     blocklist.add("walled.test", "403")
-    first_write = json.loads(path.read_text(encoding="utf-8"))["walled.test"]
+    first_write = read_blocklist_file(path)["walled.test"]
 
     blocklist.add("walled.test", "challenge")
 
-    second_write = json.loads(path.read_text(encoding="utf-8"))["walled.test"]
+    second_write = read_blocklist_file(path)["walled.test"]
     assert second_write == first_write
     assert second_write["reason"] == "403"
 
