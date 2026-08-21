@@ -39,7 +39,7 @@ _UNREAD_HEADING = "Not read at all (fetch never succeeded):"
 
 # Mirrors `harness/tools/fetch.py`'s `FetchOutcome`: a typed value, not an exception, for why
 # a run ended early.
-CutShortReason = Literal["round_cap", "wall_clock", "error"]
+CutShortReason = Literal["round_cap", "wall_clock", "synthesis_margin", "error"]
 
 _INCIDENTS_HEADING = "Tool failures during the run:"
 
@@ -67,6 +67,7 @@ _MTIME_TOLERANCE_SECONDS = 2.0
 # AND another absent, so a swapped `except` label in `__main__` cannot slip past.
 _ROUND_CAP_TEXT = "the round cap"
 _WALL_CLOCK_TEXT = "the wall clock"
+_SYNTHESIS_MARGIN_TEXT = "the synthesis reserve"
 _ERROR_TEXT = "an unrecoverable error"
 
 
@@ -252,6 +253,25 @@ def _cut_short_section(outcome: RunOutcome, config: HarnessConfig) -> str:
         bound_line = (
             f"The run was cut short by {_WALL_CLOCK_TEXT} "
             f"(configured at {config.agent.wall_clock_seconds} seconds)."
+        )
+    elif outcome.cut_short == "synthesis_margin":
+        # Not a death — the run reserved this much time to synthesize from what it had already
+        # read, rather than risking the hard wall clock cutting it off mid-thought with nothing
+        # to show. Whether the reserved pass actually PRODUCED an answer is a separate fact:
+        # a runaway synthesis pass can exhaust its recursion limit with no content, and
+        # `should_write_report` writes the report either way. Claiming an answer unconditionally
+        # would contradict the `## Answer` section three lines below.
+        synthesized = (
+            "and synthesized a final answer from what it had already read."
+            if _answer_section(outcome)
+            else (
+                "but the reserved synthesis pass produced no final answer. Coverage below is "
+                "what the run had read when research stopped."
+            )
+        )
+        bound_line = (
+            f"The run was cut short by {_SYNTHESIS_MARGIN_TEXT} "
+            f"(configured at {config.agent.synthesis_margin_seconds} seconds) {synthesized}"
         )
     else:  # "error"
         bound_line = f"The run ended due to {_ERROR_TEXT}: {outcome.cut_short_detail}"

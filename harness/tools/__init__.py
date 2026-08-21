@@ -4,6 +4,7 @@ from typing import NamedTuple
 
 from langchain_core.tools import BaseTool
 
+from harness.blocklist import load_blocklist
 from harness.config import HarnessConfig
 from harness.runlog import RunLog, or_default
 from harness.sources import SourceRegistry
@@ -35,13 +36,18 @@ def build_tools(
     ONE `run_log` is shared across every tool — per-tool logs would fragment the incidents
     the report and terminal disclose. Defaulted only for callers that assert nothing about
     incidents; the real entrypoint always passes the run's shared instance.
+
+    The persistent domain blocklist (Phase 3, R3/R4) is loaded ONCE here and shared the same
+    way, and for the same reason: a hostname walled mid-run by one fetch must start filtering
+    `search_web`'s results immediately, which three independently-loaded copies would not do.
     """
     log = or_default(run_log)
+    blocklist = load_blocklist(config.blocklist.path)
     return ToolSets(
         lead=[build_ask_user_tool(config)],
         researcher=[
-            build_search_tool(config, registry, log),
-            build_fallback_tool(config, registry, log),
+            build_search_tool(config, registry, log, blocklist),
+            build_fallback_tool(config, registry, log, blocklist),
         ],
-        reader=[build_fetch_tool(config, registry, log)],
+        reader=[build_fetch_tool(config, registry, log, blocklist)],
     )

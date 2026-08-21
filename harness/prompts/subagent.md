@@ -41,10 +41,11 @@ which reading you took.
 
 # Budget
 
-Keep your work for this task bounded: at most about 4 searches and 6 reader dispatches. If
-you have not settled the objective within that budget, report your best partial findings and
-say plainly what you could not settle, rather than continuing to search or dispatch readers
-indefinitely.
+Keep your work for this task bounded: at most about 4 searches, and no more than
+$max_reader_dispatches reader dispatches -- the harness enforces that reader-dispatch cap and
+refuses any dispatch past it, so plan your delegation to stay within it. If you have not
+settled the objective within that budget, report your best partial findings and say plainly
+what you could not settle, rather than continuing to search or dispatch readers indefinitely.
 
 # Standing boundaries
 

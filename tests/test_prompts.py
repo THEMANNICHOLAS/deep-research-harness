@@ -112,11 +112,19 @@ def test_shipped_prompts_render_with_their_declared_variables(name):
     assert Template(rendered).get_identifiers() == []
 
 
-@pytest.mark.parametrize("name", TIER_CONTRACTS)
-def test_tier_contracts_declare_exactly_their_placeholders(name):
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("subagent", {"current_date", "max_urls_per_call", "max_reader_dispatches"}),
+        ("reader", {"current_date", "max_urls_per_call"}),
+    ],
+)
+def test_tier_contracts_declare_exactly_their_placeholders(name, expected):
     # A tier receives its task through the delegation call at run time, never by substitution, so
-    # neither contract declares a task or facet placeholder.
-    assert required_variables(name) == {"current_date", "max_urls_per_call"}
+    # neither contract declares a task or facet placeholder. Only `subagent` additionally
+    # declares the enforced reader-dispatch cap (R5, Phase 4) so the harness value and the
+    # prompt's own budget claim cannot disagree; the reader prompt does not mention the cap.
+    assert required_variables(name) == expected
 
 
 @pytest.mark.parametrize("name", TIER_CONTRACTS)
@@ -155,7 +163,11 @@ def test_subagent_prompt_teaches_reader_delegation_recovery_and_budget():
     researcher must delegate reading (never fetch pages itself), reach for `fetch_raw` only
     after a failed delegation, and stay inside its search/dispatch budget.
     """
-    rendered = render("subagent", current_date="2026-01-01", max_urls_per_call=5)
+    from harness.prompts import _PROMPTS_DIR
+
+    rendered = render(
+        "subagent", current_date="2026-01-01", max_urls_per_call=5, max_reader_dispatches=6
+    )
 
     # Reading is delegated: the reader dispatch carries the per-call URL cap and the facet.
     assert 'subagent_type="reader"' in rendered
@@ -169,6 +181,38 @@ def test_subagent_prompt_teaches_reader_delegation_recovery_and_budget():
     # The budget caps: bounded searching and dispatching, partial findings over overrun.
     assert "4 searches" in rendered
     assert "6 reader dispatches" in rendered
+
+    # R5 (Phase 4): the reader-dispatch cap is templated from config, not a literal the prompt
+    # and the harness-enforced middleware can silently drift apart on.
+    raw = (_PROMPTS_DIR / "subagent.md").read_text(encoding="utf-8")
+    assert "$max_reader_dispatches" in raw
+
+
+def test_reader_prompt_names_only_the_tools_the_reader_actually_has(make_config, tmp_path):
+    """R6's prompt half, cross-checked against the REAL bound toolset rather than trusted.
+
+    `subagent.md` got a drift guard for the cap it advertises; `reader.md`'s tool list had
+    none, so re-adding a write-tool bullet after the `FilesystemMiddleware` drop — or dropping
+    `fetch_pages` — would leave the prompt promising a tool the reader does not have. That is
+    the exact class of silent mismatch Phase 4 set out to remove.
+    """
+    from harness.sources import SourceRegistry
+    from harness.tools import build_tools
+
+    config = make_config()
+    rendered = render(
+        "reader", current_date="2026-01-01", max_urls_per_call=config.fetch.max_urls_per_call
+    )
+
+    bound = {tool.name for tool in build_tools(config, SourceRegistry()).reader}
+    assert bound == {"fetch_pages"}
+    for name in bound:
+        assert f"`{name}`" in rendered
+
+    # The write tools `FilesystemMiddleware` used to supply. Named individually rather than as
+    # a blanket "no other backticked tool", so an added READ-only tool does not fail this.
+    for gone in ("write_file", "edit_file", "read_file", "ls", "glob", "grep"):
+        assert f"`{gone}`" not in rendered
 
 
 def test_orchestrator_prompt_teaches_the_full_delegation_protocol():

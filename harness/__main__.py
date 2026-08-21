@@ -14,10 +14,14 @@ survives only as a runaway backstop), and a wall clock (`AgentSettings.wall_cloc
 armed at the first top-level `task(subagent_type="researcher")` dispatch (Step 3 Drift C — the
 lead's own `search_web`/`fetch_pages` calls moved onto the nested researcher/reader tiers,
 which this top-level stream never sees) and running continuously after that, including through
-a later clarification wait. A run that lands on the round cap mid-research gets one bounded
-synthesis pass to write a final answer from what it already read (`_SYNTHESIZE_NOW`) before the
-report is written; hitting either bound, or any other mid-run failure, still writes a report
-disclosing what happened (`RunOutcome.cut_short`).
+a later clarification wait. Between the same wall clock's arming and expiry, once elapsed
+research time crosses `wall_clock_seconds - AgentSettings.synthesis_margin_seconds` (the
+synthesis reserve, R7; `0` disables it), the run gets the SAME bounded synthesis treatment as
+the round cap, synthesizing instead of risking the hard clock. A run that lands on the round cap
+or the synthesis margin mid-research gets one bounded synthesis pass to write a final answer
+from what it already read (`_SYNTHESIZE_NOW`) before the report is written; hitting any bound,
+or any other mid-run failure, still writes a report disclosing what happened
+(`RunOutcome.cut_short`).
 """
 
 from __future__ import annotations
@@ -94,14 +98,23 @@ _NO_ANSWER_GIVEN = "(The developer gave no answer to this question.)"
 # reach this top-level stream at all).
 _RESEARCHER_SUBAGENT_TYPE = "researcher"
 
-# What the lead is told when the round cap lands mid-research (R7): one bounded pass to turn
-# what was already read into a final answer, instead of dying by exception mid-tool-call and
-# leaving `## Answer` to whatever prose happened to come last.
-_SYNTHESIZE_NOW = (
-    "The research round cap has been reached. Stop researching now: do not call any more "
-    "tools. Using only the sources you have already read, write your complete final answer, "
-    "citing each claim with its [Sn] marker, and note explicitly which planned work the cap "
-    "cut off."
+# What the lead is told when either bound (the round cap or the synthesis margin) lands
+# mid-research (R7): one bounded pass to turn what was already read into a final answer,
+# instead of dying by exception mid-tool-call and leaving `## Answer` to whatever prose
+# happened to come last. Shared body so the two reasons' instructions never diverge in
+# substance, only in which bound they name (G3, 3F review: the lead was told "the round cap"
+# even on a margin trip, which is simply false, and could end up written into the answer).
+_SYNTHESIZE_NOW_INSTRUCTION = (
+    "Stop researching now: do not call any more tools. Using only the sources you have "
+    "already read, write your complete final answer, citing each claim with its [Sn] "
+    "marker, and note explicitly which planned work {cut_off} cut off."
+)
+_SYNTHESIZE_NOW = "The research round cap has been reached. " + _SYNTHESIZE_NOW_INSTRUCTION.format(
+    cut_off="the cap"
+)
+_SYNTHESIZE_NOW_MARGIN = (
+    "The synthesis reserve has been reached. "
+    + _SYNTHESIZE_NOW_INSTRUCTION.format(cut_off="the reserve")
 )
 
 # Supersteps allowed for the synthesis pass: room for a couple of model turns plus the
@@ -120,6 +133,37 @@ _PREFLIGHT_ROLES = ("head", "researcher", "reader", "verifier")
 # inline: both are recursion-limit safety margins and a tuning pass should find them together.
 _BACKSTOP_SUPERSTEPS_PER_ROUND = 20
 _BACKSTOP_FLOOR = 100
+
+
+def _pending_tool_call_ids(message: AIMessage) -> set[str]:
+    """The string `tool_call` ids `message` proposes — the work a cut must wait out.
+
+    One home for both cut-short bounds: the round cap (`_note_model_turns`) and R7's synthesis
+    margin each defer their break until the crossing turn's own tool calls have answered, or
+    LangGraph auto-heals the dangling entries with synthesized "cancelled" `ToolMessage`s and
+    the in-flight research silently vanishes. Two hand-pasted copies could drift into
+    disagreeing about which calls count.
+    """
+    return {call_id for call in message.tool_calls if isinstance(call_id := call.get("id"), str)}
+
+
+def _margin_reached(elapsed: float, wall_clock_seconds: int, margin_seconds: int) -> bool:
+    """Whether elapsed research time has crossed R7's synthesis reserve.
+
+    Extracted from the stream loop for ONE reason: testability. The loop's own margin check is
+    only reachable through a full run, and at the `margin_seconds == 0` boundary `asyncio`'s
+    timeout cancellation always wins the race against app-level code, so a full-run test
+    resolves to a wall-clock cut whether or not the disable guard is present — it cannot tell
+    a correct implementation from one missing the guard. As pure arithmetic the boundary is
+    directly assertable instead.
+
+    `margin_seconds <= 0` means DISABLED, and must never be read as "a threshold equal to the
+    wall clock": that would fire the reserve at the same instant the hard clock expires, racing
+    it for the same run.
+    """
+    if margin_seconds <= 0:
+        return False
+    return elapsed >= wall_clock_seconds - margin_seconds
 
 
 def _sum_usage(messages: list[BaseMessage]) -> UsageMetadata:
@@ -786,6 +830,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     final_state: dict[str, Any] | None = None
     clock_armed = False
+    research_started_at: float | None = None  # R7: same start point the wall clock arms on
     cut_short: CutShortReason | None = None
     cut_short_detail: str | None = None
 
@@ -796,6 +841,7 @@ async def main(argv: list[str] | None = None) -> int:
     awaiting_tool_ids: set[str] = set()
     cap_hit = False  # round `max_rounds` ended proposing tools: a synthesis pass is owed
     overrun = False  # a turn past the cap arrived anyway: stop with what already exists
+    margin_hit = False  # R7's reserve: the synthesis margin threshold was crossed
 
     def _note_model_turns(node_update: dict[str, Any]) -> None:
         """Advance the round count for each model turn in one node update (R7).
@@ -825,11 +871,7 @@ async def main(argv: list[str] | None = None) -> int:
                 # The turn AT the cap may already be the tool-free final answer — only a turn
                 # proposing more tool work owes a synthesis pass, and only after those tools
                 # finish, so the thread never ends on dangling tool calls.
-                call_ids = {
-                    call_id
-                    for call in message.tool_calls
-                    if isinstance(call_id := call.get("id"), str)
-                }
+                call_ids = _pending_tool_call_ids(message)
                 if call_ids:
                     awaiting_tool_ids.update(call_ids)
                     cap_hit = True
@@ -876,17 +918,50 @@ async def main(argv: list[str] | None = None) -> int:
                                     for call in calls:
                                         renderer.emit(Activity(_describe_tool_call(call)))
                                     if not clock_armed:
+                                        research_started_at = asyncio.get_running_loop().time()
                                         clock.reschedule(
-                                            asyncio.get_running_loop().time()
-                                            + config.agent.wall_clock_seconds
+                                            research_started_at + config.agent.wall_clock_seconds
                                         )
                                         clock_armed = True
                                 _note_model_turns(node_update)
+                                # R7's reserve: fire the same bounded synthesis pass the round
+                                # cap uses once elapsed research time crosses the margin
+                                # threshold. The threshold decision itself lives in
+                                # `_margin_reached` (including the `== 0` disable), which is
+                                # where its boundaries are tested — see that docstring for why
+                                # it is not inline.
+                                if not margin_hit and research_started_at is not None:
+                                    elapsed = (
+                                        asyncio.get_running_loop().time() - research_started_at
+                                    )
+                                    if _margin_reached(
+                                        elapsed,
+                                        config.agent.wall_clock_seconds,
+                                        config.agent.synthesis_margin_seconds,
+                                    ):
+                                        margin_hit = True
+                                        # Same bookkeeping as the cap, through the shared
+                                        # `_pending_tool_call_ids`: if THIS crossing update
+                                        # itself carries a
+                                        # fresh `AIMessage` proposing tool work, rather than,
+                                        # say, a `ToolMessage` settling PRIOR work, that work is
+                                        # what the break below would otherwise leave dangling —
+                                        # deferring it here until it answers keeps the thread
+                                        # from ending on unanswered `tool_calls`.
+                                        for message in node_update.get("messages") or []:
+                                            if isinstance(message, AIMessage):
+                                                awaiting_tool_ids.update(
+                                                    _pending_tool_call_ids(message)
+                                                )
                             # Tool-call/reader-strip/todo-meta refreshes are no longer polled
                             # here (fix-pass item 1): `_on_activity_change` pushes them the
                             # instant the sink changes, from inside the tool dispatch itself.
                             _emit_new_alerts()
-                            if overrun or (cap_hit and not awaiting_tool_ids):
+                            if (
+                                overrun
+                                or (cap_hit and not awaiting_tool_ids)
+                                or (margin_hit and not awaiting_tool_ids)
+                            ):
                                 break
                         else:  # mode == "values"
                             pass_state = chunk
@@ -916,26 +991,46 @@ async def main(argv: list[str] | None = None) -> int:
                     )
                     continue
 
-                if cap_hit or overrun:
-                    cut_short = "round_cap"
+                if cap_hit or overrun or margin_hit:
+                    # `cap_hit`/`overrun` win whenever set, even if `margin_hit` is ALSO set
+                    # from the SAME chunk (e.g. a turn that both hits the round cap and has
+                    # already crossed the margin threshold) — the round cap is the harder
+                    # bound, so its disclosure takes priority and stays exactly as it was
+                    # before the margin existed.
+                    cut_short = "round_cap" if (cap_hit or overrun) else "synthesis_margin"
                     # `overrun` means a turn PAST the cap already started new work, so its tool
                     # calls may be dangling — appending a synthesis request there would hand
-                    # the model an invalid sequence. Otherwise the capped round's tools have
-                    # all answered (`awaiting_tool_ids` drained), and one bounded pass turns
-                    # what was read into a real final answer instead of mid-run chatter.
+                    # the model an invalid sequence. Otherwise the capped round's (or margin's)
+                    # tools have all answered (`awaiting_tool_ids` drained), and one bounded
+                    # pass turns what was read into a real final answer instead of mid-run
+                    # chatter.
                     if not overrun:
-                        renderer.emit(
-                            Activity(f"round cap ({max_rounds}) reached — asking for a synthesis")
-                        )
+                        if cut_short == "round_cap":
+                            renderer.emit(
+                                Activity(
+                                    f"round cap ({max_rounds}) reached — asking for a synthesis"
+                                )
+                            )
+                        else:
+                            renderer.emit(
+                                Activity(
+                                    f"synthesis margin "
+                                    f"({config.agent.synthesis_margin_seconds}s) reached — "
+                                    "asking for a synthesis"
+                                )
+                            )
                         synthesis_config: RunnableConfig = {
                             **run_config,
                             "recursion_limit": _SYNTHESIS_RECURSION_LIMIT,
                         }
+                        synthesize_now = (
+                            _SYNTHESIZE_NOW if cut_short == "round_cap" else _SYNTHESIZE_NOW_MARGIN
+                        )
                         async with aclosing(
                             cast(
                                 "AsyncGenerator[Any, None]",
                                 agent.astream(
-                                    {"messages": [HumanMessage(content=_SYNTHESIZE_NOW)]},
+                                    {"messages": [HumanMessage(content=synthesize_now)]},
                                     config=synthesis_config,
                                     stream_mode=["updates", "values"],
                                 ),
@@ -958,9 +1053,13 @@ async def main(argv: list[str] | None = None) -> int:
             cut_short_detail = f"{type(exc).__name__}: {exc}"
     except GraphRecursionError:  # must precede `Exception` — it subclasses RuntimeError
         # Two sources, one meaning: the synthesis pass's small limit (a lead that kept calling
-        # tools despite `_SYNTHESIZE_NOW`) or the runaway backstop on `run_config`. Either way
-        # the run ended on a rounds-related bound.
-        cut_short = "round_cap"
+        # tools despite `_SYNTHESIZE_NOW`/`_SYNTHESIZE_NOW_MARGIN`) or the runaway backstop on
+        # `run_config`. Either way the run ended on a rounds-related bound — but if the
+        # synthesis pass that ran away was ITSELF the margin's own (`cut_short` already
+        # "synthesis_margin" from before that pass started), keep that label rather than
+        # reporting the wrong bound as the cause (G4, 3F review).
+        if cut_short != "synthesis_margin":
+            cut_short = "round_cap"
     except Exception as exc:  # noqa: BLE001 — never `BaseException`; KeyboardInterrupt has its own clause below
         cut_short = "error"
         cut_short_detail = f"{type(exc).__name__}: {exc}"
@@ -1030,10 +1129,13 @@ async def main(argv: list[str] | None = None) -> int:
     )
     # D2's gate: a hard error, a user abort (mapped onto `cut_short == "error"` above), and a
     # wall-clock expiry with no final answer all write NO report — stderr error, exit 1. Round
-    # cap and any wall-clock expiry that already has an answer keep the disclosed report.
+    # cap, the synthesis margin (same round-cap-like case: stopped early and DO have an answer),
+    # and any wall-clock expiry that already has an answer keep the disclosed report.
     has_answer = bool(answer.strip())
     should_write_report = (
-        cut_short is None or cut_short == "round_cap" or (cut_short == "wall_clock" and has_answer)
+        cut_short is None
+        or cut_short in ("round_cap", "synthesis_margin")
+        or (cut_short == "wall_clock" and has_answer)
     )
 
     tracker.advance("writing")

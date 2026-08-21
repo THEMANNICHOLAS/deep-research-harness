@@ -68,12 +68,24 @@ max_consecutive_failures = 3  # R2: consecutive connection-level search failures
 # sanitization of survivor markdown always runs.
 enabled = true
 
+[blocklist]
+# R3/R4: cross-session hostname blocklist fed by deliberate anti-bot refusals
+# (401/403/challenge page) — see docs/plans/PLAN-tool-feedback-and-domain-blocklist.md.
+# path defaults to ~/deep-research/blocked-domains.json; set the key below to override.
+# path = "custom-blocked-domains.json"
+
 [agent]
 # Frozen surface for the agent loop (Phase 3) and its workspace/report capture
 # (Phase 2) — see docs/plans/PLAN-research-loop.md.
 max_rounds = 50
 wall_clock_seconds = 1800
+# R7: reserve measured back from wall_clock_seconds above at which a bounded synthesis pass
+# fires instead of running out the hard clock. 0 disables it.
+synthesis_margin_seconds = 240
 # workspace_dir/reports_dir now default to ~/deep-research/{workspace,reports}; set either
 # key here to override.
 max_retries = 2
 request_timeout_seconds = 120.0
+# Harness-enforced (R5): a researcher's reader dispatch past this count is refused, not
+# merely advised in prompt prose. The researcher prompt renders this same value.
+max_reader_dispatches = 6

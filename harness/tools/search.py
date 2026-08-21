@@ -12,6 +12,7 @@ import httpx
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from harness.blocklist import Blocklist, hostname_of, resolve_blocklist
 from harness.config import HarnessConfig
 from harness.guard import fence, guard_blocked_detail, scan
 from harness.runlog import RunLog, or_default
@@ -81,6 +82,31 @@ def _parse_results(
     return results[:max_results], dropped
 
 
+def _drop_blocklisted(
+    results: list[SearchResult], blocklist: Blocklist, run_log: RunLog
+) -> list[SearchResult]:
+    """Drop results whose hostname is on the persistent blocklist (R4/D4).
+
+    Runs BEFORE `_drop_guarded` and therefore before `_approve_survivors`: D4's "never
+    provenance-approved" guarantee depends on a dropped result never reaching approval, so
+    provenance keeps rejecting it everywhere else. One `domain_blocklisted` incident per
+    dropped result, naming the URL and hostname — the run-log side names hostnames; the
+    model-facing aggregate line (in `_render`) never does.
+    """
+    survivors: list[SearchResult] = []
+    for result in results:
+        host = hostname_of(result.url)
+        if host is not None and blocklist.contains(host):
+            run_log.record(
+                "domain_blocklisted",
+                f"{result.url}: dropped from search results — {host} is on the "
+                "persistent domain blocklist",
+            )
+        else:
+            survivors.append(result)
+    return survivors
+
+
 def _drop_guarded(
     results: list[SearchResult], config: HarnessConfig, run_log: RunLog
 ) -> list[SearchResult]:
@@ -112,24 +138,57 @@ def _approve_survivors(results: list[SearchResult], registry: SourceRegistry) ->
         registry.approve(result.url)
 
 
-def _render(query: str, outcome: list[SearchResult] | SearchFailure, guard_blocked: int = 0) -> str:
+# R4's stop-hunting clause, in one place: every branch of `_render` that withholds a
+# blocklisted result must carry it, or the model keeps querying for a host that will never
+# load. Deliberately count-only — the hostnames stay in the run-log incident (D1 opacity).
+_BLOCKLIST_DISCLOSURE = (
+    "those domains are unavailable and will not load; do not look for them again"
+)
+
+
+def _render(
+    query: str,
+    outcome: list[SearchResult] | SearchFailure,
+    guard_blocked: int = 0,
+    blocklisted: int = 0,
+) -> str:
     """Render the model-facing content: a numbered list, a no-results line, or a failure.
 
     Titles/snippets are untrusted content (Phase 5, D1 spotlighting): the whole results listing
     is fenced with `harness.guard.fence` as one block, with the header line kept outside it.
 
-    `guard_blocked` distinguishes "nothing existed" from "everything was withheld": an
-    all-blocked search must not render identically to a genuinely empty one, or the model
-    (and an operator reading the transcript) retries a query that actually had answers.
+    `guard_blocked`/`blocklisted` distinguish "nothing existed" from "everything was withheld"
+    from "some results were withheld": an all-blocked/all-blocklisted search must not render
+    identically to a genuinely empty one, or the model (and an operator reading the transcript)
+    retries a query that actually had answers. When results remain, `blocklisted` instead
+    appends one aggregate disclosure line naming only the COUNT — never the hostnames, which
+    stay in the run-log incident (D1-style opacity, extended to R4).
     """
     if isinstance(outcome, SearchFailure):
         return f'Search for "{query}" failed: {outcome.reason} — {outcome.detail}'
     if not outcome:
+        if guard_blocked and blocklisted:
+            # R4's stop-hunting clause has to survive the MIXED case too: a search emptied by
+            # one guard block and one walled host is still a search whose walled hosts must
+            # not be queried again. Naming only the total would tell the model results
+            # existed while withholding the one instruction that stops the retry loop.
+            total = guard_blocked + blocklisted
+            return (
+                f'Search for "{query}" returned {total} results, all withheld — '
+                f"{guard_blocked} by the injection guard, {blocklisted} because "
+                f"{_BLOCKLIST_DISCLOSURE}."
+            )
         if guard_blocked:
             noun = "result" if guard_blocked == 1 else "results"
             return (
                 f'Search for "{query}" returned {guard_blocked} {noun}, all withheld by the '
                 "injection guard."
+            )
+        if blocklisted:
+            noun = "result" if blocklisted == 1 else "results"
+            return (
+                f'Search for "{query}" returned {blocklisted} {noun}, all withheld — '
+                f"{_BLOCKLIST_DISCLOSURE}."
             )
         return f'Search for "{query}" returned no results.'
 
@@ -138,7 +197,11 @@ def _render(query: str, outcome: list[SearchResult] | SearchFailure, guard_block
         for index, result in enumerate(outcome, start=1)
     ]
     listing = "\n".join(result_lines)
-    return f'Results for "{query}":\n\n{fence(listing)}'
+    rendered = f'Results for "{query}":\n\n{fence(listing)}'
+    if blocklisted:
+        noun = "result" if blocklisted == 1 else "results"
+        rendered += f"\n\n{blocklisted} further {noun} withheld — {_BLOCKLIST_DISCLOSURE}."
+    return rendered
 
 
 def _search_url(config: HarnessConfig) -> str:
@@ -169,17 +232,27 @@ async def _fetch_search_json(query: str, config: HarnessConfig) -> object | Sear
 
 
 async def _search(
-    query: str, max_results: int, config: HarnessConfig, registry: SourceRegistry, run_log: RunLog
+    query: str,
+    max_results: int,
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    run_log: RunLog,
+    blocklist: Blocklist | None = None,
 ) -> tuple[str, list[SearchResult] | SearchFailure]:
     """Query SearXNG, returning model-facing content and the typed result/failure.
 
     Every `SearchFailure`, and every batch that silently dropped malformed entries, is also
     recorded on `run_log` — the model-facing rendering alone leaves disclosure up to whether
     the model chooses to mention it.
+
+    `blocklist` defaults to a fresh load from `config.blocklist.path` for direct callers and
+    tests; production threads ONE shared instance from `build_tools`.
     """
+    blocklist = resolve_blocklist(blocklist, config.blocklist.path)
     payload = await _fetch_search_json(query, config)
     outcome: list[SearchResult] | SearchFailure
     guard_blocked = 0
+    blocklisted = 0
     if isinstance(payload, SearchFailure):
         outcome = payload
     elif not isinstance(payload, dict):
@@ -197,8 +270,13 @@ async def _search(
                 "dropped from the response",
             )
         if isinstance(outcome, list):
-            survivors = _drop_guarded(outcome, config, run_log)
-            guard_blocked = len(outcome) - len(survivors)
+            # R4/D4: the blocklist filter runs BEFORE the guard and therefore before
+            # `_approve_survivors` — a dropped result never reaches approval, so provenance
+            # keeps rejecting it everywhere else (D4's "never provenance-approved" guarantee).
+            kept = _drop_blocklisted(outcome, blocklist, run_log)
+            blocklisted = len(outcome) - len(kept)
+            survivors = _drop_guarded(kept, config, run_log)
+            guard_blocked = len(kept) - len(survivors)
             outcome = survivors
             # Phase 4 (R2): only the guard's survivors become fetchable — a blocked result's
             # URL is never approved, per D2's developer decision.
@@ -208,7 +286,7 @@ async def _search(
         run_log.record(
             "search_failed", f'search for "{query}" failed: {outcome.reason} — {outcome.detail}'
         )
-    return _render(query, outcome, guard_blocked), outcome
+    return _render(query, outcome, guard_blocked, blocklisted), outcome
 
 
 class SearchPreflightError(Exception):
@@ -256,7 +334,10 @@ class SearchUnavailableError(Exception):
 
 
 def build_search_tool(
-    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    run_log: RunLog | None = None,
+    blocklist: Blocklist | None = None,
 ) -> BaseTool:
     """Build the `search_web` tool, closing over `config`, the shared `registry` and `run_log`.
 
@@ -268,9 +349,14 @@ def build_search_tool(
     Strict URL provenance (Phase 4, R2) is also invisible here: every survivor's URL is
     approved on `registry` inside `_search`, so a clean result becomes fetchable while a
     guard-blocked one never does.
+
+    R3/R4 (Phase 3): the persistent domain blocklist filters results here BEFORE the guard and
+    before approval (D4) — this is the primary choke point, with `fetch_pages`/`fetch_raw`'s
+    pre-crawl check as the backstop.
     """
 
     log = or_default(run_log)
+    domain_blocklist = resolve_blocklist(blocklist, config.blocklist.path)
 
     class SearchWebInput(BaseModel):
         """Model-facing input schema for the `search_web` tool."""
@@ -301,7 +387,9 @@ def build_search_tool(
         row, which raises `SearchUnavailableError` to abort the run.
         """
         nonlocal consecutive_failures
-        content, outcome = await _search(query, max_results, config, registry, log)
+        content, outcome = await _search(
+            query, max_results, config, registry, log, domain_blocklist
+        )
 
         if isinstance(outcome, SearchFailure) and outcome.reason in ("unreachable", "bad_status"):
             consecutive_failures += 1

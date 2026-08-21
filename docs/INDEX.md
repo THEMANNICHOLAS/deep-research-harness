@@ -67,3 +67,4 @@
 | Researcher wiring | @harness/agent.py | `_researcher_spec` — declares the `researcher` `SubAgent`, the lead's only `subagents` entry; nests `_reader_spec` via `SubAgentMiddleware` and owns `search_web`/`fetch_raw` |
 | Researcher contract | @harness/prompts/subagent.md | The researcher's rendered system prompt (angle research + delegated reading) |
 | Tool registry | @harness/tools/ | `build_tools` and the per-tool `build_<name>_tool` factories |
+| Domain blocklist | @harness/blocklist.py | `load_blocklist`/`Blocklist` — cross-session hostname blocklist fed by anti-bot refusals; also `hostname_of`, the one URL→hostname definition |

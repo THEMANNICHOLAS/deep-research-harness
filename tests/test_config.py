@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.config import ConfigError, GuardSettings, load_config
+from harness.config import BlocklistSettings, ConfigError, GuardSettings, load_config
 
 VALID_TOML = """
 [providers.opencode]
@@ -187,6 +187,7 @@ def test_typo_in_key_error_names_the_offending_key(tmp_path, monkeypatch):
         ("per_page_char_cap", 0),
         ("max_urls_per_call", 0),
         ("max_consecutive_failures", 0),
+        ("max_reader_dispatches", 0),
     ],
 )
 def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_value):
@@ -198,10 +199,15 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
         "per_page_char_cap": 9000,
         "max_urls_per_call": 3,
         "max_consecutive_failures": 4,
+        "max_reader_dispatches": 6,
     }
-    toml_content = VALID_TOML.replace(
-        f"{setting} = {original[setting]}", f"{setting} = {bad_value}"
-    )
+    # `max_reader_dispatches` lives in `[agent]`, which VALID_TOML omits (the omitted-section
+    # default is covered by test_agent_section_omitted_falls_back_to_documented_defaults) --
+    # append a literal default here so the same `.replace()` pattern has something to swap.
+    base_toml = VALID_TOML
+    if setting == "max_reader_dispatches":
+        base_toml += "\n[agent]\nmax_reader_dispatches = 6\n"
+    toml_content = base_toml.replace(f"{setting} = {original[setting]}", f"{setting} = {bad_value}")
     path = _write(tmp_path, toml_content)
 
     with pytest.raises(ConfigError) as excinfo:
@@ -352,6 +358,7 @@ def test_agent_section_loads_declared_values(tmp_path, monkeypatch):
 [agent]
 max_rounds = 12
 wall_clock_seconds = 600
+synthesis_margin_seconds = 200
 workspace_dir = "custom-workspace"
 reports_dir = "custom-reports"
 max_retries = 4
@@ -364,6 +371,7 @@ request_timeout_seconds = 30.0
 
     assert config.agent.max_rounds == 12
     assert config.agent.wall_clock_seconds == 600
+    assert config.agent.synthesis_margin_seconds == 200
     assert config.agent.workspace_dir == Path("custom-workspace")
     assert config.agent.reports_dir == Path("custom-reports")
     assert config.agent.max_retries == 4
@@ -379,10 +387,46 @@ def test_agent_section_omitted_falls_back_to_documented_defaults(tmp_path, monke
 
     assert config.agent.max_rounds == 50
     assert config.agent.wall_clock_seconds == 1800
+    assert config.agent.synthesis_margin_seconds == 240
     assert config.agent.workspace_dir == Path.home() / "deep-research" / "workspace"
     assert config.agent.reports_dir == Path.home() / "deep-research" / "reports"
     assert config.agent.max_retries == 2
     assert config.agent.request_timeout_seconds == 120.0
+
+
+def test_synthesis_margin_at_or_above_the_wall_clock_is_rejected(tmp_path, monkeypatch):
+    """R7 (parent plan Phase 5): the reserve is measured back from the wall clock, so a margin
+    equal to (or larger than) `wall_clock_seconds` would fire at or after the clock has already
+    expired -- diagnosed at load time, not discovered mid-run.
+    """
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = (
+        VALID_TOML + "\n[agent]\nwall_clock_seconds = 100\nsynthesis_margin_seconds = 100\n"
+    )
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    message = str(excinfo.value)
+    assert "synthesis_margin_seconds" in message
+    assert "wall_clock_seconds" in message
+
+
+def test_synthesis_margin_seconds_zero_is_accepted(tmp_path, monkeypatch):
+    """Contracts: `0` is the documented disable value, not a violation of `synthesis_margin_seconds
+    < wall_clock_seconds` -- it must load cleanly regardless of `wall_clock_seconds`.
+    """
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + "\n[agent]\nsynthesis_margin_seconds = 0\n"
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.agent.synthesis_margin_seconds == 0
+    assert config.agent.max_reader_dispatches == 6
 
 
 def test_agent_section_rejects_unknown_key(tmp_path, monkeypatch):
@@ -472,6 +516,57 @@ def test_guard_section_rejects_unknown_key(tmp_path, monkeypatch):
 
 def test_guard_settings_model_defaults_enabled():
     assert GuardSettings().enabled is True
+
+
+# --- Phase 3: BlocklistSettings / [blocklist] -------------------------------------------
+
+
+def test_blocklist_path_defaults_to_the_home_relative_location(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    path = _write(tmp_path, VALID_TOML)
+
+    config = load_config(path)
+
+    assert config.blocklist.path == Path.home() / "deep-research" / "blocked-domains.json"
+
+
+def test_empty_blocklist_section_parses_and_keeps_the_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + "\n[blocklist]\n"
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.blocklist.path == Path.home() / "deep-research" / "blocked-domains.json"
+
+
+def test_blocklist_section_is_parsed_from_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + '\n[blocklist]\npath = "custom-blocked-domains.json"\n'
+    path = _write(tmp_path, toml_content)
+
+    config = load_config(path)
+
+    assert config.blocklist.path == Path("custom-blocked-domains.json")
+
+
+def test_blocklist_section_rejects_unknown_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML + '\n[blocklist]\ntypo_key = "oops"\n'
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "typo_key" in str(excinfo.value)
+
+
+def test_blocklist_settings_model_defaults_path():
+    assert BlocklistSettings().path == Path.home() / "deep-research" / "blocked-domains.json"
 
 
 # --- Phase 2: RoleConfig.choices (/model picker) ----------------------------------------

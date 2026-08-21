@@ -7,11 +7,19 @@ import pytest
 from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter  # type: ignore[import-untyped]
 from langchain_core.tools import BaseTool
 
-from harness.config import AgentSettings, GuardSettings
+from harness.config import AgentSettings, BlocklistSettings, GuardSettings
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
 from harness.tools import fetch
-from tests.conftest import _FakeMarkdown, _FakeResult, approve_all
+from tests.conftest import (
+    CHALLENGE_FIXTURES_DIR,
+    _challenge_fixtures,
+    _FakeMarkdown,
+    _FakeResult,
+    _seed_blocklist_file,
+    approve_all,
+    read_blocklist_file,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
 
@@ -34,14 +42,19 @@ def _rendered(markdown: str, cap: int) -> str:
     return fetch._render(page, cap)
 
 
-async def test_empty_url_list_returns_empty_content_and_artifact(install_crawler, make_config):
+async def test_empty_url_list_says_nothing_was_fetched_rather_than_returning_empty(
+    install_crawler, make_config
+):
+    """R1's floor: a batch never returns empty or silent. The degenerate `urls=[]` call is the
+    one site that still returned `""`, which is exactly the silence R1 forbids."""
     config = make_config()
     registry = SourceRegistry()
     fake_cls = install_crawler([])
 
     content, pages = await fetch._fetch([], config, registry, RunLog())
 
-    assert (content, pages) == ("", [])
+    assert content == "No URLs were requested, so nothing was fetched."
+    assert pages == []
     assert fake_cls.constructed_with == []
 
 
@@ -330,6 +343,7 @@ async def test_content_has_a_heading_for_every_url_including_failures(install_cr
         heading = f"## [{page.source_id}] {page.url}" if page.source_id else f"## {page.url}"
         assert heading in content
         assert page.outcome in content
+    assert "status 500" in content
 
 
 async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_config):
@@ -987,11 +1001,13 @@ async def test_a_failed_refetch_does_not_overwrite_a_successful_capture(  # R5
     assert "real body" in captured_path.read_text(encoding="utf-8")
 
 
-async def test_a_successful_refetch_after_an_earlier_failure_writes_a_normal_capture(  # R5
+async def test_a_refetch_after_an_earlier_failure_never_reaches_the_crawler_again(  # R5/D2
     install_crawler, make_config, tmp_path
 ):
-    """A failure leaves nothing to replace: the first (failed) call wrote no file at all, so
-    the later success just mints a fresh id and writes a normal capture.
+    """A transient failure is still sticky for the run (D2): the 429 verdict is replayed, so
+    the page that WOULD have succeeded on the second try is never fetched and writes no
+    capture. This is the reach cost the plan's risk #1 accepts to stop the model re-looping
+    on links that keep failing.
     """
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
@@ -1002,7 +1018,7 @@ async def test_a_successful_refetch_after_an_earlier_failure_writes_a_normal_cap
     first = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-blocked"))
     assert first.artifact[0].source_id is None
 
-    install_crawler(
+    would_have_succeeded = install_crawler(
         [
             _FakeResult(
                 "https://flaky.test",
@@ -1011,13 +1027,12 @@ async def test_a_successful_refetch_after_an_earlier_failure_writes_a_normal_cap
         ]
     )
     second = await fetch_pages.ainvoke(_tool_call(["https://flaky.test"], "call-good"))
-    source_id = second.artifact[0].source_id
 
-    assert source_id is not None
-    captures_dir = sources_dir(config, registry)
-    text = (captures_dir / f"{source_id}.md").read_text(encoding="utf-8")
-    assert "real body" in text
-    assert list(captures_dir.glob("*.md")) == [captures_dir / f"{source_id}.md"]
+    assert would_have_succeeded.calls == []
+    assert second.artifact == []
+    assert second.content == first.content
+    assert registry.all() == []
+    assert list(sources_dir(config, registry).glob("*.md")) == []
 
 
 # --- R5: identity-model migration — a failed fetch mints no id and writes no file ------
@@ -1106,11 +1121,12 @@ async def test_a_successful_fetch_mints_sn_writes_capture_and_renders_sn_heading
     assert "ok body" in text
 
 
-async def test_a_url_that_fails_then_succeeds_later_mints_a_fresh_sn_normally(  # R5
+async def test_a_replayed_failure_verdict_records_no_second_incident(  # R5/D2
     install_crawler, make_config, tmp_path
 ):
-    """A URL that fails on one call and succeeds on a later one is treated as if it had never
-    been attempted: the failure minted nothing, so the later success gets a normal, fresh `Sn`.
+    """The replay is not a new attempt, so it discloses nothing new: the operator's
+    `fetch_failed` incident is written once, by the call that actually failed. A second
+    incident per re-request would make one dead link look like a worsening run.
     """
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
@@ -1124,19 +1140,14 @@ async def test_a_url_that_fails_then_succeeds_later_mints_a_fresh_sn_normally(  
 
     assert first.artifact[0].source_id is None
     assert registry.all() == []
+    assert len([i for i in run_log.incidents() if i.kind == "fetch_failed"]) == 1
 
     install_crawler(
         [_FakeResult(url, markdown=_FakeMarkdown(raw_markdown="finally", fit_markdown="finally"))]
     )
-    second = await fetch_pages.ainvoke(_tool_call([url], "call-retry-2"))
+    await fetch_pages.ainvoke(_tool_call([url], "call-retry-2"))
 
-    page = second.artifact[0]
-    assert page.outcome == "fetched"
-    assert page.source_id == "S1"
-    captures_dir = sources_dir(config, registry)
-    text = (captures_dir / "S1.md").read_text(encoding="utf-8")
-    assert "finally" in text
-    assert list(captures_dir.glob("*.md")) == [captures_dir / "S1.md"]
+    assert len([i for i in run_log.incidents() if i.kind == "fetch_failed"]) == 1
 
 
 async def test_pdf_extension_url_is_routed_to_the_pdf_crawler_and_lands_fetched(
@@ -1314,17 +1325,20 @@ async def test_failed_fetch_outcomes_are_recorded_on_the_run_log(install_crawler
 
     await fetch._fetch(["https://ok.test", "https://blocked.test"], config, registry, run_log)
 
-    incidents = run_log.incidents()
-    assert [incident.kind for incident in incidents] == ["fetch_failed"]
-    assert "https://blocked.test" in incidents[0].detail
-    assert "blocked" in incidents[0].detail
-    assert "status 403" in incidents[0].detail
+    # Phase 3: a 403 now legitimately emits two incidents — `domain_blocklisted`, fed inside
+    # the crawl loop as each result is classified, then `fetch_failed`, recorded in the later
+    # pass over `pages` — so both are pinned here, in that order, rather than narrowed to one.
+    assert [i.kind for i in run_log.incidents()] == ["domain_blocklisted", "fetch_failed"]
+    fetch_failed = run_log.incidents()[1]
+    assert "https://blocked.test" in fetch_failed.detail
+    assert "blocked" in fetch_failed.detail
+    assert "status 403" in fetch_failed.detail
 
 
 # --- Phase 3: firewall wiring (scan -> classify -> mint -> sanitize -> capture -> render) ----
 
 
-async def test_a_page_carrying_an_attack_string_mints_no_sn_writes_no_file_and_is_absent(  # R1
+async def test_an_attack_page_mints_no_sn_writes_no_file_and_renders_an_opaque_rejection(  # R1
     install_crawler, make_config, tmp_path
 ):
     """A blocked page vanishes from the pipeline entirely; a clean page in the same batch
@@ -1355,7 +1369,7 @@ async def test_a_page_carrying_an_attack_string_mints_no_sn_writes_no_file_and_i
     # in the same batch still fetches and registers normally.
     assert [page.url for page in message.artifact] == ["https://clean.test"]
     assert [source.url for source in registry.all()] == ["https://clean.test"]
-    assert "https://evil.test" not in message.content
+    assert fetch._rejection_block("https://evil.test") in message.content
     assert "clean body" in message.content
 
     captures_dir = sources_dir(config, registry)
@@ -1404,12 +1418,13 @@ async def test_a_page_whose_injection_lives_only_in_its_title_is_blocked(  # R1
 async def test_a_fetched_page_title_is_stripped_of_invisibles_in_page_and_capture(  # R3
     install_crawler, make_config, tmp_path
 ):
-    """`_write_source_file` writes `page.title`, not the registry's already-stripped copy,
-    so the page object itself must carry the cleaned title (guard off: hygiene is
-    unconditional, detection is not — and the zero-width chars would otherwise block)."""
-    config = make_config(
-        guard=GuardSettings(enabled=False), agent=AgentSettings(workspace_dir=tmp_path)
-    )
+    """`_write_source_file` writes `page.title`, not the registry's already-stripped copy, so
+    the page object itself must carry the cleaned title.
+
+    Runs with the guard ON: since D5 a zero-width-laden title no longer blocks, so this proves
+    hygiene on a page that genuinely fetched rather than on one the guard was switched off for.
+    """
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
     approve_all(registry, ["https://titled.test"])
     run_log = RunLog()
@@ -1454,7 +1469,7 @@ async def test_a_blocked_pdf_page_is_dropped_identically_to_an_html_page(  # R1
 
     assert pages == []
     assert registry.all() == []
-    assert "https://docs.test/evil.pdf" not in content
+    assert fetch._rejection_block("https://docs.test/evil.pdf") in content
 
     incidents = [i for i in run_log.incidents() if i.kind == "guard_blocked"]
     assert len(incidents) == 1
@@ -1486,15 +1501,13 @@ async def test_guard_disabled_bypasses_scanning_and_the_attack_page_fetches_norm
     assert [i for i in run_log.incidents() if i.kind == "guard_blocked"] == []
 
 
-async def test_survivor_markdown_zero_width_chars_stripped_when_guard_disabled(  # D5/D3
+async def test_survivor_markdown_zero_width_chars_stripped(  # D5/D3
     install_crawler, make_config, tmp_path
 ):
-    """The obfuscation family blocks on zero-width chars, so proving the sanitize-still-runs
-    invariant (guard toggles detection, not hygiene) needs the guard OFF for THIS variant.
+    """After D5, the guard no longer blocks on zero-width chars alone, so this page fetches
+    normally with the guard ON; it proves byte hygiene (D3) still strips them from the capture.
     """
-    config = make_config(
-        agent=AgentSettings(workspace_dir=tmp_path), guard=GuardSettings(enabled=False)
-    )
+    config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
     approve_all(registry, ["https://zerowidth.test"])
     dirty_markdown = "wo​rd"
@@ -1560,7 +1573,7 @@ async def test_an_unapproved_url_is_rejected_pre_crawl_and_never_reaches_the_cra
     content, pages = await fetch._fetch(["https://never-approved.test"], config, registry, run_log)
 
     assert pages == []
-    assert content == ""
+    assert content == fetch._rejection_block("https://never-approved.test")
     assert fake_cls.calls == []
     assert registry.all() == []
 
@@ -1599,8 +1612,516 @@ async def test_mixed_batch_approved_urls_fetch_while_the_unapproved_one_is_rejec
     assert fake_cls.calls[0].urls == ["https://approved-a.test", "https://approved-b.test"]
     assert [page.url for page in pages] == ["https://approved-a.test", "https://approved-b.test"]
     assert all(page.outcome == "fetched" for page in pages)
-    assert "https://not-approved.test" not in content
+    assert fetch._rejection_block("https://not-approved.test") in content
 
     incidents = [i for i in run_log.incidents() if i.kind == "provenance_rejected"]
     assert len(incidents) == 1
     assert "https://not-approved.test" in incidents[0].detail
+
+
+# --- Visible, sticky fetch failures (R1/D1/D2) -------------------------------------------
+#
+# The rejection wording is pinned in exactly ONE place below — the golden test. Every other
+# test here (and in test_fallback.py) asserts against `fetch._rejection_block`, so a reworded
+# policy line fails one test rather than a dozen, and no test can pin a stale copy of it.
+
+
+def test_the_rejection_block_wording_is_pinned():  # D1
+    """The one golden assertion on the opaque block's exact text.
+
+    Rewording it is a policy change and must break a test deliberately; every other assertion
+    in the suite goes through `_rejection_block`, so this is the only copy of the string.
+    """
+    assert fetch._rejection_block("https://x.test") == (
+        "## https://x.test\n\nrejected — do not retry this URL or request variants of it"
+    )
+
+
+async def test_provenance_and_guard_rejection_blocks_both_come_from_the_shared_builder(  # D1
+    install_crawler, make_config
+):
+    """D1's consequence: all rejection paths funnel through one block-builder, so the wording
+    cannot drift into revealing WHICH policy rejected the URL. Proving each path's output IS
+    `_rejection_block(url)` is what makes the blocks identical-but-for-the-URL structural
+    rather than a coincidence two hand-rolled strings currently share.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://evil.test"])
+    attack_markdown = _attack_markdown()
+    results = [
+        _FakeResult(
+            "https://evil.test",
+            markdown=_FakeMarkdown(raw_markdown=attack_markdown, fit_markdown=attack_markdown),
+        ),
+    ]
+    install_crawler(results)
+
+    content, pages = await fetch._fetch(
+        ["https://unapproved.test", "https://evil.test"], config, registry, RunLog()
+    )
+
+    # Left: rejected by provenance, pre-crawl. Right: dropped by the guard, post-crawl.
+    assert fetch._rejection_block("https://unapproved.test") in content
+    assert fetch._rejection_block("https://evil.test") in content
+
+
+async def test_rejection_block_names_no_policy(install_crawler, make_config):  # D1
+    config = make_config()
+    registry = SourceRegistry()  # deliberately nothing approved
+    install_crawler([])
+
+    content, pages = await fetch._fetch(["https://random-url.test"], config, registry, RunLog())
+
+    lowered = content.lower()
+    for word in ("guard", "injection", "provenance", "approved", "blocklist"):
+        assert word not in lowered
+
+
+async def test_a_batch_where_every_url_is_rejected_returns_blocks_not_an_empty_string(
+    install_crawler, make_config
+):
+    config = make_config()
+    registry = SourceRegistry()  # deliberately nothing approved
+    fake_cls = install_crawler([])
+
+    content, pages = await fetch._fetch(
+        ["https://one-unapproved.test", "https://two-unapproved.test"], config, registry, RunLog()
+    )
+
+    assert content != ""
+    assert fetch._rejection_block("https://one-unapproved.test") in content
+    assert fetch._rejection_block("https://two-unapproved.test") in content
+    assert fake_cls.calls == []
+
+
+async def test_a_blocked_url_replays_its_verdict_on_re_request_with_no_further_crawler_calls(  # D2
+    install_crawler, make_config
+):
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://blocked.test"])
+    results = [_FakeResult("https://blocked.test", status_code=403, markdown=None)]
+    fake_cls = install_crawler(results)
+
+    first_content, _ = await fetch._fetch(["https://blocked.test"], config, registry, RunLog())
+    assert len(fake_cls.calls) == 1
+
+    second_content, second_pages = await fetch._fetch(
+        ["https://blocked.test"], config, registry, RunLog()
+    )
+
+    assert len(fake_cls.calls) == 1
+    assert second_content == first_content
+    # R1: the failure carries the do-not-retry instruction the FIRST time, not only on replay —
+    # a model that has to spend the retry to learn the retry is futile has already looped once.
+    assert fetch._DO_NOT_RETRY_LINE in first_content
+    assert second_pages == []
+
+
+async def test_a_search_approval_rescues_a_url_strict_provenance_rejected_earlier(
+    install_crawler, make_config
+):
+    """The model guesses a URL from memory, provenance rejects it, then `search_web` surfaces
+    that same real URL and approves it. The rejection must not outlive the approval — otherwise
+    a legitimate source is lost for the run, which is the exact silent coverage loss this phase
+    exists to end. `registry.approve` is the seam search.py's `_approve_survivors` calls.
+    """
+    config = make_config()
+    registry = SourceRegistry()  # deliberately nothing approved: the URL is a memory guess
+    guessed = "https://docs.test/real-page"
+
+    fake_cls = install_crawler([])
+    rejected_content, rejected_pages = await fetch._fetch([guessed], config, registry, RunLog())
+    assert rejected_pages == []
+    assert rejected_content == fetch._rejection_block(guessed)
+    assert fake_cls.calls == []
+
+    registry.approve(guessed)  # search surfaced it for real
+    fake_cls = install_crawler(
+        [_FakeResult(guessed, markdown=_FakeMarkdown(raw_markdown="body", fit_markdown="body"))]
+    )
+    content, pages = await fetch._fetch([guessed], config, registry, RunLog())
+
+    assert len(fake_cls.calls) == 1
+    assert [page.outcome for page in pages] == ["fetched"]
+    assert "body" in content
+
+
+async def test_re_approving_a_url_does_not_clear_a_guard_or_failure_verdict(
+    install_crawler, make_config
+):
+    """The other half of the rescue: search returning an already-approved URL a second time
+    must NOT reopen it. Guard blocks and genuine failures are recorded downstream of the
+    provenance check, so they are sticky for the whole run (D2) no matter how often a search
+    result re-approves the URL.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://evil.test"])
+    attack_markdown = _attack_markdown()
+    fake_cls = install_crawler(
+        [
+            _FakeResult(
+                "https://evil.test",
+                markdown=_FakeMarkdown(raw_markdown=attack_markdown, fit_markdown=attack_markdown),
+            )
+        ]
+    )
+
+    await fetch._fetch(["https://evil.test"], config, registry, RunLog())
+    assert len(fake_cls.calls) == 1
+
+    registry.approve("https://evil.test")  # a second search result names the same page
+    content, pages = await fetch._fetch(["https://evil.test"], config, registry, RunLog())
+
+    assert len(fake_cls.calls) == 1
+    assert pages == []
+    assert content == fetch._rejection_block("https://evil.test")
+
+
+# --- Phase 3: persistent domain blocklist (R3/R4) ----------------------------------------
+
+
+def test_a_401_response_classifies_blocked():
+    assert fetch.classify(401, None, "text/html", "x") == "blocked"
+
+
+async def test_a_pre_blocklisted_hostname_is_rejected_pre_crawl_with_zero_crawler_calls(
+    install_crawler, make_config, tmp_path
+):
+    """The pre-crawl backstop: a hostname already on the persistent blocklist is rejected
+    before any crawler work, with the same opaque D1 block and a `domain_blocklisted`
+    incident."""
+    blocklist_path = tmp_path / "blocked-domains.json"
+    _seed_blocklist_file(blocklist_path, "walled.test")
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://walled.test/page"])
+    run_log = RunLog()
+    fake_cls = install_crawler([])
+
+    content, pages = await fetch._fetch(["https://walled.test/page"], config, registry, run_log)
+
+    assert pages == []
+    assert content == fetch._rejection_block("https://walled.test/page")
+    assert fake_cls.calls == []
+
+    incidents = [i for i in run_log.incidents() if i.kind == "domain_blocklisted"]
+    assert len(incidents) == 1
+    assert "https://walled.test/page" in incidents[0].detail
+
+
+async def test_an_unapproved_blocklisted_url_is_rejected_by_provenance_not_the_blocklist(
+    install_crawler, make_config, tmp_path
+):
+    """Placement invariant (Phase 1 `## Discoveries`): the blocklist backstop sits AFTER the
+    provenance check, so an unapproved URL is rejected by provenance — not the blocklist —
+    even when its hostname is already walled. Getting this backwards would record a verdict
+    for an unapproved URL, which a later `approve()` would silently clear.
+    """
+    blocklist_path = tmp_path / "blocked-domains.json"
+    _seed_blocklist_file(blocklist_path, "walled.test")
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()  # deliberately nothing approved
+    run_log = RunLog()
+    fake_cls = install_crawler([])
+
+    content, pages = await fetch._fetch(["https://walled.test/page"], config, registry, run_log)
+
+    assert pages == []
+    assert content == fetch._rejection_block("https://walled.test/page")
+    assert fake_cls.calls == []
+    assert [i.kind for i in run_log.incidents()] == ["provenance_rejected"]
+
+
+async def test_a_401_response_adds_the_hostname_with_reason_401(
+    install_crawler, make_config, tmp_path
+):
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://denied.test/page"])
+    results = [
+        _FakeResult(
+            "https://denied.test/page",
+            status_code=401,
+            markdown=_FakeMarkdown(raw_markdown="denied", fit_markdown="denied"),
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://denied.test/page"], config, registry, RunLog())
+
+    data = read_blocklist_file(blocklist_path)
+    assert data["denied.test"]["reason"] == "401"
+
+
+async def test_a_403_response_adds_the_hostname_with_reason_403(
+    install_crawler, make_config, tmp_path
+):
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://forbidden.test/page"])
+    results = [
+        _FakeResult(
+            "https://forbidden.test/page",
+            status_code=403,
+            markdown=_FakeMarkdown(raw_markdown="forbidden", fit_markdown="forbidden"),
+        )
+    ]
+    install_crawler(results)
+    run_log = RunLog()
+
+    await fetch._fetch(["https://forbidden.test/page"], config, registry, run_log)
+
+    data = read_blocklist_file(blocklist_path)
+    assert data["forbidden.test"]["reason"] == "403"
+
+    # The feed's own disclosure, at its own call site (`_feed_blocklist`), not asserted by any
+    # other test: one `domain_blocklisted` incident naming the hostname, the reason, and the URL.
+    incidents = [i for i in run_log.incidents() if i.kind == "domain_blocklisted"]
+    assert len(incidents) == 1
+    assert "forbidden.test" in incidents[0].detail
+    assert "403" in incidents[0].detail
+    assert "https://forbidden.test/page" in incidents[0].detail
+
+
+@pytest.mark.parametrize("path", _challenge_fixtures(), ids=lambda p: p.stem)
+async def test_a_challenge_marker_body_on_a_non_fetched_response_adds_the_hostname_as_challenge(
+    install_crawler, make_config, tmp_path, path
+):
+    """R3's reconciled clause: a non-`fetched` outcome (503 here) whose body fires a challenge
+    marker persists with reason "challenge", whatever its status."""
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://interstitial.test/page"])
+    body = path.read_text(encoding="utf-8")
+    results = [
+        _FakeResult(
+            "https://interstitial.test/page",
+            status_code=503,
+            markdown=_FakeMarkdown(raw_markdown=body, fit_markdown=body),
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://interstitial.test/page"], config, registry, RunLog())
+
+    data = read_blocklist_file(blocklist_path)
+    assert data["interstitial.test"]["reason"] == "challenge"
+
+
+async def test_a_challenge_marker_in_the_title_alone_adds_the_hostname_as_challenge(
+    install_crawler, make_config, tmp_path
+):
+    """The marker check must see the same text the guard scan does — title included.
+
+    A real Cloudflare interstitial carries "Just a moment..." as its `<title>`, while the one
+    phrase static in its BODY lives in a `<noscript>` block that `_EXCLUDED_TAGS` strips and
+    `PruningContentFilter` can prune to nothing. Scanning the body alone let exactly the site
+    this feature exists to stop retrying escape the blocklist.
+    """
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://interstitial.test/page"])
+    results = [
+        _FakeResult(
+            "https://interstitial.test/page",
+            status_code=503,
+            metadata={"title": "Just a moment..."},
+            markdown=_FakeMarkdown(raw_markdown="interstitial.test", fit_markdown=""),
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://interstitial.test/page"], config, registry, RunLog())
+
+    data = read_blocklist_file(blocklist_path)
+    assert data["interstitial.test"]["reason"] == "challenge"
+
+
+async def test_a_zero_width_split_challenge_marker_still_adds_the_hostname(
+    install_crawler, make_config, tmp_path
+):
+    """The same strip-then-match discipline `guard.scan` gained in Phase 2: a zero-width char
+    splitting a marker phrase must not defeat the match. The fetch path's own
+    `strip_invisibles` runs only for a `fetched` outcome, never for `blocked`, so the strip has
+    to happen where both policy checks read the page.
+    """
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://interstitial.test/page"])
+    # Written as an escape, not a literal: an invisible character in source is invisible to
+    # the next reader too, and any editor that strips it would quietly gut this test.
+    split = "just a mo\u200bment"
+    results = [
+        _FakeResult(
+            "https://interstitial.test/page",
+            status_code=503,
+            markdown=_FakeMarkdown(raw_markdown=split, fit_markdown=split),
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://interstitial.test/page"], config, registry, RunLog())
+
+    data = read_blocklist_file(blocklist_path)
+    assert data["interstitial.test"]["reason"] == "challenge"
+
+
+async def test_an_extensionless_pdf_reroute_that_is_refused_feeds_the_blocklist_once(
+    install_crawler, make_config, tmp_path
+):
+    """The reroute path deliberately skips the feed on the first pass (a reroute is an internal
+    signal, not an outcome), leaving the PDF batch's own classification to do it. Pin that it
+    happens EXACTLY once there: a dropped call silently stops blocklisting refused
+    PDF-hosting domains, and a call before the `continue` would double-feed.
+    """
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://walled.test/paper"])
+    # First pass: an extensionless URL whose content type reveals a PDF -> rerouted.
+    html_results = [
+        _FakeResult(
+            "https://walled.test/paper",
+            status_code=200,
+            response_headers={"content-type": "application/pdf"},
+            markdown=_FakeMarkdown(raw_markdown="%PDF", fit_markdown="%PDF"),
+        )
+    ]
+    # The reroute lands on the PDF batch and is refused there.
+    pdf_results = [_FakeResult("https://walled.test/paper", status_code=403)]
+    install_crawler(html_results, pdf_results=pdf_results)
+    run_log = RunLog()
+
+    await fetch._fetch(["https://walled.test/paper"], config, registry, run_log)
+
+    data = read_blocklist_file(blocklist_path)
+    assert data["walled.test"]["reason"] == "403"
+    assert len([i for i in run_log.incidents() if i.kind == "domain_blocklisted"]) == 1
+
+
+@pytest.mark.parametrize(
+    "result_kwargs",
+    [
+        {"status_code": 429},
+        {"status_code": 503},
+        {"error_message": "Timeout after 15000ms", "status_code": 200},
+    ],
+    ids=["bare-429", "bare-503", "timeout"],
+)
+async def test_a_bare_transient_failure_with_no_challenge_marker_does_not_persist(
+    install_crawler, make_config, tmp_path, result_kwargs
+):
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://transient.test/page"])
+    results = [
+        _FakeResult(
+            "https://transient.test/page",
+            markdown=_FakeMarkdown(raw_markdown="ordinary body", fit_markdown="ordinary body"),
+            **result_kwargs,
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://transient.test/page"], config, registry, RunLog())
+
+    assert not blocklist_path.exists()
+
+
+async def test_a_guard_blocked_page_does_not_feed_the_blocklist(
+    install_crawler, make_config, tmp_path
+):
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://evil.test"])
+    attack_markdown = _attack_markdown()
+    results = [
+        _FakeResult(
+            "https://evil.test",
+            markdown=_FakeMarkdown(raw_markdown=attack_markdown, fit_markdown=attack_markdown),
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://evil.test"], config, registry, RunLog())
+
+    assert not blocklist_path.exists()
+
+
+async def test_a_provenance_rejected_url_does_not_feed_the_blocklist(
+    install_crawler, make_config, tmp_path
+):
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()  # deliberately nothing approved
+    install_crawler([])
+
+    await fetch._fetch(["https://never-approved.test"], config, registry, RunLog())
+
+    assert not blocklist_path.exists()
+
+
+async def test_a_fetched_page_quoting_a_challenge_phrase_does_not_feed_the_blocklist(
+    install_crawler, make_config, tmp_path
+):
+    """The scoping decision (risk #2): a `fetched` (200) page containing a marker phrase in
+    real prose must never be blocklisted — markers are checked only when `outcome != "fetched"`.
+    """
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://article.test/page"])
+    body = (CHALLENGE_FIXTURES_DIR / "benign_article_quoting_challenge_phrase.txt").read_text(
+        encoding="utf-8"
+    )
+    results = [
+        _FakeResult(
+            "https://article.test/page",
+            status_code=200,
+            markdown=_FakeMarkdown(raw_markdown=body, fit_markdown=body),
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://article.test/page"], config, registry, RunLog())
+
+    assert not blocklist_path.exists()
+
+
+async def test_a_non_html_page_quoting_a_challenge_phrase_does_not_feed_the_blocklist(
+    install_crawler, make_config, tmp_path
+):
+    """The regression the `outcome == "blocked"` tightening exists for: a `non_html` outcome
+    (e.g. a `text/plain` RFC, changelog, or mailing-list archive) can carry genuine extracted
+    page text that happens to quote a marker phrase, and must never be blocklisted for it —
+    only a `blocked` outcome (refusal-shaped by construction) is scanned."""
+    blocklist_path = tmp_path / "blocked-domains.json"
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://plaintext.test/doc"])
+    body = (CHALLENGE_FIXTURES_DIR / "benign_article_quoting_challenge_phrase.txt").read_text(
+        encoding="utf-8"
+    )
+    results = [
+        _FakeResult(
+            "https://plaintext.test/doc",
+            status_code=200,
+            response_headers={"Content-Type": "text/plain"},
+            markdown=_FakeMarkdown(raw_markdown=body, fit_markdown=body),
+        )
+    ]
+    install_crawler(results)
+
+    await fetch._fetch(["https://plaintext.test/doc"], config, registry, RunLog())
+
+    assert not blocklist_path.exists()

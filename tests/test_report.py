@@ -369,13 +369,9 @@ def test_write_report_discloses_the_round_cap_bound(make_config, tmp_path):
     assert "20" not in section
 
 
-def test_write_report_discloses_the_wall_clock_bound(make_config, tmp_path):
+def test_write_report_discloses_the_wall_clock_bound(make_config, make_agent_settings):
     """Same shape as the round-cap test, for the other bound."""
-    agent = AgentSettings(
-        wall_clock_seconds=93,
-        workspace_dir=tmp_path / "workspace",
-        reports_dir=tmp_path / "reports",
-    )
+    agent = make_agent_settings(wall_clock_seconds=93)
     config = make_config(agent=agent)
     outcome = RunOutcome(
         question="How long did the run get before the wall clock hit?",
@@ -392,6 +388,63 @@ def test_write_report_discloses_the_wall_clock_bound(make_config, tmp_path):
     section = _section(body, _CUT_SHORT_HEADING)
     assert "93" in section
     assert "1800" not in section  # the untouched AgentSettings default
+
+
+def test_write_report_discloses_the_synthesis_margin_bound(make_config, tmp_path):
+    """Same shape as the other two bounds: the CONFIGURED margin must appear, so a future edit
+    reading the wrong config field (`wall_clock_seconds`, say) cannot pass."""
+    agent = AgentSettings(
+        synthesis_margin_seconds=71,
+        workspace_dir=tmp_path / "workspace",
+        reports_dir=tmp_path / "reports",
+    )
+    config = make_config(agent=agent)
+    answer = "Synthesized from what had been read."
+    outcome = RunOutcome(
+        question="Did the reserve leave time to synthesize?",
+        answer=answer,
+        # `## Answer` renders from `paragraphs`, never from `answer` (D2) — and so does the
+        # cut-short line's own "did the reserved pass produce anything?" check.
+        paragraphs=split_paragraphs(answer),
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="synthesis_margin",
+    )
+
+    path = write_report(outcome, config)
+    section = _section(path.read_text(encoding="utf-8"), _CUT_SHORT_HEADING)
+
+    assert "71" in section
+    assert "240" not in section  # the untouched AgentSettings default
+    assert "synthesized a final answer" in section
+
+
+def test_write_report_claims_no_synthesis_when_the_reserved_pass_produced_nothing(
+    make_config, tmp_path
+):
+    """`should_write_report` writes a report for `synthesis_margin` whether or not the reserved
+    pass produced an answer (a runaway pass can exhaust its recursion limit with no content).
+    An unconditional "and synthesized a final answer" then sat three lines above `## Answer`
+    reading "The run produced no final answer." — two adjacent contradictory statements in an
+    artifact read at face value.
+    """
+    config = make_config()
+    outcome = RunOutcome(
+        question="What did the reserve manage to say?",
+        answer="",
+        registry=SourceRegistry(),
+        usage=_usage(),
+        cut_short="synthesis_margin",
+    )
+
+    path = write_report(outcome, config)
+    body = path.read_text(encoding="utf-8")
+    section = _section(body, _CUT_SHORT_HEADING)
+
+    assert "synthesized a final answer" not in section
+    assert "produced no final answer" in section
+    # The contradiction this pins: the answer section says the same thing, not the opposite.
+    assert _NO_ANSWER_TEXT in body
 
 
 def test_write_report_names_the_error_when_a_run_dies_mid_flight(make_config):

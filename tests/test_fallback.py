@@ -4,7 +4,8 @@ from pathlib import Path
 
 from langchain_core.tools import BaseTool
 
-from harness.config import AgentSettings
+from harness.blocklist import load_blocklist
+from harness.config import AgentSettings, BlocklistSettings
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
 from harness.tools import fallback, fetch
@@ -217,11 +218,11 @@ async def test_a_call_over_the_url_limit_is_rejected_before_any_fetch(install_cr
     assert fake_cls.calls == []
 
 
-async def test_fetch_raw_drops_a_blocked_page_the_same_as_fetch_pages(  # R1
+async def test_fetch_raw_renders_a_guard_blocked_page_the_same_as_fetch_pages(  # R1/D1
     install_crawler, make_config, tmp_path
 ):
     """Proves the shared `_fetch` covers both surfaces: a blocked page mints no Sn, writes
-    no capture file, is absent from the rendered content, and records one `guard_blocked`
+    no capture file, renders the opaque rejection block, and records one `guard_blocked`
     incident, through `fetch_raw` exactly as through `fetch_pages`."""
     config = make_config(agent=AgentSettings(workspace_dir=tmp_path))
     registry = SourceRegistry()
@@ -243,7 +244,7 @@ async def test_fetch_raw_drops_a_blocked_page_the_same_as_fetch_pages(  # R1
 
     assert message.artifact == []
     assert registry.all() == []
-    assert "https://evil.test" not in message.content
+    assert message.content == fetch._rejection_block("https://evil.test")
     assert list(sources_dir(config, registry).glob("*.md")) == []
 
     incidents = [i for i in run_log.incidents() if i.kind == "guard_blocked"]
@@ -288,3 +289,75 @@ async def test_fetch_raw_rejects_an_unapproved_url_before_any_crawl(install_craw
     incidents = [i for i in run_log.incidents() if i.kind == "provenance_rejected"]
     assert len(incidents) == 1
     assert "https://never-approved.test" in incidents[0].detail
+
+
+# --- Visible, sticky fetch failures (R1/D1/D2) -------------------------------------------
+#
+# The block's exact wording is pinned once, by test_fetch.py's golden test; everything here
+# asserts against `fetch._rejection_block` so no stale copy of the policy line can survive.
+
+
+async def test_fetch_raw_replays_the_stored_verdict_with_zero_crawler_calls(
+    install_crawler, make_config
+):
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://blocked.test"])
+    results = [_FakeResult("https://blocked.test", status_code=403, markdown=None)]
+    fake_cls = install_crawler(results)
+
+    await fetch._fetch(["https://blocked.test"], config, registry, RunLog())
+    assert len(fake_cls.calls) == 1
+
+    fetch_raw = fallback.build_fallback_tool(config, registry)
+    message = await fetch_raw.ainvoke(
+        _tool_call(["https://blocked.test"], "retrying the failed one", "call-1")
+    )
+
+    assert len(fake_cls.calls) == 1
+    assert message.artifact == []
+    # A genuine failure replays its rendered outcome, not the opaque policy block.
+    assert "## https://blocked.test" in message.content
+    assert "blocked — status 403" in message.content
+
+
+async def test_fetch_raw_renders_an_opaque_rejection_for_an_unapproved_url(
+    install_crawler, make_config
+):
+    config = make_config()
+    registry = SourceRegistry()  # deliberately nothing approved
+    fake_cls = install_crawler([])
+    fetch_raw = fallback.build_fallback_tool(config, registry)
+
+    message = await fetch_raw.ainvoke(
+        _tool_call(["https://never-approved.test"], "some reason", "call-1")
+    )
+
+    assert fake_cls.calls == []
+    assert message.artifact == []
+    assert message.content == fetch._rejection_block("https://never-approved.test")
+
+
+# --- Phase 3: persistent domain blocklist (R3/R4) -----------------------------------------
+
+
+async def test_fetch_raw_hits_the_pre_crawl_blocklist_backstop_with_zero_crawler_calls(
+    install_crawler, make_config, tmp_path
+):
+    """`fetch_raw` shares `_fetch`, so a blocklisted hostname hits the same pre-crawl
+    backstop through `fetch_raw` as through `fetch_pages`, with zero crawler calls."""
+    blocklist_path = tmp_path / "blocked-domains.json"
+    load_blocklist(blocklist_path).add("walled.test", "403")
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://walled.test/page"])
+    fake_cls = install_crawler([])
+    fetch_raw = fallback.build_fallback_tool(config, registry)
+
+    message = await fetch_raw.ainvoke(
+        _tool_call(["https://walled.test/page"], "some reason", "call-1")
+    )
+
+    assert fake_cls.calls == []
+    assert message.artifact == []
+    assert message.content == fetch._rejection_block("https://walled.test/page")

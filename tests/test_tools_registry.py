@@ -1,8 +1,10 @@
 """Behavioral tests for harness.tools.build_tools."""
 
+import pytest
 from langchain_core.tools import BaseTool
 
 import harness.tools
+from harness.blocklist import Blocklist
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from harness.tools import build_tools
@@ -14,9 +16,9 @@ def test_build_tools_returns_the_frozen_tool_set(make_config, monkeypatch):
     calls = []
     real_build_fetch_tool = harness.tools.build_fetch_tool
 
-    def _spy(cfg, reg, log):
+    def _spy(cfg, reg, log, blocklist):
         calls.append((cfg, reg, log))
-        return real_build_fetch_tool(cfg, reg, log)
+        return real_build_fetch_tool(cfg, reg, log, blocklist)
 
     monkeypatch.setattr("harness.tools.build_fetch_tool", _spy)
 
@@ -67,7 +69,7 @@ async def test_build_tools_wires_the_callers_registry_into_the_fetch_tool(make_c
     registry = SourceRegistry()
     seen = []
 
-    async def _spy(urls, cfg, reg, log):
+    async def _spy(urls, cfg, reg, log, blocklist):
         seen.append(reg)
         return "", []
 
@@ -93,11 +95,15 @@ def test_tools_are_langchain_base_tools_with_content_and_artifact(make_config):
         assert tool.response_format == "content_and_artifact"
 
 
-def test_one_run_log_instance_reaches_every_tool_builder(make_config, monkeypatch):
-    """The docstring's "ONE `run_log` is shared" claim, asserted rather than trusted.
+@pytest.mark.parametrize("shared_type", [RunLog, Blocklist], ids=["run_log", "blocklist"])
+def test_one_shared_instance_reaches_every_tool_builder(make_config, monkeypatch, shared_type):
+    """The docstring's "ONE `run_log` is shared" / "loaded ONCE here and shared" claims,
+    asserted rather than trusted — for BOTH shared instances, since the docstring makes the
+    same promise about each and only the run_log was ever checked.
 
-    A second `RunLog()` built for any one builder would fragment the incidents the report
-    and terminal disclose, and every existing test would still pass.
+    A second instance built for any one builder would fragment what the report and terminal
+    disclose (`RunLog`) or stop a mid-run walling from filtering `search_web` immediately
+    (`Blocklist`) — and every existing test would still pass.
     """
     config = make_config()
     run_log = RunLog()
@@ -107,7 +113,10 @@ def test_one_run_log_instance_reaches_every_tool_builder(make_config, monkeypatc
         real = getattr(harness.tools, name)
 
         def _spy(*args, _name=name, _real=real, **kwargs):
-            seen[_name] = args[-1]
+            # Selected by type, not by position: this captured `args[-1]` until Phase 3 added
+            # a fourth builder argument and made the run_log no longer last, breaking three
+            # tests over a detail none of them is about.
+            seen[_name] = next((arg for arg in args if isinstance(arg, shared_type)), None)
             return _real(*args, **kwargs)
 
         monkeypatch.setattr(f"harness.tools.{name}", _spy)
@@ -115,4 +124,6 @@ def test_one_run_log_instance_reaches_every_tool_builder(make_config, monkeypatc
     build_tools(config, SourceRegistry(), run_log)
 
     assert set(seen) == {"build_search_tool", "build_fallback_tool", "build_fetch_tool"}
-    assert all(log is run_log for log in seen.values())
+    instances = list(seen.values())
+    assert all(instance is not None for instance in instances)
+    assert all(instance is instances[0] for instance in instances)

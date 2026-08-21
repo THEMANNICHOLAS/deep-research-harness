@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
+from harness.blocklist import Blocklist, fires_challenge_marker, hostname_of, resolve_blocklist
 from harness.config import HarnessConfig
 from harness.guard import fence, guard_blocked_detail, scan, strip_invisibles
 from harness.runlog import RunLog, or_default
@@ -30,7 +31,9 @@ from harness.sources import (
 
 FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error", "pdf"]
 
-_BLOCKED_STATUSES = frozenset({403, 429, 503})
+# 401 added for R3/Phase 3: a persistent-blocklist feed status, alongside the pre-existing
+# transient/refusal statuses.
+_BLOCKED_STATUSES = frozenset({401, 403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
 
 # 75%, not crawl4ai's default 90%: each concurrent crawl is a real browser page, and this
@@ -203,11 +206,23 @@ def _write_source_file(captures_dir: Path, page: FetchedPage, run_log: RunLog) -
         )
 
 
+# Genuine failures keep their outcome and status (R1: those are operational facts, not policy
+# verdicts), so this is a separate line from `_REJECTION_LINE`'s opaque one — same instruction,
+# different amount of truth the model is allowed.
+_DO_NOT_RETRY_LINE = "do not retry this URL — it gets one fetch attempt per run, now spent"
+
+
 def _render(page: FetchedPage, cap: int) -> str:
     """Render one page's model-facing block: heading, outcome line, capped markdown.
 
     A failure has no `source_id` (R5), so it renders by URL alone rather than a `[Sn]` heading
     that would imply it was ever registered as evidence.
+
+    A failure also carries `_DO_NOT_RETRY_LINE`, after the fence. R1 wants every failure to
+    reach the model as an explicit do-not-retry instruction, and D2 makes that literally true —
+    one attempt per URL per run, so a retry replays this same block and buys nothing. Appended
+    here rather than at the replay site so the FIRST failure says it too: telling the model
+    only on the retry means the retry it was meant to prevent has already happened.
 
     The page's own markdown is untrusted content (Phase 5, D1 spotlighting): it is fenced with
     `harness.guard.fence` AFTER truncation, never before (risk #4 — truncating a fenced block
@@ -238,6 +253,8 @@ def _render(page: FetchedPage, cap: int) -> str:
             + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
         )
     lines.append(fence(text))
+    if page.outcome != "fetched":
+        lines.append(_DO_NOT_RETRY_LINE)
 
     return "\n\n".join(lines)
 
@@ -255,6 +272,24 @@ def _failure_detail(page: FetchedPage) -> str:
     return f"{page.url}: {' — '.join(bits)}"
 
 
+_REJECTION_LINE = "rejected — do not retry this URL or request variants of it"
+
+# R1's floor for the degenerate call: no URLs were asked for, so nothing was fetched. Not a
+# failure and not a rejection — the model simply gets told what it did rather than silence.
+_EMPTY_REQUEST_TEXT = "No URLs were requested, so nothing was fetched."
+
+
+def _rejection_block(url: str) -> str:
+    """The opaque, reason-free block rendered for any policy-rejected URL (D1).
+
+    Guard blocks, provenance rejections (and, from Phase 3, blocklisted hostnames) all render
+    this one line, because naming which policy fired would tell an adversarial page — or
+    anyone reading the transcript — exactly what the guard caught. The rejecting policy and
+    its reason go ONLY to `RunLog` incidents, never here.
+    """
+    return f"## {url}\n\n{_REJECTION_LINE}"
+
+
 def _provenance_rejected_detail(url: str) -> str:
     """One incident line for a URL rejected by strict provenance (Phase 4, D2/R2).
 
@@ -262,6 +297,80 @@ def _provenance_rejected_detail(url: str) -> str:
     to do with content, only with where the URL came from.
     """
     return f"{url}: rejected — not from search results or explicit user approval"
+
+
+def _blocklisted_detail(url: str, hostname: str) -> str:
+    """One incident line for a URL rejected pre-crawl by the persistent blocklist (R4)."""
+    return f"{url}: rejected — {hostname} is on the persistent domain blocklist"
+
+
+def _page_text(markdown: str, title: str | None) -> str:
+    """The page-controlled text a policy check must see: the title, then the body, stripped.
+
+    One definition for both checks that read a fetched page's own words — the guard scan and
+    the blocklist's challenge-marker match. They previously disagreed twice over:
+
+    - The guard folded the title in (it is page-controlled content exactly as the body is, and
+      `search.py` scans title+snippet the same way) while the marker match saw the body alone.
+      That gap let a Cloudflare-style 429/503 interstitial escape the blocklist whenever its
+      marker phrase lived only in `<title>` — the common case, since `_EXCLUDED_TAGS` strips
+      the `<noscript>` block carrying the phrase and `PruningContentFilter` can empty a
+      ~20-word interstitial.
+    - `scan` strips invisibles for itself (Phase 2), precisely because a zero-width char
+      splitting a phrase defeats substring matching; `fires_challenge_marker` does a raw
+      match, and the fetch path's own `strip_invisibles` runs later and only for a `fetched`
+      outcome — never for `blocked`. Stripping here closes that asymmetry for both checks at
+      once; `scan`'s own strip stays idempotent over this.
+    """
+    return strip_invisibles(markdown if title is None else f"{title}\n{markdown}")
+
+
+def _record_guard_block(
+    url: str, signals: list[str], registry: SourceRegistry, run_log: RunLog
+) -> None:
+    """Disclose and stick a guard-blocked URL. Both batch loops `continue` right after.
+
+    One home for the pair, so a change to what a guard block discloses or how it is made
+    sticky cannot land on the HTML batch and be forgotten on the PDF batch.
+    """
+    run_log.record("guard_blocked", guard_blocked_detail(url, signals))
+    registry.record_failure(url, _rejection_block(url))
+
+
+def _feed_blocklist(
+    url: str,
+    status_code: int | None,
+    outcome: FetchOutcome,
+    page_text: str,
+    blocklist: Blocklist,
+    run_log: RunLog,
+) -> None:
+    """Persist `url`'s hostname to `blocklist` if this fetch was a deliberate anti-bot refusal.
+
+    `page_text` is `_page_text(markdown, title)` — title included, see there.
+
+    A bare 429/503/timeout status never persists (R3); a `blocked` outcome whose text fires a
+    challenge marker does, whatever its status — that is the "detected challenge page" clause
+    of R3 (2026-08-20 reconciliation). Markers are checked ONLY when `outcome == "blocked"`
+    (`status_code in _BLOCKED_STATUSES`) — not merely `!= "fetched"` — because `non_html`,
+    `error`, and `timeout` can all carry genuine extracted page text (a `text/plain` RFC, a
+    changelog, a mailing-list archive) that happens to quote a marker phrase; only `blocked` is
+    refusal-shaped by construction. This scoping is what makes the design safe with no
+    body-length threshold (risk #2).
+    """
+    host = hostname_of(url)
+    if host is None or blocklist.contains(host):
+        return
+    if status_code in (401, 403):
+        reason = str(status_code)
+    elif outcome == "blocked" and fires_challenge_marker(page_text):
+        reason = "challenge"
+    else:
+        return
+    blocklist.add(host, reason)
+    run_log.record(
+        "domain_blocklisted", f"{host} added to the persistent blocklist ({reason}) after {url}"
+    )
 
 
 def _no_result_page(url: str) -> FetchedPage:
@@ -283,9 +392,19 @@ def _no_result_page(url: str) -> FetchedPage:
 
 
 async def _fetch(
-    urls: list[str], config: HarnessConfig, registry: SourceRegistry, run_log: RunLog
+    urls: list[str],
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    run_log: RunLog,
+    blocklist: Blocklist | None = None,
 ) -> tuple[str, list[FetchedPage]]:
-    """Fetch every URL, returning model-facing markdown and the full per-URL artifact."""
+    """Fetch every URL, returning model-facing markdown and the full per-URL artifact.
+
+    `blocklist` defaults to a fresh load from `config.blocklist.path` for direct callers and
+    tests; production threads ONE shared instance from `build_tools`, so a hostname walled
+    mid-run by one fetch is visible to `search_web`'s filter for the rest of the run.
+    """
+    blocklist = resolve_blocklist(blocklist, config.blocklist.path)
     from crawl4ai import (
         BrowserConfig,
         CacheMode,
@@ -314,21 +433,50 @@ async def _fetch(
             run_log.record("urls_merged", f"{url} merged into {survivor}; only the latter was read")
     urls = unique_urls
     if not urls:
-        return "", []
+        # The third empty-batch site (R1: a batch never returns empty or silent). Only a
+        # literally empty `urls` list reaches here — the dedup loop always keeps the first
+        # spelling of every URL — but an empty tool result is exactly the silence R1 forbids,
+        # so say what happened instead of returning "".
+        return _EMPTY_REQUEST_TEXT, []
+    # The assembly loop below walks this: every deduped URL the caller asked for gets a block,
+    # whether or not it reached a crawler (D1/D2).
+    requested = list(urls)
+
+    # D2: a URL already answered this run — by a policy rejection or a genuine failure —
+    # replays its stored verdict from the assembly loop, with no crawler work and no second
+    # incident, since the first one already disclosed it.
+    urls = [url for url in urls if registry.failed_block(url) is None]
 
     # Phase 4 strict provenance (D2/R2): a URL is fetchable only if it arrived from a
     # `search_web` result or explicit user approval (`__main__` at run start) — never from a
     # page's own in-body links. Rejection is per-URL: one unapproved URL never fails the rest
-    # of the batch, and a rejected URL never reaches the crawler at all.
+    # of the batch, and a rejected URL never reaches the crawler at all — and now also renders
+    # the opaque D1 rejection block.
     approved_urls: list[str] = []
     for url in urls:
         if registry.is_approved(url):
             approved_urls.append(url)
         else:
             run_log.record("provenance_rejected", _provenance_rejected_detail(url))
+            registry.record_failure(url, _rejection_block(url))
     urls = approved_urls
-    if not urls:
-        return "", []
+
+    # R4 pre-crawl backstop — placement is load-bearing (Phase 1 `## Discoveries`): this MUST
+    # sit AFTER the provenance check. Placed before it, this would record verdicts for
+    # UNAPPROVED URLs, and a later `approve()` would clear them — the invariant that keeps
+    # guard/failure stickiness honest is that every non-provenance verdict is recorded only
+    # for an already-approved URL, which this branch (downstream of the provenance filter)
+    # cannot reach. The assembly loop at the end of `_fetch` renders these from
+    # `registry.failed_block`, so no other change is needed to make the block reach the model.
+    survivors: list[str] = []
+    for url in urls:
+        host = hostname_of(url)
+        if host is not None and blocklist.contains(host):
+            run_log.record("domain_blocklisted", _blocklisted_detail(url, host))
+            registry.record_failure(url, _rejection_block(url))
+        else:
+            survivors.append(url)
+    urls = survivors
 
     # One crawler cannot mix strategies in one `arun_many`: partition the batch by extension
     # first (cheap, pre-fetch routing); an extensionless PDF is only discoverable after the
@@ -370,16 +518,20 @@ async def _fetch(
             markdown = _markdown_of(result)
             title = _title_of(result)
 
-            # D5: scan raw markdown AND title BEFORE classify/mint/capture — nothing blocked
-            # ever reaches disk. The title rides along because it is page-controlled content
-            # exactly like the body (search.py scans title+snippet the same way), and
-            # `_write_source_file` puts it on the capture's first line where verify.py reads
-            # it. A blocked page vanishes entirely: no FetchedPage, no Sn, no capture file,
-            # absent from the rendered content (D4).
+            # D5: scan markdown AND title BEFORE classify/mint/capture — nothing blocked
+            # ever reaches disk. (`scan` strips invisibles for itself, so what it sees is the
+            # stripped text, not the raw fetch.) The title rides along because it is
+            # page-controlled content exactly like the body (search.py scans title+snippet the
+            # same way), and `_write_source_file` puts it on the capture's first line where
+            # verify.py reads it. A blocked page vanishes entirely: no FetchedPage, no Sn, no
+            # capture file — it now renders an opaque, reason-free rejection block instead (D1).
             if config.guard.enabled:
-                scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
+                scan_result = scan(_page_text(markdown, title))
                 if scan_result.blocked:
-                    run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
+                    # A guard block is a policy verdict, not a site refusal (R3/D3) — it
+                    # deliberately does not feed the blocklist, and `continue`s before the
+                    # feed call site below.
+                    _record_guard_block(url, scan_result.signals, registry, run_log)
                     continue
 
             status_code = getattr(result, "status_code", None)
@@ -387,9 +539,14 @@ async def _fetch(
             outcome = classify(status_code, error_message, _content_type(result), markdown)
             if outcome == "pdf":
                 # An extensionless PDF URL, discovered only after the fetch: reroute it
-                # through the PDF batch once rather than reporting the internal signal.
+                # through the PDF batch once rather than reporting the internal signal. A
+                # reroute is an internal signal, not an outcome, so it must not feed the
+                # blocklist either — the PDF batch's own classification does that instead.
                 reroute_urls.append(url)
                 continue
+            _feed_blocklist(
+                url, status_code, outcome, _page_text(markdown, title), blocklist, run_log
+            )
 
             # Only a `fetched` outcome is evidence (R5): a failure mints no id, so it can
             # never end up with a capture file to be mistaken for real content.
@@ -441,12 +598,14 @@ async def _fetch(
             markdown = _markdown_of(result)
             title = _title_of(result)
 
-            # D5: same guard site as the HTML batch — scan raw markdown and title before
-            # classify/mint.
+            # D5: same guard site as the HTML batch — scan markdown and title (stripped, not
+            # raw — `scan` strips invisibles for itself) before classify/mint. A blocked page
+            # vanishes entirely and now renders an opaque, reason-free rejection block instead
+            # (D1).
             if config.guard.enabled:
-                scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
+                scan_result = scan(_page_text(markdown, title))
                 if scan_result.blocked:
-                    run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
+                    _record_guard_block(url, scan_result.signals, registry, run_log)
                     continue
 
             status_code = getattr(result, "status_code", None)
@@ -459,6 +618,9 @@ async def _fetch(
             # response headers on success, and reclassifying with that would re-trigger the
             # "pdf" reroute signal forever.
             outcome = classify(status_code, error_message, "text/html", markdown)
+            _feed_blocklist(
+                url, status_code, outcome, _page_text(markdown, title), blocklist, run_log
+            )
             source_id = registry.add(url, title=title) if outcome == "fetched" else None
             if outcome == "fetched":
                 markdown = strip_invisibles(markdown)
@@ -473,8 +635,9 @@ async def _fetch(
                 error=error_message,
             )
 
-    # A guard-blocked URL never got a `pages_by_url` entry (D4: it vanishes entirely, not
-    # even as a failure outcome) — filter it out rather than indexing a KeyError.
+    # A guard-blocked URL never got a `pages_by_url` entry — D4 still holds for the artifact
+    # (no FetchedPage, no Sn, no capture); it is the RENDER that changed, to an opaque
+    # rejection block (D1). Filter it out rather than indexing a KeyError.
     pages = [pages_by_url[url] for url in urls if url in pages_by_url]
 
     # Recorded here, in the shared path, so `fetch_pages` and `fetch_raw` disclose alike.
@@ -487,12 +650,31 @@ async def _fetch(
     for page in pages:
         _write_source_file(captures_dir, page, run_log)
 
-    content = "\n\n".join(_render(page, config.fetch.per_page_char_cap) for page in pages)
-    return content, pages
+    cap = config.fetch.per_page_char_cap
+    blocks: list[str] = []
+    for url in requested:
+        attempted = pages_by_url.get(url)
+        if attempted is None:
+            # Rejected pre-crawl (provenance), dropped by the guard, or replayed from an
+            # earlier attempt: whichever path answered it recorded the verdict (D1/D2).
+            block = registry.failed_block(url)
+            if block is not None:
+                blocks.append(block)
+            continue
+        rendered = _render(attempted, cap)
+        if attempted.outcome != "fetched":
+            # D2: sticky for the run — a re-request replays this exact block, no crawler work.
+            registry.record_failure(url, rendered)
+        blocks.append(rendered)
+
+    return "\n\n".join(blocks), pages
 
 
 def build_fetch_tool(
-    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    run_log: RunLog | None = None,
+    blocklist: Blocklist | None = None,
 ) -> BaseTool:
     """Build the `fetch_pages` tool, closing over `config`, the shared `registry` and `run_log`.
 
@@ -501,16 +683,27 @@ def build_fetch_tool(
 
     The guard is invisible here (D5): every fetched page is scanned for injection signals
     inside the shared `_fetch`, before classification, minting, or capture. A blocked page
-    vanishes from the pipeline entirely and is disclosed only via a `guard_blocked`
-    `RunLog` incident — see harness/guard.py and PLAN-prompt-injection-defense.md Phase 3.
+    vanishes from the pipeline entirely; the REASON is disclosed only via a `guard_blocked`
+    `RunLog` incident — see harness/guard.py and PLAN-prompt-injection-defense.md Phase 3 —
+    but the model now sees an opaque, reason-free rejection block for the URL (D1).
 
     Strict URL provenance (Phase 4, R2) is enforced the same way, one step earlier: an
-    unapproved URL never reaches the crawler at all, disclosed via a `provenance_rejected`
-    incident instead.
+    unapproved URL never reaches the crawler at all, its REASON disclosed via a
+    `provenance_rejected` incident instead, and the model again sees only the opaque block.
+
+    R3/R4 (Phase 3): the persistent domain blocklist is a pre-crawl backstop here —
+    `search_web` is the primary choke point (D4) — so a URL whose hostname is already walled
+    is rejected before any crawler work, rendering the same opaque block as guard/provenance
+    (D1). A refusal status (401/403) or a detected challenge page on a non-`fetched` outcome
+    feeds the set for future runs.
     """
     sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
     log = or_default(run_log)
+    # Production threads ONE shared instance from `build_tools`, so a hostname walled mid-run
+    # by a fetch is visible to `search_web`'s filter for the rest of the run; the `None`
+    # fallback is for direct callers and tests.
+    domain_blocklist = resolve_blocklist(blocklist, config.blocklist.path)
     max_urls = config.fetch.max_urls_per_call
 
     class FetchPagesInput(BaseModel):
@@ -534,7 +727,7 @@ def build_fetch_tool(
         their outcome rather than raising, so one bad URL never fails the batch. Equivalent
         spellings of the same page (trailing slash, fragment, case) are fetched once.
         """
-        content, pages = await _fetch(urls, config, registry, log)
+        content, pages = await _fetch(urls, config, registry, log, domain_blocklist)
         # Only a real capture is even a digest CANDIDATE (R5) — a failed fetch stays "unread".
         # The mark itself is deferred to the delegation boundary: agent.py's
         # `_ReaderDigestMiddleware` promotes these to "digested" only when the reader's digest
