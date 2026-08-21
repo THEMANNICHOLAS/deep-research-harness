@@ -2175,9 +2175,8 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
     Raises the interrupt directly from `main()`'s own `async for` over `agent.astream(...)`
     (a monkeypatched stream, per the plan's alternative to scripting a model side-effect) rather
     than from inside a model/tool call: a KeyboardInterrupt raised THERE was observed to surface
-    at this boundary as `asyncio.CancelledError` instead — see the Phase 4 handoff note — which
-    is neither `Exception` nor `KeyboardInterrupt` and escapes `main()` uncaught. That gap is out
-    of THIS test's scope (it pins `main()`'s own except clause, not langgraph's internals).
+    at this boundary as `asyncio.CancelledError` instead — see the Phase 4 handoff note — and
+    the sibling `test_main_exits_cleanly_on_cancelled_error_mid_stream` pins that path.
     """
     config = make_config(
         agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
@@ -2217,6 +2216,52 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
 
     assert exit_code == 1
     assert files == [], f"a report was written for a Ctrl+C abort: {files}"
+    assert any(line.startswith("error:") for line in err.splitlines()), err
+    assert "ctrl" in err.lower() or "abort" in err.lower()
+    assert "Traceback" not in err
+    assert "summary:" in out
+
+
+async def test_main_exits_cleanly_on_cancelled_error_mid_stream(
+    make_config, monkeypatch, scripted_model, tmp_path, capsys
+):
+    """A genuine external cancellation (Ctrl+C surfacing as `asyncio.CancelledError` rather
+    than `KeyboardInterrupt` — see the sibling `keyboard_interrupt` test's docstring) maps
+    onto the same hard-error path: no report, exit 1, no traceback escaping `main()`.
+    """
+    config = make_config(
+        agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
+    )
+    reply = AIMessage(content="pong")
+    model = scripted_model([reply])
+    patch_run(monkeypatch, config, model)
+
+    import harness.agent as agent_module
+
+    real_build_agent = agent_module.build_agent
+
+    def _build_agent_that_interrupts(
+        config: HarnessConfig, registry: Any, run_log: Any = None, sink: Any = None
+    ) -> Any:
+        real_agent = real_build_agent(config, registry, run_log, sink)
+
+        class _InterruptingAgent:
+            def astream(self, *args: Any, **kwargs: Any) -> Any:
+                async def _gen() -> Any:
+                    async for mode, chunk in real_agent.astream(*args, **kwargs):
+                        yield mode, chunk
+                        raise asyncio.CancelledError("test abort")
+
+                return _gen()
+
+        return _InterruptingAgent()
+
+    monkeypatch.setattr(agent_module, "build_agent", _build_agent_that_interrupts)
+
+    exit_code, files, out, err = await _run_main(["a question"], config, capsys)
+
+    assert exit_code == 1
+    assert files == [], f"a report was written for a cancelled run: {files}"
     assert any(line.startswith("error:") for line in err.splitlines()), err
     assert "ctrl" in err.lower() or "abort" in err.lower()
     assert "Traceback" not in err
