@@ -83,3 +83,6 @@ wall_clock_seconds = 1800
 # key here to override.
 max_retries = 2
 request_timeout_seconds = 120.0
+# Harness-enforced (R5): a researcher's reader dispatch past this count is refused, not
+# merely advised in prompt prose. The researcher prompt renders this same value.
+max_reader_dispatches = 6

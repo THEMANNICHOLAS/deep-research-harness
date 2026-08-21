@@ -212,8 +212,9 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ### D6: The reader-dispatch cap is a task-middleware counter
 - **Chosen:** A middleware on the researcher tier counts `task(subagent_type="reader")`
-  dispatches per researcher attempt (contextvar scope, mirroring `pending_digest_scope`;
-  dedup by `tool_call["id"]` so a ToolRetry re-invocation is not double-counted) and past
+  dispatches per researcher attempt (~~contextvar scope, mirroring `pending_digest_scope`~~
+  counted from the researcher's own message history -- see `## Reconciliations`; dedup by
+  `tool_call["id"]` so a ToolRetry re-invocation is not double-counted) and past
   `[agent].max_reader_dispatches` (default 6) returns a "budget exhausted — report your
   findings now" ToolMessage without dispatching.
 - **Rejected:** Prompt-only budget (status quo — proven ignored in run `172105`); schema
@@ -248,7 +249,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Visible, sticky fetch failures
 - [x] Phase 2: Guard strip-then-rescan
 - [x] Phase 3: Persistent domain blocklist
-- [ ] Phase 4: Enforced caps and reader tool trim
+- [x] Phase 4: Enforced caps and reader tool trim
 - [ ] Phase 5: Synthesis reserve
 - [ ] Final verification
 
@@ -447,9 +448,10 @@ no write tools.
 
 **Reuse:**
 - Middleware shape mirrors `_ToolActivityMiddleware` (`awrap_tool_call`, keyed on
-  `tool_call["name"] == "task"` and `subagent_type == "reader"`); per-attempt scoping mirrors
+  `tool_call["name"] == "task"` and `subagent_type == "reader"`); ~~per-attempt scoping mirrors
   `pending_digest_scope` (`harness/sources.py`); retry dedup by `tool_call["id"]` mirrors
-  `_ToolActivityMiddleware._reader_ids_by_call`
+  `_ToolActivityMiddleware._reader_ids_by_call`~~ per-attempt scoping and retry dedup both come
+  from reading `request.state` -- see `## Reconciliations`
 - Config field mirrors `AgentSettings`' existing bounded ints
 
 **Contracts:**
@@ -463,11 +465,11 @@ no write tools.
   researcher tool changes; no reader prompt content changes beyond removing tool mentions
 
 **Tests (write first, confirm red):**
-- [ ] The 7th reader dispatch in one researcher attempt returns the budget message and spawns
+- [x] The 7th reader dispatch in one researcher attempt returns the budget message and spawns
   no reader; a second researcher attempt gets a fresh budget
-- [ ] A ToolRetry re-invocation of the same `tool_call["id"]` is not double-counted
-- [ ] The reader's bound tool names contain no `write_file`/`edit_file`/`ls`/`glob`/`grep`
-- [ ] Rendered prompts state the config value, not a literal
+- [x] A ToolRetry re-invocation of the same `tool_call["id"]` is not double-counted
+- [x] The reader's bound tool names contain no `write_file`/`edit_file`/`ls`/`glob`/`grep`
+- [x] Rendered prompts state the config value, not a literal
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -475,8 +477,8 @@ no write tools.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `uv run pytest` green
-- [ ] Reader summarization still offloads to the backend with `FilesystemMiddleware` gone —
+- [x] `uv run pytest` green
+- [x] Reader summarization still offloads to the backend with `FilesystemMiddleware` gone —
   covered by an existing-or-new agent test, not assumed
 
 ### Phase 5: Synthesis reserve
@@ -563,6 +565,71 @@ stream loop triggers the existing bounded synthesis pass at the margin.
 
 ## Reconciliations
 <!-- Drift amendments written by /implement during execution. Append-only. Empty at plan creation. -->
+### 2026-08-21 -- Phase 4: D6's contextvar scope cannot cover a researcher attempt
+
+**Contradiction.** D6 specifies the reader-dispatch cap as "a middleware on the researcher
+tier" using "contextvar scope, mirroring `pending_digest_scope`". Those two cannot both hold.
+A contextvar is only visible to what the setting frame awaits, which is why
+`_ReaderDigestMiddleware` works: it opens `pending_digest_scope()` on the researcher tier and
+the reader's `fetch_pages`, one tier down, writes into it. A per-RESEARCHER-ATTEMPT scope would
+have to be opened when the attempt begins, but the researcher tier only executes when the
+researcher makes a tool call -- by then the attempt is underway -- and each tool call is a
+separate graph node, so a `.set()` during one tool call is not visible during the next. The
+installed middleware API (`langchain.agents.middleware.types.AgentMiddleware`) offers
+`before_agent`/`after_agent`, `wrap_model_call` and `wrap_tool_call` -- there is no
+whole-agent wrapper hook -- so the only frame that spans a researcher attempt is the LEAD's
+`task` dispatch, one tier above where D6 places the middleware.
+
+**Amendment.** The cap stays entirely on the researcher tier, as D6's first clause says, and
+derives the count instead of maintaining one: `awrap_tool_call` counts the distinct
+`task(subagent_type="reader")` tool-call ids already present in `request.state["messages"]`
+(`ToolCallRequest.state` carries the researcher subgraph's own state). Past
+`[agent].max_reader_dispatches` it returns the budget-exhausted ToolMessage without calling
+the handler. Everything D6 promised still holds, with less machinery:
+- Fresh budget per attempt -- a new attempt is a new subgraph with a new message history.
+- Parallel-researcher isolation -- separate attempts have separate states, so no shared tally
+  can leak between them (the middleware instance itself is built once and shared, which is
+  exactly why an instance counter was never an option).
+- No ToolRetry double-count -- `ToolRetryMiddleware` re-invokes the handler with the same
+  `tool_call`, and the AIMessage in state carries that id once, so counting distinct ids is
+  inherently retry-safe. No `_reader_ids_by_call`-style bookkeeping is needed.
+
+**Cost accepted.** The count trusts the researcher's message history to stay intact.
+~~No summarization middleware runs on the researcher tier today (its list is
+`SubAgentMiddleware`, `_task_dispatch_guard`, `_ReaderDigestMiddleware`,
+`_ToolActivityMiddleware`), so nothing evicts history there; adding one later would silently
+loosen the cap. The implementation carries a comment saying so.~~
+
+**Correction, same day (3F judgment review).** The struck sentence above is FALSE and its
+reasoning was wrong, though the conclusion -- the cap is safe -- still holds for a different
+reason. Summarization DOES run on the researcher tier: `create_deep_agent`'s `subagents=` path
+prepends `FilesystemMiddleware`, `create_summarization_middleware` and `PatchToolCallsMiddleware`
+to every subagent declared through it (`deepagents/graph.py` ~667-675), and the researcher is
+declared exactly that way (`subagents=[researcher_spec]` in `build_agent`). The hand-written
+list in `_researcher_spec` shows only the middleware ADDED to that base stack, never the
+injected entries -- which is why checking it "confirmed" the wrong thing. Only the READER
+escapes injection, because it is nested via a hand-built `SubAgentMiddleware`; `_reader_spec`'s
+own docstring says so and is the sentence that should have been read.
+
+What actually makes the cap safe is that deepagents' summarizer does not touch the message
+list. `_DeepAgentsSummarizationMiddleware` implements ONLY `wrap_model_call`/`awrap_model_call`
+(`summarization.py` 1324 and 1458) -- no `before_model`, no `after_model`, and no `RemoveMessage`
+anywhere in the class body. Its factory docstring states this as a deliberate divergence:
+"Non-mutating message state. Summarization is tracked in a private `_summarization_event` field
+via `wrap_model_call`, leaving `state["messages"]` intact. LangChain rewrites it with
+`RemoveMessage(id=REMOVE_ALL_MESSAGES)` from `before_model`."
+
+**So the real standing risk is a deepagents change to LangChain-style mutating summarization**,
+not the addition of a summarizer to the researcher tier (one is already there). That would evict
+old dispatch ids from `state["messages"]`, reset the count mid-attempt, and silently uncap
+reader dispatches. It is pinned by a test asserting the middleware exposes no message-mutating
+hook, so a bump that changes this fails loudly instead of quietly. Revisit on ANY deepagents
+bump, alongside the `langchain-google-genai` override note in @pyproject.toml.
+
+**Also settled:** the phase's `## Out of scope` line "no lead-tier dispatch cap" is now moot
+rather than strained -- nothing is registered on the lead tier at all. Developer chose this
+option over keeping the contextvar with a lead-tier scope opener (2026-08-21).
+
 
 ### 2026-08-20 — Phase 1: D2 said two contradictory things about `fetch_raw`
 
@@ -653,6 +720,27 @@ non-`fetched` page — on the FIRST failure, not just the replay, since a model 
 the retry to learn the retry is futile has already looped once. Genuine failures keep their
 outcome and status per R1; the line is separate text from `_REJECTION_LINE`'s opaque one.
 
+### 2026-08-21 -- Phase 4: the FilesystemMiddleware drop also removed large-tool-result eviction
+
+Dropping `FilesystemMiddleware` from `_reader_spec` (R6) removed more than the scratch
+workspace. That middleware also evicted oversized tool results to the backend
+(`tool_token_limit_before_evict` default 20000, `NUM_CHARS_PER_TOKEN = 4`, so an ~80,000-char
+threshold), and `fetch_pages` is NOT in its `TOOLS_EXCLUDED_FROM_EVICTION` list. The 3F review
+judged this unreachable at default config; that was based on the TEST fixture's
+`per_page_char_cap` of 12000. The real default is **120000** (`harness/config.py`,
+`harness.toml`), so a single fetched page can exceed the eviction threshold by 40k chars and the
+safety net is gone TODAY at stock settings, not merely if an operator raises the cap.
+
+Not breakage: the reader keeps `create_summarization_middleware`, which triggers on context
+pressure and carries a `ContextOverflowError` retry, so an oversized digest now degrades to
+summarization instead of file eviction. The reader also can no longer `read_file` the offloaded
+history the summarizer points it at -- noted in `reader.md` and the spec docstring.
+
+Deferred, not acted on: whether the reader should keep an eviction path (e.g. re-adding
+`FilesystemMiddleware` with `permissions` restricted to reads, or lowering
+`per_page_char_cap` for the reader tier) is a design question this phase's R6 does not settle.
+Belongs in docs/backlog.md if it is not taken up in Phase 5.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate. Append-only, empty at plan creation. MUST remain the LAST section of this file. -->
 
@@ -718,3 +806,36 @@ outcome and status per R1; the line is separate text from `_REJECTION_LINE`'s op
   remaining entry is load-bearing. Also note Phase 3 did NOT run its manual live-check
   (`https://httpbin.org/status/403` twice); that acceptance box is still open and needs `.env`
   + SearXNG.
+
+### 2026-08-21 — Phase 4: Enforced caps and reader tool trim
+- Done: new `_ReaderDispatchCapMiddleware` on the researcher tier refuses a reader dispatch once
+  the researcher's own history carries `[agent].max_reader_dispatches` (default 6) distinct ones,
+  by ORDERED POSITION not raw count, so a multi-dispatch AIMessage lets the first N through;
+  `FilesystemMiddleware` dropped from `_reader_spec`; `max_reader_dispatches` on `AgentSettings`
+  + `harness.toml`; `reader.md` lost its write-tool bullet; `subagent.md` renders
+  `$max_reader_dispatches` and states the cap is enforced; `_is_reader_dispatch` factored across
+  its three sites. 762 tests green, four gates clean.
+- Learned: (a) `create_deep_agent`'s `subagents=` path PREPENDS
+  `FilesystemMiddleware`/`create_summarization_middleware`/`PatchToolCallsMiddleware` to every
+  subagent declared through it, so `_researcher_spec`'s hand-written list shows only what is
+  ADDED — reading that list to conclude "no summarization on this tier" is a trap, and it caught
+  both a Reconciliations entry and an impl-plan assumption this phase. Only the READER escapes
+  injection, being nested by hand. (b) The cap is safe because deepagents' summarizer is
+  documented non-mutating (`wrap_model_call` only, no `before_model`, no `RemoveMessage`), NOT
+  because summarization is absent; a bump to LangChain-style mutating summarization would
+  silently uncap it, and
+  `test_deepagents_summarization_never_overrides_message_mutating_hooks` now pins that.
+  (c) `tests/conftest.py`'s `per_page_char_cap` default (12000) is 10x SMALLER than the real one
+  (120000) — do not read fixture defaults as harness defaults, which is how the 3F review
+  mis-scored the eviction finding. (d) Passing a bare `AgentSettings(...)` to `make_config`
+  silently discards its `tmp_path` scoping and leaks run dirs into `~/deep-research/workspace/`.
+- Drift: one `## Reconciliations` entry (D6's contextvar scope cannot cover a researcher attempt
+  -> count from `request.state["messages"]`), developer-approved, then CORRECTED the same day
+  after the 3F review found its "Cost accepted" rationale factually wrong. Both the struck text
+  and the correction are in that entry.
+- Watch-next: Phase 5 (flagged !#4) mirrors the round cap for a synthesis reserve in
+  `harness/__main__.py`. Two open live checks accumulate now, both needing `.env` + SearXNG and
+  neither runnable offline: Phase 3's `httpbin.org/status/403` double-run and Phase 5's own
+  `wall_clock_seconds=300, synthesis_margin_seconds=120` run. Also open: one `## Discoveries`
+  entry says the reader lost large-tool-result eviction at stock config — decide in Phase 5 or
+  push to docs/backlog.md.

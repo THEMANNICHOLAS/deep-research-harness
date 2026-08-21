@@ -203,12 +203,12 @@ def test_lead_interrupt_on_contains_exactly_ask_user():  # R4
     assert set(_INTERRUPT_ON) == {ASK_USER_TOOL_NAME}
 
 
-async def test_the_nested_readers_tool_surface_includes_its_filesystem_workspace(noop_agent):
-    """Developer finding (post Step-3-migration): nesting the reader via a hand-built
-    `SubAgentMiddleware` (rather than `create_deep_agent`'s own top-level `subagents=`, which
-    auto-injects a base middleware stack) does not carry `FilesystemMiddleware` along for free
-    — `reader.md` still promises `write_file`/`read_file`/`edit_file`/`ls`/`glob`/`grep` as a
-    scratch workspace, so the reader must actually have them.
+async def test_the_nested_readers_tool_surface_excludes_a_filesystem_workspace(noop_agent):
+    """R6 (Phase 4 trim): the reader carries only what it needs to read and answer in prose —
+    no write tools. Inverts the prior contract (the reader used to get a scratch workspace via
+    `FilesystemMiddleware`, restored by hand since nesting through a hand-built
+    `SubAgentMiddleware` gets none of `create_deep_agent`'s auto-injected base stack for free);
+    `reader.md`'s scratch-workspace promise is removed in the same phase (Step 4).
     """
     _, graph = noop_agent
 
@@ -216,7 +216,10 @@ async def test_the_nested_readers_tool_surface_includes_its_filesystem_workspace
     reader_runnable = _declared_subagents(researcher_runnable)["reader"]
     reader_tool_names = set(_tools_by_name(reader_runnable))
 
-    assert {"write_file", "read_file", "edit_file", "ls", "glob", "grep"} <= reader_tool_names
+    assert reader_tool_names.isdisjoint(
+        {"write_file", "edit_file", "ls", "glob", "grep", "read_file", "delete", "execute"}
+    )
+    assert "fetch_pages" in reader_tool_names
 
 
 async def test_build_agent_lead_excludes_search_and_fetch_and_gains_task(
@@ -281,13 +284,18 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
         max_urls_per_call=config.fetch.max_urls_per_call,
     )
     assert spec["tools"] is reader_tools
-    # Restores the FULL base stack `create_deep_agent`'s own top-level `subagents=` path
-    # auto-injects — nesting via a hand-built `SubAgentMiddleware` (Step 3) injects NOTHING:
-    # the filesystem middleware for the scratch workspace `reader.md` promises, the
-    # summarizer so a reader digesting large pages gets context eviction instead of a
-    # provider context-length error, and the tool-call patcher (PR #18 review).
-    assert any(isinstance(m, FilesystemMiddleware) for m in spec["middleware"])
-    assert any(isinstance(m, DeepagentsSummarizationMiddleware) for m in spec["middleware"])
+    # R6 (Phase 4 trim): `FilesystemMiddleware` — and the scratch workspace it backed — is
+    # gone. The remaining entries are asserted positively, not just the removal, because a
+    # manually-nested subagent gets NONE of `create_deep_agent`'s auto-injected base stack for
+    # free (architecture.md) and every surviving entry matters: the summarizer still offloads
+    # evicted history to the SAME backend independent of `FilesystemMiddleware` (it holds its
+    # own reference, PR #18 review), and the tool-call patcher matches the pre-trim stack.
+    assert not any(isinstance(m, FilesystemMiddleware) for m in spec["middleware"])
+    summarization_middlewares = [
+        m for m in spec["middleware"] if isinstance(m, DeepagentsSummarizationMiddleware)
+    ]
+    assert len(summarization_middlewares) == 1
+    assert summarization_middlewares[0]._backend is backend
     assert any(isinstance(m, PatchToolCallsMiddleware) for m in spec["middleware"])
     # Phase 6 (D-C): the reader tier is the ONLY place `fetch_pages` is observable, so its
     # activity middleware is part of this spec's contract, not an incidental extra.
@@ -296,6 +304,35 @@ def test_reader_spec_contract(make_config, scripted_model, tmp_path):
     # `ask_user` interrupt entry would register an interrupt that can never fire.
     # R4 regression (Phase 5): `interrupt_on` stays confined to the lead alone.
     assert "interrupt_on" not in spec
+
+
+def test_deepagents_summarization_never_overrides_message_mutating_hooks(scripted_model, tmp_path):
+    """Pins the invariant `_ReaderDispatchCapMiddleware`'s docstring depends on (review fix
+    F2): the cap counts distinct dispatch ids out of `state["messages"]`, which only stays
+    correct as long as deepagents' summarizer never rewrites that list. If a future deepagents
+    bump ever swaps in LangChain-style mutating summarization (a `before_model`/`after_model`
+    override issuing `RemoveMessage`), old dispatch ids would fall out of history and the cap
+    would silently reset mid-attempt -- this must fail loudly here instead.
+    """
+    from deepagents.backends.filesystem import FilesystemBackend
+    from deepagents.middleware.summarization import create_summarization_middleware
+    from langchain.agents.middleware import AgentMiddleware
+
+    backend = FilesystemBackend(root_dir=tmp_path / "workspace")
+    reader_model = scripted_model([AIMessage(content="done")])
+
+    middleware = create_summarization_middleware(reader_model, backend)
+
+    # `AgentMiddleware` defines all four as concrete (no-op) methods, not abstract ones, so an
+    # unoverridden hook on `middleware`'s class is literally the SAME function object as the
+    # base class's -- `is`, not just an equality/behavior check. A middleware that overrode any
+    # of these to mutate `state["messages"]` would define its own function here and fail this.
+    for hook in ("before_model", "abefore_model", "after_model", "aafter_model"):
+        assert getattr(type(middleware), hook) is getattr(AgentMiddleware, hook), (
+            f"{hook} is overridden on {type(middleware).__name__} -- deepagents' summarizer "
+            "may now mutate state['messages'], which would silently uncap "
+            "_ReaderDispatchCapMiddleware"
+        )
 
 
 def test_researcher_spec_has_no_interrupt_on(make_config, scripted_model, tmp_path):
@@ -511,8 +548,25 @@ def build_researcher(make_config, tmp_path):
         registry: SourceRegistry | None = None,
         run_log: RunLog | None = None,
         sink: ActivitySink | None = None,
+        agent: AgentSettings | None = None,
+        max_reader_dispatches: int | None = None,
     ):
-        config = make_config()
+        # `agent` lets a caller override `AgentSettings` wholesale. `max_reader_dispatches`
+        # (F3 review fix) is the narrower knob a cap test actually needs: it sets the cap
+        # WITHOUT reverting `workspace_dir`/`reports_dir` to their real HOME-relative defaults
+        # the way handing a bare `AgentSettings(max_reader_dispatches=...)` as `agent` did --
+        # that leaked run directories into the developer's real `~/deep-research/workspace/`,
+        # since `build_fetch_tool` eagerly `mkdir`s under it. Mirrors `make_config`'s own
+        # `tmp_path`-scoped defaults exactly.
+        if max_reader_dispatches is not None:
+            if agent is not None:
+                raise ValueError("pass either `agent` or `max_reader_dispatches`, not both")
+            agent = AgentSettings(
+                workspace_dir=tmp_path / "workspace",
+                reports_dir=tmp_path / "reports",
+                max_reader_dispatches=max_reader_dispatches,
+            )
+        config = make_config(agent=agent)
         registry = registry if registry is not None else SourceRegistry()
         backend = FilesystemBackend(root_dir=tmp_path / "workspace")
         tool_sets = build_tools(config, registry)
@@ -570,6 +624,132 @@ async def test_a_reader_crash_becomes_an_error_task_message_after_one_retry(
     assert task_messages[0].status == "error"
     assert str(task_messages[0].content).startswith("READER FAILED")
     assert reader_model._call_count == 2  # initial attempt + exactly one retry
+
+
+def _multi_task_call(descriptions: list[str], call_ids: list[str]) -> AIMessage:
+    """Like `_task_call`, but emits several `task(subagent_type="reader")` calls in ONE
+    AIMessage — the shape `_ReaderDispatchCapMiddleware` must refuse only the surplus of, not
+    the whole batch (see the plan's "position, not a count" rationale).
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": description, "subagent_type": "reader"},
+                "id": call_id,
+            }
+            for description, call_id in zip(descriptions, call_ids, strict=True)
+        ],
+    )
+
+
+async def test_a_dispatch_past_the_cap_is_refused_and_spawns_no_reader(
+    build_researcher, scripted_model
+):
+    """R5 (D6, amended per the parent plan's 2026-08-21 Reconciliations entry):
+    `[agent].max_reader_dispatches` is harness-enforced, not merely advised in prompt prose.
+    A low cap (2, rather than the default of 6) makes the boundary explicit: the researcher
+    emits cap+1 reader dispatches in one AIMessage, and only the surplus is refused.
+    """
+    cap = 2
+    call_ids = [f"call_{i}" for i in range(cap + 1)]
+    researcher_model = scripted_model(
+        [
+            _multi_task_call([f"Fetch and digest facet {i}" for i in range(cap + 1)], call_ids),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = scripted_model([AIMessage(content=f"digest {i}") for i in range(cap)])
+    researcher, _ = build_researcher(researcher_model, reader_model, max_reader_dispatches=cap)
+
+    result = await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    task_messages_by_id = {
+        m.tool_call_id: m
+        for m in result["messages"]
+        if isinstance(m, ToolMessage) and m.name == "task"
+    }
+    assert set(task_messages_by_id) == set(call_ids)
+    for call_id in call_ids[:cap]:
+        assert "budget exhausted" not in str(task_messages_by_id[call_id].content).lower()
+    refused = task_messages_by_id[call_ids[cap]]
+    assert "budget exhausted" in str(refused.content).lower()
+    assert refused.status != "error"  # a budget verdict, not a failure
+    # The surplus dispatch never reached the reader subgraph at all.
+    assert reader_model._call_count == cap
+
+
+async def test_a_second_researcher_attempt_gets_a_fresh_budget(build_researcher, scripted_model):
+    """The count derives from the researcher's OWN message history (Reconciliations,
+    2026-08-21), so a fresh `ainvoke` — a new subgraph with a new message history — gets a
+    fresh budget: the shared middleware instance holds no cross-attempt tally.
+    """
+    cap = 2
+    attempt_a_ids = ["call_a0", "call_a1"]
+    attempt_b_ids = ["call_b0", "call_b1"]
+    researcher_model = scripted_model(
+        [
+            _multi_task_call(["Fetch and digest a0", "Fetch and digest a1"], attempt_a_ids),
+            AIMessage(content="done"),
+            _multi_task_call(["Fetch and digest b0", "Fetch and digest b1"], attempt_b_ids),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = scripted_model([AIMessage(content=f"digest {i}") for i in range(4)])
+    researcher, _ = build_researcher(researcher_model, reader_model, max_reader_dispatches=cap)
+
+    result_a = await researcher.ainvoke({"messages": [HumanMessage(content="research angle a")]})
+    result_b = await researcher.ainvoke({"messages": [HumanMessage(content="research angle b")]})
+
+    for result in (result_a, result_b):
+        task_messages = [
+            m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+        ]
+        assert len(task_messages) == cap
+        for message in task_messages:
+            assert "budget exhausted" not in str(message.content).lower()
+    assert reader_model._call_count == 4  # every dispatch in BOTH attempts reached the reader
+
+
+async def test_a_tool_retry_reinvocation_is_not_double_counted(build_researcher, scripted_model):
+    """`ToolRetryMiddleware(max_retries=1)` (`_task_dispatch_guard`) re-invokes the SAME
+    `tool_call["id"]` on a reader crash; since the cap counts distinct ids already present in
+    the researcher's message history, that re-invocation costs no extra budget. With the cap at
+    N and N dispatches (each crashing and retrying, mirroring
+    `test_a_reader_crash_becomes_an_error_task_message_after_one_retry`), none is refused.
+    """
+    from pydantic import SecretStr
+
+    cap = 2
+    call_ids = [f"call_{i}" for i in range(cap)]
+    researcher_model = scripted_model(
+        [
+            _multi_task_call([f"Fetch and digest facet {i}" for i in range(cap)], call_ids),
+            AIMessage(content="done"),
+        ]
+    )
+    reader_model = _RaisingChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    researcher, _ = build_researcher(researcher_model, reader_model, max_reader_dispatches=cap)
+
+    result = await researcher.ainvoke({"messages": [HumanMessage(content="research this angle")]})
+
+    task_messages_by_id = {
+        m.tool_call_id: m
+        for m in result["messages"]
+        if isinstance(m, ToolMessage) and m.name == "task"
+    }
+    assert set(task_messages_by_id) == set(call_ids)
+    for call_id in call_ids:
+        message = task_messages_by_id[call_id]
+        assert "budget exhausted" not in str(message.content).lower()
+        assert message.status == "error"
+        assert str(message.content).startswith("READER FAILED")
+    # initial attempt + exactly one retry, for EACH of the `cap` dispatches -- the retry
+    # consumed no extra cap budget, only extra reader-model calls.
+    assert reader_model._call_count == cap * 2
 
 
 async def test_a_swallowed_subagent_crash_records_a_run_log_incident(

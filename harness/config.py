@@ -131,6 +131,8 @@ class BlocklistSettings(_StrictModel):
 class AgentSettings(_StrictModel):
     max_rounds: int = Field(default=50, gt=0)  # hard cap on agent-loop rounds
     wall_clock_seconds: int = Field(default=1800, gt=0)  # wall-clock budget, in seconds
+    # Harness-enforced (R5): refused past this count, not merely advised in prompt prose.
+    max_reader_dispatches: int = Field(default=6, gt=0)
     # Under the user's home dir, not the repo root; overridable per-key from [agent].
     workspace_dir: Path = Field(
         default_factory=lambda: Path.home() / "deep-research" / "workspace"

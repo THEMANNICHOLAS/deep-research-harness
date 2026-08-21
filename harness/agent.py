@@ -11,7 +11,6 @@ from datetime import date
 from typing import Any, Literal
 
 from deepagents import (
-    FilesystemMiddleware,
     FilesystemPermission,
     GeneralPurposeSubagentProfile,
     HarnessProfile,
@@ -183,6 +182,84 @@ def _digest_text(result: ToolMessage | Command[Any]) -> str:
     return message.text.strip() if message is not None else ""
 
 
+def _is_reader_dispatch(name: str | None, args: dict[str, Any]) -> bool:
+    """Is this `task` call a dispatch to the reader subagent?
+
+    One predicate for the three sites that all needed to ask this (CLAUDE.md: a third
+    repetition gets factored out) -- `_ReaderDispatchCapMiddleware`'s own early return, its
+    inner history scan, and `_ToolActivityMiddleware`'s reader/researcher split. `.get`-guarded
+    so a malformed or missing `subagent_type` reads as "not a reader dispatch" rather than
+    raising.
+    """
+    return name == "task" and args.get("subagent_type") == "reader"
+
+
+class _ReaderDispatchCapMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Enforce `[agent].max_reader_dispatches` (R5; parent plan's 2026-08-21 Reconciliations
+    entry) by refusing a reader dispatch once the researcher's OWN message history already
+    carries that many distinct ones — no contextvar, no dispatch counter of its own.
+
+    Counts by POSITION, not a running tally: a model can emit several
+    `task(subagent_type="reader")` calls in a single `AIMessage`, so all of them are already in
+    `request.state["messages"]` when the first is processed. A raw count would refuse the whole
+    batch; indexing into the ordered list of distinct dispatch ids lets the first N through and
+    refuses only the surplus, and a `ToolRetryMiddleware` re-invocation of the same
+    `tool_call["id"]` (D2) resolves to the same position — hence the same verdict — for free.
+
+    Reading the count from the researcher's own history assumes deepagents' own summarizer
+    never rewrites `state["messages"]` -- it DOES run on the researcher tier (via
+    `create_deep_agent`'s auto-injected base stack, not the hand-written list above it in
+    `_researcher_spec`'s `middleware=`). `_DeepAgentsSummarizationMiddleware` implements only
+    `wrap_model_call`/`awrap_model_call`, tracking eviction in a private field rather than
+    `before_model`/`after_model` and never issuing a `RemoveMessage` -- a deliberate divergence
+    from LangChain's own `SummarizationMiddleware`, which rewrites the list with
+    `RemoveMessage(id=REMOVE_ALL_MESSAGES)` from `before_model`. The standing risk: a
+    deepagents bump to that LangChain-style mutating behavior would evict old dispatch ids,
+    reset the count mid-attempt, and silently uncap this dispatch limit. See the parent plan's
+    corrected 2026-08-21 `## Reconciliations` entry.
+    """
+
+    def __init__(self, max_dispatches: int) -> None:
+        super().__init__()
+        self._max_dispatches = max_dispatches
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        call = request.tool_call
+        args = call["args"] or {}
+        if not _is_reader_dispatch(call["name"], args):
+            return await handler(request)
+
+        ids: list[str] = []
+        state = request.state
+        messages = state.get("messages") if isinstance(state, dict) else None
+        for message in messages or []:
+            tool_calls = getattr(message, "tool_calls", None) or []
+            for tool_call in tool_calls:
+                if not _is_reader_dispatch(tool_call.get("name"), tool_call.get("args") or {}):
+                    continue
+                call_id = tool_call.get("id")
+                if call_id is not None and call_id not in ids:
+                    ids.append(call_id)
+
+        call_id = call.get("id")
+        position = ids.index(call_id) if call_id in ids else len(ids)
+        if position >= self._max_dispatches:
+            return ToolMessage(
+                content=(
+                    f"Reader dispatch budget exhausted: {self._max_dispatches} reader "
+                    "dispatches already used for this task. No reader was dispatched. "
+                    "Report your findings now, including what you could not settle."
+                ),
+                tool_call_id=call["id"],
+                name="task",
+            )
+        return await handler(request)
+
+
 class _ReaderDigestMiddleware(AgentMiddleware[Any, Any, Any]):
     """Promote reader-fetched sources to `digested` only when a digest reaches the researcher
     that dispatched it (R5, relocated from the lead in Step 3 — the mechanism, not the
@@ -307,8 +384,7 @@ class _ToolActivityMiddleware(AgentMiddleware[Any, Any, Any]):
             # must never break the dispatch itself.
             return await handler(request)
         args = request.tool_call["args"] or {}
-        subagent_type = str(args.get("subagent_type", "")) if name == "task" else ""
-        is_reader = name == "task" and subagent_type == "reader"
+        is_reader = _is_reader_dispatch(name, args)
 
         retry = self._sink.start_call(call_id, name, _summarize_tool_args(name, args))
 
@@ -396,28 +472,40 @@ def _reader_spec(
     cannot interrupt, so inheriting an ancestor's `ask_user` entry would register an interrupt
     that can never fire.
 
-    `middleware` restores the base stack `create_deep_agent`'s top-level `subagents=` path
-    auto-injects for every declared subagent (`graph.py`: `FilesystemMiddleware`,
+    `middleware` restores PART of the base stack `create_deep_agent`'s top-level `subagents=`
+    path auto-injects for every declared subagent (`graph.py`: `FilesystemMiddleware`,
     `create_summarization_middleware`, `PatchToolCallsMiddleware`) — nesting the reader via a
     hand-built `SubAgentMiddleware` (Step 3) bypasses that path entirely, so a manually
-    nested spec gets NONE of it for free and every entry must be re-added here explicitly:
-    `FilesystemMiddleware` for the scratch workspace `reader.md` promises
-    (`write_file`/`read_file`/`edit_file`/`ls`/`glob`/`grep`), `create_summarization_middleware`
-    so a reader digesting large fetched pages gets context-window eviction instead of a
-    provider context-length error (PR #18 review), and `PatchToolCallsMiddleware` matching the
-    injected stack. Mirrors only the `backend`/`model` arguments from that site: this harness
-    never sets `tool_description_overrides` or per-subagent `permissions`, so the other
-    `FilesystemMiddleware` kwargs there are always `None` and add nothing here.
+    nested spec gets NONE of it for free and every entry needed must be re-added here
+    explicitly. `FilesystemMiddleware` (and the scratch workspace it backed) is deliberately
+    OMITTED (R6, Phase 4 trim): the reader has no write tools, `reader.md` no longer promises
+    a scratch workspace, and the only remaining reader toolset is `fetch_pages`.
+    `create_summarization_middleware` stays so a reader digesting large fetched pages gets
+    context-window eviction instead of a provider context-length error (PR #18 review) — it
+    holds its own `backend` reference and offloads evicted history through it independent of
+    `FilesystemMiddleware`. `PatchToolCallsMiddleware` matches the injected stack. Mirrors only
+    the `backend`/`model` arguments from that site: this harness never sets
+    `tool_description_overrides` or per-subagent `permissions`, so the other
+    `FilesystemMiddleware` kwargs there would always have been `None` anyway.
+
+    Two further consequences of dropping `FilesystemMiddleware` (review fix F6): it also
+    evicted oversized tool RESULTS to disk (`tool_token_limit_before_evict` default 20000
+    tokens, ~80,000 chars at deepagents' `NUM_CHARS_PER_TOKEN=4`), and `fetch_pages` was never
+    in its `TOOLS_EXCLUDED_FROM_EVICTION` list — so the reader has lost that safety net, and
+    already at THIS harness's own default `[fetch].per_page_char_cap` (120000): one fetched
+    page at the cap alone already exceeds the 80,000-char threshold, before a second URL is
+    even joined in. Separately, the summarization offload above still writes evicted history
+    to disk and still tells the model it may `read_file` the saved path — a tool the reader no
+    longer has; a dead `read_file` attempt there is expected degradation, not a new bug.
 
     `_ToolActivityMiddleware(sink)` is appended last (Phase 6, D-C): this is the ONLY tier
     where `fetch_pages` is observable, since the reader is the only tier that calls it.
     """
-    # Explicitly typed, matching `_middleware`'s own convention: `FilesystemMiddleware`'s state
-    # type param is fixed to `FilesystemState`, and an unannotated list literal here infers that
-    # concrete type instead of the broad `AgentMiddleware[Any, Any, Any]` `SubAgent["middleware"]`
-    # expects, which mypy then rejects as a list-item mismatch.
+    # Explicitly typed, matching `_middleware`'s own convention: `create_summarization_middleware`
+    # returns a middleware with its state type param fixed, and an unannotated list literal here
+    # infers that concrete type instead of the broad `AgentMiddleware[Any, Any, Any]`
+    # `SubAgent["middleware"]` expects, which mypy then rejects as a list-item mismatch.
     reader_middleware: list[AgentMiddleware[Any, Any, Any]] = [
-        FilesystemMiddleware(backend=backend),
         create_summarization_middleware(reader_model, backend),
         PatchToolCallsMiddleware(),
         _ToolActivityMiddleware(sink),
@@ -456,12 +544,15 @@ def _researcher_spec(
     a nested researcher has no checkpointer forwarded and cannot interrupt.
 
     `middleware`: `SubAgentMiddleware` nests the reader tier under THIS researcher's own
-    `task` tool; `_task_dispatch_guard` guards a crashed (or aborted, Drift C) reader
-    dispatch, the same shared pair as the lead's own guard on dispatching a researcher;
-    `_ReaderDigestMiddleware` marks a source `digested` only when a reader's digest actually
-    reaches this researcher (R7's mechanism moved, not broken); and `_ToolActivityMiddleware`
-    (Phase 6, D-C) is appended LAST (innermost) so a retried `task` dispatch to the reader
-    arrives as a second start for the same `tool_call["id"]`.
+    `task` tool; `_ReaderDispatchCapMiddleware` (R5, Phase 4) sits immediately after it and
+    before `_task_dispatch_guard`, so a refused dispatch short-circuits the retry guard, the
+    digest scope, and the activity sink — nothing logs or scopes a reader that never ran;
+    `_task_dispatch_guard` guards a crashed (or aborted, Drift C) reader dispatch, the same
+    shared pair as the lead's own guard on dispatching a researcher; `_ReaderDigestMiddleware`
+    marks a source `digested` only when a reader's digest actually reaches this researcher
+    (R7's mechanism moved, not broken); and `_ToolActivityMiddleware` (Phase 6, D-C) is
+    appended LAST (innermost) so a retried `task` dispatch to the reader arrives as a second
+    start for the same `tool_call["id"]`.
     """
     return SubAgent(
         name="researcher",
@@ -473,11 +564,13 @@ def _researcher_spec(
             "subagent",
             current_date=date.today().isoformat(),
             max_urls_per_call=config.fetch.max_urls_per_call,
+            max_reader_dispatches=config.agent.max_reader_dispatches,
         ),
         model=researcher_model,
         tools=researcher_tools,
         middleware=[
             SubAgentMiddleware(backend=backend, subagents=[reader_spec]),
+            _ReaderDispatchCapMiddleware(config.agent.max_reader_dispatches),
             *_task_dispatch_guard(run_log),
             _ReaderDigestMiddleware(registry),
             _ToolActivityMiddleware(sink),
