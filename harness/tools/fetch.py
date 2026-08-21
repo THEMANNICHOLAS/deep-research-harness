@@ -203,11 +203,23 @@ def _write_source_file(captures_dir: Path, page: FetchedPage, run_log: RunLog) -
         )
 
 
+# Genuine failures keep their outcome and status (R1: those are operational facts, not policy
+# verdicts), so this is a separate line from `_REJECTION_LINE`'s opaque one — same instruction,
+# different amount of truth the model is allowed.
+_DO_NOT_RETRY_LINE = "do not retry this URL — it gets one fetch attempt per run, now spent"
+
+
 def _render(page: FetchedPage, cap: int) -> str:
     """Render one page's model-facing block: heading, outcome line, capped markdown.
 
     A failure has no `source_id` (R5), so it renders by URL alone rather than a `[Sn]` heading
     that would imply it was ever registered as evidence.
+
+    A failure also carries `_DO_NOT_RETRY_LINE`, after the fence. R1 wants every failure to
+    reach the model as an explicit do-not-retry instruction, and D2 makes that literally true —
+    one attempt per URL per run, so a retry replays this same block and buys nothing. Appended
+    here rather than at the replay site so the FIRST failure says it too: telling the model
+    only on the retry means the retry it was meant to prevent has already happened.
 
     The page's own markdown is untrusted content (Phase 5, D1 spotlighting): it is fenced with
     `harness.guard.fence` AFTER truncation, never before (risk #4 — truncating a fenced block
@@ -238,6 +250,8 @@ def _render(page: FetchedPage, cap: int) -> str:
             + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
         )
     lines.append(fence(text))
+    if page.outcome != "fetched":
+        lines.append(_DO_NOT_RETRY_LINE)
 
     return "\n\n".join(lines)
 
@@ -253,6 +267,20 @@ def _failure_detail(page: FetchedPage) -> str:
     if page.error:
         bits.append(page.error)
     return f"{page.url}: {' — '.join(bits)}"
+
+
+_REJECTION_LINE = "rejected — do not retry this URL or request variants of it"
+
+
+def _rejection_block(url: str) -> str:
+    """The opaque, reason-free block rendered for any policy-rejected URL (D1).
+
+    Guard blocks, provenance rejections (and, from Phase 3, blocklisted hostnames) all render
+    this one line, because naming which policy fired would tell an adversarial page — or
+    anyone reading the transcript — exactly what the guard caught. The rejecting policy and
+    its reason go ONLY to `RunLog` incidents, never here.
+    """
+    return f"## {url}\n\n{_REJECTION_LINE}"
 
 
 def _provenance_rejected_detail(url: str) -> str:
@@ -315,20 +343,28 @@ async def _fetch(
     urls = unique_urls
     if not urls:
         return "", []
+    # The assembly loop below walks this: every deduped URL the caller asked for gets a block,
+    # whether or not it reached a crawler (D1/D2).
+    requested = list(urls)
+
+    # D2: a URL already answered this run — by a policy rejection or a genuine failure —
+    # replays its stored verdict from the assembly loop, with no crawler work and no second
+    # incident, since the first one already disclosed it.
+    urls = [url for url in urls if registry.failed_block(url) is None]
 
     # Phase 4 strict provenance (D2/R2): a URL is fetchable only if it arrived from a
     # `search_web` result or explicit user approval (`__main__` at run start) — never from a
     # page's own in-body links. Rejection is per-URL: one unapproved URL never fails the rest
-    # of the batch, and a rejected URL never reaches the crawler at all.
+    # of the batch, and a rejected URL never reaches the crawler at all — and now also renders
+    # the opaque D1 rejection block.
     approved_urls: list[str] = []
     for url in urls:
         if registry.is_approved(url):
             approved_urls.append(url)
         else:
             run_log.record("provenance_rejected", _provenance_rejected_detail(url))
+            registry.record_failure(url, _rejection_block(url))
     urls = approved_urls
-    if not urls:
-        return "", []
 
     # One crawler cannot mix strategies in one `arun_many`: partition the batch by extension
     # first (cheap, pre-fetch routing); an extensionless PDF is only discoverable after the
@@ -374,12 +410,13 @@ async def _fetch(
             # ever reaches disk. The title rides along because it is page-controlled content
             # exactly like the body (search.py scans title+snippet the same way), and
             # `_write_source_file` puts it on the capture's first line where verify.py reads
-            # it. A blocked page vanishes entirely: no FetchedPage, no Sn, no capture file,
-            # absent from the rendered content (D4).
+            # it. A blocked page vanishes entirely: no FetchedPage, no Sn, no capture file —
+            # it now renders an opaque, reason-free rejection block instead (D1).
             if config.guard.enabled:
                 scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
                 if scan_result.blocked:
                     run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
+                    registry.record_failure(url, _rejection_block(url))
                     continue
 
             status_code = getattr(result, "status_code", None)
@@ -442,11 +479,13 @@ async def _fetch(
             title = _title_of(result)
 
             # D5: same guard site as the HTML batch — scan raw markdown and title before
-            # classify/mint.
+            # classify/mint. A blocked page vanishes entirely and now renders an opaque,
+            # reason-free rejection block instead (D1).
             if config.guard.enabled:
                 scan_result = scan(markdown if title is None else f"{title}\n{markdown}")
                 if scan_result.blocked:
                     run_log.record("guard_blocked", guard_blocked_detail(url, scan_result.signals))
+                    registry.record_failure(url, _rejection_block(url))
                     continue
 
             status_code = getattr(result, "status_code", None)
@@ -473,8 +512,9 @@ async def _fetch(
                 error=error_message,
             )
 
-    # A guard-blocked URL never got a `pages_by_url` entry (D4: it vanishes entirely, not
-    # even as a failure outcome) — filter it out rather than indexing a KeyError.
+    # A guard-blocked URL never got a `pages_by_url` entry — D4 still holds for the artifact
+    # (no FetchedPage, no Sn, no capture); it is the RENDER that changed, to an opaque
+    # rejection block (D1). Filter it out rather than indexing a KeyError.
     pages = [pages_by_url[url] for url in urls if url in pages_by_url]
 
     # Recorded here, in the shared path, so `fetch_pages` and `fetch_raw` disclose alike.
@@ -487,8 +527,24 @@ async def _fetch(
     for page in pages:
         _write_source_file(captures_dir, page, run_log)
 
-    content = "\n\n".join(_render(page, config.fetch.per_page_char_cap) for page in pages)
-    return content, pages
+    cap = config.fetch.per_page_char_cap
+    blocks: list[str] = []
+    for url in requested:
+        attempted = pages_by_url.get(url)
+        if attempted is None:
+            # Rejected pre-crawl (provenance), dropped by the guard, or replayed from an
+            # earlier attempt: whichever path answered it recorded the verdict (D1/D2).
+            block = registry.failed_block(url)
+            if block is not None:
+                blocks.append(block)
+            continue
+        rendered = _render(attempted, cap)
+        if attempted.outcome != "fetched":
+            # D2: sticky for the run — a re-request replays this exact block, no crawler work.
+            registry.record_failure(url, rendered)
+        blocks.append(rendered)
+
+    return "\n\n".join(blocks), pages
 
 
 def build_fetch_tool(
@@ -501,12 +557,13 @@ def build_fetch_tool(
 
     The guard is invisible here (D5): every fetched page is scanned for injection signals
     inside the shared `_fetch`, before classification, minting, or capture. A blocked page
-    vanishes from the pipeline entirely and is disclosed only via a `guard_blocked`
-    `RunLog` incident — see harness/guard.py and PLAN-prompt-injection-defense.md Phase 3.
+    vanishes from the pipeline entirely; the REASON is disclosed only via a `guard_blocked`
+    `RunLog` incident — see harness/guard.py and PLAN-prompt-injection-defense.md Phase 3 —
+    but the model now sees an opaque, reason-free rejection block for the URL (D1).
 
     Strict URL provenance (Phase 4, R2) is enforced the same way, one step earlier: an
-    unapproved URL never reaches the crawler at all, disclosed via a `provenance_rejected`
-    incident instead.
+    unapproved URL never reaches the crawler at all, its REASON disclosed via a
+    `provenance_rejected` incident instead, and the model again sees only the opaque block.
     """
     sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 

@@ -247,14 +247,47 @@ class SourceRegistry:
         # `search_web` result surviving Phase 3's guard, or a user-supplied URL `__main__`
         # approves at run start. Never from a page's own in-body links (D2).
         self._approved: set[str] = set()
+        # Every URL whose fetch did not end `fetched` — policy rejection or genuine failure —
+        # keeps its rendered verdict here for the rest of the run, so a re-request replays it
+        # instead of re-crawling. One attempt per URL per run (D2).
+        self._failed: dict[str, str] = {}
 
     def approve(self, url: str) -> None:
-        """Mark `url` fetchable (Phase 4, R2) -- the only sanctioned way to widen fetchability."""
-        self._approved.add(normalize_url(url))
+        """Mark `url` fetchable (Phase 4, R2) -- the only sanctioned way to widen fetchability.
+
+        Approving a URL for the FIRST time also clears any verdict standing against it. A
+        provenance rejection is the one verdict that can stop being true, and this call is what
+        stops it: the URL was unfetchable only because nothing had approved it yet. Without
+        this, a URL the model guessed at from memory (rejected) and then legitimately found via
+        `search_web` (`_approve_survivors` calls straight through to here) would replay its
+        rejection forever and be lost for the run.
+
+        Every other verdict is recorded downstream of `_fetch`'s provenance check and so only
+        ever for an ALREADY-approved URL, which this branch cannot reach — guard blocks and
+        genuine failures stay sticky for the whole run, as D2 requires. Phase 3's blocklist
+        rejections are self-healing either way: a cleared one is re-rejected by the next
+        pre-crawl blocklist check.
+        """
+        normalized = normalize_url(url)
+        if normalized not in self._approved:
+            self._failed.pop(normalized, None)
+        self._approved.add(normalized)
 
     def is_approved(self, url: str) -> bool:
         """Whether `url` (any `normalize_url`-equivalent spelling) has been approved."""
         return normalize_url(url) in self._approved
+
+    def record_failure(self, url: str, rendered_block: str) -> None:
+        """Store `rendered_block` as `url`'s verdict for the rest of the run (D2).
+
+        First write wins, mirroring `add`: the block that answered the URL the first time is the
+        one every re-request replays.
+        """
+        self._failed.setdefault(normalize_url(url), rendered_block)
+
+    def failed_block(self, url: str) -> str | None:
+        """`url`'s stored verdict block, or `None` if it has not failed this run."""
+        return self._failed.get(normalize_url(url))
 
     def add(self, url: str, title: str | None = None) -> str:
         """Register `url` and return its ID; the same normalized URL is never added twice.

@@ -486,3 +486,62 @@ def test_extract_urls_ignores_non_http_schemes():
     text = "Do not fetch javascript:alert(1) or ftp://example.com/file, only prose here."
 
     assert extract_urls(text) == []
+
+
+# --- Visible, sticky fetch failures (R1/D1/D2) -------------------------------------------
+
+
+def test_record_failure_is_retrievable_through_a_normalize_url_equivalent_spelling():
+    registry = SourceRegistry()
+
+    registry.record_failure("https://A.test/x/", "## https://A.test/x/\n\nrejected")
+
+    assert registry.failed_block("https://a.test/x") == "## https://A.test/x/\n\nrejected"
+
+
+def test_failed_block_returns_none_for_a_url_that_never_failed():
+    registry = SourceRegistry()
+
+    assert registry.failed_block("https://never-failed.test") is None
+
+
+def test_first_record_failure_wins_a_second_call_keeps_the_first_block():
+    registry = SourceRegistry()
+
+    registry.record_failure("https://example.com/a", "first block")
+    registry.record_failure("https://example.com/a", "second block")
+
+    assert registry.failed_block("https://example.com/a") == "first block"
+
+
+def test_a_recorded_failure_registers_no_source():
+    registry = SourceRegistry()
+
+    registry.record_failure("https://example.com/a", "some block")
+
+    assert registry.all() == []
+
+
+def test_a_first_approval_clears_a_verdict_standing_against_an_unapproved_url():
+    """Only a provenance rejection can be recorded against a not-yet-approved URL, and an
+    approval is exactly what makes that rejection stop being true.
+    """
+    registry = SourceRegistry()
+    registry.record_failure("https://example.com/a", "rejected block")
+
+    registry.approve("https://example.com/a")
+
+    assert registry.failed_block("https://example.com/a") is None
+
+
+def test_re_approving_an_already_approved_url_leaves_its_verdict_intact():
+    """Guard blocks and genuine failures are only ever recorded for already-approved URLs, so
+    a repeat approval must not reopen them — D2 stickiness holds for the whole run.
+    """
+    registry = SourceRegistry()
+    registry.approve("https://example.com/a")
+    registry.record_failure("https://example.com/a", "guard block verdict")
+
+    registry.approve("https://example.com/a")
+
+    assert registry.failed_block("https://example.com/a") == "guard block verdict"

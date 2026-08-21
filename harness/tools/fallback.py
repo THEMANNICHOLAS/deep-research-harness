@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harness.config import HarnessConfig
 from harness.runlog import RunLog, or_default
-from harness.sources import SourceRegistry, sources_dir
+from harness.sources import SourceRegistry, normalize_url, sources_dir
 from harness.tools.fetch import (
     FetchedPage,
     _fetch,
@@ -54,6 +54,20 @@ async def _fetch_raw(
                 f"</undigested>"
             )
         blocks.append(rendered)
+
+    # A URL that produced no page was rejected by policy or replayed from an earlier failure
+    # (D1/D2). `_fetch` recorded its verdict; fetch_raw shows it rather than returning a batch
+    # with silent holes (R1). Grouped after the pages rather than interleaved: a fetch_raw call
+    # is a one- or two-URL recovery batch, so ordering carries no information here.
+    seen = {normalize_url(page.url) for page in pages}
+    for url in urls:
+        key = normalize_url(url)
+        if key in seen:
+            continue
+        seen.add(key)
+        block = registry.failed_block(url)
+        if block is not None:
+            blocks.append(block)
 
     return "\n\n".join(blocks), pages
 
