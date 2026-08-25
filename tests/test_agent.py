@@ -1678,6 +1678,21 @@ async def test_run_outcome_records_token_usage_summed_with_reasoning_split(
 async def test_main_prints_the_report_path_as_the_final_line_of_stdout(
     make_config, monkeypatch, scripted_model, capsys
 ):
+    # Phase 1: `harness.browser.BrowserSession` is imported by value into `main_module` at
+    # module import time (Step 5's cheap-import treatment, matching `preflight_search` —
+    # conftest.py:331-334), so patching the class object itself (same object either way it's
+    # accessed) reaches the instance `main()` builds without needing a `main_module` name.
+    from harness.browser import BrowserSession
+
+    closed: list[bool] = []
+    original_close = BrowserSession.close
+
+    async def _spy_close(self: BrowserSession) -> None:
+        closed.append(True)
+        await original_close(self)
+
+    monkeypatch.setattr(BrowserSession, "close", _spy_close)
+
     config = make_config()
     final = AIMessage(
         content="Final answer.",
@@ -1694,6 +1709,34 @@ async def test_main_prints_the_report_path_as_the_final_line_of_stdout(
     assert printed_path.endswith(".md")
     assert Path(printed_path).exists()
     assert Path(printed_path).parent == config.agent.reports_dir
+    assert closed, "BrowserSession.close() was never reached on the normal exit path"
+
+
+async def test_main_exits_nonzero_and_writes_no_report_when_browser_preflight_fails(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    """R1: a Chromium launch failure fails fast, before any run or report."""
+    # Same value-import reasoning as the teardown test above.
+    from harness.browser import BrowserPreflightError, BrowserSession
+
+    config = make_config()
+    model = scripted_model([AIMessage(content="unused — the browser preflight aborts first")])
+    patch_run(monkeypatch, config, model, skip_preflight=True)
+
+    # Patched AFTER `patch_run`: monkeypatch applies in call order, so this patch — which must
+    # actually raise — wins over `patch_run`'s own default neutralization of `start`.
+    async def _raise_preflight(self: BrowserSession) -> None:
+        raise BrowserPreflightError("Chromium could not be launched: boom (try crawl4ai-setup)")
+
+    monkeypatch.setattr(BrowserSession, "start", _raise_preflight)
+
+    exit_code = await main_module.main(["a question"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "error:" in captured.err
+    assert "chromium" in captured.err.lower()
+    assert not config.agent.reports_dir.exists() or not any(config.agent.reports_dir.iterdir())
 
 
 async def test_main_exits_nonzero_and_writes_no_report_when_searxng_is_unreachable(
@@ -1807,6 +1850,42 @@ async def test_main_reports_a_model_error_from_build_agent_cleanly(
     assert "reader" in captured.err
     assert "Traceback" not in captured.err
     assert not config.agent.reports_dir.exists() or not any(config.agent.reports_dir.iterdir())
+
+
+async def test_main_closes_the_browser_session_when_build_agent_raises_a_model_error(
+    make_config, monkeypatch, scripted_model, capsys
+):
+    """The Phase 1 Discoveries teardown site: `build_agent`'s `ModelError` early exit
+    (`__main__.py:805-810`) must close the session too, not only the final `finally` — mirrors
+    `test_main_prints_the_report_path_as_the_final_line_of_stdout`'s close-spy shape above.
+    """
+    from harness.browser import BrowserSession
+    from harness.models import ModelError
+
+    closed: list[bool] = []
+    original_close = BrowserSession.close
+
+    async def _spy_close(self: BrowserSession) -> None:
+        closed.append(True)
+        await original_close(self)
+
+    monkeypatch.setattr(BrowserSession, "close", _spy_close)
+
+    config = make_config()
+    model = scripted_model([AIMessage(content="unused — build_agent raises first")])
+    patch_run(monkeypatch, config, model)
+
+    def _broken_build_agent(*args: Any, **kwargs: Any) -> Any:
+        raise ModelError("role 'reader' is not declared in [roles]")
+
+    monkeypatch.setattr("harness.agent.build_agent", _broken_build_agent)
+
+    exit_code = await main_module.main(["a question"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "error:" in captured.err
+    assert closed, "BrowserSession.close() was never reached on the build_agent ModelError path"
 
 
 # --- Phase 5: round cap, wall clock, and cut-short reporting ---------------------------
@@ -2799,9 +2878,13 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
     real_build_agent = agent_module.build_agent
 
     def _build_agent_that_interrupts(
-        config: HarnessConfig, registry: Any, run_log: Any = None, sink: Any = None
+        config: HarnessConfig,
+        registry: Any,
+        run_log: Any = None,
+        sink: Any = None,
+        browser: Any = None,
     ) -> Any:
-        real_agent = real_build_agent(config, registry, run_log, sink)
+        real_agent = real_build_agent(config, registry, run_log, sink, browser)
 
         class _InterruptingAgent:
             def astream(self, *args: Any, **kwargs: Any) -> Any:
@@ -2847,9 +2930,13 @@ async def test_main_exits_cleanly_on_cancelled_error_mid_stream(
     real_build_agent = agent_module.build_agent
 
     def _build_agent_that_interrupts(
-        config: HarnessConfig, registry: Any, run_log: Any = None, sink: Any = None
+        config: HarnessConfig,
+        registry: Any,
+        run_log: Any = None,
+        sink: Any = None,
+        browser: Any = None,
     ) -> Any:
-        real_agent = real_build_agent(config, registry, run_log, sink)
+        real_agent = real_build_agent(config, registry, run_log, sink, browser)
 
         class _InterruptingAgent:
             def astream(self, *args: Any, **kwargs: Any) -> Any:

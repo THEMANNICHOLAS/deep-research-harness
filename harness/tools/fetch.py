@@ -11,7 +11,7 @@ overlapped with the model's first research turn.
 
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 from langchain_core.tools import BaseTool, tool
@@ -28,6 +28,9 @@ from harness.sources import (
     note_digest_candidate,
     sources_dir,
 )
+
+if TYPE_CHECKING:
+    from harness.browser import BrowserSession
 
 FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error", "pdf"]
 
@@ -397,12 +400,17 @@ async def _fetch(
     registry: SourceRegistry,
     run_log: RunLog,
     blocklist: Blocklist | None = None,
+    browser: "BrowserSession | None" = None,
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL, returning model-facing markdown and the full per-URL artifact.
 
     `blocklist` defaults to a fresh load from `config.blocklist.path` for direct callers and
     tests; production threads ONE shared instance from `build_tools`, so a hostname walled
     mid-run by one fetch is visible to `search_web`'s filter for the rest of the run.
+
+    `browser` (Phase 1, R2): the shared session the HTML batch runs through when given one.
+    `None` preserves the prior per-call `async with _crawler_class()(...)` behavior, which
+    every direct caller and existing test still rides.
     """
     blocklist = resolve_blocklist(blocklist, config.blocklist.path)
     from crawl4ai import (
@@ -503,12 +511,17 @@ async def _fetch(
     reroute_urls: list[str] = []
 
     if playwright_urls:
-        # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
-        async with _crawler_class()(config=BrowserConfig(verbose=False)) as crawler:
-            raw_results = await crawler.arun_many(
+        if browser is not None:
+            results = await browser.arun_many(
                 playwright_urls, config=run_config, dispatcher=dispatcher
             )
-            results = list(raw_results)
+        else:
+            # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
+            async with _crawler_class()(config=BrowserConfig(verbose=False)) as crawler:
+                raw_results = await crawler.arun_many(
+                    playwright_urls, config=run_config, dispatcher=dispatcher
+                )
+                results = list(raw_results)
 
         for url, result in _pair(playwright_urls, results):
             if result is None:
@@ -675,11 +688,15 @@ def build_fetch_tool(
     registry: SourceRegistry,
     run_log: RunLog | None = None,
     blocklist: Blocklist | None = None,
+    browser: "BrowserSession | None" = None,
 ) -> BaseTool:
     """Build the `fetch_pages` tool, closing over `config`, the shared `registry` and `run_log`.
 
     Creates `<workspace_dir>/<run_id>/sources` up front, so an unwritable workspace fails at
     startup rather than silently losing captures mid-run.
+
+    `browser` (Phase 1, R2), when given, is the one shared session `_fetch`'s HTML batch reuses
+    instead of launching a fresh crawler per call.
 
     The guard is invisible here (D5): every fetched page is scanned for injection signals
     inside the shared `_fetch`, before classification, minting, or capture. A blocked page
@@ -727,7 +744,7 @@ def build_fetch_tool(
         their outcome rather than raising, so one bad URL never fails the batch. Equivalent
         spellings of the same page (trailing slash, fragment, case) are fetched once.
         """
-        content, pages = await _fetch(urls, config, registry, log, domain_blocklist)
+        content, pages = await _fetch(urls, config, registry, log, domain_blocklist, browser)
         # Only a real capture is even a digest CANDIDATE (R5) — a failed fetch stays "unread".
         # The mark itself is deferred to the delegation boundary: agent.py's
         # `_ReaderDigestMiddleware` promotes these to "digested" only when the reader's digest

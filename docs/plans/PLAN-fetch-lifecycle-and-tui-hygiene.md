@@ -1,6 +1,6 @@
 # PLAN: Fetch Lifecycle and TUI Hygiene
 
-**Status:** Not started
+**Status:** In Progress
 **Created:** 2026-08-21
 **Type:** Single plan
 
@@ -200,7 +200,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R6 | HTTP-first with warm-browser escalation | Phase 2 (ported PR #20 skeleton) |
 
 ## Progress
-- [ ] Phase 1: Session browser + Chromium preflight
+- [x] Phase 1: Session browser + Chromium preflight
 - [ ] Phase 2: HTTP-first fetch with thin-text escalation
 - [ ] Phase 3: TUI alert hygiene
 - [ ] Phase 4: Live source counter
@@ -220,6 +220,8 @@ for the whole run, reused by every fetch call, relaunched at most once if it die
 - `harness/__main__.py` — start session after SearXNG preflight (same catch→stderr→exit-1
   shape); close in the existing `finally` beside `renderer.close()`.
 - `harness/tools/__init__.py` — `build_tools`/factory signatures gain the session argument.
+- `harness/agent.py` — added 2026-08-24, see `## Reconciliations`: `build_agent` forwards the
+  session to `build_tools`, whose only call site this is.
 - `harness/tools/fetch.py` — HTML batch uses the session instead of
   `async with _crawler_class()(...)`; PDF batch untouched.
 - `tests/conftest.py` — extend `install_crawler` seam with a fake session (constructible
@@ -244,7 +246,8 @@ for the whole run, reused by every fetch call, relaunched at most once if it die
   current per-call behavior for tests that don't care.
 
 **Out of scope:**
-- No HTTP strategy yet (Phase 2). No change to `fallback.py` (it rides `_fetch`). No PDF
+- No HTTP strategy yet (Phase 2). ~~No change to `fallback.py` (it rides `_fetch`).~~ (struck
+  2026-08-24 — see `## Reconciliations`.) No PDF
   batch changes. No display changes. No retry machinery beyond the single relaunch.
 
 **Tests (write first, confirm red):**
@@ -262,7 +265,7 @@ for the whole run, reused by every fetch call, relaunched at most once if it die
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Full suite green; `uv run mypy .` clean with the new module.
+- [x] Full suite green; `uv run mypy .` clean with the new module.
 
 ### Phase 2: HTTP-first fetch with thin-text escalation
 **Risk:** flagged (!#3)
@@ -433,12 +436,82 @@ run progresses.
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+2026-08-24 — Phase 1: "No change to `fallback.py`" contradicts R2. `fallback.py:40` calls
+`_fetch(urls, config, registry, run_log, blocklist)` positionally, so once `_fetch` takes the
+session browser from its CALLER (D1 rejected a module-level singleton, which is the only design
+that would have kept fallback.py untouched), `fetch_raw` cannot reach the session without being
+threaded. Leaving it unchanged would silently keep `fetch_raw` on a per-call browser launch,
+failing R2's "reused by every fetch call" for that path. → AMENDMENT: `fallback.py` IS in scope
+for Phase 1, limited to threading only — `build_fallback_tool` gains the same `browser`
+parameter as `build_fetch_tool` and forwards it to `_fetch`. No other change to `fallback.py`;
+its retry/marker logic is untouched.
+
+2026-08-24 — Phase 1: the phase's `**Files:**` list omits `harness/agent.py`, and the Codebase
+Map implied `build_tools` was reachable from `__main__.py`. It is not: `build_tools` has exactly
+ONE call site, `harness/agent.py:636` inside `build_agent`. Threading the session only as far as
+`__main__` would leave it unreachable by `fetch_pages`/`fetch_raw`, silently failing R2 in every
+real run while the unit tests (which call `build_tools` directly) still passed. → AMENDMENT:
+`harness/agent.py` is in Phase 1 scope, limited to a pass-through — `build_agent` gains a
+`browser` parameter forwarded verbatim to `build_tools`. `build_agent` owns NO lifecycle over it;
+`main()` keeps start/close. Diff budget grows from ~6 to ~7 files.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+
+2026-08-24 — Phase 1: the Codebase Map says teardown goes in "the existing `finally` beside
+`renderer.close()`", but that `finally` (`__main__.py:1146-1163`) wraps report-writing only —
+`renderer.close()` is called INLINE before each of the three early `return 1` paths. Of those,
+only the agent-build `ModelError` path (`__main__.py:805-810`) can be reached after the session
+would exist, so closing solely in the `finally` leaks the browser on exactly that one path.
+→ Suggested action: close the session at BOTH sites, mirroring how `renderer.close()` itself is
+already handled, rather than restructuring `main()` into one outer try/finally (bigger diff,
+out of Phase 1's scope).
+
+2026-08-24 — Phase 1: the plan says start the session "immediately after the SearXNG preflight"
+(`__main__.py:686`), but `run_log = RunLog()` is not constructed until line 700, and
+`BrowserSession` needs it to record its own relaunch incident (the Contracts line leaves this as
+"a caller-supplied hook or return signal"). → Suggested action: construct and start the session
+immediately AFTER `run_log = RunLog()` and pass `run_log` in, so the session records its own
+incident with no extra hook. Only `started_at`/`registry`/`approve` sit in between — none can
+fail meaningfully — so this is still a startup preflight and R1's fail-fast is unaffected.
+
+2026-08-24 — Phase 1: BOTH discoveries above dispositioned **act now** by the developer — folded
+into Phase 1's implementation rather than deferred.
+
+2026-08-24 — Phase 1: a SECOND browser death costs a wasted reader subagent run. The raise from
+`BrowserSession.arun_many` propagates out of `_fetch`/`fetch_pages`, and is not in
+`_PASS_THROUGH_TASK_FAILURES` (`harness/agent.py:129`), so `_retry_on_non_search_abort` re-runs
+the whole reader before `_task_failure_handler` renders "READER FAILED". NOTE the rejected fix:
+adding `BrowserPreflightError` to that tuple would make `_handle` return `None`, propagating to
+`__main__`'s abort handling — i.e. ABORTING THE RUN, contradicting the Phase 1 contract ("second
+death... run continues") and the best-effort+disclose invariant. Any real fix needs a THIRD
+category (skip the retry, still soft-fail the reader). → DEFERRED by the developer: the cost is
+one wasted re-run after an already-rare second death, the run still completes with disclosed
+degraded coverage, and a third failure taxonomy in `agent.py` is not worth an unmeasured cost.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so
 never add a section below it. -->
+
+### 2026-08-24 — Phase 1: Session browser + Chromium preflight
+- Done: `harness/browser.py` (`BrowserSession` + `BrowserPreflightError`), startup preflight in
+  `__main__` with the SearXNG catch/stderr/exit-1 shape, teardown at both exit sites, and the
+  session threaded `build_agent` -> `build_tools` -> fetch/fallback into `_fetch`'s HTML batch.
+  801 tests pass; ruff/format/mypy clean. Two review rounds; 5 findings fixed, 1 deferred.
+- Learned: (1) `build_tools`'s ONLY call site is `harness/agent.py:636`, not `__main__` — the
+  session must be threaded through `build_agent`, or R2 is silently false in production while
+  every unit test passes. (2) `patch_run` must neutralize `BrowserSession.start`, or ~30
+  `main()` tests launch a REAL Chromium (this cut the suite from 107s to 64s). (3) The relaunch
+  needs a lock AND a generation counter: siblings already in flight ride it, and an ARRIVAL
+  during the None window must wait on the lock rather than be told a relaunch failed.
+  (4) `_PASS_THROUGH_TASK_FAILURES` means ABORT THE RUN, not "fail this subagent fast" — do not
+  put browser errors there.
+- Drift: two entries in `## Reconciliations` (fallback.py scoped in for threading; agent.py
+  added to the file list), plus three `## Discoveries` (two acted, one deferred). All approved.
+- Watch-next: Phase 2 hangs the warm HTTP strategy off this same `BrowserSession` (D1's stated
+  consequence) — `self._config` is stored but currently unread, and exists for exactly that.
+  Phase 2 must also keep `patch_run`'s browser neutralization working once the HTTP strategy
+  starts/closes alongside the browser.

@@ -7,6 +7,7 @@ import pytest
 from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter  # type: ignore[import-untyped]
 from langchain_core.tools import BaseTool
 
+from harness.browser import BrowserSession
 from harness.config import AgentSettings, BlocklistSettings, GuardSettings
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
@@ -2125,3 +2126,31 @@ async def test_a_non_html_page_quoting_a_challenge_phrase_does_not_feed_the_bloc
     await fetch._fetch(["https://plaintext.test/doc"], config, registry, RunLog())
 
     assert not blocklist_path.exists()
+
+
+async def test_two_fetch_pages_calls_through_a_shared_session_construct_the_crawler_once(
+    install_crawler, make_config
+):
+    """R2's actual wiring, pinned end to end (not just in isolation on `BrowserSession` itself,
+    see test_browser.py): a `BrowserSession` threaded through `build_fetch_tool` is reused
+    across two separate `fetch_pages` calls, rather than each call constructing its own
+    crawler via the per-call `async with` branch."""
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test", "https://b.test"])
+    results = [
+        _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="A", fit_markdown="A")),
+        _FakeResult("https://b.test", markdown=_FakeMarkdown(raw_markdown="B", fit_markdown="B")),
+    ]
+    fake_cls = install_crawler(results)
+    session = BrowserSession(config)
+    await session.start()
+    fetch_pages = fetch.build_fetch_tool(config, registry, browser=session)
+
+    first = await fetch_pages.ainvoke(_tool_call(["https://a.test"], "shared-1"))
+    second = await fetch_pages.ainvoke(_tool_call(["https://b.test"], "shared-2"))
+
+    assert len(fake_cls.constructed_with) == 1
+    assert [call.urls for call in fake_cls.calls] == [["https://a.test"], ["https://b.test"]]
+    assert "## [S1] https://a.test" in first.content
+    assert "## [S2] https://b.test" in second.content

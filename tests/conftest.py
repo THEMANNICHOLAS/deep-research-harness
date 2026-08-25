@@ -78,7 +78,9 @@ class _FakePDFContentScrapingStrategy:
 
 
 def _make_fake_crawler_class(
-    results: list[_FakeResult], pdf_results: list[_FakeResult] | None = None
+    results: list[_FakeResult],
+    pdf_results: list[_FakeResult] | None = None,
+    fail_batches: int = 0,
 ) -> type:
     """Build a fake AsyncWebCrawler class recording construction and `arun_many` calls.
 
@@ -87,11 +89,28 @@ def _make_fake_crawler_class(
     passed at construction. `pdf_results` (defaulting to `results`, so existing single-arg
     callers are unaffected) lets a test give the PDF batch its own canned results distinct
     from the Playwright batch's.
+
+    `fail_batches` (default 0, so every existing caller is unaffected) makes the first N calls
+    to `arun_many` — across ALL instances of this class, matching crawl4ai's real dead-handle
+    behavior surfacing on whichever instance is current — raise `RuntimeError` instead of
+    recording/returning anything, for `harness.browser.BrowserSession`'s relaunch path to
+    relaunch from. `start`/`close` are real coroutines (not just `__aenter__`/`__aexit__`) so
+    `BrowserSession` can drive the fake directly; `closed` records each `close()` call.
+
+    `arun_many` yields (`asyncio.sleep`) before doing anything, but ONLY when `fail_batches > 0`:
+    with no real `await` in its body it never actually suspends, so two `asyncio.gather`-driven
+    calls (Phase 1 fix #3's concurrency test) would run one to completion before the other's
+    Task ever got a turn — same reasoning as `ConcurrencyTrackingModel`'s `_sleep_seconds`. Gated
+    to the relaunch scenario alone so the rest of the suite, which never sets `fail_batches`,
+    pays nothing.
     """
 
     class _FakeCrawler:
         constructed_with: list[object] = []
         calls: list[SimpleNamespace] = []
+        closed: list[object] = []
+        _fail_remaining: int = fail_batches
+        _yield_on_call: bool = fail_batches > 0
 
         def __init__(self, config: object = None, crawler_strategy: object = None) -> None:
             _FakeCrawler.constructed_with.append(config)
@@ -103,9 +122,20 @@ def _make_fake_crawler_class(
         async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
             return False
 
+        async def start(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            _FakeCrawler.closed.append(self)
+
         async def arun_many(
             self, urls: list[str], config: object = None, dispatcher: object = None
         ) -> list[_FakeResult]:
+            if _FakeCrawler._yield_on_call:
+                await asyncio.sleep(0.05)
+            if _FakeCrawler._fail_remaining > 0:
+                _FakeCrawler._fail_remaining -= 1
+                raise RuntimeError("crawler handle is dead")
             _FakeCrawler.calls.append(
                 SimpleNamespace(
                     urls=urls, config=config, dispatcher=dispatcher, is_pdf=self._is_pdf
@@ -128,10 +158,19 @@ def install_crawler(monkeypatch):
     and that is where the crawler is actually constructed, so both fetch and fallback
     tests share this one fixture. `_pdf_crawler_parts` is the parallel seam for the PDF
     strategy classes fetch.py's PDF batch constructs.
+
+    Also the fixture `harness.browser.BrowserSession` tests use: it calls the very same
+    `_crawler_class()` seam (see `browser.py`'s module docstring), so `fail_batches` (see
+    `_make_fake_crawler_class`) lets a browser test script a dead-handle relaunch without a
+    second, parallel fixture.
     """
 
-    def _install(results: list[_FakeResult], pdf_results: list[_FakeResult] | None = None) -> type:
-        fake_cls = _make_fake_crawler_class(results, pdf_results)
+    def _install(
+        results: list[_FakeResult],
+        pdf_results: list[_FakeResult] | None = None,
+        fail_batches: int = 0,
+    ) -> type:
+        fake_cls = _make_fake_crawler_class(results, pdf_results, fail_batches)
         monkeypatch.setattr("harness.tools.fetch._crawler_class", lambda: fake_cls)
         monkeypatch.setattr(
             "harness.tools.fetch._pdf_crawler_parts",
@@ -294,6 +333,7 @@ def patch_run(
     *,
     skip_preflight: bool = True,
     run_search_preflight: bool = False,
+    run_browser_preflight: bool = False,
 ) -> None:
     """Patch everything a `main()` test reaches outside the compiled graph.
 
@@ -311,6 +351,13 @@ def patch_run(
     `search_web` and have no transport installed, so it is ALWAYS neutralized here by default
     (regardless of `skip_preflight`). Pass `run_search_preflight=True` to let the real probe run
     instead (install a search transport via `install_search_transport` before calling `main()`).
+
+    The browser preflight (`BrowserSession.start`) is a real Chromium launch, same story: most
+    `main()` tests never fetch anything, so a real browser launch per test is exactly what the
+    fixture-based suite exists to avoid, and it is neutralized here by default too. Pass
+    `run_browser_preflight=True` for a test that asserts something about the browser preflight
+    itself (or installs its own `BrowserSession.start`/`close` patch and needs this one to stay
+    out of the way).
     """
     import harness.__main__ as main_module
 
@@ -332,6 +379,16 @@ def patch_run(
         # by value at module import time (it is cheap, so it stays out of the deferred block),
         # so `harness.tools.search.preflight_search` is not the name `main` calls.
         monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
+    if not run_browser_preflight:
+        from harness.browser import BrowserSession
+
+        async def _noop_browser_start(self: BrowserSession) -> None:
+            return None
+
+        # On the CLASS, not a module attribute: `main_module` holds a module-level reference
+        # to `BrowserSession` itself, so patching the class's method covers every binding
+        # regardless of how it was imported.
+        monkeypatch.setattr(BrowserSession, "start", _noop_browser_start)
     patch_model(monkeypatch, model)
 
 

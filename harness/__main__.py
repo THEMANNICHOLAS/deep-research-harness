@@ -46,6 +46,7 @@ from langchain_core.messages.ai import UsageMetadata, add_usage
 from rich.console import Console, RenderableType
 
 from harness.activity import ActivitySink, DisplayError, brief_summary
+from harness.browser import BrowserPreflightError, BrowserSession
 from harness.config import ConfigError, load_config
 from harness.display import (
     Activity,
@@ -699,6 +700,18 @@ async def main(argv: list[str] | None = None) -> int:
         registry.approve(url)
     run_log = RunLog()
 
+    # After `run_log`, not beside the other preflights above: `BrowserSession` records its OWN
+    # relaunch incident onto it (Phase 1 Discoveries) rather than taking a caller-supplied hook,
+    # so it cannot be constructed any earlier.
+    renderer.emit(Activity("preflight: launching the browser"))
+    browser = BrowserSession(config, run_log)
+    try:
+        await browser.start()
+    except BrowserPreflightError as exc:
+        renderer.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     # Live disclosure (best-effort + disclose): every incident a tool records is echoed to
     # the terminal as soon as the stream yields control back, and `alerts_emitted` keeps a
     # later poll from re-printing what an earlier one already showed.
@@ -803,8 +816,9 @@ async def main(argv: list[str] | None = None) -> int:
     # role through `build_chat_model`, so a missing or TODO role raises `ModelError` here —
     # unhandled it would escape as a traceback under the alternate screen (PR #18 review).
     try:
-        agent = build_agent(config, registry, run_log, sink)
+        agent = build_agent(config, registry, run_log, sink, browser)
     except ModelError as exc:
+        await browser.close()
         renderer.close()
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -1160,6 +1174,7 @@ async def main(argv: list[str] | None = None) -> int:
             )
         )
     finally:
+        await browser.close()
         renderer.close()
     # Error prints belong AFTER close(): under `Live(screen=True)` anything written to the
     # terminal — stderr included, it shares the device — while the Live runs lands on the
