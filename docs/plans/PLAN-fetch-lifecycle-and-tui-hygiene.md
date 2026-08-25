@@ -203,7 +203,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Session browser + Chromium preflight
 - [x] Phase 2: HTTP-first fetch with thin-text escalation
 - [x] Phase 3: TUI alert hygiene
-- [ ] Phase 4: Live source counter
+- [x] Phase 4: Live source counter
 - [ ] Final verification
 
 ## Phases
@@ -387,8 +387,8 @@ run progresses.
 - Attempted/unusable counts. Search-result counts. Report changes.
 
 **Tests (write first, confirm red):**
-- [ ] Count renders and updates in the rich frame; plain renderer prints only on change.
-- [ ] Emission fires when the registry grows, not on every chunk.
+- [x] Count renders and updates in the rich frame; plain renderer prints only on change.
+- [x] Emission fires when the registry grows, not on every chunk.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -396,13 +396,13 @@ run progresses.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] A scripted full-run test shows the counter present alongside alerts/todos (no layout
+- [x] A scripted full-run test shows the counter present alongside alerts/todos (no layout
   regression in existing frame tests).
 
 ## Verification
-- [ ] `uv run pytest` — full suite green.
-- [ ] `uv run ruff check .` && `uv run ruff format --check .`
-- [ ] `uv run mypy .`
+- [x] `uv run pytest` — full suite green (826).
+- [x] `uv run ruff check .` && `uv run ruff format --check .`
+- [x] `uv run mypy .`
 - [ ] Manual (homelab, post-merge): one live run — startup shows the Chromium preflight
   passing; a research question completes with the alert window bounded and the source
   counter climbing; kill the Chromium process mid-run once and observe disclose+relaunch.
@@ -564,6 +564,50 @@ NOTE for anyone probing this again — a bare `console.print(Text(..., no_wrap=T
 reproduce it, because `Console.print` resets `no_wrap` from its own render options; the
 attribute is only honored when the `Text` is rendered inside a Group, which is the frame path.
 
+2026-08-25 — Phase 4: the phase's `**Files:**` names `tests/test_agent.py` for emission
+coverage, but that file contains zero `TodosUpdated`/`RoundsUpdated` references — every
+display-event test in the repo, including the full scripted `main_module.main` runs, lives in
+`tests/test_display.py`. Following the file list literally would have put a lone display test in
+a file with no such neighbours, against CLAUDE.md's "match the patterns of neighboring files".
+→ ACTED NOW (developer, at the 3C gate): all Phase 4 display/emission tests went to
+`tests/test_display.py` and the registry test to `tests/test_sources.py`; `tests/test_agent.py`
+was not touched. Four files changed, not the five the plan predicted.
+
+2026-08-25 — Phase 4: `__main__._sources_read`'s docstring claims "a URL is registered the
+moment it is seen in search results, so the raw count would climb far ahead of anything actually
+fetched and read". That is STALE and misleading: `registry.add` has exactly two call sites
+(`harness/tools/fetch.py:652`, `:723`), both gated `if outcome == "fetched"` — what happens on a
+search result is `approve`, not `add`. The claim matters because it is the stated reason
+`_sources_read` counts `read_mode != "unread"` instead of `len(registry.all())`, and it would
+mislead the next reader of D5's counter semantics into thinking the two differ far more than
+they do. → REPORTED, NOT FIXED: `_sources_read` is outside Phase 4's scope and CLAUDE.md forbids
+editing comments on code this phase did not change. Correcting the docstring is a one-line
+follow-up for whoever next touches that function.
+
+2026-08-25 — Phase 4: two of the phase's own new tests were green without testing what they
+claimed, both found by the 3F review and both verified against the code before acting. (1)
+`test_the_source_count_survives_the_ask_user_overlay` — written specifically to guard Phase 3's
+flagged two-`Group(...)`-site hazard — asserted `"sources: 4"` against the WHOLE cumulative
+buffer, but the `SourcesUpdated(4)` frame painted before the `Question` already contained that
+text, so the test passed even with the counter in the non-overlay branch alone. (2) the
+acceptance-criterion full-run test asserted the todo, the warnings total and the counter against
+the cumulative buffer, establishing "each appeared at some point" rather than the "alongside"
+the criterion states. → ACTED NOW (developer): (1) now slices the single frame the overlay
+paints, following the pattern `test_overlay_retracts_on_question_answered` documents; (2) split
+in two — the full-run test keeps the cumulative assert with a comment stating it proves REACH
+only (it cannot prove one-frame coexistence, because `RunFinished` stops the Live and nulls
+`_live` before the run returns), and a new direct
+`test_the_counter_shares_one_frame_with_the_alert_total_and_todos` proves the layout half.
+Both repairs were confirmed non-vacuous by sabotage: dropping the counter from the overlay
+branch alone turns (1) red, and removing the counter line entirely turns (2) red.
+
+2026-08-25 — Phase 4: a test-construction trap in `tests/conftest.py`, hit while building the
+change-gated emission test. `_pair` matches a fake crawl result to a URL by the fake's own
+`.url` attribute, NOT by call position, so reusing one shared `_FakeResult` across two different
+fetched URLs silently yields "no result returned for this URL" for the second. Not a product
+bug — but it fails in a way that reads like a fetch-pipeline problem rather than a fixture
+problem. → REPORTED, no action: worth knowing before writing the next multi-URL fetch test.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
@@ -645,3 +689,31 @@ never add a section below it. -->
   line must be added to both or it will silently vanish whenever the `ask_user` overlay is up.
   Phase 4 is also the natural home for the non-disclosure signal channel deferred in Phase
   2's second Discovery, since it is already adding an event emitted from `__main__`'s poll.
+
+### 2026-08-25 — Phase 4: Live source counter
+- Done: `SourcesUpdated(count: int)` frozen event + `DisplayEvent` union member in
+  `harness/display.py`; `SourceRegistry.count()` in `harness/sources.py`; `RichRenderer`
+  `_source_count` state starting at 0 with the `sources: {n}` line appended to the single
+  `status_part` list (renamed from `alert_part`) splatted at BOTH `_build_activity_group`
+  returns; an explicit `PlainRenderer` branch before the `Activity` fallthrough; and a
+  change-gated `_emit_source_count()` closure called at all three `_emit_new_alerts()` sites in
+  `__main__`. 826 tests pass; ruff/format/mypy clean; coverage 96%. One 3F Major (a vacuous
+  guard test) and one Minor fixed before commit.
+- Learned: (1) `PlainRenderer.emit` ends in `else:  # Activity` and reads `event.text`, so a new
+  event type WITHOUT its own branch is an `AttributeError` at runtime, not a silent no-op —
+  every new `DisplayEvent` must add a branch there. (2) Any assertion about a `RichRenderer`
+  frame must slice `buffer.getvalue()[before:]`; under `screen=True` every frame repeats
+  whatever is still current, so a cumulative-buffer assert cannot distinguish "in this frame"
+  from "in some earlier frame" — this is exactly how the two-site guard test came out vacuous.
+  (3) `RunFinished` stops the Live and sets `_live = None` BEFORE printing the summary, so no
+  frame can be repainted after `main()` returns — a full-run test can prove an event reached the
+  renderer but cannot prove one-frame layout. (4) The counter's placement in a single
+  `status_part` list, rather than at each `Group(...)` call, is what makes the two-site hazard
+  structurally impossible to reintroduce; keep any future persistent line in that same list.
+- Drift: none. Four `## Discoveries` (test placement and the two vacuous tests acted now; the
+  stale `_sources_read` docstring and the `conftest._pair` trap reported only).
+- Watch-next: all four phases are committed, so what is left is the plan's `## Verification`
+  manual homelab step — one live run confirming the Chromium preflight, a bounded alert window,
+  the counter climbing, and disclose+relaunch after killing Chromium mid-run. That run is also
+  what validates `min_markdown_words = 50` (risk #3) and the Phase 2 escalation rate. Nothing
+  in the code is waiting on it.

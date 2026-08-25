@@ -323,6 +323,13 @@ class SourceRegistry:
         """Return every registered source, in insertion order."""
         return list(self._by_id.values())
 
+    def count(self) -> int:
+        """How many sources are registered -- one per `[Sn]` minted (R5's live counter).
+
+        Cheaper than `len(self.all())`, which materializes a list on every poll.
+        """
+        return len(self._by_id)
+
     def link(self, source_id: str) -> str:
         """Render `source_id` as a `[domain](url)` link; `KeyError` if unregistered.
 

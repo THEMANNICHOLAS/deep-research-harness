@@ -59,6 +59,7 @@ from harness.display import (
     Renderer,
     RoundsUpdated,
     RunFinished,
+    SourcesUpdated,
     StageTracker,
     TodoItem,
     TodosUpdated,
@@ -724,6 +725,24 @@ async def main(argv: list[str] | None = None) -> int:
             renderer.emit(Alert(incident.detail))
         alerts_emitted = len(incidents)
 
+    # R5's live counter: registered sources = `[Sn]` minted (`registry.add` is gated
+    # `if outcome == "fetched"`, so a registered source is by construction a successfully
+    # fetched one). Dedupe variable initialized to 0 so a run that registers no sources
+    # emits nothing.
+    last_source_count = 0
+
+    def _emit_source_count() -> None:
+        """Emit the live source counter (R5), but only when it actually changed.
+
+        Change-gated like `last_todos`: the poll runs per stream chunk, and a repeated
+        identical count would repaint the frame and spam the non-TTY log for nothing.
+        """
+        nonlocal last_source_count
+        count = registry.count()
+        if count != last_source_count:
+            renderer.emit(SourcesUpdated(count))
+            last_source_count = count
+
     # Fix-pass item 1: `ActivitySink` PUSHES via `on_change` rather than being drained from the
     # stream loop -- the middleware writes from inside the lead's `task` tool NODE, and one node
     # is one superstep, so no top-level `astream` chunk arrives until the whole
@@ -971,6 +990,7 @@ async def main(argv: list[str] | None = None) -> int:
                             # here (fix-pass item 1): `_on_activity_change` pushes them the
                             # instant the sink changes, from inside the tool dispatch itself.
                             _emit_new_alerts()
+                            _emit_source_count()
                             if (
                                 overrun
                                 or (cap_hit and not awaiting_tool_ids)
@@ -1055,6 +1075,7 @@ async def main(argv: list[str] | None = None) -> int:
                                     final_state = chunk
                                 else:
                                     _emit_new_alerts()
+                                    _emit_source_count()
                 break
     except TimeoutError as exc:
         # `clock.expired()`, not a bare `except TimeoutError`: a timeout raised INSIDE the
@@ -1089,6 +1110,7 @@ async def main(argv: list[str] | None = None) -> int:
     # One last poll: the final tool executions (or a cut-short pass) may have recorded
     # incidents after the last updates chunk was handled.
     _emit_new_alerts()
+    _emit_source_count()
 
     messages: list[BaseMessage] = final_state["messages"] if final_state else []
     usage = _sum_usage(messages)

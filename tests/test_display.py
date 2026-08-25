@@ -42,12 +42,15 @@ from harness.display import (
 )
 from harness.sources import SourceRegistry
 from tests.conftest import (
+    _FakeMarkdown,
+    _FakeResult,
     drain_stdout,
     install_search_transport,
     patch_run,
     verify_reply,
     write_source_capture,
 )
+from tests.test_agent import _reader_fetch_call, _task_call
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
@@ -467,6 +470,100 @@ async def test_todos_meta_refreshes_on_live_reader_count_change_and_only_then(
     # meta -- proof the refresh is driven by the sink's live-reader count, not by a change to
     # the todos themselves (there is only ever one `write_todos` call in this script).
     assert metas[-1] != "1 in flight"
+
+
+async def test_the_source_count_is_emitted_only_when_the_registry_grows(
+    make_config, monkeypatch, scripted_model, install_crawler
+):
+    """A full 3-tier run (lead -> researcher -> reader, twice, each fetching a real page)
+    registers a source at two DIFFERENT points in the stream -- proves `_emit_source_count`
+    (Contracts) is change-gated, not a per-chunk poll. Template: the 3-tier single-shared-
+    model script `test_todos_meta_refreshes_on_live_reader_count_change_and_only_then` uses
+    above, and the real-source registration `test_the_summary_counts_real_usable_and_unusable
+    _sources` (~line 1421) uses, but here through the real `fetch_pages` tool so the registry
+    actually grows mid-run rather than being pre-populated.
+    """
+    config = make_config()
+    model = scripted_model(
+        [
+            _task_call("Investigate angle A", call_id="call_r1", subagent_type="researcher"),
+            _task_call(
+                "Fetch and digest https://a.test", call_id="call_reader_a", subagent_type="reader"
+            ),
+            _reader_fetch_call("https://a.test"),
+            AIMessage(content="Digest A."),
+            AIMessage(content="Researcher A report: finding confirmed."),
+            _task_call("Investigate angle B", call_id="call_r2", subagent_type="researcher"),
+            _task_call(
+                "Fetch and digest https://b.test", call_id="call_reader_b", subagent_type="reader"
+            ),
+            # Not `_reader_fetch_call` (hardcodes id="call_fetch", already used for a.test's
+            # fetch above -- a REUSED tool-call id across two different dispatches, sharing one
+            # thread, corrupted the graph's message history and silently broke this fetch).
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "fetch_pages",
+                        "args": {"urls": ["https://b.test"]},
+                        "id": "call_fetch_b",
+                    }
+                ],
+            ),
+            AIMessage(content="Digest B."),
+            AIMessage(content="Researcher B report: finding confirmed."),
+            AIMessage(
+                content="Final answer summarizing both pages.",
+                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            ),
+        ]
+    )
+    # `_pair` (fetch.py) matches a result to its URL by the result's OWN `.url` attribute, not
+    # by position -- one result per URL, or the second fetch pairs with nothing and reads as
+    # "no result returned for this URL".
+    install_crawler(
+        [
+            _FakeResult(
+                "https://a.test",
+                markdown=_FakeMarkdown(raw_markdown="A body", fit_markdown="A body"),
+            ),
+            _FakeResult(
+                "https://b.test",
+                markdown=_FakeMarkdown(raw_markdown="B body", fit_markdown="B body"),
+            ),
+        ]
+    )
+    # A real (not no-op'd) browser preflight: it constructs its warm crawler through the very
+    # same `_crawler_class()` seam `install_crawler` just faked, which is what makes the
+    # HTTP-first fetch below actually succeed instead of failing with no browser to escalate to.
+    patch_run(monkeypatch, config, model, run_browser_preflight=True)
+
+    # Counts every `SourceRegistry.count()` call regardless of instance -- `main()` builds its
+    # own registry internally, so there is no instance to wrap directly. This is the exact
+    # count of `_emit_source_count()` invocations, i.e. of relevant stream chunks polled.
+    poll_calls = 0
+    original_count = SourceRegistry.count
+
+    def _counting_count(self: SourceRegistry) -> int:
+        nonlocal poll_calls
+        poll_calls += 1
+        return original_count(self)
+
+    monkeypatch.setattr(SourceRegistry, "count", _counting_count)
+
+    recorder = _RecordingRenderer()
+    monkeypatch.setattr(main_module, "build_renderer", lambda: recorder)
+
+    # Pasted URLs are the sanctioned pre-approval route (R2) -- no `search_web` call needed.
+    await main_module.main(["Please read https://a.test and https://b.test and summarize"])
+
+    counts = [
+        event.count
+        for event in recorder.events
+        if isinstance(event, harness.display.SourcesUpdated)
+    ]
+    assert counts == [1, 2]
+    assert len(counts) < poll_calls
 
 
 # --- RichRenderer tests -------------------------------------------------------------------
@@ -1054,6 +1151,58 @@ def test_rich_renderer_stage_line_shows_round_after_rounds_updated():
     renderer.close()
 
     assert "04:12 · round 9/50" in frame
+
+
+# --- Phase 4 (fetch lifecycle and TUI hygiene): live source counter (R5, D5) -------------
+
+
+def test_rich_renderer_frame_shows_the_source_count():
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(harness.display.SourcesUpdated(7))
+    frame = _strip_ansi(buffer.getvalue())
+
+    assert "sources: 7" in frame
+
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.SourcesUpdated(9))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    # A replacement, not an accumulating log -- the new frame carries only the new count.
+    assert "sources: 9" in frame
+    assert "sources: 7" not in frame
+
+
+def test_the_source_count_survives_the_ask_user_overlay():
+    """`_build_activity_group` returns from TWO `Group(...)` sites (the overlay branch and
+    the normal branch) -- this fails if the counter line is added to only one of them.
+    """
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(harness.display.SourcesUpdated(4))
+    # Slice to the single frame the overlay itself paints, not the cumulative buffer: the
+    # `SourcesUpdated(4)` frame above already carries "sources: 4", so a whole-buffer assert
+    # would pass even with the counter appended to the non-overlay branch alone -- exactly
+    # the bug this test exists to catch. Same pattern as
+    # `test_overlay_retracts_on_question_answered`.
+    before = len(buffer.getvalue())
+    renderer.emit(Question("Which region?"))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "sources: 4" in frame
+
+
+def test_plain_renderer_prints_the_source_count(capsys):
+    renderer = PlainRenderer()
+
+    renderer.emit(harness.display.SourcesUpdated(3))
+
+    out, lines = drain_stdout(capsys)
+    assert any("sources: 3" in line for line in lines)
 
 
 def test_rich_renderer_elapsed_advances_on_refresh_without_any_new_event():
@@ -1738,6 +1887,96 @@ async def test_a_dead_search_backend_is_disclosed_on_the_terminal_and_in_the_rep
     assert "## Gaps and disclosures" in body
     assert "Tool failures during the run:" in body
     assert "unreachable" in body
+
+
+async def test_a_full_run_frame_shows_the_counter_alongside_alerts_and_todos(
+    make_config, monkeypatch, scripted_model
+):
+    """The phase's acceptance criterion (R5): the todo checklist, the R4 alert total, and the
+    new R5 source counter all coexist in the same frame -- no layout regression from adding
+    the third. Template: the dead-search-backend test above, plus a pre-populated registry
+    (the `SourceRegistry` injection `test_the_summary_counts_real_usable_and_unusable_sources`
+    uses) standing in for a real fetch.
+    """
+    config = make_config()
+
+    registry = SourceRegistry(run_id="2020-01-01-000000")
+    registry.add("https://example.test/pricing", title="Pricing")
+    monkeypatch.setattr(main_module, "SourceRegistry", lambda run_id: registry)
+
+    todos_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_todos",
+                "args": {"todos": [{"content": "Find sources", "status": "pending"}]},
+                "id": "call_todos",
+            }
+        ],
+    )
+    task_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": "Search for the answer", "subagent_type": "researcher"},
+                "id": "call_task",
+            }
+        ],
+    )
+    search_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_web", "args": {"query": "the answer"}, "id": "call_search"}],
+    )
+    researcher_report = AIMessage(content="Researcher report: no sources found.")
+    final = AIMessage(
+        content="Best-effort answer.",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    model = scripted_model([todos_call, task_call, search_call, researcher_report, final])
+    patch_run(monkeypatch, config, model)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    install_search_transport(monkeypatch, handler)
+
+    renderer, buffer = _rich_renderer()
+    monkeypatch.setattr(main_module, "build_renderer", lambda: renderer)
+
+    await main_module.main(["a question needing research"])
+
+    # The cumulative buffer, deliberately: this test's claim is that all three reach the
+    # renderer in a REAL run. It cannot claim they share one frame -- `RunFinished` stops
+    # the Live and nulls `_live`, so no frame can be repainted afterwards to check. The
+    # one-frame coexistence half of the acceptance criterion is
+    # `test_the_counter_shares_one_frame_with_the_alert_total_and_todos` below.
+    text = _strip_ansi(buffer.getvalue())
+
+    assert "Find sources" in text
+    assert "warnings: 1 this run - full list in report" in text
+    assert "sources: 1" in text
+
+
+def test_the_counter_shares_one_frame_with_the_alert_total_and_todos():
+    """The layout half of Phase 4's acceptance criterion: counter present ALONGSIDE the
+    alert total and the checklist, in a single painted frame -- not merely somewhere in the
+    cumulative buffer. Fails if a new persistent line displaces either of the others.
+    """
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(TodosUpdated((TodoItem(content="Find sources", status="in_progress"),)))
+    renderer.emit(Alert("fetch failed for https://a.test"))
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.SourcesUpdated(1))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "Find sources" in frame
+    assert "fetch failed for https://a.test" in frame
+    assert "warnings: 1 this run - full list in report" in frame
+    assert "sources: 1" in frame
 
 
 # --- Phase 6: structured tool-call log + reader-strip visibility hook --------------------

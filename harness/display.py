@@ -47,6 +47,17 @@ class RoundsUpdated:
 
 
 @dataclass(frozen=True)
+class SourcesUpdated:
+    """The count of registered sources (`[Sn]` minted) -- a replacement, not a delta (R5).
+
+    Separate from `RunFinished`'s end-of-run totals: this is the LIVE counter, polled from
+    `__main__` while the run is still going.
+    """
+
+    count: int
+
+
+@dataclass(frozen=True)
 class Activity:
     text: str
 
@@ -154,6 +165,7 @@ DisplayEvent = (
     | RoundsUpdated
     | ToolCall
     | ReadersUpdated
+    | SourcesUpdated
 )
 
 
@@ -301,6 +313,8 @@ class PlainRenderer:
             # the reader strip is pure live-frame decoration, presence-only, and a line per
             # status tick would flood a non-TTY log.
             pass
+        elif isinstance(event, SourcesUpdated):
+            out(f"sources: {event.count}")
         else:  # Activity
             out(f"  {event.text}")
 
@@ -475,6 +489,9 @@ class RichRenderer:
         # per-stage timings are already shown in the completed-stage timeline (Step 3).
         self._started_at = self._elapsed.now()
         self._rounds: tuple[int, int] | None = None
+        # Starts at 0, not `None` (R5): the counter is in the frame from the first render,
+        # not only after the first source lands.
+        self._source_count: int = 0
 
     def _build_checklist(self) -> Group:
         heading = Text("Tasks", style=f"bold {_ACCENT_2}")
@@ -591,19 +608,22 @@ class RichRenderer:
         # R4: the rolling window plus a running total, shown whenever any alert has fired --
         # not only once eviction starts (D4's example line reads that way, and one steady
         # line is not the flood R3/R4 exist to prevent).
-        alert_part: list[Text] = list(self._alerts)
+        status_part: list[Text] = list(self._alerts)
         if self._alert_count:
-            alert_part.append(
+            status_part.append(
                 Text(
                     f"warnings: {self._alert_count} this run - full list in report",
                     style="yellow",
                 )
             )
+        # R5: the live source counter, always present -- placed AFTER the warnings total so
+        # the alert window stays adjacent to the timeline above it.
+        status_part.append(Text(f"sources: {self._source_count}", style=_MUTED))
         if self._overlay_question is not None:
             # The overlay REPLACES the activity lines only -- the checklist (outside this
             # panel), the timeline, the stage header, and the reader strip all stay visible (R4).
             return Group(
-                *self._timeline, *alert_part, header, *strip_part, self._build_ask_overlay()
+                *self._timeline, *status_part, header, *strip_part, self._build_ask_overlay()
             )
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
         log = self._build_tool_log()
@@ -611,7 +631,7 @@ class RichRenderer:
             *activity_lines,
             *((log,) if log is not None else ()),
         )
-        return Group(*self._timeline, *alert_part, header, *strip_part, *log_or_activity)
+        return Group(*self._timeline, *status_part, header, *strip_part, *log_or_activity)
 
     def _build_renderable(self) -> Group:
         return Group(
@@ -736,6 +756,12 @@ class RichRenderer:
             # own — it only repaints an already-running frame, since a round only advances
             # once a stage (and so the frame) exists.
             self._rounds = (event.rounds_used, event.max_rounds)
+            if self._live is not None:
+                self._live.refresh()
+        elif isinstance(event, SourcesUpdated):
+            # Same policy as `RoundsUpdated`: pure decoration of an already-running frame,
+            # never starts the Live region on its own.
+            self._source_count = event.count
             if self._live is not None:
                 self._live.refresh()
         elif isinstance(event, ToolCall):
