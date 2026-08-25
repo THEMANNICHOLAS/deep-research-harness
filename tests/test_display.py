@@ -1503,12 +1503,186 @@ async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
 
 
 @pytest.mark.parametrize("kind", ["plain", "rich"])
-def test_alert_renders_as_a_persistent_warning_line(kind, capsys):
+def test_alert_renders_as_a_bounded_warning_line(kind, capsys):
+    """Renamed from `..._as_a_persistent_warning_line` (D4): alerts are no longer persistent
+    in the live TUI — the rolling window evicts them. A short detail still renders verbatim;
+    the window/total behavior is pinned by the eviction test below."""
     event = Alert('search for "solar" failed: unreachable')
 
     lines = _render_lines(kind, event, capsys)
 
     assert any('warning: search for "solar" failed: unreachable' in line for line in lines)
+
+
+@pytest.mark.parametrize("kind", ["plain", "rich"])
+def test_alert_with_a_crawl4ai_shaped_dump_renders_as_one_capped_line(kind, capsys):
+    """R3/D3: a multi-line upstream dump collapses to exactly one bounded line, and nothing
+    past the first source line leaks into the output — a length check alone would also pass
+    on a helper that wrapped instead of cutting, so this pins the cut itself."""
+    leak_token = "SHOULD_NOT_APPEAR_BEYOND_FIRST_LINE"
+    trailing_lines = [
+        f"{leak_token} call log line {i} with padding to make this realistically long"
+        for i in range(20)
+    ]
+    detail = "\n".join(["fetch failed for https://example.com/report"] + trailing_lines)
+    event = Alert(detail)
+
+    lines = _render_lines(kind, event, capsys)
+
+    warning_lines = [line for line in lines if "warning:" in line]
+    assert len(warning_lines) == 1
+    assert len(warning_lines[0]) <= harness.display._ALERT_MAX_CHARS + len("warning: ")
+    assert leak_token not in "\n".join(lines)
+
+
+def test_bound_alert_truncates_an_enormous_single_line_at_the_cap():
+    """The cap branch itself (PR review, Phase 3). The multi-line test above cannot reach it:
+    its first source line is well under the cap, so its length assertion passes vacuously and
+    an off-by-one or a dropped `.rstrip()` in the truncation would go unnoticed."""
+    cap = harness.display._ALERT_MAX_CHARS
+    tail = "TAIL_PAST_THE_CAP"
+    detail = "E " + ("x" * (cap * 3)) + tail
+
+    bounded = harness.display._bound_alert(detail)
+
+    assert len(bounded) == cap
+    assert bounded.endswith("...")
+    assert tail not in bounded
+    # One char under the cap is returned untouched -- pins the boundary from the other side.
+    assert harness.display._bound_alert("y" * (cap - 1)) == "y" * (cap - 1)
+    assert harness.display._bound_alert("y" * cap) == "y" * cap
+
+
+def test_a_long_alert_occupies_one_row_inside_the_live_frame_on_a_narrow_terminal():
+    """R3 literally, and the reason `no_wrap`/`overflow="ellipsis"` are set (PR review).
+
+    The parametrized test above renders the `rich` arm through the no-Live fallback
+    (`_console.print`), never the windowed in-frame group, so nothing there pins the one-ROW
+    property. A 40-column console makes wrapping visible: the char cap alone would spill a
+    capped line across two rows.
+    """
+    console, buffer = _make_console(width=40)
+    renderer = RichRenderer(console=console, auto_refresh=False)
+    renderer.emit(StageStarted("researching"))
+    detail = "fetch failed for https://example.com/a-very-long-path-that-keeps-going-and-going"
+    before = len(buffer.getvalue())
+
+    renderer.emit(Alert(detail))
+
+    frame_lines = _strip_ansi(buffer.getvalue()[before:]).splitlines()
+    warning_rows = [line for line in frame_lines if "warning:" in line]
+    assert len(warning_rows) == 1
+    # The tail must be truncated away, not wrapped onto a following row.
+    assert not any("keeps-going" in line for line in frame_lines)
+    renderer.close()
+
+
+def test_rich_renderer_alert_window_evicts_the_oldest_and_the_running_total_counts_all(capsys):
+    renderer, buffer = _rich_renderer()
+    # A stage must be running for alerts to render inside the live frame (where the window
+    # and total line live) rather than print straight to the normal terminal.
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(Alert("alert one"))
+    renderer.emit(Alert("alert two"))
+    renderer.emit(Alert("alert three"))
+    before = len(buffer.getvalue())
+    renderer.emit(Alert("alert four"))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+
+    assert "alert one" not in frame
+    assert "alert two" in frame
+    assert "alert three" in frame
+    assert "alert four" in frame
+    assert "warnings: 4 this run" in frame
+    renderer.close()  # releases Live's stdout redirect before the plain renderer prints below
+
+    plain_renderer = PlainRenderer()
+    for text in ["alert one", "alert two", "alert three", "alert four"]:
+        plain_renderer.emit(Alert(text))
+    _, plain_lines = drain_stdout(capsys)
+    for text in ["alert one", "alert two", "alert three", "alert four"]:
+        assert any(text in line for line in plain_lines)
+
+
+def test_run_finished_summary_reports_the_full_incident_count_past_the_alert_window():
+    renderer, buffer = _rich_renderer()
+    for i in range(5):
+        renderer.emit(Alert(f"alert {i}"))
+    event = RunFinished(
+        stage_timings=(),
+        usable_sources=1,
+        unusable_sources=0,
+        cut_short=None,
+        verification_failures=0,
+        incidents=5,
+    )
+
+    renderer.emit(event)
+
+    text = _strip_ansi(buffer.getvalue())
+    assert "  tool failures: 5" in text
+
+
+def test_plain_renderer_alert_survives_a_non_cp1252_character_on_a_cp1252_stream(monkeypatch):
+    """LATER-PROBLEMS.md: redirected stdout on Windows is cp1252, and one non-ASCII byte in
+    an upstream error string used to raise `UnicodeEncodeError` out of `emit` and abort the
+    whole run. A `TextIOWrapper` over `BytesIO` with `encoding="cp1252", errors="strict"`
+    reproduces the real failure mode -- confirmed below to raise without the fix."""
+    import io
+
+    raw = io.BytesIO()
+    cp1252_stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+    non_cp1252_char = "中"  # a CJK character: not in cp1252's repertoire
+    monkeypatch.setattr(sys, "stdout", cp1252_stream)
+
+    with pytest.raises(UnicodeEncodeError):
+        print(f"warning: {non_cp1252_char}", file=cp1252_stream)
+
+    renderer = PlainRenderer()
+    renderer.emit(Alert(f"fetch failed: {non_cp1252_char}"))
+    cp1252_stream.flush()
+
+    raw.seek(0)
+    written = raw.read().decode("cp1252")
+    assert "warning:" in written
+    assert non_cp1252_char not in written
+
+
+def test_plain_renderer_survives_a_non_cp1252_character_on_every_branch(monkeypatch):
+    """PR review, Phase 3: the alert path was never the only exposure.
+
+    `ToolCall.result_summary` comes from fetched page content and `Activity.text` from
+    model-authored prose, so both carry arbitrary web Unicode — and both were bare-printed.
+    The fix moved to `emit`'s single `out()` boundary, so this pins the whole class rather
+    than one branch; a future branch that prints directly would fail here.
+    """
+    import io
+
+    cjk = "中"  # not in cp1252's repertoire
+    events = [
+        StageStarted(f"researching {cjk}"),
+        Activity(f"reading {cjk}"),
+        ToolCall(
+            call_id="c1",
+            tool="fetch_pages",
+            arg_summary=f"https://example.com/{cjk}",
+            result_summary=f"digested {cjk}",
+        ),
+        Alert(f"fetch failed: {cjk}"),
+    ]
+
+    for event in events:
+        raw = io.BytesIO()
+        cp1252_stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+        monkeypatch.setattr(sys, "stdout", cp1252_stream)
+
+        PlainRenderer().emit(event)  # must not raise
+
+        cp1252_stream.flush()
+        raw.seek(0)
+        written = raw.read().decode("cp1252")
+        assert cjk not in written
+        assert written.strip(), f"{type(event).__name__} printed nothing at all"
 
 
 async def test_a_dead_search_backend_is_disclosed_on_the_terminal_and_in_the_report(

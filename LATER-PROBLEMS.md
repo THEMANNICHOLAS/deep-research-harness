@@ -176,6 +176,17 @@ entries and for `Verdict: not verified` lines in the first real report.
 
 ## A non-ASCII character in an incident detail aborts the whole run on Windows
 
+**Resolved:** by `PLAN-fetch-lifecycle-and-tui-hygiene.md` Phase 3. `harness/display.py`'s
+`_encodable` round-trips text through the destination stream's own encoding with
+`errors="replace"`, applied at `PlainRenderer.emit`'s single `out()` write boundary — so
+EVERY branch is covered, not only `Alert`. That width was the PR review's finding: the alert
+path was never the only exposure. `ToolCall.result_summary` is derived from fetched page
+content and `Activity.text` from model-authored prose, so both carry arbitrary web Unicode
+(the ellipsis in those summaries is a red herring — U+2026 is cp1252 byte 0x85 and encodes
+fine; CJK and arrows are what crash). A cp1252 stream now renders a replacement character
+instead of raising, on any line. `RichRenderer` is unchanged: it is the TTY path, whose
+stream is UTF-8 capable, and it writes through `rich.Console` rather than this boundary.
+
 **What is wrong:** `harness/display.py`'s `emit` writes incidents with a bare
 `print(..., file=stream)`. When stdout is redirected on Windows the stream encoding is
 cp1252, so the first incident detail carrying a non-ASCII character raises

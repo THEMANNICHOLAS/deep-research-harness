@@ -202,7 +202,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 - [x] Phase 1: Session browser + Chromium preflight
 - [x] Phase 2: HTTP-first fetch with thin-text escalation
-- [ ] Phase 3: TUI alert hygiene
+- [x] Phase 3: TUI alert hygiene
 - [ ] Phase 4: Live source counter
 - [ ] Final verification
 
@@ -344,12 +344,12 @@ a Windows run.
   not modified. Timeline rendering.
 
 **Tests (write first, confirm red):**
-- [ ] A multi-line alert (real crawl4ai-shaped dump) renders as exactly one capped line in
+- [x] A multi-line alert (real crawl4ai-shaped dump) renders as exactly one capped line in
   both renderers.
-- [ ] A 4th alert evicts the 1st; the running total still counts all 4.
-- [ ] The full incident list still reaches the `RunFinished` summary count and (existing
+- [x] A 4th alert evicts the 1st; the running total still counts all 4.
+- [x] The full incident list still reaches the `RunFinished` summary count and (existing
   test) the report gaps section — unchanged.
-- [ ] An alert containing a non-cp1252 character renders (replaced) instead of raising on a
+- [x] An alert containing a non-cp1252 character renders (replaced) instead of raising on a
   cp1252-encoding stream.
 
 **Steps:**
@@ -358,7 +358,7 @@ a Windows run.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] LATER-PROBLEMS.md entry for the Windows abort updated to resolved-by-this-change.
+- [x] LATER-PROBLEMS.md entry for the Windows abort updated to resolved-by-this-change.
 
 ### Phase 4: Live source counter
 **Risk:** none
@@ -535,6 +535,35 @@ the no-incident decision). The SIGNAL half is DEFERRED — it needs a non-disclo
 threaded into `_fetch`, which is a larger change than this phase, and Phase 3/4 both touch the
 display layer where such a channel would naturally live.
 
+2026-08-25 — Phase 3: the phase's `## Out of scope` says `PlainRenderer` "gets only the one-line
+bound + encoding fix" without saying WHICH branches the encoding fix covers. The Phase 3 impl
+plan narrowed it to the `Alert` branch on the premise that every other branch "prints our own
+strings" — that premise is FALSE. `ToolCall.result_summary` is built by
+`agent._summarize_tool_result` from fetched page content, and `Activity.text` by
+`activity.brief_summary` from model-authored prose; both are bare-printed, so a redirected
+Windows run still aborted on any page carrying CJK, an arrow, or anything else outside cp1252.
+Worth recording precisely because the near-miss was subtle: the PR review blamed the U+2026
+ellipsis those two summarizers append, but U+2026 IS cp1252 (byte 0x85) and encodes fine — the
+crash comes from arbitrary web Unicode in the summarized text, not from the truncation marker.
+→ ACTED NOW (developer): `_encodable` moved to a single `out()` write boundary inside
+`PlainRenderer.emit`, so every branch is covered and a future branch cannot reintroduce the
+crash by printing directly. `LATER-PROBLEMS.md`'s resolved note states that width, and a
+regression test walks every event type through a strict cp1252 stream. `RichRenderer` is
+deliberately untouched: it is the TTY path (UTF-8 capable) and writes via `rich.Console`.
+
+2026-08-25 — Phase 3: two tests were passing without testing anything, both found by the PR
+review. (1) The R3 multi-line test's char-cap assertion was vacuous — its first source line is
+43 characters, well under the 120 cap, so an off-by-one or a dropped `.rstrip()` in the
+truncation would not have failed it. (2) The same test's `rich` arm renders through the
+no-Live `_console.print` fallback, never the windowed in-frame group, so nothing pinned the
+`no_wrap`/`overflow="ellipsis"` one-ROW property those kwargs exist for. → ACTED NOW: a direct
+`_bound_alert` cap test (asserting the exact cap length, the `...` marker, and both sides of
+the boundary) and a 40-column in-frame test. Verified the second is not itself vacuous by
+dumping the real frame: `warning: fetch failed for https://e…` on one row inside the Panel.
+NOTE for anyone probing this again — a bare `console.print(Text(..., no_wrap=True))` does NOT
+reproduce it, because `Console.print` resets `no_wrap` from its own render options; the
+attribute is only honored when the `Text` is rendered inside a Group, which is the frame path.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
@@ -588,3 +617,31 @@ never add a section below it. -->
   the deferred half of the second Discovery becomes nearly free. Also note `min_markdown_words
   = 50` is an unvalidated guess (risk #3): the manual homelab run in `## Verification` is what
   confirms the escalation rate before anyone tunes it.
+
+### 2026-08-25 — Phase 3: TUI alert hygiene
+- Done: `_bound_alert` (first line, 120-char cap, `strip_invisibles`) and `_encodable`
+  (round-trip through the stream's own encoding, `errors="replace"`) in `harness/display.py`;
+  `RichRenderer._alerts` is a `deque(maxlen=3)` with a separate `_alert_count` running total
+  rendered as one line; `Alert`'s docstring contract rewritten from PERSISTENT to EPHEMERAL.
+  Plus the PR-review widening: `_encodable` applied at `PlainRenderer.emit`'s single `out()`
+  boundary rather than the `Alert` branch alone. 819 tests pass; ruff/format/mypy clean;
+  `display.py` at 99% coverage.
+- Learned: (1) U+2026 and the em dash ARE in cp1252 (bytes 0x85/0x97) — the characters that
+  actually crash a redirected Windows run are CJK, arrows, and the like. Do not assume a
+  "smart punctuation" character is the culprit in an encoding crash. (2) Rich honors a
+  `Text`'s `no_wrap`/`overflow` only when it is rendered inside a Group; `Console.print`
+  resets them from its own render options, so a bare-print probe cannot reproduce or refute
+  the one-row behavior. (3) `Live(screen=True)` redirects `sys.stdout` through a FileProxy
+  until `close()`/`stop()`, so any test mixing a live `RichRenderer` with a `PlainRenderer`
+  (or with plain `print` debugging) must close the renderer first or the output vanishes.
+  (4) An `Alert` emitted before the first `StageStarted` renders through the `_console.print`
+  fallback, NOT the in-frame window — still bounded and still counted, but it persists on the
+  normal terminal by design.
+- Drift: none. Two `## Discoveries` (the cp1252 fix widened past the impl plan's narrowing,
+  and two vacuous tests), both acted now.
+- Watch-next: Phase 4 adds a source-counter event to this same frame, immediately alongside
+  the alert region built here — `_build_activity_group` now splats a built `alert_part` list
+  at TWO sites (the `Question` overlay branch and the normal branch), so a new persistent
+  line must be added to both or it will silently vanish whenever the `ask_user` overlay is up.
+  Phase 4 is also the natural home for the non-disclosure signal channel deferred in Phase
+  2's second Discovery, since it is already adding an event emitted from `__main__`'s poll.
