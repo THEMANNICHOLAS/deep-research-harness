@@ -704,7 +704,7 @@ async def main(argv: list[str] | None = None) -> int:
     # relaunch incident onto it (Phase 1 Discoveries) rather than taking a caller-supplied hook,
     # so it cannot be constructed any earlier.
     renderer.emit(Activity("preflight: launching the browser"))
-    browser = BrowserSession(config, run_log)
+    browser = BrowserSession(config, run_log, run_id=registry.run_id)
     try:
         await browser.start()
     except BrowserPreflightError as exc:

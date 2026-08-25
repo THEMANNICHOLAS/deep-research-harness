@@ -9,7 +9,7 @@ construction site.
 import asyncio
 from typing import Any
 
-from harness.config import HarnessConfig
+from harness.config import HarnessConfig, run_downloads_dir
 from harness.runlog import RunLog, or_default
 
 _SETUP_HINT = "crawl4ai manages its own Playwright/Chromium (try: crawl4ai-setup)"
@@ -36,20 +36,39 @@ class BrowserSession:
     one relaunch instead of racing to trigger (or re-raise past) their own.
     """
 
-    def __init__(self, config: HarnessConfig, run_log: RunLog | None = None) -> None:
+    def __init__(
+        self, config: HarnessConfig, run_log: RunLog | None = None, *, run_id: str
+    ) -> None:
+        # `run_id` is keyword-only and required: it names the per-run workspace subtree the
+        # HTTP crawler's downloads are contained in, and there is no safe default (falling
+        # back would put them in `~/.crawl4ai/downloads`). Keyword-only so it can never be
+        # mis-bound by an existing positional `BrowserSession(config, run_log)` call.
         self._config = config
+        self._run_id = run_id
         self._run_log = or_default(run_log)
         self._crawler: Any = None
+        self._http: Any = None
         self._relaunched = False
         self._lock = asyncio.Lock()
         self._generation = 0
 
     async def start(self) -> None:
-        """Construct and start the underlying crawler, or raise `BrowserPreflightError`."""
+        """Construct and start both underlying crawlers, or raise `BrowserPreflightError`.
+
+        Browser first, HTTP second: the expensive, actually-failure-prone launch fails fast
+        before the cheap one is paid for. Each has its own try/except so a Chromium failure
+        and an HTTP-strategy failure never report as each other.
+
+        Both imports sit INSIDE the first try, not hoisted above it (PR review, Phase 2): an
+        `ImportError` from crawl4ai, or a circular import of `harness.tools.fetch`, must reach
+        `__main__`'s `except BrowserPreflightError` like any other launch failure. Hoisted, it
+        escaped as a raw traceback that skipped `renderer.close()` and left the Rich
+        full-screen buffer unrestored on a TTY.
+        """
         try:
             from crawl4ai import BrowserConfig  # type: ignore[import-untyped]
 
-            from harness.tools.fetch import _crawler_class
+            from harness.tools.fetch import _crawler_class, _http_crawler_parts
 
             crawler = _crawler_class()(config=BrowserConfig(verbose=False))
             await crawler.start()
@@ -59,15 +78,41 @@ class BrowserSession:
             ) from exc
         self._crawler = crawler
 
+        try:
+            http_strategy_cls, http_config_cls = _http_crawler_parts()
+            http_crawler = _crawler_class()(
+                crawler_strategy=http_strategy_cls(
+                    browser_config=http_config_cls(
+                        # Containment, not a preference (PR review, Phase 2): unset, crawl4ai
+                        # writes every non-`text/html` body under `~/.crawl4ai/downloads`,
+                        # outside the workspace and never cleaned. See `run_downloads_dir`.
+                        downloads_path=str(run_downloads_dir(self._config, self._run_id)),
+                    ),
+                    # D6: the HTTP pass reuses `max_concurrency` rather than adding a knob.
+                    # The shared dispatcher never runs more crawls than this at once, so a
+                    # larger connection pool than that would go unused.
+                    max_connections=self._config.fetch.max_concurrency,
+                ),
+                config=BrowserConfig(verbose=False),
+            )
+            await http_crawler.start()
+        except Exception as exc:
+            raise BrowserPreflightError(
+                f"the browser-free HTTP fetch strategy could not be started: {exc}"
+            ) from exc
+        self._http = http_crawler
+
     async def close(self) -> None:
         """Idempotent teardown: a teardown error must never mask the run's real outcome."""
-        if self._crawler is None:
-            return
-        try:
-            await self._crawler.close()
-        except Exception:
-            pass
-        self._crawler = None
+        for attr in ("_http", "_crawler"):
+            crawler = getattr(self, attr)
+            if crawler is None:
+                continue
+            try:
+                await crawler.close()
+            except Exception:
+                pass
+            setattr(self, attr, None)
 
     async def arun_many(self, urls: list[str], config: Any = None, dispatcher: Any = None) -> list:
         """Fetch `urls` through the held crawler, relaunching once per session on failure.
@@ -104,6 +149,9 @@ class BrowserSession:
                     self._run_log.record(
                         "browser_relaunched", f"the browser session died and was relaunched: {exc}"
                     )
+                    # Rebuilds BOTH handles (browser AND the warm HTTP crawler): `start()`
+                    # is the only construction site, so the HTTP handle must not be left
+                    # dangling after a relaunch either.
                     await self.close()
                     await self.start()  # a failed relaunch raises BrowserPreflightError
                     self._generation += 1
@@ -112,3 +160,17 @@ class BrowserSession:
             if crawler is None:
                 raise BrowserPreflightError(_NOT_RUNNING_DETAIL) from exc
             return list(await crawler.arun_many(urls, config=config, dispatcher=dispatcher))
+
+    async def http_arun_many(
+        self, urls: list[str], config: Any = None, dispatcher: Any = None
+    ) -> list:
+        """Fetch `urls` through the warm browser-free HTTP crawler (R6).
+
+        Deliberately WITHOUT `arun_many`'s relaunch machinery: a dead aiohttp session is not
+        the Chromium failure mode that machinery exists for, and a batch-level failure here
+        costs nothing — `_fetch` catches it, every URL reads as thin, and the browser pass
+        recovers all of them, which is exactly the pre-R6 behavior.
+        """
+        if self._http is None:
+            raise BrowserPreflightError(_NOT_RUNNING_DETAIL)
+        return list(await self._http.arun_many(urls, config=config, dispatcher=dispatcher))

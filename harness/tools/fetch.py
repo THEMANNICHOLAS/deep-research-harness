@@ -18,7 +18,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.blocklist import Blocklist, fires_challenge_marker, hostname_of, resolve_blocklist
-from harness.config import HarnessConfig
+from harness.config import HarnessConfig, run_downloads_dir
 from harness.guard import fence, guard_blocked_detail, scan, strip_invisibles
 from harness.runlog import RunLog, or_default
 from harness.sources import (
@@ -66,6 +66,23 @@ def _pdf_crawler_parts() -> tuple[Any, Any]:
     from crawl4ai.processors.pdf import PDFCrawlerStrategy  # type: ignore[import-untyped]
 
     return PDFCrawlerStrategy, PDFContentScrapingStrategy
+
+
+def _http_crawler_parts() -> tuple[Any, Any]:
+    """The `(AsyncHTTPCrawlerStrategy, HTTPCrawlerConfig)` pair the HTTP pass constructs.
+
+    Same shape and same reason as `_pdf_crawler_parts`: a function so crawl4ai stays
+    unimported until a fetch happens, and so tests patch this one seam rather than the
+    classes. `harness.browser` imports it from here too — the session's warm HTTP crawler
+    and `_fetch`'s per-call fallback must come from the SAME seam or a test would patch
+    only one of them.
+    """
+    from crawl4ai.async_crawler_strategy import (  # type: ignore[import-untyped]
+        AsyncHTTPCrawlerStrategy,
+        HTTPCrawlerConfig,
+    )
+
+    return AsyncHTTPCrawlerStrategy, HTTPCrawlerConfig
 
 
 def _looks_like_pdf_url(url: str) -> bool:
@@ -117,6 +134,27 @@ def classify(
     if error_message:
         return "error"
     return "fetched"
+
+
+def _is_thin(result: object | None, min_words: int) -> bool:
+    """Whether the HTTP pass's result is too bare to trust, so this URL escalates once (D2).
+
+    Word count only, per D2 ("the little/bare text is the hint"): a transport failure, an
+    empty body and a JS-shell challenge page all arrive as little-or-no markdown, so one
+    rule covers them and no second trigger is needed. A non-2xx carrying a substantial body
+    deliberately does NOT escalate.
+
+    The content-type exemption is what makes D2's arxiv case work: a PDF (or an image) has
+    no text for Chromium to extract either, and a PDF specifically must reach `classify`'s
+    "pdf" branch to be rerouted through the PDF batch — escalating it instead would send it
+    back to the browser navigation that failed on it in the first place.
+    """
+    if result is None:
+        return True
+    content_type = _content_type(result)
+    if content_type and "html" not in content_type.lower():
+        return False
+    return len(_markdown_of(result).split()) < min_words
 
 
 class FetchedPage(BaseModel):
@@ -408,9 +446,10 @@ async def _fetch(
     tests; production threads ONE shared instance from `build_tools`, so a hostname walled
     mid-run by one fetch is visible to `search_web`'s filter for the rest of the run.
 
-    `browser` (Phase 1, R2): the shared session the HTML batch runs through when given one.
-    `None` preserves the prior per-call `async with _crawler_class()(...)` behavior, which
-    every direct caller and existing test still rides.
+    `browser` (Phase 1, R2; Phase 2, R6): the shared session the HTTP-first pass and its
+    thin-text browser escalation both run through when given one. `None` preserves the prior
+    per-call `async with _crawler_class()(...)` behavior, now of both crawlers, which every
+    direct caller and existing test still rides.
     """
     blocklist = resolve_blocklist(blocklist, config.blocklist.path)
     from crawl4ai import (
@@ -511,19 +550,66 @@ async def _fetch(
     reroute_urls: list[str] = []
 
     if playwright_urls:
-        if browser is not None:
-            results = await browser.arun_many(
-                playwright_urls, config=run_config, dispatcher=dispatcher
-            )
-        else:
-            # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
-            async with _crawler_class()(config=BrowserConfig(verbose=False)) as crawler:
-                raw_results = await crawler.arun_many(
+        # R6/D2: HTTP-first. A browser-free pass covers most pages at a fraction of a
+        # Chromium navigation's cost; only URLs whose extracted text comes back thin
+        # escalate, once, through the session browser.
+        http_strategy_cls, http_config_cls = _http_crawler_parts()
+        try:
+            if browser is not None:
+                http_results = await browser.http_arun_many(
                     playwright_urls, config=run_config, dispatcher=dispatcher
                 )
-                results = list(raw_results)
+            else:
+                async with _crawler_class()(
+                    crawler_strategy=http_strategy_cls(
+                        browser_config=http_config_cls(
+                            # Same containment as the session's crawler in `harness/browser.py`
+                            # — see `run_downloads_dir` for what crawl4ai does without it.
+                            downloads_path=str(run_downloads_dir(config, registry.run_id)),
+                        ),
+                        max_connections=config.fetch.max_concurrency,
+                    ),
+                    config=BrowserConfig(verbose=False),
+                ) as http_crawler:
+                    http_results = list(
+                        await http_crawler.arun_many(
+                            playwright_urls, config=run_config, dispatcher=dispatcher
+                        )
+                    )
+        except Exception:
+            # Records NO incident, deliberately: this is not degraded coverage. Every URL
+            # comes back resultless, reads as thin below, and the browser pass recovers all
+            # of them -- i.e. exactly the pre-R6 behavior, which is plan risk #3's stated
+            # bound. A RunLog incident here would put a fully-covered run in the report's
+            # gaps section.
+            http_results = []
 
-        for url, result in _pair(playwright_urls, results):
+        pairs = _pair(playwright_urls, http_results)
+        thin_urls = [
+            url for url, result in pairs if _is_thin(result, config.fetch.min_markdown_words)
+        ]
+        if thin_urls:
+            if browser is not None:
+                escalated = await browser.arun_many(
+                    thin_urls, config=run_config, dispatcher=dispatcher
+                )
+            else:
+                # verbose=False is deliberate: crawl4ai defaults it True and prints into our
+                # process.
+                async with _crawler_class()(config=BrowserConfig(verbose=False)) as crawler:
+                    raw_escalated = await crawler.arun_many(
+                        thin_urls, config=run_config, dispatcher=dispatcher
+                    )
+                    escalated = list(raw_escalated)
+
+            # D2: the escalated result wins unconditionally -- one escalation per URL per
+            # call, no "keep whichever looks better" comparison.
+            replacement = dict(_pair(thin_urls, escalated))
+            pairs = [
+                (url, replacement[url] if url in replacement else result) for url, result in pairs
+            ]
+
+        for url, result in pairs:
             if result is None:
                 pages_by_url[url] = _no_result_page(url)
                 continue

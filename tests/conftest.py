@@ -77,36 +77,66 @@ class _FakePDFContentScrapingStrategy:
         pass
 
 
+class _FakeHTTPCrawlerStrategy:
+    """Stand-in for crawl4ai's `AsyncHTTPCrawlerStrategy` — the HTTP-seam construction marker."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.kwargs = kwargs
+
+
+class _FakeHTTPCrawlerConfig:
+    """Stand-in for crawl4ai's `HTTPCrawlerConfig`.
+
+    Retains `kwargs` for the same reason `_FakeHTTPCrawlerStrategy` does: it is reachable as
+    `fake_cls.http_strategies[0].kwargs["browser_config"].kwargs`, which is how a test asserts
+    `downloads_path` was contained inside the workspace rather than left at crawl4ai's
+    `~/.crawl4ai/downloads` default.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.kwargs = kwargs
+
+
 def _make_fake_crawler_class(
     results: list[_FakeResult],
     pdf_results: list[_FakeResult] | None = None,
+    http_results: list[_FakeResult] | None = None,
     fail_batches: int = 0,
 ) -> type:
     """Build a fake AsyncWebCrawler class recording construction and `arun_many` calls.
 
-    One fake class serves both the Playwright batch and the PDF batch — `_fetch` gets both
-    from the same `_crawler_class()` seam, distinguished only by the `crawler_strategy` kwarg
-    passed at construction. `pdf_results` (defaulting to `results`, so existing single-arg
-    callers are unaffected) lets a test give the PDF batch its own canned results distinct
-    from the Playwright batch's.
+    One fake class serves the Playwright batch, the HTTP batch, and the PDF batch — `_fetch`
+    gets all three from the same `_crawler_class()` seam, distinguished only by the
+    `crawler_strategy` kwarg passed at construction. `pdf_results`/`http_results` (each
+    defaulting to `results`, so existing single-arg callers are unaffected) let a test give
+    the PDF batch and/or the HTTP pass their own canned results distinct from the Playwright
+    (browser) batch's.
 
     `fail_batches` (default 0, so every existing caller is unaffected) makes the first N calls
     to `arun_many` — across ALL instances of this class, matching crawl4ai's real dead-handle
     behavior surfacing on whichever instance is current — raise `RuntimeError` instead of
     recording/returning anything, for `harness.browser.BrowserSession`'s relaunch path to
-    relaunch from. `start`/`close` are real coroutines (not just `__aenter__`/`__aexit__`) so
-    `BrowserSession` can drive the fake directly; `closed` records each `close()` call.
+    relaunch from. It means "the Chromium handle is dead" and drives `BrowserSession`'s
+    relaunch, so it is gated to non-HTTP instances — an HTTP call consuming one would silently
+    change what Phase 1's relaunch tests exercise. `start`/`close` are real coroutines (not
+    just `__aenter__`/`__aexit__`) so `BrowserSession` can drive the fake directly; `closed`
+    records each `close()` call.
 
-    `arun_many` yields (`asyncio.sleep`) before doing anything, but ONLY when `fail_batches > 0`:
-    with no real `await` in its body it never actually suspends, so two `asyncio.gather`-driven
-    calls (Phase 1 fix #3's concurrency test) would run one to completion before the other's
-    Task ever got a turn — same reasoning as `ConcurrencyTrackingModel`'s `_sleep_seconds`. Gated
-    to the relaunch scenario alone so the rest of the suite, which never sets `fail_batches`,
-    pays nothing.
+    `arun_many` yields (`asyncio.sleep`) before doing anything, but ONLY when `fail_batches > 0`
+    (and not for an HTTP instance, for the same reason as above): with no real `await` in its
+    body it never actually suspends, so two `asyncio.gather`-driven calls (Phase 1 fix #3's
+    concurrency test) would run one to completion before the other's Task ever got a turn —
+    same reasoning as `ConcurrencyTrackingModel`'s `_sleep_seconds`. Gated to the relaunch
+    scenario alone so the rest of the suite, which never sets `fail_batches`, pays nothing.
     """
 
     class _FakeCrawler:
         constructed_with: list[object] = []
+        constructed_kinds: list[str] = []
+        # The `_FakeHTTPCrawlerStrategy` instance passed at construction, one per HTTP
+        # construction -- how a test reaches its `.kwargs` to assert `max_connections` was
+        # wired from `config.fetch.max_concurrency` (D6).
+        http_strategies: list[object] = []
         calls: list[SimpleNamespace] = []
         closed: list[object] = []
         _fail_remaining: int = fail_batches
@@ -114,7 +144,13 @@ def _make_fake_crawler_class(
 
         def __init__(self, config: object = None, crawler_strategy: object = None) -> None:
             _FakeCrawler.constructed_with.append(config)
-            self._is_pdf = crawler_strategy is not None
+            self._is_pdf = isinstance(crawler_strategy, _FakePDFCrawlerStrategy)
+            self._is_http = isinstance(crawler_strategy, _FakeHTTPCrawlerStrategy)
+            if self._is_http:
+                _FakeCrawler.http_strategies.append(crawler_strategy)
+            _FakeCrawler.constructed_kinds.append(
+                "pdf" if self._is_pdf else "http" if self._is_http else "browser"
+            )
 
         async def __aenter__(self) -> "_FakeCrawler":
             return self
@@ -131,18 +167,24 @@ def _make_fake_crawler_class(
         async def arun_many(
             self, urls: list[str], config: object = None, dispatcher: object = None
         ) -> list[_FakeResult]:
-            if _FakeCrawler._yield_on_call:
+            if _FakeCrawler._yield_on_call and not self._is_http:
                 await asyncio.sleep(0.05)
-            if _FakeCrawler._fail_remaining > 0:
+            if _FakeCrawler._fail_remaining > 0 and not self._is_http:
                 _FakeCrawler._fail_remaining -= 1
                 raise RuntimeError("crawler handle is dead")
             _FakeCrawler.calls.append(
                 SimpleNamespace(
-                    urls=urls, config=config, dispatcher=dispatcher, is_pdf=self._is_pdf
+                    urls=urls,
+                    config=config,
+                    dispatcher=dispatcher,
+                    is_pdf=self._is_pdf,
+                    is_http=self._is_http,
                 )
             )
             if self._is_pdf:
                 return pdf_results if pdf_results is not None else results
+            if self._is_http:
+                return http_results if http_results is not None else results
             return results
 
     return _FakeCrawler
@@ -150,14 +192,17 @@ def _make_fake_crawler_class(
 
 @pytest.fixture
 def install_crawler(monkeypatch):
-    """Patch `harness.tools.fetch._crawler_class`/`_pdf_crawler_parts` with fakes.
+    """Patch `harness.tools.fetch._crawler_class`/`_pdf_crawler_parts`/`_http_crawler_parts`
+    with fakes.
 
     `_crawler_class` (not a module-level `AsyncWebCrawler` name) because fetch.py imports
     crawl4ai lazily inside `_fetch` — the function is the deliberate patch seam. Patches
     fetch.py's namespace regardless of caller: `fallback.py` reuses fetch.py's `_fetch`,
     and that is where the crawler is actually constructed, so both fetch and fallback
     tests share this one fixture. `_pdf_crawler_parts` is the parallel seam for the PDF
-    strategy classes fetch.py's PDF batch constructs.
+    strategy classes fetch.py's PDF batch constructs; `_http_crawler_parts` is the parallel
+    seam for the HTTP-first pass, used by both `_fetch`'s per-call fallback and
+    `BrowserSession.start`'s warm crawler.
 
     Also the fixture `harness.browser.BrowserSession` tests use: it calls the very same
     `_crawler_class()` seam (see `browser.py`'s module docstring), so `fail_batches` (see
@@ -168,13 +213,18 @@ def install_crawler(monkeypatch):
     def _install(
         results: list[_FakeResult],
         pdf_results: list[_FakeResult] | None = None,
+        http_results: list[_FakeResult] | None = None,
         fail_batches: int = 0,
     ) -> type:
-        fake_cls = _make_fake_crawler_class(results, pdf_results, fail_batches)
+        fake_cls = _make_fake_crawler_class(results, pdf_results, http_results, fail_batches)
         monkeypatch.setattr("harness.tools.fetch._crawler_class", lambda: fake_cls)
         monkeypatch.setattr(
             "harness.tools.fetch._pdf_crawler_parts",
             lambda: (_FakePDFCrawlerStrategy, _FakePDFContentScrapingStrategy),
+        )
+        monkeypatch.setattr(
+            "harness.tools.fetch._http_crawler_parts",
+            lambda: (_FakeHTTPCrawlerStrategy, _FakeHTTPCrawlerConfig),
         )
         return fake_cls
 
@@ -572,6 +622,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         max_concurrency: int = 5,
         per_page_char_cap: int = 12000,
         max_urls_per_call: int = 5,
+        min_markdown_words: int = 50,
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
         max_consecutive_failures: int = 3,
@@ -607,6 +658,7 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
                 max_concurrency=max_concurrency,
                 per_page_char_cap=per_page_char_cap,
                 max_urls_per_call=max_urls_per_call,
+                min_markdown_words=min_markdown_words,
             ),
             search=SearchSettings(
                 base_url=base_url,

@@ -201,7 +201,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Session browser + Chromium preflight
-- [ ] Phase 2: HTTP-first fetch with thin-text escalation
+- [x] Phase 2: HTTP-first fetch with thin-text escalation
 - [ ] Phase 3: TUI alert hygiene
 - [ ] Phase 4: Live source counter
 - [ ] Final verification
@@ -303,12 +303,12 @@ extracted text is thin escalate (once) through the session browser; pipeline ord
   per-URL retry loops.
 
 **Tests (write first, confirm red):**
-- [ ] A rich HTML page fetched via HTTP never touches the browser.
-- [ ] A thin page escalates once; the browser result wins; a thin browser result still
+- [x] A rich HTML page fetched via HTTP never touches the browser.
+- [x] A thin page escalates once; the browser result wins; a thin browser result still
   classifies by the normal rules.
-- [ ] Transport failure (no body) escalates via the same thin rule.
-- [ ] HTTP-discovered PDF content-type reroutes to the PDF batch (arxiv-style URL).
-- [ ] Ordering preserved: provenance-rejected and blocklisted URLs are never HTTP-fetched.
+- [x] Transport failure (no body) escalates via the same thin rule.
+- [x] HTTP-discovered PDF content-type reroutes to the PDF batch (arxiv-style URL).
+- [x] Ordering preserved: provenance-rejected and blocklisted URLs are never HTTP-fetched.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -316,8 +316,8 @@ extracted text is thin escalate (once) through the session browser; pipeline ord
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] Existing `test_fetch.py` suite still green (ordering/policy unchanged).
-- [ ] `harness.toml` documents the new key next to its `fetch` siblings.
+- [x] Existing `test_fetch.py` suite still green (ordering/policy unchanged).
+- [x] `harness.toml` documents the new key next to its `fetch` siblings.
 
 ### Phase 3: TUI alert hygiene
 **Risk:** none
@@ -455,6 +455,21 @@ real run while the unit tests (which call `build_tools` directly) still passed. 
 `browser` parameter forwarded verbatim to `build_tools`. `build_agent` owns NO lifecycle over it;
 `main()` keeps start/close. Diff budget grows from ~6 to ~7 files.
 
+2026-08-25 — Phase 2: D2's frozen Contracts line reads "escalate iff extracted markdown word
+count < `min_markdown_words`", but that rule alone breaks D2's own stated arxiv consequence. A
+PDF fetched by the HTTP pass has little or no extracted text, so a pure word-count rule sends it
+BACK to the browser navigation that failed on it ("Page.goto: Download is starting") instead of
+letting `classify` return `pdf` and reroute it to the PDF batch. The same holds for any non-HTML
+body — an image or a binary has no text for Chromium to extract either. → AMENDMENT: the
+escalation rule is word count AND not-an-identified-non-HTML-content-type. `_is_thin`
+(`harness/tools/fetch.py`) returns False for any result whose content-type is present and does
+not contain "html", before the word count is consulted. Consequence to know: `application/json`,
+`text/plain` and images are now also exempt from escalation, which is correct for the same
+reason (the browser extracts no more text from them than aiohttp did) but is broader than the
+arxiv case that motivated it. The word-count half of D2 is otherwise unchanged, and "escalated
+result wins unconditionally" is implemented literally — including when the escalation returns no
+result at all, which beats a thin-but-real HTTP body (developer-confirmed 2026-08-25).
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
@@ -490,6 +505,36 @@ category (skip the retry, still soft-fail the reader). → DEFERRED by the devel
 one wasted re-run after an already-rare second death, the run still completes with disclosed
 degraded coverage, and a third failure taxonomy in `agent.py` is not worth an unmeasured cost.
 
+2026-08-25 — Phase 2: crawl4ai's HTTP strategy writes the raw body of any response whose
+content-type is not exactly `text/html` to `downloads_path`, defaulting to
+`~/.crawl4ai/downloads` — outside the workspace, unbounded, never cleaned, one file per fetch
+(`_is_file_download` + `_handle_http` in `crawl4ai/async_crawler_strategy.py`; `CacheMode.BYPASS`
+does not reach that branch, and a non-2xx raises before it, so blocked pages never write). Not a
+rare path: D2's arxiv consequence routes extensionless PDFs through exactly it, and JSON/XML
+URLs hit it too. This violates the project invariant that the agent's writes stay inside the
+workspace dir. The plan's `## Non-Goals` declines PR #20's `downloads_dir` KNOB, which this does
+not re-add — the containment is a path derived from the existing `workspace_dir`, with no new
+config key, so it is a gap the plan did not cover rather than a contradiction of it.
+→ ACTED NOW (developer, per-run option): new `run_downloads_dir(config, run_id)` in
+`harness/config.py` beside `run_workspace_dir`, giving `<workspace_dir>/<run_id>/downloads`;
+passed as `HTTPCrawlerConfig(downloads_path=...)` at both HTTP-crawler construction sites.
+`BrowserSession.__init__` gains a keyword-only required `run_id` to reach it — keyword-only so
+no existing positional `BrowserSession(config, run_log)` call can mis-bind it, and required
+because the only possible default is the `$HOME` path this fixes.
+
+2026-08-25 — Phase 2: the batch-level HTTP-failure branch (`except Exception: http_results = []`
+in `_fetch`) has no observability channel. A `RunLog` incident is wrong — coverage is complete
+because the browser pass recovers every URL, and every RunLog incident lands in the report's
+`## Gaps and disclosures`, so it would report a gap that does not exist. But `_fetch` can reach
+nothing else: it holds no renderer (`Activity` events are emitted from `__main__`, which has the
+renderer) and `harness/` uses no `logging`. So a persistent HTTP-pass breakage — say a crawl4ai
+bump changing the strategy signature — reads as "every page is thin" and silently doubles every
+fetch's latency forever, with nothing anywhere saying so. → PARTIALLY ACTED: the branch is now
+TESTED (`test_a_wholesale_http_pass_failure_escalates_every_url_to_the_browser`, which also pins
+the no-incident decision). The SIGNAL half is DEFERRED — it needs a non-disclosure channel
+threaded into `_fetch`, which is a larger change than this phase, and Phase 3/4 both touch the
+display layer where such a channel would naturally live.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
@@ -515,3 +560,31 @@ never add a section below it. -->
   consequence) — `self._config` is stored but currently unread, and exists for exactly that.
   Phase 2 must also keep `patch_run`'s browser neutralization working once the HTTP strategy
   starts/closes alongside the browser.
+
+### 2026-08-25 — Phase 2: HTTP-first fetch with thin-text escalation
+- Done: `_http_crawler_parts()` seam + `_is_thin()` in `fetch.py`; `_fetch`'s HTML batch is now
+  HTTP pass -> thin selection -> one browser escalation -> merge -> the unchanged per-result
+  loop. `BrowserSession` holds a warm `AsyncHTTPCrawlerStrategy` crawler alongside Chromium
+  (`http_arun_many`, no relaunch machinery) and closes both idempotently.
+  `fetch.min_markdown_words = 50` is the only new config key. Plus the PR-review fixes:
+  `run_downloads_dir` containment, imports moved back inside `start()`'s try, and a test for
+  the HTTP-failure branch. 811 tests pass; ruff/format/mypy clean; coverage 96%.
+- Learned: (1) crawl4ai's `arun_many` delegates to `dispatcher.run_urls(crawler=self, ...)` and
+  is strategy-AGNOSTIC, so the HTTP pass reuses the existing `MemoryAdaptiveDispatcher` — PR
+  #20's `asyncio.gather`+semaphore+httpx-HEAD machinery was unnecessary and was not ported.
+  (2) crawl4ai writes the raw body of any non-`text/html` response to `downloads_path`,
+  defaulting INSIDE `$HOME` — every new crawl4ai construction site needs that kwarg or it
+  breaches the workspace-writes invariant. (3) A 403 always has empty markdown (crawl4ai
+  discards the body on non-2xx), so every blocked page now reads as thin and always escalates:
+  the browser pass, not the HTTP fingerprint, still decides `blocked` and still owns the
+  blocklist feed. (4) `RunLog` is the ONLY channel `_fetch` can reach, and everything on it
+  lands in the report's gaps section — so there is no way to signal a non-coverage event
+  (like a wholesale HTTP-pass failure) from inside `_fetch` today.
+- Drift: one `## Reconciliations` entry (the `_is_thin` content-type exemption amending D2's
+  frozen word-count-only rule). Two `## Discoveries`: the `~/.crawl4ai/downloads` containment
+  (acted, per-run) and the un-signalable HTTP-failure branch (tested; signal half deferred).
+- Watch-next: Phase 3 and 4 both touch `harness/display.py`, which is where the missing
+  non-disclosure signal channel would naturally live — if one gets built for the alert work,
+  the deferred half of the second Discovery becomes nearly free. Also note `min_markdown_words
+  = 50` is an unvalidated guess (risk #3): the manual homelab run in `## Verification` is what
+  confirms the escalation rate before anyone tunes it.

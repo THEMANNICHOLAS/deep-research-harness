@@ -141,7 +141,7 @@ def test_the_one_browser_session_reaches_fetch_and_fallback_but_not_search(
     `build_search_tool` deliberately does not take a browser (it never fetches a page itself),
     so folding this in would make that test's own docstring false."""
     config = make_config()
-    browser = BrowserSession(config)
+    browser = BrowserSession(config, run_id="test-run")
     seen: dict[str, object] = {}
 
     for name in ("build_search_tool", "build_fallback_tool", "build_fetch_tool"):

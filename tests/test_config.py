@@ -28,6 +28,7 @@ page_timeout_ms = 20000
 max_concurrency = 8
 per_page_char_cap = 9000
 max_urls_per_call = 3
+min_markdown_words = 30
 
 [search]
 base_url = "http://localhost:8080"
@@ -85,6 +86,7 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
     assert config.fetch.max_concurrency == 8
     assert config.fetch.per_page_char_cap == 9000
     assert config.fetch.max_urls_per_call == 3
+    assert config.fetch.min_markdown_words == 30
 
     assert config.search.base_url == "http://localhost:8080"
     assert config.search.default_max_results == 7
@@ -102,6 +104,7 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
     assert config.fetch.max_concurrency == 5
     assert config.fetch.per_page_char_cap == 120000
     assert config.fetch.max_urls_per_call == 5
+    assert config.fetch.min_markdown_words == 50
     assert config.search.default_max_results == 10
     assert config.search.max_consecutive_failures == 3
 
@@ -186,6 +189,7 @@ def test_typo_in_key_error_names_the_offending_key(tmp_path, monkeypatch):
         ("max_concurrency", -1),
         ("per_page_char_cap", 0),
         ("max_urls_per_call", 0),
+        ("min_markdown_words", 0),
         ("max_consecutive_failures", 0),
         ("max_reader_dispatches", 0),
     ],
@@ -198,6 +202,7 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
         "max_concurrency": 8,
         "per_page_char_cap": 9000,
         "max_urls_per_call": 3,
+        "min_markdown_words": 30,
         "max_consecutive_failures": 4,
         "max_reader_dispatches": 6,
     }

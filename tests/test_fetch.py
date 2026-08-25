@@ -8,7 +8,7 @@ from crawl4ai import DefaultMarkdownGenerator, PruningContentFilter  # type: ign
 from langchain_core.tools import BaseTool
 
 from harness.browser import BrowserSession
-from harness.config import AgentSettings, BlocklistSettings, GuardSettings
+from harness.config import AgentSettings, BlocklistSettings, GuardSettings, run_downloads_dir
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
 from harness.tools import fetch
@@ -27,6 +27,18 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures" / "injection"
 
 def _attack_markdown() -> str:
     return (FIXTURES_DIR / "attack_instruction_override_ignore.txt").read_text(encoding="utf-8")
+
+
+# Well above `make_config`'s default `min_markdown_words` (50): the R6/D2 tests below use this
+# for whichever pass must NOT read as thin and trigger an (unwanted, for that test) escalation.
+_RICH_MARKDOWN = " ".join(f"word{i}" for i in range(60))
+
+
+def _not_thin(marker: str) -> str:
+    """`marker`, padded past `min_markdown_words` -- for a pre-Phase-2 test whose short filler
+    text would otherwise read as thin and trigger an incidental HTTP-first escalation that
+    the test itself isn't about. `marker` stays findable in the padded text."""
+    return f"{marker} {_RICH_MARKDOWN}"
 
 
 def _rendered(markdown: str, cap: int) -> str:
@@ -354,7 +366,7 @@ async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_confi
     results = [
         _FakeResult(
             "https://a.test",
-            markdown=_FakeMarkdown(raw_markdown="a", fit_markdown="a"),
+            markdown=_FakeMarkdown(raw_markdown=_not_thin("a"), fit_markdown=_not_thin("a")),
         )
     ]
     fake_cls = install_crawler(results)
@@ -579,6 +591,270 @@ async def test_content_type_header_on_the_result_reroutes_through_the_pdf_batch(
     assert [call.is_pdf for call in fake_cls.calls] == [False, True]
     assert pages[0].outcome == "fetched"
     assert pages[0].markdown == "Extracted text"
+
+
+# --- Phase 2: HTTP-first fetch with thin-text escalation (R6/D2) -------------------------
+
+
+async def test_a_rich_html_page_fetched_via_http_never_touches_the_browser(
+    install_crawler, make_config
+):
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://rich.test/page"])
+    http_results = [
+        _FakeResult(
+            "https://rich.test/page",
+            markdown=_FakeMarkdown(raw_markdown=_RICH_MARKDOWN, fit_markdown=_RICH_MARKDOWN),
+        )
+    ]
+    fake_cls = install_crawler([], http_results=http_results)
+
+    _, pages = await fetch._fetch(["https://rich.test/page"], config, registry, RunLog())
+
+    assert len(fake_cls.calls) == 1
+    assert fake_cls.calls[0].is_http is True
+    assert not any(not call.is_http and not call.is_pdf for call in fake_cls.calls)
+    assert pages[0].outcome == "fetched"
+    assert pages[0].source_id is not None
+
+
+async def test_a_thin_page_escalates_once_and_the_browser_result_wins(install_crawler, make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://thin.test/page"])
+    http_results = [
+        _FakeResult(
+            "https://thin.test/page",
+            markdown=_FakeMarkdown(raw_markdown="bare", fit_markdown="bare"),
+        )
+    ]
+    browser_results = [
+        _FakeResult(
+            "https://thin.test/page",
+            markdown=_FakeMarkdown(raw_markdown=_RICH_MARKDOWN, fit_markdown=_RICH_MARKDOWN),
+        )
+    ]
+    fake_cls = install_crawler(browser_results, http_results=http_results)
+
+    _, pages = await fetch._fetch(["https://thin.test/page"], config, registry, RunLog())
+
+    assert [call.is_http for call in fake_cls.calls] == [True, False]
+    assert fake_cls.calls[1].urls == ["https://thin.test/page"]
+    assert pages[0].markdown == _RICH_MARKDOWN
+
+
+async def test_a_thin_browser_result_still_classifies_by_the_normal_rules_no_second_escalation(
+    install_crawler, make_config
+):
+    """Even a still-thin browser result wins unconditionally (D2) -- it classifies by the
+    ordinary rules (non-empty is `fetched`, empty is `non_html`), and there is no THIRD
+    (second-escalation) crawler call."""
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test", "https://b.test"])
+    http_results = [
+        _FakeResult(
+            "https://a.test", markdown=_FakeMarkdown(raw_markdown="bare", fit_markdown="bare")
+        ),
+        _FakeResult(
+            "https://b.test", markdown=_FakeMarkdown(raw_markdown="bare", fit_markdown="bare")
+        ),
+    ]
+    browser_results = [
+        _FakeResult(
+            "https://a.test",
+            markdown=_FakeMarkdown(raw_markdown="still bare", fit_markdown="still bare"),
+        ),
+        _FakeResult("https://b.test", markdown=_FakeMarkdown(raw_markdown="", fit_markdown="")),
+    ]
+    fake_cls = install_crawler(browser_results, http_results=http_results)
+
+    _, pages = await fetch._fetch(["https://a.test", "https://b.test"], config, registry, RunLog())
+
+    assert [call.is_http for call in fake_cls.calls] == [True, False]
+    a_page = next(p for p in pages if p.url == "https://a.test")
+    b_page = next(p for p in pages if p.url == "https://b.test")
+    assert a_page.outcome == "fetched"
+    assert a_page.markdown == "still bare"
+    assert b_page.outcome == "non_html"
+
+
+async def test_a_transport_failure_escalates_via_the_same_thin_rule(install_crawler, make_config):
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://gone.test/page"])
+    browser_results = [
+        _FakeResult(
+            "https://gone.test/page",
+            markdown=_FakeMarkdown(raw_markdown=_RICH_MARKDOWN, fit_markdown=_RICH_MARKDOWN),
+        )
+    ]
+    fake_cls = install_crawler(browser_results, http_results=[])
+
+    _, pages = await fetch._fetch(["https://gone.test/page"], config, registry, RunLog())
+
+    assert [call.is_http for call in fake_cls.calls] == [True, False]
+    assert pages[0].markdown == _RICH_MARKDOWN
+
+
+async def test_an_http_discovered_pdf_content_type_reroutes_through_the_pdf_batch_not_the_browser(
+    install_crawler, make_config
+):
+    """D2's arxiv case: an extensionless PDF URL is exempt from the thin check by content
+    type, so it reroutes straight from the HTTP pass to the PDF batch and never reaches the
+    (Chromium-navigation-failed-on-it-already) browser."""
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://arxiv.test/abs/1234"])
+    http_results = [
+        _FakeResult(
+            "https://arxiv.test/abs/1234",
+            response_headers={"Content-Type": "application/pdf"},
+            markdown=_FakeMarkdown(raw_markdown="%PDF junk", fit_markdown="%PDF junk"),
+        )
+    ]
+    pdf_results = [
+        _FakeResult(
+            "https://arxiv.test/abs/1234",
+            markdown=_FakeMarkdown(
+                raw_markdown="Extracted arxiv text", fit_markdown="Extracted arxiv text"
+            ),
+        )
+    ]
+    fake_cls = install_crawler([], http_results=http_results, pdf_results=pdf_results)
+
+    _, pages = await fetch._fetch(["https://arxiv.test/abs/1234"], config, registry, RunLog())
+
+    assert [call.is_http for call in fake_cls.calls] == [True, False]
+    assert fake_cls.calls[1].is_pdf is True
+    assert pages[0].outcome == "fetched"
+    assert pages[0].markdown == "Extracted arxiv text"
+
+
+async def test_rejected_urls_are_never_http_fetched(install_crawler, make_config, tmp_path):
+    """Ordering preserved: provenance rejection and the domain blocklist still run before any
+    crawler pass, HTTP included -- neither rejected URL reaches the HTTP call, and their
+    opaque rejection blocks still render."""
+    blocklist_path = tmp_path / "blocked-domains.json"
+    _seed_blocklist_file(blocklist_path, "walled.test")
+    config = make_config(blocklist=BlocklistSettings(path=blocklist_path))
+    registry = SourceRegistry()
+    approve_all(registry, ["https://ok.test/page", "https://walled.test/page"])
+    # "https://unapproved.test/page" is deliberately left unapproved.
+    http_results = [
+        _FakeResult(
+            "https://ok.test/page",
+            markdown=_FakeMarkdown(raw_markdown=_RICH_MARKDOWN, fit_markdown=_RICH_MARKDOWN),
+        )
+    ]
+    fake_cls = install_crawler([], http_results=http_results)
+
+    content, pages = await fetch._fetch(
+        ["https://unapproved.test/page", "https://walled.test/page", "https://ok.test/page"],
+        config,
+        registry,
+        RunLog(),
+    )
+
+    assert len(fake_cls.calls) == 1
+    assert fake_cls.calls[0].urls == ["https://ok.test/page"]
+    assert fetch._rejection_block("https://unapproved.test/page") in content
+    assert fetch._rejection_block("https://walled.test/page") in content
+
+
+async def test_the_http_strategy_is_wired_with_the_configured_max_concurrency(
+    install_crawler, make_config
+):
+    """D6: the HTTP pass reuses `max_concurrency` rather than adding a new knob."""
+    config = make_config(max_concurrency=7)
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
+    http_results = [
+        _FakeResult(
+            "https://a.test",
+            markdown=_FakeMarkdown(raw_markdown=_RICH_MARKDOWN, fit_markdown=_RICH_MARKDOWN),
+        )
+    ]
+    fake_cls = install_crawler([], http_results=http_results)
+
+    await fetch._fetch(["https://a.test"], config, registry, RunLog())
+
+    assert fake_cls.http_strategies[0].kwargs["max_connections"] == 7
+
+
+async def test_http_downloads_are_contained_in_the_run_workspace(install_crawler, make_config):
+    """PR review, Phase 2: unset, crawl4ai writes non-`text/html` bodies under `$HOME`.
+
+    The project invariant is that the agent's writes stay inside the workspace dir, and that
+    has to hold for bytes crawl4ai writes on our behalf too — an extensionless PDF or a JSON
+    URL is a routine fetch, not an edge case.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
+    http_results = [
+        _FakeResult(
+            "https://a.test",
+            markdown=_FakeMarkdown(raw_markdown=_RICH_MARKDOWN, fit_markdown=_RICH_MARKDOWN),
+        )
+    ]
+    fake_cls = install_crawler([], http_results=http_results)
+
+    await fetch._fetch(["https://a.test"], config, registry, RunLog())
+
+    http_config = fake_cls.http_strategies[0].kwargs["browser_config"]
+    assert http_config.kwargs["downloads_path"] == str(run_downloads_dir(config, registry.run_id))
+    assert config.agent.workspace_dir in Path(http_config.kwargs["downloads_path"]).parents
+
+
+async def test_a_wholesale_http_pass_failure_escalates_every_url_to_the_browser(
+    install_crawler, make_config
+):
+    """Risk #3's stated bound: worst case is the pre-R6 behavior, not a failed fetch.
+
+    A batch-level HTTP failure must not fail the call. Every URL comes back resultless, reads
+    as thin, and the browser pass recovers it. Deliberately records NO `RunLog` incident:
+    coverage is complete, and an incident would put a fully-covered run in the report's gaps.
+    """
+    config = make_config()
+    registry = SourceRegistry()
+    approve_all(registry, ["https://a.test"])
+    # So the recovered page's capture write succeeds: an unwritable dir would record a
+    # `capture_write_failed` incident and mask the "no incident" assertion below.
+    sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
+    browser_results = [
+        _FakeResult(
+            "https://a.test",
+            markdown=_FakeMarkdown(raw_markdown=_RICH_MARKDOWN, fit_markdown=_RICH_MARKDOWN),
+        )
+    ]
+    fake_cls = install_crawler(browser_results)
+
+    async def _dead_http_batch(*args: object, **kwargs: object) -> list:
+        raise RuntimeError("the HTTP strategy signature changed under us")
+
+    original_arun_many = fake_cls.arun_many
+
+    async def _arun_many(self, urls, config=None, dispatcher=None):
+        if self._is_http:
+            return await _dead_http_batch()
+        return await original_arun_many(self, urls, config=config, dispatcher=dispatcher)
+
+    fake_cls.arun_many = _arun_many
+
+    run_log = RunLog()
+    _, pages = await fetch._fetch(["https://a.test"], config, registry, run_log)
+
+    # Recovered by the browser pass: the page is real evidence, not an error block.
+    assert [page.outcome for page in pages] == ["fetched"]
+    assert pages[0].source_id is not None
+    assert _RICH_MARKDOWN in pages[0].markdown
+    # The browser pass ran for the URL the HTTP pass could not answer.
+    assert [call.is_http for call in fake_cls.calls] == [False]
+    assert fake_cls.calls[0].urls == ["https://a.test"]
+    # No incident: this is not degraded coverage.
+    assert run_log.incidents() == []
 
 
 async def test_input_url_with_no_result_reports_a_single_error_outcome(
@@ -1247,7 +1523,9 @@ async def test_a_mixed_html_and_pdf_batch_writes_both_captures_with_existing_sha
     html_results = [
         _FakeResult(
             "https://article.test/page",
-            markdown=_FakeMarkdown(raw_markdown="html body", fit_markdown="html body"),
+            markdown=_FakeMarkdown(
+                raw_markdown=_not_thin("html body"), fit_markdown=_not_thin("html body")
+            ),
         )
     ]
     pdf_results = [
@@ -1706,13 +1984,16 @@ async def test_a_blocked_url_replays_its_verdict_on_re_request_with_no_further_c
     fake_cls = install_crawler(results)
 
     first_content, _ = await fetch._fetch(["https://blocked.test"], config, registry, RunLog())
-    assert len(fake_cls.calls) == 1
+    # R6/D2: a 403 with no body reads as thin (word count only) and escalates once through
+    # the browser -- two calls, same "blocked" outcome either way.
+    assert len(fake_cls.calls) == 2
 
     second_content, second_pages = await fetch._fetch(
         ["https://blocked.test"], config, registry, RunLog()
     )
 
-    assert len(fake_cls.calls) == 1
+    # Replayed from the sticky verdict: no further crawler calls of any kind.
+    assert len(fake_cls.calls) == 2
     assert second_content == first_content
     # R1: the failure carries the do-not-retry instruction the FIRST time, not only on replay —
     # a model that has to spend the retry to learn the retry is futile has already looped once.
@@ -1740,7 +2021,14 @@ async def test_a_search_approval_rescues_a_url_strict_provenance_rejected_earlie
 
     registry.approve(guessed)  # search surfaced it for real
     fake_cls = install_crawler(
-        [_FakeResult(guessed, markdown=_FakeMarkdown(raw_markdown="body", fit_markdown="body"))]
+        [
+            _FakeResult(
+                guessed,
+                markdown=_FakeMarkdown(
+                    raw_markdown=_not_thin("body"), fit_markdown=_not_thin("body")
+                ),
+            )
+        ]
     )
     content, pages = await fetch._fetch([guessed], config, registry, RunLog())
 
@@ -1771,12 +2059,15 @@ async def test_re_approving_a_url_does_not_clear_a_guard_or_failure_verdict(
     )
 
     await fetch._fetch(["https://evil.test"], config, registry, RunLog())
-    assert len(fake_cls.calls) == 1
+    # R6/D2: the attack fixture is short enough to read as thin and escalate once through
+    # the browser -- the guard blocks it either way.
+    assert len(fake_cls.calls) == 2
 
     registry.approve("https://evil.test")  # a second search result names the same page
     content, pages = await fetch._fetch(["https://evil.test"], config, registry, RunLog())
 
-    assert len(fake_cls.calls) == 1
+    # Replayed from the sticky guard verdict: no further crawler calls.
+    assert len(fake_cls.calls) == 2
     assert pages == []
     assert content == fetch._rejection_block("https://evil.test")
 
@@ -2139,18 +2430,27 @@ async def test_two_fetch_pages_calls_through_a_shared_session_construct_the_craw
     registry = SourceRegistry()
     approve_all(registry, ["https://a.test", "https://b.test"])
     results = [
-        _FakeResult("https://a.test", markdown=_FakeMarkdown(raw_markdown="A", fit_markdown="A")),
-        _FakeResult("https://b.test", markdown=_FakeMarkdown(raw_markdown="B", fit_markdown="B")),
+        _FakeResult(
+            "https://a.test",
+            markdown=_FakeMarkdown(raw_markdown=_not_thin("A"), fit_markdown=_not_thin("A")),
+        ),
+        _FakeResult(
+            "https://b.test",
+            markdown=_FakeMarkdown(raw_markdown=_not_thin("B"), fit_markdown=_not_thin("B")),
+        ),
     ]
     fake_cls = install_crawler(results)
-    session = BrowserSession(config)
+    session = BrowserSession(config, run_id="test-run")
     await session.start()
     fetch_pages = fetch.build_fetch_tool(config, registry, browser=session)
 
     first = await fetch_pages.ainvoke(_tool_call(["https://a.test"], "shared-1"))
     second = await fetch_pages.ainvoke(_tool_call(["https://b.test"], "shared-2"))
 
-    assert len(fake_cls.constructed_with) == 1
+    # `session.start()` builds two handles (browser + warm HTTP crawler, Phase 2 R6); the
+    # point pinned here is that it's ONE `start()`, not one construction per `fetch_pages`
+    # call.
+    assert len(fake_cls.constructed_with) == 2
     assert [call.urls for call in fake_cls.calls] == [["https://a.test"], ["https://b.test"]]
     assert "## [S1] https://a.test" in first.content
     assert "## [S2] https://b.test" in second.content

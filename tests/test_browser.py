@@ -13,13 +13,15 @@ async def test_session_reuses_one_crawler_across_multiple_batches(install_crawle
     """R2's core assertion: one started session spans many batches without reconstructing."""
     config = make_config()
     fake_cls = install_crawler([_FakeResult("https://a.test")])
-    session = BrowserSession(config)
+    session = BrowserSession(config, run_id="test-run")
     await session.start()
 
     await session.arun_many(["https://a.test"])
     await session.arun_many(["https://a.test"])
 
-    assert len(fake_cls.constructed_with) == 1
+    # `start()` also builds the warm HTTP crawler (Phase 2, R6) -- count BROWSER
+    # constructions specifically.
+    assert fake_cls.constructed_kinds.count("browser") == 1
 
 
 async def test_one_batch_failure_relaunches_once_and_returns_the_retried_results(
@@ -32,13 +34,15 @@ async def test_one_batch_failure_relaunches_once_and_returns_the_retried_results
     ]
     fake_cls = install_crawler(results, fail_batches=1)
     run_log = RunLog()
-    session = BrowserSession(config, run_log)
+    session = BrowserSession(config, run_log, run_id="test-run")
     await session.start()
 
     returned = await session.arun_many(["https://a.test"])
 
     assert returned == results
-    assert len(fake_cls.constructed_with) == 2
+    # `start()` also builds the warm HTTP crawler (Phase 2, R6) -- count BROWSER
+    # constructions specifically: one from the initial start, one from the relaunch.
+    assert fake_cls.constructed_kinds.count("browser") == 2
     kinds = [incident.kind for incident in run_log.incidents()]
     assert "browser_relaunched" in kinds
 
@@ -49,13 +53,15 @@ async def test_a_second_batch_failure_raises_instead_of_relaunching_again(
     """The relaunch is per-SESSION, not per-call: a second death re-raises to the caller."""
     config = make_config()
     fake_cls = install_crawler([_FakeResult("https://a.test")], fail_batches=2)
-    session = BrowserSession(config)
+    session = BrowserSession(config, run_id="test-run")
     await session.start()
 
     with pytest.raises(RuntimeError):
         await session.arun_many(["https://a.test"])
 
-    assert len(fake_cls.constructed_with) == 2
+    # `start()` also builds the warm HTTP crawler (Phase 2, R6) -- count BROWSER
+    # constructions specifically.
+    assert fake_cls.constructed_kinds.count("browser") == 2
 
 
 async def test_close_is_idempotent_and_closes_the_underlying_crawler_once(
@@ -63,13 +69,14 @@ async def test_close_is_idempotent_and_closes_the_underlying_crawler_once(
 ):
     config = make_config()
     fake_cls = install_crawler([])
-    session = BrowserSession(config)
+    session = BrowserSession(config, run_id="test-run")
     await session.start()
 
     await session.close()
     await session.close()
 
-    assert len(fake_cls.closed) == 1
+    # Two handles (browser + warm HTTP crawler, Phase 2 R6), each closed exactly once.
+    assert len(fake_cls.closed) == 2
 
 
 async def test_concurrent_batch_failures_share_one_relaunch(install_crawler, make_config):
@@ -83,7 +90,7 @@ async def test_concurrent_batch_failures_share_one_relaunch(install_crawler, mak
     ]
     fake_cls = install_crawler(results, fail_batches=2)
     run_log = RunLog()
-    session = BrowserSession(config, run_log)
+    session = BrowserSession(config, run_log, run_id="test-run")
     await session.start()
 
     first, second = await asyncio.gather(
@@ -95,7 +102,11 @@ async def test_concurrent_batch_failures_share_one_relaunch(install_crawler, mak
     # not which slice of `results` came back.
     assert first == results
     assert second == results
-    assert len(fake_cls.constructed_with) == 2, "one shared relaunch, not one per sibling"
+    # `start()` also builds the warm HTTP crawler (Phase 2, R6) -- count BROWSER
+    # constructions specifically.
+    assert fake_cls.constructed_kinds.count("browser") == 2, (
+        "one shared relaunch, not one per sibling"
+    )
     kinds = [incident.kind for incident in run_log.incidents()]
     assert kinds.count("browser_relaunched") == 1, "only one sibling should trigger the relaunch"
 
@@ -108,7 +119,7 @@ async def test_arun_many_after_a_failed_relaunch_raises_preflight_error_not_attr
     'arun_many'`, which is what used to reach the model and the report's disclosure."""
     config = make_config()
     fake_cls = install_crawler([_FakeResult("https://a.test")], fail_batches=1)
-    session = BrowserSession(config, RunLog())
+    session = BrowserSession(config, RunLog(), run_id="test-run")
     await session.start()
 
     async def _dead_start() -> None:
@@ -122,7 +133,9 @@ async def test_arun_many_after_a_failed_relaunch_raises_preflight_error_not_attr
     with pytest.raises(BrowserPreflightError):
         await session.arun_many(["https://a.test"])
 
-    assert len(fake_cls.constructed_with) == 1
+    # `start()` also builds the warm HTTP crawler (Phase 2, R6) -- count BROWSER
+    # constructions specifically: the ONE real `start()` call, before it was monkeypatched.
+    assert fake_cls.constructed_kinds.count("browser") == 1
 
 
 async def test_arrival_during_a_healthy_relaunch_rides_it_instead_of_raising(
@@ -140,7 +153,7 @@ async def test_arrival_during_a_healthy_relaunch_rides_it_instead_of_raising(
     ]
     fake_cls = install_crawler(results, fail_batches=1)
     run_log = RunLog()
-    session = BrowserSession(config, run_log)
+    session = BrowserSession(config, run_log, run_id="test-run")
     await session.start()
 
     relaunch_started = asyncio.Event()
@@ -164,7 +177,9 @@ async def test_arrival_during_a_healthy_relaunch_rides_it_instead_of_raising(
 
     assert first == results
     assert second == results
-    assert len(fake_cls.constructed_with) == 2
+    # `start()` also builds the warm HTTP crawler (Phase 2, R6) -- count BROWSER
+    # constructions specifically.
+    assert fake_cls.constructed_kinds.count("browser") == 2
     kinds = [incident.kind for incident in run_log.incidents()]
     assert kinds.count("browser_relaunched") == 1
 
@@ -183,7 +198,7 @@ async def test_start_failure_raises_browser_preflight_error_naming_chromium(
             raise RuntimeError("could not launch")
 
     monkeypatch.setattr("harness.tools.fetch._crawler_class", lambda: _DeadCrawler)
-    session = BrowserSession(config)
+    session = BrowserSession(config, run_id="test-run")
 
     with pytest.raises(BrowserPreflightError, match="(?i)chromium"):
         await session.start()
