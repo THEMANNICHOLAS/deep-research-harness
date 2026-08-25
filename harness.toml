@@ -49,7 +49,7 @@ model = "deepseek-v4-flash"
 # D4: verification runs on a model that did not write the report.
 [roles.verifier]
 provider = "opencode"
-model = "gpt-5.6-luna"
+model = "qwen3.7-plus"
 
 [fetch]
 page_timeout_ms = 15000

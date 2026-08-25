@@ -26,7 +26,7 @@
   crawl4ai-managed Playwright/Chromium (Lightpanda was tried and retired — see
   docs/decisions.md), OpenCode API for all four model roles — `kimi-k3` for the head,
   `deepseek-v4-pro` for the researcher, `deepseek-v4-flash` for the reader, and
-  `gpt-5.6-luna` for the verifier. API **keys** live
+  `qwen3.7-plus` for the verifier. API **keys** live
   in `.env`; **endpoints, model IDs and limits** live in `harness.toml` (see
   docs/guides/setup.md). Neither is ever hardcoded.
 - **CI:** GitHub Actions, running on a self-hosted runner with the default tags

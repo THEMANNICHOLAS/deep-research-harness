@@ -256,3 +256,9 @@ sentences each, append-only, newest last.
   The OpenCode dashboard exposes no RPM/TPM figures the developer could find; decision
   (developer, 2026-08-15): ignore limits until one is actually hit, so Step 3's
   researcher-count guidance uses a conservative default fan-out rather than a measured bound.
+
+- **2026-08-25 — `[roles.verifier]` moved from `gpt-5.6-luna` to `qwen3.7-plus`
+  (developer request).** The OpenCode endpoint started 500ing on every
+  `gpt-5.6-luna` preflight chat call (`Internal server error`), surfaced as a
+  fail-fast startup abort. `qwen3.7-plus` was already a listed `[roles.head]`
+  `choices` slug; swapped in with no other config changes.

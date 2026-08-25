@@ -68,7 +68,7 @@ not the ceiling).
 - Search: self-hosted SearXNG (JSON API).
 - Models: OpenCode API serves four roles — `[roles.head]` = `kimi-k3`,
   `[roles.researcher]` = `deepseek-v4-pro`, `[roles.reader]` = `deepseek-v4-flash`,
-  `[roles.verifier]` = `gpt-5.6-luna`. Config-swappable; no other provider is
+  `[roles.verifier]` = `qwen3.7-plus`. Config-swappable; no other provider is
   declared today. The DeepSeek line required a region opt-in on the OpenCode
   workspace dashboard for the `-flash` tier — without it the endpoint 403s (see
   docs/decisions.md); `-pro` worked without a fresh opt-in in a live check.
