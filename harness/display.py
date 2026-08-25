@@ -87,7 +87,9 @@ class QuestionAnswered:
 class Alert:
     """A degraded-coverage warning (a `RunLog` incident).
 
-    Bounded to ONE line by `_bound_alert` before it is rendered (R3), and EPHEMERAL in the
+    Bounded to ONE line by `_bound_alert` at CONSTRUCTION (R3) — in `__post_init__`, not in
+    each renderer's `Alert` branch, so every consumer of `text` gets the bounded line and a
+    future renderer or emitter cannot reintroduce the multi-line flood. EPHEMERAL in the
     live TUI: `RichRenderer` keeps only the most recent `_ALERT_WINDOW` of them plus a
     running total (R4), because the grow-forever list this replaced filled the terminal on a
     run with many incidents. Nothing is lost — the full list still reaches the `RunFinished`
@@ -95,6 +97,9 @@ class Alert:
     """
 
     text: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "text", _bound_alert(self.text))
 
 
 @dataclass(frozen=True)
@@ -285,7 +290,8 @@ class PlainRenderer:
         elif isinstance(event, Question):
             out(event.text)
         elif isinstance(event, Alert):
-            out(f"warning: {_bound_alert(event.text)}")
+            # `event.text` is already bounded — `Alert.__post_init__` is the one bounding site.
+            out(f"warning: {event.text}")
         elif isinstance(event, RunFinished):
             for line in _summary_lines(event):
                 out(line)
@@ -728,8 +734,9 @@ class RichRenderer:
             # `Question` — the detail can carry model- or URL-derived brackets. The run's
             # full incident list still reaches the normal screen via `RunFinished` and the
             # report's `## Gaps and disclosures`.
+            # `event.text` is already bounded -- `Alert.__post_init__` is the one bounding site.
             warning = Text(
-                f"warning: {_bound_alert(event.text)}",
+                f"warning: {event.text}",
                 style="yellow",
                 # R3 literally: one ROW, whatever the terminal width. The char cap alone
                 # would still wrap a long line into two rows on a narrow terminal.

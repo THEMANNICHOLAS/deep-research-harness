@@ -184,6 +184,31 @@ async def test_arrival_during_a_healthy_relaunch_rides_it_instead_of_raising(
     assert kinds.count("browser_relaunched") == 1
 
 
+async def test_a_failed_http_half_of_start_closes_the_already_launched_browser(
+    install_crawler, monkeypatch, make_config
+):
+    """The partial-start leak (PR 38 review): Chromium launches, then the warm HTTP crawler
+    fails to start. `start()` must close the live Chromium before raising, or every such
+    preflight exit orphans a headless browser process -- `__main__`'s handler and the
+    mid-run relaunch path both rely on `start()` never leaving a half-open session."""
+    config = make_config()
+    fake_cls = install_crawler([])
+
+    def _dead_http_crawler(config: object, run_id: str) -> object:
+        raise RuntimeError("no sockets left")
+
+    monkeypatch.setattr("harness.tools.fetch._build_http_crawler", _dead_http_crawler)
+    session = BrowserSession(config, run_id="test-run")
+
+    with pytest.raises(BrowserPreflightError, match="HTTP fetch strategy"):
+        await session.start()
+
+    assert len(fake_cls.closed) == 1, "the launched Chromium must be closed, not leaked"
+    # And the session is fully reset: a later `close()` (e.g. `__main__`'s finally) is a no-op.
+    await session.close()
+    assert len(fake_cls.closed) == 1
+
+
 async def test_start_failure_raises_browser_preflight_error_naming_chromium(
     monkeypatch, make_config
 ):

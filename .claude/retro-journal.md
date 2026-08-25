@@ -42,3 +42,11 @@
 - gotcha: `implement-commit-guard.sh` reads `.claude/implement-state.json` at PreToolUse, before the command runs — setting `commit_allowed` and committing in one compound Bash call is always blocked.
 - dead-end: Bash heredoc (`<<'PY'`) for multi-line Python/markdown fails with `unexpected EOF while looking for matching \`''\`` despite the quoted delimiter; use the Write tool then `uv run python <path>`.
 - decision: a test asserting a flagged risk's outer symptom is not a test of the risk — verify concurrency regression tests BOTH ways (must fail against a deliberately broken implementation) before trusting them.
+
+## 2026-08-25 09:59 — /handoff — PR 38 fetch lifecycle and TUI hygiene, Phases 2-3
+- correction: two of my own /implement impl-plan instructions were defects caught only by the 3F review (hoisting imports out of a try that a caller catches; fencing an encoding fix to one branch on a false "our own strings" premise) — a green suite did not surface either.
+- correction: reviewer findings can be real with the wrong mechanism — a cited crawl4ai `'text\html'` typo did not exist in the installed package, and a cp1252 crash was blamed on U+2026 which encodes fine at byte 0x85. Verify the mechanism before acting on the finding.
+- dead-end: `console.print(Text(..., no_wrap=True))` cannot prove or refute Rich one-row truncation — `Console.print` resets `no_wrap` from its own render options; only in-Group (live-frame) rendering honors it.
+- gotcha: crawl4ai's HTTP strategy writes any non-`text/html` response body to `downloads_path`, defaulting to `~/.crawl4ai/downloads` — outside the workspace, unbounded.
+- gotcha: a Bash heredoc on a `&&` chain binds to the wrong command (`python -c "..." && git commit -F - <<'EOF'` silently skipped the python), and piping a quality gate to `tail` masks its exit code.
+- gotcha: `Live(screen=True)` redirects `sys.stdout` via a FileProxy until `close()`, silently swallowing print-debugging and capsys assertions in mixed-renderer tests.

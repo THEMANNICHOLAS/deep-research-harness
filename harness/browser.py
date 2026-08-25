@@ -9,13 +9,21 @@ construction site.
 import asyncio
 from typing import Any
 
-from harness.config import HarnessConfig, run_downloads_dir
+from harness.config import HarnessConfig
 from harness.runlog import RunLog, or_default
 
 _SETUP_HINT = "crawl4ai manages its own Playwright/Chromium (try: crawl4ai-setup)"
 
 _NOT_RUNNING_DETAIL = (
     f"the browser session is not running (a previous relaunch failed) ({_SETUP_HINT})"
+)
+
+# The HTTP handle's own detail: it has no relaunch machinery and no Chromium, so
+# `_NOT_RUNNING_DETAIL`'s relaunch/`crawl4ai-setup` framing would send a debugger down
+# entirely the wrong path.
+_HTTP_NOT_RUNNING_DETAIL = (
+    "the browser-free HTTP fetch strategy is not running (the session was never started, "
+    "or was closed)"
 )
 
 
@@ -68,7 +76,7 @@ class BrowserSession:
         try:
             from crawl4ai import BrowserConfig  # type: ignore[import-untyped]
 
-            from harness.tools.fetch import _crawler_class, _http_crawler_parts
+            from harness.tools.fetch import _build_http_crawler, _crawler_class
 
             crawler = _crawler_class()(config=BrowserConfig(verbose=False))
             await crawler.start()
@@ -79,24 +87,13 @@ class BrowserSession:
         self._crawler = crawler
 
         try:
-            http_strategy_cls, http_config_cls = _http_crawler_parts()
-            http_crawler = _crawler_class()(
-                crawler_strategy=http_strategy_cls(
-                    browser_config=http_config_cls(
-                        # Containment, not a preference (PR review, Phase 2): unset, crawl4ai
-                        # writes every non-`text/html` body under `~/.crawl4ai/downloads`,
-                        # outside the workspace and never cleaned. See `run_downloads_dir`.
-                        downloads_path=str(run_downloads_dir(self._config, self._run_id)),
-                    ),
-                    # D6: the HTTP pass reuses `max_concurrency` rather than adding a knob.
-                    # The shared dispatcher never runs more crawls than this at once, so a
-                    # larger connection pool than that would go unused.
-                    max_connections=self._config.fetch.max_concurrency,
-                ),
-                config=BrowserConfig(verbose=False),
-            )
+            http_crawler = _build_http_crawler(self._config, self._run_id)
             await http_crawler.start()
         except Exception as exc:
+            # The Chromium half is already live: a half-failed start must not leak it past
+            # the raise, or every such preflight exit orphans a headless Chromium process
+            # (`close()` is idempotent and swallows teardown errors).
+            await self.close()
             raise BrowserPreflightError(
                 f"the browser-free HTTP fetch strategy could not be started: {exc}"
             ) from exc
@@ -172,5 +169,5 @@ class BrowserSession:
         recovers all of them, which is exactly the pre-R6 behavior.
         """
         if self._http is None:
-            raise BrowserPreflightError(_NOT_RUNNING_DETAIL)
+            raise BrowserPreflightError(_HTTP_NOT_RUNNING_DETAIL)
         return list(await self._http.arun_many(urls, config=config, dispatcher=dispatcher))

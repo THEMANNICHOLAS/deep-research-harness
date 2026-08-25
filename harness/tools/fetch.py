@@ -9,6 +9,7 @@ which every CLI invocation paid before doing anything. The first fetch pays it i
 overlapped with the model's first research turn.
 """
 
+import asyncio
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -73,9 +74,7 @@ def _http_crawler_parts() -> tuple[Any, Any]:
 
     Same shape and same reason as `_pdf_crawler_parts`: a function so crawl4ai stays
     unimported until a fetch happens, and so tests patch this one seam rather than the
-    classes. `harness.browser` imports it from here too — the session's warm HTTP crawler
-    and `_fetch`'s per-call fallback must come from the SAME seam or a test would patch
-    only one of them.
+    classes.
     """
     from crawl4ai.async_crawler_strategy import (  # type: ignore[import-untyped]
         AsyncHTTPCrawlerStrategy,
@@ -83,6 +82,35 @@ def _http_crawler_parts() -> tuple[Any, Any]:
     )
 
     return AsyncHTTPCrawlerStrategy, HTTPCrawlerConfig
+
+
+def _build_http_crawler(config: HarnessConfig, run_id: str) -> Any:
+    """Construct (unstarted) the browser-free HTTP crawler (R6).
+
+    THE one construction site: `BrowserSession.start()`'s warm crawler and `_fetch`'s
+    per-call fallback both call this, so the two can never drift apart on what the recipe
+    carries —
+    - `downloads_path` containment: unset, crawl4ai writes every non-`text/html` body under
+      `~/.crawl4ai/downloads`, outside the workspace and never cleaned (see
+      `run_downloads_dir`).
+    - D6: the HTTP pass reuses `max_concurrency` rather than adding a knob. The shared
+      dispatcher never runs more crawls than this at once, so a larger connection pool
+      than that would go unused.
+    Goes through the `_crawler_class`/`_http_crawler_parts` seams, so tests that patch
+    either seam cover both call sites.
+    """
+    from crawl4ai import BrowserConfig
+
+    http_strategy_cls, http_config_cls = _http_crawler_parts()
+    return _crawler_class()(
+        crawler_strategy=http_strategy_cls(
+            browser_config=http_config_cls(
+                downloads_path=str(run_downloads_dir(config, run_id)),
+            ),
+            max_connections=config.fetch.max_concurrency,
+        ),
+        config=BrowserConfig(verbose=False),
+    )
 
 
 def _looks_like_pdf_url(url: str) -> bool:
@@ -549,28 +577,19 @@ async def _fetch(
     pages_by_url: dict[str, FetchedPage] = {}
     reroute_urls: list[str] = []
 
-    if playwright_urls:
+    async def _html_pass() -> None:
+        if not playwright_urls:
+            return
         # R6/D2: HTTP-first. A browser-free pass covers most pages at a fraction of a
         # Chromium navigation's cost; only URLs whose extracted text comes back thin
         # escalate, once, through the session browser.
-        http_strategy_cls, http_config_cls = _http_crawler_parts()
         try:
             if browser is not None:
                 http_results = await browser.http_arun_many(
                     playwright_urls, config=run_config, dispatcher=dispatcher
                 )
             else:
-                async with _crawler_class()(
-                    crawler_strategy=http_strategy_cls(
-                        browser_config=http_config_cls(
-                            # Same containment as the session's crawler in `harness/browser.py`
-                            # — see `run_downloads_dir` for what crawl4ai does without it.
-                            downloads_path=str(run_downloads_dir(config, registry.run_id)),
-                        ),
-                        max_connections=config.fetch.max_concurrency,
-                    ),
-                    config=BrowserConfig(verbose=False),
-                ) as http_crawler:
+                async with _build_http_crawler(config, registry.run_id) as http_crawler:
                     http_results = list(
                         await http_crawler.arun_many(
                             playwright_urls, config=run_config, dispatcher=dispatcher
@@ -667,8 +686,15 @@ async def _fetch(
                 error=error_message,
             )
 
-    pdf_batch_urls = pdf_urls + reroute_urls
-    if pdf_batch_urls:
+    async def _crawl_pdfs(batch: list[str]) -> list:
+        """One PDF-strategy crawl over `batch` (empty batch: no crawler is constructed).
+
+        Builds its OWN dispatcher rather than sharing `dispatcher`: the known-PDF call runs
+        concurrently with the HTML pass, and `MemoryAdaptiveDispatcher.run_urls` stores the
+        crawler on `self`, so one instance can never serve two crawls at once.
+        """
+        if not batch:
+            return []
         pdf_crawler_strategy_cls, pdf_scraping_strategy_cls = _pdf_crawler_parts()
         pdf_run_config = CrawlerRunConfig(
             page_timeout=config.fetch.page_timeout_ms,
@@ -681,14 +707,34 @@ async def _fetch(
             stream=False,
             verbose=False,
         )
+        pdf_dispatcher = MemoryAdaptiveDispatcher(
+            max_session_permit=config.fetch.max_concurrency,
+            memory_threshold_percent=_MEMORY_THRESHOLD_PERCENT,
+            rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
+        )
         async with _crawler_class()(
             crawler_strategy=pdf_crawler_strategy_cls(), config=BrowserConfig(verbose=False)
         ) as pdf_crawler:
             raw_pdf_results = await pdf_crawler.arun_many(
-                pdf_batch_urls, config=pdf_run_config, dispatcher=dispatcher
+                batch, config=pdf_run_config, dispatcher=pdf_dispatcher
             )
-            pdf_results = list(raw_pdf_results)
+            return list(raw_pdf_results)
 
+    # Known-`.pdf` URLs have no dependency on the HTML pass, so the two run concurrently;
+    # only the reroutes (a PDF content-type is discovered by the HTML fetch) wait for it.
+    # `return_exceptions=True` so both passes always settle before an error propagates —
+    # a plain gather would raise while the sibling still ran detached, leaking its crawler.
+    html_outcome, pdf_outcome = await asyncio.gather(
+        _html_pass(), _crawl_pdfs(pdf_urls), return_exceptions=True
+    )
+    if isinstance(html_outcome, BaseException):
+        raise html_outcome
+    if isinstance(pdf_outcome, BaseException):
+        raise pdf_outcome
+
+    pdf_batch_urls = pdf_urls + reroute_urls
+    pdf_results = pdf_outcome + (await _crawl_pdfs(reroute_urls) if reroute_urls else [])
+    if pdf_batch_urls:
         for url, result in _pair(pdf_batch_urls, pdf_results):
             if result is None:
                 pages_by_url[url] = _no_result_page(url)
