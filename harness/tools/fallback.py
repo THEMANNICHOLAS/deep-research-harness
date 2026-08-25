@@ -7,6 +7,8 @@ and orchestrator prompt can disclose that a source was never actually digested b
 reader — it is the lead reading raw page text directly, not the reader's [Sn]-cited summary.
 """
 
+from typing import TYPE_CHECKING
+
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,6 +23,9 @@ from harness.tools.fetch import (
     _render,
 )
 
+if TYPE_CHECKING:
+    from harness.browser import BrowserSession
+
 
 async def _fetch_raw(
     urls: list[str],
@@ -29,15 +34,17 @@ async def _fetch_raw(
     registry: SourceRegistry,
     run_log: RunLog,
     blocklist: Blocklist | None = None,
+    browser: "BrowserSession | None" = None,
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL via the shared `_fetch`, wrapping each successful page in the marker.
 
     Only a successful (`fetched`) page is wrapped and marked `"fallback"` — a failed fetch's
     stub is rendered exactly like `fetch_pages` renders it and stays `"unread"`, since nothing
     was actually captured for the lead to read raw. `_fetch` is shared, so a blocklisted URL
-    hits the same pre-crawl backstop here as through `fetch_pages` (R4).
+    hits the same pre-crawl backstop here as through `fetch_pages` (R4), and `browser`, when
+    given, is the same shared session — or R2 would be false for this fallback path.
     """
-    _, pages = await _fetch(urls, config, registry, run_log, blocklist)
+    _, pages = await _fetch(urls, config, registry, run_log, blocklist, browser)
 
     # `"` is escaped rather than stripped: the reason is model-supplied prose that may
     # legitimately quote something, and dropping the quote marks would lose that context.
@@ -84,12 +91,14 @@ def build_fallback_tool(
     registry: SourceRegistry,
     run_log: RunLog | None = None,
     blocklist: Blocklist | None = None,
+    browser: "BrowserSession | None" = None,
 ) -> BaseTool:
     """Build the `fetch_raw` tool, closing over `config`, the shared `registry` and `run_log`.
 
     Mirrors `build_fetch_tool`'s own `mkdir`: `fetch_raw` can be exercised (and, in a live
     run, called) before `fetch_pages` ever has been, so it cannot rely on the reader's tool
-    having already created `<workspace_dir>/<run_id>/sources`.
+    having already created `<workspace_dir>/<run_id>/sources`. `browser` (Phase 1, R2) threads
+    the same way, to the same shared session.
     """
     sources_dir(config, registry).mkdir(parents=True, exist_ok=True)
 
@@ -119,6 +128,6 @@ def build_fallback_tool(
         or returned an empty digest. Each successfully fetched page is wrapped in an
         `<undigested>` marker so the run's report can disclose it as raw, undigested content.
         """
-        return await _fetch_raw(urls, reason, config, registry, log, domain_blocklist)
+        return await _fetch_raw(urls, reason, config, registry, log, domain_blocklist, browser)
 
     return _install_url_limit_contract(fetch_raw, max_urls)

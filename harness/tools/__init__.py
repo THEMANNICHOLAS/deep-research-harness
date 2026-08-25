@@ -1,6 +1,6 @@
 """The harness's tool registry package."""
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from langchain_core.tools import BaseTool
 
@@ -13,6 +13,9 @@ from harness.tools.fallback import build_fallback_tool
 from harness.tools.fetch import build_fetch_tool
 from harness.tools.search import build_search_tool
 
+if TYPE_CHECKING:
+    from harness.browser import BrowserSession
+
 
 class ToolSets(NamedTuple):
     """The harness's tools, split by which tier gets to call them (Step 3's 3-tier hierarchy)."""
@@ -23,7 +26,10 @@ class ToolSets(NamedTuple):
 
 
 def build_tools(
-    config: HarnessConfig, registry: SourceRegistry, run_log: RunLog | None = None
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    run_log: RunLog | None = None,
+    browser: "BrowserSession | None" = None,
 ) -> ToolSets:
     """Build every tool the harness exposes, bound to this run's config, registry and run log.
 
@@ -40,6 +46,11 @@ def build_tools(
     The persistent domain blocklist (Phase 3, R3/R4) is loaded ONCE here and shared the same
     way, and for the same reason: a hostname walled mid-run by one fetch must start filtering
     `search_web`'s results immediately, which three independently-loaded copies would not do.
+
+    ONE `browser` session (Phase 1, R2) is shared for the same reason as the `run_log` and the
+    blocklist above: a fresh crawler per call would defeat the whole point of a session browser.
+    It goes to BOTH `fetch_pages` and `fetch_raw` — `search_web` never fetches a page itself, so
+    it does not take one — or R2 would be false for the fallback path the moment it fired.
     """
     log = or_default(run_log)
     blocklist = load_blocklist(config.blocklist.path)
@@ -47,7 +58,7 @@ def build_tools(
         lead=[build_ask_user_tool(config)],
         researcher=[
             build_search_tool(config, registry, log, blocklist),
-            build_fallback_tool(config, registry, log, blocklist),
+            build_fallback_tool(config, registry, log, blocklist, browser),
         ],
-        reader=[build_fetch_tool(config, registry, log, blocklist)],
+        reader=[build_fetch_tool(config, registry, log, blocklist, browser)],
     )

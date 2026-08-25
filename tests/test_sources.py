@@ -545,3 +545,21 @@ def test_re_approving_an_already_approved_url_leaves_its_verdict_intact():
     registry.approve("https://example.com/a")
 
     assert registry.failed_block("https://example.com/a") == "guard block verdict"
+
+
+# --- Phase 4 (fetch lifecycle and TUI hygiene): live source counter (R5) -----------------
+
+
+def test_count_returns_the_number_of_registered_sources():
+    registry = SourceRegistry()
+
+    assert registry.count() == 0
+
+    registry.add("https://a.example")
+    registry.add("https://b.example")
+
+    assert registry.count() == 2
+
+    registry.add("https://a.example/")  # normalize_url-equivalent spelling
+
+    assert registry.count() == 2

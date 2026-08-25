@@ -4,6 +4,7 @@
 
 import sys
 import time
+from collections import deque
 from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
+
+from harness.guard import strip_invisibles
 
 Stage = Literal["clarifying", "researching", "verifying", "writing"]
 
@@ -41,6 +44,17 @@ class RoundsUpdated:
 
     rounds_used: int
     max_rounds: int
+
+
+@dataclass(frozen=True)
+class SourcesUpdated:
+    """The count of registered sources (`[Sn]` minted) -- a replacement, not a delta (R5).
+
+    Separate from `RunFinished`'s end-of-run totals: this is the LIVE counter, polled from
+    `__main__` while the run is still going.
+    """
+
+    count: int
 
 
 @dataclass(frozen=True)
@@ -71,10 +85,21 @@ class QuestionAnswered:
 
 @dataclass(frozen=True)
 class Alert:
-    """A degraded-coverage warning (a `RunLog` incident): rendered as a PERSISTENT line, not
-    part of the scrolling activity tail — a failed search must not vanish off the feed."""
+    """A degraded-coverage warning (a `RunLog` incident).
+
+    Bounded to ONE line by `_bound_alert` at CONSTRUCTION (R3) — in `__post_init__`, not in
+    each renderer's `Alert` branch, so every consumer of `text` gets the bounded line and a
+    future renderer or emitter cannot reintroduce the multi-line flood. EPHEMERAL in the
+    live TUI: `RichRenderer` keeps only the most recent `_ALERT_WINDOW` of them plus a
+    running total (R4), because the grow-forever list this replaced filled the terminal on a
+    run with many incidents. Nothing is lost — the full list still reaches the `RunFinished`
+    summary count and the report's `## Gaps and disclosures`, verbatim and unbounded.
+    """
 
     text: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "text", _bound_alert(self.text))
 
 
 @dataclass(frozen=True)
@@ -145,7 +170,67 @@ DisplayEvent = (
     | RoundsUpdated
     | ToolCall
     | ReadersUpdated
+    | SourcesUpdated
 )
+
+
+# R4's rolling window: the live region shows only the most recent alerts, with a running
+# total standing in for everything evicted. 3 is the developer's confirmed default.
+_ALERT_WINDOW = 3
+# R3's char bound. Generous enough that an ordinary incident line survives intact, small
+# enough that crawl4ai's multi-hundred-character error dumps cannot own the screen. The
+# first-line cut in `_bound_alert` is what actually stops the 25-line floods; this caps the
+# pathological single-line case.
+_ALERT_MAX_CHARS = 120
+
+
+def _bound_alert(text: str) -> str:
+    """Reduce any alert detail to ONE bounded line (R3/D3).
+
+    Bounds at the display layer, not at `run_log.record`'s 13 call sites: the report's
+    `## Gaps and disclosures` must keep the full verbatim detail, and bounding at the source
+    would thin it there too. Any future emitter gets this for free.
+
+    First line, then char cap, then `strip_invisibles` — the order matters. crawl4ai's error
+    text embeds call logs and code context over dozens of lines, so the newline cut is what
+    actually prevents a flood; the cap only handles a pathological single line. Stripping
+    last means a control character can never survive as the last thing written.
+
+    NOT a duplicate of `activity.brief_summary` or `agent._summarize_tool_result`, despite the
+    shared first-line-plus-cap shape (PR review, Phase 3). Each is scoped to a different kind
+    of text and differs where it matters: those two summarize model-authored prose, so
+    `brief_summary` cuts at the first SENTENCE — which would be wrong here, since an error's
+    first sentence is often a useless prefix ("Error: ") and the diagnostic follows it. This
+    one also strips invisibles, which the other two have no need to (their input is not
+    adversarial), and marks truncation with ASCII "..." rather than U+2026, because the plain
+    renderer's stream may be cp1252. Merging them would need a parameter per difference —
+    three, for two real call sites each.
+    """
+    stripped = text.strip()
+    first_line = stripped.splitlines()[0] if stripped else ""
+    if len(first_line) > _ALERT_MAX_CHARS:
+        first_line = first_line[: _ALERT_MAX_CHARS - 3].rstrip() + "..."
+    return strip_invisibles(first_line)
+
+
+def _encodable(text: str, stream: object) -> str:
+    """Replace any character `stream` cannot encode, instead of raising (LATER-PROBLEMS.md).
+
+    Redirected stdout on Windows is cp1252, so one non-ASCII character inside crawl4ai or
+    site error text raised `UnicodeEncodeError` out of `_emit_new_alerts` and killed the run
+    — discarding a report for a display detail. The characters are not ours, so no ASCII-only
+    rule on our own source prevents it.
+
+    Round-trips through the stream's own encoding rather than reconfiguring the stream:
+    `PlainRenderer` re-resolves `sys.stdout` on EVERY emit (pytest's `capsys` swaps it), so
+    there is no single construction-time stream to reconfigure. A stream with no `encoding`
+    — `StringIO` in the tests — takes any `str`, so it passes through untouched. UTF-8
+    terminals are unaffected: every character round-trips.
+    """
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return text
+    return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
 
 
 def _summary_lines(event: RunFinished) -> list[str]:
@@ -186,20 +271,33 @@ class PlainRenderer:
         # Resolved at emit time, not captured in `__init__`: pytest's capsys replaces
         # `sys.stdout` per-test, and a captured reference would miss that swap.
         stream = sys.stdout
+
+        def out(text: str) -> None:
+            """Every write goes through `_encodable` — this is THE plain-output boundary.
+
+            Not just the `Alert` branch (PR review, Phase 3): `ToolCall.result_summary` is
+            derived from fetched page content and `Activity.text` from model-authored prose,
+            so both carry arbitrary web Unicode. On redirected Windows stdout (cp1252) either
+            one raised `UnicodeEncodeError` and killed the run. Wrapping the boundary rather
+            than the branches means a future branch cannot reintroduce the crash.
+            """
+            print(_encodable(text, stream), file=stream)
+
         if isinstance(event, StageStarted):
-            print(f"{event.stage}...", file=stream)
+            out(f"{event.stage}...")
         elif isinstance(event, StageCompleted):
-            print(f"{event.stage} done ({event.elapsed_seconds:.1f}s)", file=stream)
+            out(f"{event.stage} done ({event.elapsed_seconds:.1f}s)")
         elif isinstance(event, Question):
-            print(event.text, file=stream)
+            out(event.text)
         elif isinstance(event, Alert):
-            print(f"warning: {event.text}", file=stream)
+            # `event.text` is already bounded — `Alert.__post_init__` is the one bounding site.
+            out(f"warning: {event.text}")
         elif isinstance(event, RunFinished):
             for line in _summary_lines(event):
-                print(line, file=stream)
+                out(line)
         elif isinstance(event, TodosUpdated):
             for item in event.todos:
-                print(f"  [{item.status}] {item.content}", file=stream)
+                out(f"  [{item.status}] {item.content}")
         elif isinstance(event, RoundsUpdated):
             # Dropped: pure live-frame decoration (D2), and a line per model turn would spam
             # the non-TTY CI logs; every other event carries a real, one-time textual meaning
@@ -215,17 +313,16 @@ class PlainRenderer:
             # decoration (D-B), and the completed line is the durable fact worth a CI log line.
             if event.result_summary is not None:
                 retry_suffix = " (retry)" if event.retry else ""
-                print(
-                    f"  {event.tool}: {event.arg_summary} -- {event.result_summary}{retry_suffix}",
-                    file=stream,
-                )
+                out(f"  {event.tool}: {event.arg_summary} -- {event.result_summary}{retry_suffix}")
         elif isinstance(event, ReadersUpdated):
             # Dropped, same policy as `RoundsUpdated`/`AnswerDraft`/`QuestionAnswered` above:
             # the reader strip is pure live-frame decoration, presence-only, and a line per
             # status tick would flood a non-TTY log.
             pass
+        elif isinstance(event, SourcesUpdated):
+            out(f"sources: {event.count}")
         else:  # Activity
-            print(f"  {event.text}", file=stream)
+            out(f"  {event.text}")
 
     def suspend(self) -> AbstractContextManager[None]:
         return nullcontext()
@@ -374,7 +471,11 @@ class RichRenderer:
         self._stage: Stage | None = None
         self._activities: list[str] = []
         self._timeline: list[Text] = []
-        self._alerts: list[Text] = []
+        # R4: a bounded window, not a list -- `deque(maxlen=...)` evicts the oldest for us.
+        self._alerts: deque[Text] = deque(maxlen=_ALERT_WINDOW)
+        # Counts every alert this run, including the ones the window has evicted, so the
+        # total line stays truthful. `len(self._alerts)` caps at the window and cannot.
+        self._alert_count = 0
         self._todos: tuple[TodoItem, ...] = ()
         # Insertion-ordered: a replaced key (the completion emit) keeps its original
         # position, which is what holds the log stable rather than jumping the row to the
@@ -394,6 +495,9 @@ class RichRenderer:
         # per-stage timings are already shown in the completed-stage timeline (Step 3).
         self._started_at = self._elapsed.now()
         self._rounds: tuple[int, int] | None = None
+        # Starts at 0, not `None` (R5): the counter is in the frame from the first render,
+        # not only after the first source lands.
+        self._source_count: int = 0
 
     def _build_checklist(self) -> Group:
         heading = Text("Tasks", style=f"bold {_ACCENT_2}")
@@ -507,11 +611,25 @@ class RichRenderer:
         # The strip is pinned live state, like the timeline and alerts -- not part of the
         # log region, so it stays visible even when the overlay below replaces the log.
         strip_part: tuple[RenderableType, ...] = (strip,) if strip is not None else ()
+        # R4: the rolling window plus a running total, shown whenever any alert has fired --
+        # not only once eviction starts (D4's example line reads that way, and one steady
+        # line is not the flood R3/R4 exist to prevent).
+        status_part: list[Text] = list(self._alerts)
+        if self._alert_count:
+            status_part.append(
+                Text(
+                    f"warnings: {self._alert_count} this run - full list in report",
+                    style="yellow",
+                )
+            )
+        # R5: the live source counter, always present -- placed AFTER the warnings total so
+        # the alert window stays adjacent to the timeline above it.
+        status_part.append(Text(f"sources: {self._source_count}", style=_MUTED))
         if self._overlay_question is not None:
             # The overlay REPLACES the activity lines only -- the checklist (outside this
             # panel), the timeline, the stage header, and the reader strip all stay visible (R4).
             return Group(
-                *self._timeline, *self._alerts, header, *strip_part, self._build_ask_overlay()
+                *self._timeline, *status_part, header, *strip_part, self._build_ask_overlay()
             )
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
         log = self._build_tool_log()
@@ -519,7 +637,7 @@ class RichRenderer:
             *activity_lines,
             *((log,) if log is not None else ()),
         )
-        return Group(*self._timeline, *self._alerts, header, *strip_part, *log_or_activity)
+        return Group(*self._timeline, *status_part, header, *strip_part, *log_or_activity)
 
     def _build_renderable(self) -> Group:
         return Group(
@@ -608,15 +726,25 @@ class RichRenderer:
             if self._live is not None:
                 self._live.refresh()
         elif isinstance(event, Alert):
-            # Appended to a PERSISTENT list rendered inside the frame, not `console.print`ed
+            # Appended to a bounded rolling WINDOW (R4) rendered inside the frame, not
+            # `console.print`ed
             # and not part of the scrolling `_activities` tail: under `screen=True` a print
             # while the Live runs is overwritten and then discarded on exit, and a failed
             # search must not scroll away. `Text(...)` for the same markup-safety reason as
             # `Question` — the detail can carry model- or URL-derived brackets. The run's
             # full incident list still reaches the normal screen via `RunFinished` and the
             # report's `## Gaps and disclosures`.
-            warning = Text(f"warning: {event.text}", style="yellow")
+            # `event.text` is already bounded -- `Alert.__post_init__` is the one bounding site.
+            warning = Text(
+                f"warning: {event.text}",
+                style="yellow",
+                # R3 literally: one ROW, whatever the terminal width. The char cap alone
+                # would still wrap a long line into two rows on a narrow terminal.
+                no_wrap=True,
+                overflow="ellipsis",
+            )
             self._alerts.append(warning)
+            self._alert_count += 1
             if self._live is not None:
                 self._live.refresh()
             else:
@@ -635,6 +763,12 @@ class RichRenderer:
             # own — it only repaints an already-running frame, since a round only advances
             # once a stage (and so the frame) exists.
             self._rounds = (event.rounds_used, event.max_rounds)
+            if self._live is not None:
+                self._live.refresh()
+        elif isinstance(event, SourcesUpdated):
+            # Same policy as `RoundsUpdated`: pure decoration of an already-running frame,
+            # never starts the Live region on its own.
+            self._source_count = event.count
             if self._live is not None:
                 self._live.refresh()
         elif isinstance(event, ToolCall):

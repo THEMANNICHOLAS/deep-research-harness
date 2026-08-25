@@ -104,6 +104,12 @@ class FetchSettings(_StrictModel):
     # Judgment, not a measured optimum (D1): bounds one call to ~150k tokens at the current
     # per-page cap. Bounds one `fetch_pages` call, never the run (R9/D11).
     max_urls_per_call: int = Field(default=5, gt=0)
+    # R6/D2's escalation threshold: markdown below this many words sends the URL back
+    # through Chromium once. 50 is a starting guess (plan risk #3), not a measured
+    # threshold — check the escalation rate on a real run before treating it as settled.
+    # Too high sends ordinary short pages to Chromium needlessly; too low lets a JS shell
+    # through as `fetched`.
+    min_markdown_words: int = Field(default=50, gt=0)
 
 
 class SearchSettings(_StrictModel):
@@ -236,3 +242,19 @@ def run_workspace_dir(config: HarnessConfig, run_id: str) -> Path:
     notes. Takes the bare `run_id`, not a `SourceRegistry`, so config stays free of that import.
     """
     return config.agent.workspace_dir / run_id
+
+
+def run_downloads_dir(config: HarnessConfig, run_id: str) -> Path:
+    """The one place the `<workspace_dir>/<run_id>/downloads` layout is built.
+
+    crawl4ai's HTTP strategy writes the raw body of any response whose content-type is not
+    exactly `text/html` — an extensionless PDF, JSON, XML — to its `downloads_path`, which
+    defaults to `~/.crawl4ai/downloads`: outside the workspace, unbounded, never cleaned.
+    Both HTTP-crawler construction sites point here instead, so the invariant that the
+    agent's writes stay inside the workspace holds for bytes crawl4ai writes on our behalf.
+
+    Beside `run_workspace_dir` and taking the bare `run_id` for the same reason: the two
+    consumers (`harness/browser.py`'s session crawler, `tools/fetch.py`'s per-call one) are
+    peers, and config stays free of a `SourceRegistry` import.
+    """
+    return run_workspace_dir(config, run_id) / "downloads"

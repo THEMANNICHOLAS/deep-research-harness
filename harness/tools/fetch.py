@@ -9,16 +9,17 @@ which every CLI invocation paid before doing anything. The first fetch pays it i
 overlapped with the model's first research turn.
 """
 
+import asyncio
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.blocklist import Blocklist, fires_challenge_marker, hostname_of, resolve_blocklist
-from harness.config import HarnessConfig
+from harness.config import HarnessConfig, run_downloads_dir
 from harness.guard import fence, guard_blocked_detail, scan, strip_invisibles
 from harness.runlog import RunLog, or_default
 from harness.sources import (
@@ -28,6 +29,9 @@ from harness.sources import (
     note_digest_candidate,
     sources_dir,
 )
+
+if TYPE_CHECKING:
+    from harness.browser import BrowserSession
 
 FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error", "pdf"]
 
@@ -63,6 +67,50 @@ def _pdf_crawler_parts() -> tuple[Any, Any]:
     from crawl4ai.processors.pdf import PDFCrawlerStrategy  # type: ignore[import-untyped]
 
     return PDFCrawlerStrategy, PDFContentScrapingStrategy
+
+
+def _http_crawler_parts() -> tuple[Any, Any]:
+    """The `(AsyncHTTPCrawlerStrategy, HTTPCrawlerConfig)` pair the HTTP pass constructs.
+
+    Same shape and same reason as `_pdf_crawler_parts`: a function so crawl4ai stays
+    unimported until a fetch happens, and so tests patch this one seam rather than the
+    classes.
+    """
+    from crawl4ai.async_crawler_strategy import (  # type: ignore[import-untyped]
+        AsyncHTTPCrawlerStrategy,
+        HTTPCrawlerConfig,
+    )
+
+    return AsyncHTTPCrawlerStrategy, HTTPCrawlerConfig
+
+
+def _build_http_crawler(config: HarnessConfig, run_id: str) -> Any:
+    """Construct (unstarted) the browser-free HTTP crawler (R6).
+
+    THE one construction site: `BrowserSession.start()`'s warm crawler and `_fetch`'s
+    per-call fallback both call this, so the two can never drift apart on what the recipe
+    carries —
+    - `downloads_path` containment: unset, crawl4ai writes every non-`text/html` body under
+      `~/.crawl4ai/downloads`, outside the workspace and never cleaned (see
+      `run_downloads_dir`).
+    - D6: the HTTP pass reuses `max_concurrency` rather than adding a knob. The shared
+      dispatcher never runs more crawls than this at once, so a larger connection pool
+      than that would go unused.
+    Goes through the `_crawler_class`/`_http_crawler_parts` seams, so tests that patch
+    either seam cover both call sites.
+    """
+    from crawl4ai import BrowserConfig
+
+    http_strategy_cls, http_config_cls = _http_crawler_parts()
+    return _crawler_class()(
+        crawler_strategy=http_strategy_cls(
+            browser_config=http_config_cls(
+                downloads_path=str(run_downloads_dir(config, run_id)),
+            ),
+            max_connections=config.fetch.max_concurrency,
+        ),
+        config=BrowserConfig(verbose=False),
+    )
 
 
 def _looks_like_pdf_url(url: str) -> bool:
@@ -114,6 +162,27 @@ def classify(
     if error_message:
         return "error"
     return "fetched"
+
+
+def _is_thin(result: object | None, min_words: int) -> bool:
+    """Whether the HTTP pass's result is too bare to trust, so this URL escalates once (D2).
+
+    Word count only, per D2 ("the little/bare text is the hint"): a transport failure, an
+    empty body and a JS-shell challenge page all arrive as little-or-no markdown, so one
+    rule covers them and no second trigger is needed. A non-2xx carrying a substantial body
+    deliberately does NOT escalate.
+
+    The content-type exemption is what makes D2's arxiv case work: a PDF (or an image) has
+    no text for Chromium to extract either, and a PDF specifically must reach `classify`'s
+    "pdf" branch to be rerouted through the PDF batch — escalating it instead would send it
+    back to the browser navigation that failed on it in the first place.
+    """
+    if result is None:
+        return True
+    content_type = _content_type(result)
+    if content_type and "html" not in content_type.lower():
+        return False
+    return len(_markdown_of(result).split()) < min_words
 
 
 class FetchedPage(BaseModel):
@@ -397,12 +466,18 @@ async def _fetch(
     registry: SourceRegistry,
     run_log: RunLog,
     blocklist: Blocklist | None = None,
+    browser: "BrowserSession | None" = None,
 ) -> tuple[str, list[FetchedPage]]:
     """Fetch every URL, returning model-facing markdown and the full per-URL artifact.
 
     `blocklist` defaults to a fresh load from `config.blocklist.path` for direct callers and
     tests; production threads ONE shared instance from `build_tools`, so a hostname walled
     mid-run by one fetch is visible to `search_web`'s filter for the rest of the run.
+
+    `browser` (Phase 1, R2; Phase 2, R6): the shared session the HTTP-first pass and its
+    thin-text browser escalation both run through when given one. `None` preserves the prior
+    per-call `async with _crawler_class()(...)` behavior, now of both crawlers, which every
+    direct caller and existing test still rides.
     """
     blocklist = resolve_blocklist(blocklist, config.blocklist.path)
     from crawl4ai import (
@@ -502,15 +577,58 @@ async def _fetch(
     pages_by_url: dict[str, FetchedPage] = {}
     reroute_urls: list[str] = []
 
-    if playwright_urls:
-        # verbose=False is deliberate: crawl4ai defaults it True and prints into our process.
-        async with _crawler_class()(config=BrowserConfig(verbose=False)) as crawler:
-            raw_results = await crawler.arun_many(
-                playwright_urls, config=run_config, dispatcher=dispatcher
-            )
-            results = list(raw_results)
+    async def _html_pass() -> None:
+        if not playwright_urls:
+            return
+        # R6/D2: HTTP-first. A browser-free pass covers most pages at a fraction of a
+        # Chromium navigation's cost; only URLs whose extracted text comes back thin
+        # escalate, once, through the session browser.
+        try:
+            if browser is not None:
+                http_results = await browser.http_arun_many(
+                    playwright_urls, config=run_config, dispatcher=dispatcher
+                )
+            else:
+                async with _build_http_crawler(config, registry.run_id) as http_crawler:
+                    http_results = list(
+                        await http_crawler.arun_many(
+                            playwright_urls, config=run_config, dispatcher=dispatcher
+                        )
+                    )
+        except Exception:
+            # Records NO incident, deliberately: this is not degraded coverage. Every URL
+            # comes back resultless, reads as thin below, and the browser pass recovers all
+            # of them -- i.e. exactly the pre-R6 behavior, which is plan risk #3's stated
+            # bound. A RunLog incident here would put a fully-covered run in the report's
+            # gaps section.
+            http_results = []
 
-        for url, result in _pair(playwright_urls, results):
+        pairs = _pair(playwright_urls, http_results)
+        thin_urls = [
+            url for url, result in pairs if _is_thin(result, config.fetch.min_markdown_words)
+        ]
+        if thin_urls:
+            if browser is not None:
+                escalated = await browser.arun_many(
+                    thin_urls, config=run_config, dispatcher=dispatcher
+                )
+            else:
+                # verbose=False is deliberate: crawl4ai defaults it True and prints into our
+                # process.
+                async with _crawler_class()(config=BrowserConfig(verbose=False)) as crawler:
+                    raw_escalated = await crawler.arun_many(
+                        thin_urls, config=run_config, dispatcher=dispatcher
+                    )
+                    escalated = list(raw_escalated)
+
+            # D2: the escalated result wins unconditionally -- one escalation per URL per
+            # call, no "keep whichever looks better" comparison.
+            replacement = dict(_pair(thin_urls, escalated))
+            pairs = [
+                (url, replacement[url] if url in replacement else result) for url, result in pairs
+            ]
+
+        for url, result in pairs:
             if result is None:
                 pages_by_url[url] = _no_result_page(url)
                 continue
@@ -568,8 +686,15 @@ async def _fetch(
                 error=error_message,
             )
 
-    pdf_batch_urls = pdf_urls + reroute_urls
-    if pdf_batch_urls:
+    async def _crawl_pdfs(batch: list[str]) -> list:
+        """One PDF-strategy crawl over `batch` (empty batch: no crawler is constructed).
+
+        Builds its OWN dispatcher rather than sharing `dispatcher`: the known-PDF call runs
+        concurrently with the HTML pass, and `MemoryAdaptiveDispatcher.run_urls` stores the
+        crawler on `self`, so one instance can never serve two crawls at once.
+        """
+        if not batch:
+            return []
         pdf_crawler_strategy_cls, pdf_scraping_strategy_cls = _pdf_crawler_parts()
         pdf_run_config = CrawlerRunConfig(
             page_timeout=config.fetch.page_timeout_ms,
@@ -582,14 +707,34 @@ async def _fetch(
             stream=False,
             verbose=False,
         )
+        pdf_dispatcher = MemoryAdaptiveDispatcher(
+            max_session_permit=config.fetch.max_concurrency,
+            memory_threshold_percent=_MEMORY_THRESHOLD_PERCENT,
+            rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
+        )
         async with _crawler_class()(
             crawler_strategy=pdf_crawler_strategy_cls(), config=BrowserConfig(verbose=False)
         ) as pdf_crawler:
             raw_pdf_results = await pdf_crawler.arun_many(
-                pdf_batch_urls, config=pdf_run_config, dispatcher=dispatcher
+                batch, config=pdf_run_config, dispatcher=pdf_dispatcher
             )
-            pdf_results = list(raw_pdf_results)
+            return list(raw_pdf_results)
 
+    # Known-`.pdf` URLs have no dependency on the HTML pass, so the two run concurrently;
+    # only the reroutes (a PDF content-type is discovered by the HTML fetch) wait for it.
+    # `return_exceptions=True` so both passes always settle before an error propagates —
+    # a plain gather would raise while the sibling still ran detached, leaking its crawler.
+    html_outcome, pdf_outcome = await asyncio.gather(
+        _html_pass(), _crawl_pdfs(pdf_urls), return_exceptions=True
+    )
+    if isinstance(html_outcome, BaseException):
+        raise html_outcome
+    if isinstance(pdf_outcome, BaseException):
+        raise pdf_outcome
+
+    pdf_batch_urls = pdf_urls + reroute_urls
+    pdf_results = pdf_outcome + (await _crawl_pdfs(reroute_urls) if reroute_urls else [])
+    if pdf_batch_urls:
         for url, result in _pair(pdf_batch_urls, pdf_results):
             if result is None:
                 pages_by_url[url] = _no_result_page(url)
@@ -675,11 +820,15 @@ def build_fetch_tool(
     registry: SourceRegistry,
     run_log: RunLog | None = None,
     blocklist: Blocklist | None = None,
+    browser: "BrowserSession | None" = None,
 ) -> BaseTool:
     """Build the `fetch_pages` tool, closing over `config`, the shared `registry` and `run_log`.
 
     Creates `<workspace_dir>/<run_id>/sources` up front, so an unwritable workspace fails at
     startup rather than silently losing captures mid-run.
+
+    `browser` (Phase 1, R2), when given, is the one shared session `_fetch`'s HTML batch reuses
+    instead of launching a fresh crawler per call.
 
     The guard is invisible here (D5): every fetched page is scanned for injection signals
     inside the shared `_fetch`, before classification, minting, or capture. A blocked page
@@ -727,7 +876,7 @@ def build_fetch_tool(
         their outcome rather than raising, so one bad URL never fails the batch. Equivalent
         spellings of the same page (trailing slash, fragment, case) are fetched once.
         """
-        content, pages = await _fetch(urls, config, registry, log, domain_blocklist)
+        content, pages = await _fetch(urls, config, registry, log, domain_blocklist, browser)
         # Only a real capture is even a digest CANDIDATE (R5) — a failed fetch stays "unread".
         # The mark itself is deferred to the delegation boundary: agent.py's
         # `_ReaderDigestMiddleware` promotes these to "digested" only when the reader's digest

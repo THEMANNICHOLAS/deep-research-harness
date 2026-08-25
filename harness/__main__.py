@@ -46,6 +46,7 @@ from langchain_core.messages.ai import UsageMetadata, add_usage
 from rich.console import Console, RenderableType
 
 from harness.activity import ActivitySink, DisplayError, brief_summary
+from harness.browser import BrowserPreflightError, BrowserSession
 from harness.config import ConfigError, load_config
 from harness.display import (
     Activity,
@@ -58,6 +59,7 @@ from harness.display import (
     Renderer,
     RoundsUpdated,
     RunFinished,
+    SourcesUpdated,
     StageTracker,
     TodoItem,
     TodosUpdated,
@@ -699,6 +701,18 @@ async def main(argv: list[str] | None = None) -> int:
         registry.approve(url)
     run_log = RunLog()
 
+    # After `run_log`, not beside the other preflights above: `BrowserSession` records its OWN
+    # relaunch incident onto it (Phase 1 Discoveries) rather than taking a caller-supplied hook,
+    # so it cannot be constructed any earlier.
+    renderer.emit(Activity("preflight: launching the browser"))
+    browser = BrowserSession(config, run_log, run_id=registry.run_id)
+    try:
+        await browser.start()
+    except BrowserPreflightError as exc:
+        renderer.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     # Live disclosure (best-effort + disclose): every incident a tool records is echoed to
     # the terminal as soon as the stream yields control back, and `alerts_emitted` keeps a
     # later poll from re-printing what an earlier one already showed.
@@ -710,6 +724,24 @@ async def main(argv: list[str] | None = None) -> int:
         for incident in incidents[alerts_emitted:]:
             renderer.emit(Alert(incident.detail))
         alerts_emitted = len(incidents)
+
+    # R5's live counter: registered sources = `[Sn]` minted (`registry.add` is gated
+    # `if outcome == "fetched"`, so a registered source is by construction a successfully
+    # fetched one). Dedupe variable initialized to 0 so a run that registers no sources
+    # emits nothing.
+    last_source_count = 0
+
+    def _emit_source_count() -> None:
+        """Emit the live source counter (R5), but only when it actually changed.
+
+        Change-gated like `last_todos`: the poll runs per stream chunk, and a repeated
+        identical count would repaint the frame and spam the non-TTY log for nothing.
+        """
+        nonlocal last_source_count
+        count = registry.count()
+        if count != last_source_count:
+            renderer.emit(SourcesUpdated(count))
+            last_source_count = count
 
     # Fix-pass item 1: `ActivitySink` PUSHES via `on_change` rather than being drained from the
     # stream loop -- the middleware writes from inside the lead's `task` tool NODE, and one node
@@ -803,8 +835,9 @@ async def main(argv: list[str] | None = None) -> int:
     # role through `build_chat_model`, so a missing or TODO role raises `ModelError` here —
     # unhandled it would escape as a traceback under the alternate screen (PR #18 review).
     try:
-        agent = build_agent(config, registry, run_log, sink)
+        agent = build_agent(config, registry, run_log, sink, browser)
     except ModelError as exc:
+        await browser.close()
         renderer.close()
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -957,6 +990,7 @@ async def main(argv: list[str] | None = None) -> int:
                             # here (fix-pass item 1): `_on_activity_change` pushes them the
                             # instant the sink changes, from inside the tool dispatch itself.
                             _emit_new_alerts()
+                            _emit_source_count()
                             if (
                                 overrun
                                 or (cap_hit and not awaiting_tool_ids)
@@ -1041,6 +1075,7 @@ async def main(argv: list[str] | None = None) -> int:
                                     final_state = chunk
                                 else:
                                     _emit_new_alerts()
+                                    _emit_source_count()
                 break
     except TimeoutError as exc:
         # `clock.expired()`, not a bare `except TimeoutError`: a timeout raised INSIDE the
@@ -1075,6 +1110,7 @@ async def main(argv: list[str] | None = None) -> int:
     # One last poll: the final tool executions (or a cut-short pass) may have recorded
     # incidents after the last updates chunk was handled.
     _emit_new_alerts()
+    _emit_source_count()
 
     messages: list[BaseMessage] = final_state["messages"] if final_state else []
     usage = _sum_usage(messages)
@@ -1160,6 +1196,7 @@ async def main(argv: list[str] | None = None) -> int:
             )
         )
     finally:
+        await browser.close()
         renderer.close()
     # Error prints belong AFTER close(): under `Live(screen=True)` anything written to the
     # terminal — stderr included, it shares the device — while the Live runs lands on the

@@ -5,6 +5,7 @@ from langchain_core.tools import BaseTool
 
 import harness.tools
 from harness.blocklist import Blocklist
+from harness.browser import BrowserSession
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from harness.tools import build_tools
@@ -16,9 +17,11 @@ def test_build_tools_returns_the_frozen_tool_set(make_config, monkeypatch):
     calls = []
     real_build_fetch_tool = harness.tools.build_fetch_tool
 
-    def _spy(cfg, reg, log, blocklist):
+    # `*args` for the trailing builder arguments, not fixed arity: this stub broke when Phase 1
+    # added a fifth (the browser session), for the same reason the `_spy` below already learned.
+    def _spy(cfg, reg, log, *args):
         calls.append((cfg, reg, log))
-        return real_build_fetch_tool(cfg, reg, log, blocklist)
+        return real_build_fetch_tool(cfg, reg, log, *args)
 
     monkeypatch.setattr("harness.tools.build_fetch_tool", _spy)
 
@@ -69,7 +72,7 @@ async def test_build_tools_wires_the_callers_registry_into_the_fetch_tool(make_c
     registry = SourceRegistry()
     seen = []
 
-    async def _spy(urls, cfg, reg, log, blocklist):
+    async def _spy(urls, cfg, reg, log, *args):
         seen.append(reg)
         return "", []
 
@@ -127,3 +130,34 @@ def test_one_shared_instance_reaches_every_tool_builder(make_config, monkeypatch
     instances = list(seen.values())
     assert all(instance is not None for instance in instances)
     assert all(instance is instances[0] for instance in instances)
+
+
+def test_the_one_browser_session_reaches_fetch_and_fallback_but_not_search(
+    make_config, monkeypatch
+):
+    """The docstring's "ONE `browser` session ... goes to BOTH `fetch_pages` and `fetch_raw`"
+    claim, asserted rather than trusted. A separate test from
+    `test_one_shared_instance_reaches_every_tool_builder`, whose contract is EVERY builder --
+    `build_search_tool` deliberately does not take a browser (it never fetches a page itself),
+    so folding this in would make that test's own docstring false."""
+    config = make_config()
+    browser = BrowserSession(config, run_id="test-run")
+    seen: dict[str, object] = {}
+
+    for name in ("build_search_tool", "build_fallback_tool", "build_fetch_tool"):
+        real = getattr(harness.tools, name)
+
+        def _spy(*args, _name=name, _real=real, **kwargs):
+            # Selected by type, not by position -- same reasoning as
+            # `test_one_shared_instance_reaches_every_tool_builder`'s comment: a fourth
+            # builder argument already broke position-based capture once.
+            seen[_name] = next((arg for arg in args if isinstance(arg, BrowserSession)), None)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(f"harness.tools.{name}", _spy)
+
+    build_tools(config, SourceRegistry(), browser=browser)
+
+    assert seen["build_fetch_tool"] is browser
+    assert seen["build_fallback_tool"] is browser
+    assert seen["build_search_tool"] is None

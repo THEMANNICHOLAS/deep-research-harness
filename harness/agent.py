@@ -8,7 +8,7 @@ closing over `config` and the caller's `registry`, no class.
 
 from collections.abc import Awaitable, Callable
 from datetime import date
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from deepagents import (
     FilesystemPermission,
@@ -60,6 +60,9 @@ from harness.sources import SourceRegistry, pending_digest_scope
 from harness.tools import build_tools
 from harness.tools.ask_user import ASK_USER_TOOL_NAME
 from harness.tools.search import SearchUnavailableError
+
+if TYPE_CHECKING:
+    from harness.browser import BrowserSession
 
 # The summarizer's policy, deliberately not config-driven (D7). `trigger` sits above the
 # profile fallback of 170,000: generous for a reasoning model that spends heavily on output,
@@ -598,6 +601,7 @@ def build_agent(
     registry: SourceRegistry,
     run_log: RunLog | None = None,
     sink: ActivitySink | None = None,
+    browser: "BrowserSession | None" = None,
 ) -> Runnable:
     """Compile the lead research agent, driven with `ainvoke`/`astream` (substrate D1).
 
@@ -610,7 +614,9 @@ def build_agent(
     between this agent and the report so disclosure sees everything (best-effort + disclose).
     `sink` (Phase 6, D-C) collects the researcher/reader tiers' observed tool calls for the
     running pane's structured log and reader strip -- the lead tier is deliberately not
-    instrumented, so `_middleware` below is unchanged.
+    instrumented, so `_middleware` below is unchanged. `browser` (Phase 1, R2) is forwarded
+    to `build_tools` unchanged -- this function has no lifecycle over it, `main()` owns
+    start/close.
     """
     model = models.build_chat_model(config, "head")
     _register_no_shell_profile(model)
@@ -627,7 +633,7 @@ def build_agent(
     workspace.mkdir(parents=True, exist_ok=True)
     backend = FilesystemBackend(root_dir=workspace)
 
-    tool_sets = build_tools(config, registry, run_log)
+    tool_sets = build_tools(config, registry, run_log, browser)
 
     system_prompt = render(
         "orchestrator",

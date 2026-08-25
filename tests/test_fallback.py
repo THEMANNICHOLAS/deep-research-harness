@@ -307,14 +307,17 @@ async def test_fetch_raw_replays_the_stored_verdict_with_zero_crawler_calls(
     fake_cls = install_crawler(results)
 
     await fetch._fetch(["https://blocked.test"], config, registry, RunLog())
-    assert len(fake_cls.calls) == 1
+    # R6/D2: a 403 with no body reads as thin (word count only) and escalates once through
+    # the browser -- two calls, same "blocked" outcome either way.
+    assert len(fake_cls.calls) == 2
 
     fetch_raw = fallback.build_fallback_tool(config, registry)
     message = await fetch_raw.ainvoke(
         _tool_call(["https://blocked.test"], "retrying the failed one", "call-1")
     )
 
-    assert len(fake_cls.calls) == 1
+    # Replayed from the sticky verdict: no further crawler calls.
+    assert len(fake_cls.calls) == 2
     assert message.artifact == []
     # A genuine failure replays its rendered outcome, not the opaque policy block.
     assert "## https://blocked.test" in message.content

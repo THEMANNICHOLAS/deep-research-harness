@@ -54,8 +54,9 @@
 
 | Resource | Location | Purpose |
 |---|---|---|
-| Config models | @harness/config.py | TOML-backed `HarnessConfig` and settings, secrets by env var |
+| Config models | @harness/config.py | TOML-backed `HarnessConfig` and settings, secrets by env var; also the per-run path helpers `run_workspace_dir` and `run_downloads_dir` (crawl4ai downloads land under `<workspace_dir>/<run_id>/downloads`, never `$HOME`) |
 | Model clients | @harness/models.py | `build_chat_model` / `preflight` — role → chat client, fail-fast and bounded retry |
+| Session browser | @harness/browser.py | `BrowserSession` — the run's ONE Chromium plus its warm browser-free HTTP crawler, started at preflight (`BrowserPreflightError` → nonzero exit, no report), reused by every fetch, relaunched at most once |
 | Lead agent | @harness/agent.py | `build_agent` — the deepagents lead, its backend, middleware and interrupts |
 | Source registry | @harness/sources.py | Per-run registry assigning `[Sn]` citation IDs to fetched pages; also the capture-file policy (`sources_dir`, `is_failed_capture`) shared by report/verify/tests |
 | Run log | @harness/runlog.py | `RunLog`/`Incident` — per-run degraded-coverage incidents, echoed live to the terminal and disclosed in the report's gaps section |
