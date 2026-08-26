@@ -469,7 +469,9 @@ def test_orchestrator_prompt_names_the_answer_structure_contract():
     """
     from harness.prompts import render
 
-    prompt = render("orchestrator", current_date=date.today().isoformat())
+    prompt = render(
+        "orchestrator", current_date=date.today().isoformat(), max_concurrent_researchers=4
+    )
 
     assert "start at `## `" in prompt
     assert "never `# `" in prompt

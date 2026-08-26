@@ -84,7 +84,10 @@ are never stored here — each provider names an environment variable
   may have IN FLIGHT at once — a concurrency cap, not a total for the run, so a further
   wave is allowed once the running ones report back. A surplus dispatch is refused with a
   message telling the lead to wait for the results it already asked for, and the refusal is
-  disclosed as a `researcher_budget_exhausted` incident.
+  disclosed as a `researcher_budget_exhausted` incident. Both this key and
+  `searches_per_researcher` (default 4, advisory: rendered into the researcher prompt as a
+  search budget, never counted or enforced) are rendered into the prompts that read them, so
+  changing either changes what the model is told.
 - When `synthesis_margin_seconds` is non-zero the same reserve now also applies inside a
   dispatch: a researcher still running when the margin arrives is cut off and the lead is
   told to synthesize from what it has (disclosed as `research_deadline_reached`). Set it to

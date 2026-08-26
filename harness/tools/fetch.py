@@ -349,14 +349,38 @@ _EMPTY_REQUEST_TEXT = "No URLs were requested, so nothing was fetched."
 
 
 def _rejection_block(url: str) -> str:
-    """The opaque, reason-free block rendered for any policy-rejected URL (D1).
+    """The opaque, reason-free block rendered for a guard- or blocklist-rejected URL (D1).
 
-    Guard blocks, provenance rejections (and, from Phase 3, blocklisted hostnames) all render
-    this one line, because naming which policy fired would tell an adversarial page — or
-    anyone reading the transcript — exactly what the guard caught. The rejecting policy and
-    its reason go ONLY to `RunLog` incidents, never here.
+    Guard blocks and blocklisted hostnames render this one line, because naming which policy
+    fired would tell an adversarial page — or anyone reading the transcript — exactly what
+    the guard caught. The rejecting policy and its reason go ONLY to `RunLog` incidents.
+
+    Provenance is the one rejection that does NOT come through here (R1): it is the model's
+    own mistake rather than the page's, so it is explained — see `_provenance_rejection_block`.
     """
     return f"## {url}\n\n{_REJECTION_LINE}"
+
+
+# The one phrase every surface that states the provenance rule must carry verbatim (R1) —
+# the three tool descriptions here and in fallback/search, and the three tier prompts. Defined
+# once so the rule cannot be worded three different ways in three places.
+PROVENANCE_RULE_MARKER = "only URLs returned by search_web"
+
+_PROVENANCE_REJECTION_LINE = (
+    "rejected — this URL did not come from a search_web result or the user; search for it "
+    "first, then fetch the URL the search returns"
+)
+
+
+def _provenance_rejection_block(url: str) -> str:
+    """The block rendered for a URL rejected by strict provenance (R1).
+
+    Unlike `_rejection_block`, this names the reason and the remedy. A guard rejection stays
+    opaque because the adversary is the page; here the adversary is nobody — the model
+    guessed a URL or lifted it from a page's own links, and a rejection it cannot interpret
+    is one it repeats (the ~110 provenance rejections of run 20260825134545).
+    """
+    return f"## {url}\n\n{_PROVENANCE_REJECTION_LINE}"
 
 
 def _provenance_rejected_detail(url: str) -> str:
@@ -525,15 +549,15 @@ async def _fetch(
     # Phase 4 strict provenance (D2/R2): a URL is fetchable only if it arrived from a
     # `search_web` result or explicit user approval (`__main__` at run start) — never from a
     # page's own in-body links. Rejection is per-URL: one unapproved URL never fails the rest
-    # of the batch, and a rejected URL never reaches the crawler at all — and now also renders
-    # the opaque D1 rejection block.
+    # of the batch, and a rejected URL never reaches the crawler at all — and now renders the
+    # explaining block (R1), the one rejection that tells the model what it did wrong.
     approved_urls: list[str] = []
     for url in urls:
         if registry.is_approved(url):
             approved_urls.append(url)
         else:
             run_log.record("provenance_rejected", _provenance_rejected_detail(url))
-            registry.record_failure(url, _rejection_block(url))
+            registry.record_failure(url, _provenance_rejection_block(url))
     urls = approved_urls
 
     # R4 pre-crawl backstop — placement is load-bearing (Phase 1 `## Discoveries`): this MUST
@@ -886,19 +910,24 @@ def build_fetch_tool(
                 note_digest_candidate(page.source_id)
         return content, pages
 
-    return _install_url_limit_contract(fetch_pages, max_urls)
+    return _install_fetch_contract(fetch_pages, max_urls)
 
 
-def _install_url_limit_contract(fetch_tool: BaseTool, max_urls: int) -> BaseTool:
-    """Append the config-driven URL cap to `fetch_tool` and install its validation explainer.
+def _install_fetch_contract(fetch_tool: BaseTool, max_urls: int) -> BaseTool:
+    """Append the two enforced contract sentences to `fetch_tool` and install its explainer.
 
     Shared by `build_fetch_tool` and `build_fallback_tool` — the wording is policy, and two
-    hand-pasted copies could drift. Appended rather than written into the docstring: the limit
-    is config, and a literal would go stale the moment an operator changed it (D2).
+    hand-pasted copies could drift. Appended rather than written into the docstring: the URL
+    limit is config, and a literal would go stale the moment an operator changed it (D2); the
+    provenance rule is one phrase (`PROVENANCE_RULE_MARKER`) shared with the tier prompts and
+    `search_web`, so the rule is stated identically wherever the model can read it (R1).
     """
     fetch_tool.description = (
         f"{fetch_tool.description}\n\nAt most {max_urls} URLs may be requested per call; "
-        "a call carrying more is rejected without fetching anything."
+        "a call carrying more is rejected without fetching anything. "
+        f"Fetch {PROVENANCE_RULE_MARKER} or pasted by the user; a URL found inside a fetched "
+        "page is not fetchable until a search_web result returns it — such a URL is rejected "
+        "with a message saying so."
     )
 
     # `exc` is `object`: langchain may hand over a pydantic v1 or v2 `ValidationError`. A

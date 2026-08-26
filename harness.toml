@@ -93,5 +93,8 @@ max_reader_dispatches = 6
 # Harness-enforced (D5): a CONCURRENCY cap on how many researcher dispatches the lead may
 # have in flight at once — NOT a total for the run, so a second wave is allowed once the
 # first returns. The surplus dispatch is refused with a message telling the lead to wait.
-# Phase 2 of docs/plans/PLAN-research-throughput.md renders this value into the lead prompt.
+# This value is rendered into the lead prompt, so the model is told the limit it is held to.
 max_concurrent_researchers = 4
+# Prompt-only (D5): a budget rendered into the researcher prompt, NOT enforced — nothing
+# counts a researcher's searches. max_reader_dispatches above is what bounds cost in code.
+searches_per_researcher = 4

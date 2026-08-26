@@ -11,7 +11,7 @@ from harness.browser import BrowserSession
 from harness.config import AgentSettings, BlocklistSettings, GuardSettings, run_downloads_dir
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
-from harness.tools import fetch
+from harness.tools import fallback, fetch, search
 from tests.conftest import (
     CHALLENGE_FIXTURES_DIR,
     _challenge_fixtures,
@@ -759,7 +759,7 @@ async def test_rejected_urls_are_never_http_fetched(install_crawler, make_config
 
     assert len(fake_cls.calls) == 1
     assert fake_cls.calls[0].urls == ["https://ok.test/page"]
-    assert fetch._rejection_block("https://unapproved.test/page") in content
+    assert fetch._provenance_rejection_block("https://unapproved.test/page") in content
     assert fetch._rejection_block("https://walled.test/page") in content
 
 
@@ -1012,6 +1012,26 @@ def test_both_prose_surfaces_state_the_url_limit(make_config):
     assert expected in fetch_pages.description
     schema = fetch_pages.args_schema.model_json_schema()
     assert expected in schema["properties"]["urls"]["description"]
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(fetch.build_fetch_tool, id="fetch_pages"),
+        pytest.param(fallback.build_fallback_tool, id="fetch_raw"),
+        pytest.param(search.build_search_tool, id="search_web"),
+    ],
+)
+def test_every_url_tool_description_states_the_provenance_rule(build, make_config):
+    """R1: the provenance rule is enforced in `_fetch`, so it must be readable from every tool
+    whose behavior it governs -- the two fetchers it rejects for, and `search_web`, which is
+    the only way to earn a fetchable URL. One shared marker phrase, defined once in fetch.py,
+    so the three descriptions cannot drift into stating three different rules.
+    """
+    tool = build(make_config(), SourceRegistry())
+
+    assert "search_web" in tool.description
+    assert fetch.PROVENANCE_RULE_MARKER in tool.description
 
 
 def test_the_schema_url_limit_follows_the_configured_value(make_config):
@@ -1852,7 +1872,7 @@ async def test_an_unapproved_url_is_rejected_pre_crawl_and_never_reaches_the_cra
     content, pages = await fetch._fetch(["https://never-approved.test"], config, registry, run_log)
 
     assert pages == []
-    assert content == fetch._rejection_block("https://never-approved.test")
+    assert content == fetch._provenance_rejection_block("https://never-approved.test")
     assert fake_cls.calls == []
     assert registry.all() == []
 
@@ -1891,7 +1911,7 @@ async def test_mixed_batch_approved_urls_fetch_while_the_unapproved_one_is_rejec
     assert fake_cls.calls[0].urls == ["https://approved-a.test", "https://approved-b.test"]
     assert [page.url for page in pages] == ["https://approved-a.test", "https://approved-b.test"]
     assert all(page.outcome == "fetched" for page in pages)
-    assert fetch._rejection_block("https://not-approved.test") in content
+    assert fetch._provenance_rejection_block("https://not-approved.test") in content
 
     incidents = [i for i in run_log.incidents() if i.kind == "provenance_rejected"]
     assert len(incidents) == 1
@@ -1916,13 +1936,25 @@ def test_the_rejection_block_wording_is_pinned():  # D1
     )
 
 
-async def test_provenance_and_guard_rejection_blocks_both_come_from_the_shared_builder(  # D1
+def test_the_provenance_rejection_block_wording_is_pinned():  # R1
+    """The second golden assertion: the provenance block's exact text, frozen in the plan's
+    Contracts because it is what teaches the model the rule it broke. Every other assertion
+    goes through `_provenance_rejection_block`, so this is the only copy of the string.
+    """
+    assert fetch._provenance_rejection_block("https://x.test") == (
+        "## https://x.test\n\nrejected — this URL did not come from a search_web result or "
+        "the user; search for it first, then fetch the URL the search returns"
+    )
+
+
+async def test_provenance_and_guard_rejections_say_different_amounts_of_truth(  # R1
     install_crawler, make_config
 ):
-    """D1's consequence: all rejection paths funnel through one block-builder, so the wording
-    cannot drift into revealing WHICH policy rejected the URL. Proving each path's output IS
-    `_rejection_block(url)` is what makes the blocks identical-but-for-the-URL structural
-    rather than a coincidence two hand-rolled strings currently share.
+    """R1 splits D1's single block in two. A guard (or blocklist) rejection stays opaque --
+    naming the policy would tell an adversarial page exactly what fired. A provenance
+    rejection is the MODEL's own mistake, not the page's, so it says why and what to do
+    instead: a model that cannot see the rule it broke keeps breaking it (the ~110 provenance
+    rejections of run 20260825134545).
     """
     config = make_config()
     registry = SourceRegistry()
@@ -1941,8 +1973,11 @@ async def test_provenance_and_guard_rejection_blocks_both_come_from_the_shared_b
     )
 
     # Left: rejected by provenance, pre-crawl. Right: dropped by the guard, post-crawl.
-    assert fetch._rejection_block("https://unapproved.test") in content
+    assert fetch._provenance_rejection_block("https://unapproved.test") in content
     assert fetch._rejection_block("https://evil.test") in content
+    # The provenance block does not merely wrap the opaque line with extra prose: the two
+    # rejections share no wording at all.
+    assert fetch._REJECTION_LINE not in fetch._provenance_rejection_block("https://unapproved.test")
 
 
 async def test_rejection_block_names_no_policy(install_crawler, make_config):  # D1
@@ -1969,8 +2004,8 @@ async def test_a_batch_where_every_url_is_rejected_returns_blocks_not_an_empty_s
     )
 
     assert content != ""
-    assert fetch._rejection_block("https://one-unapproved.test") in content
-    assert fetch._rejection_block("https://two-unapproved.test") in content
+    assert fetch._provenance_rejection_block("https://one-unapproved.test") in content
+    assert fetch._provenance_rejection_block("https://two-unapproved.test") in content
     assert fake_cls.calls == []
 
 
@@ -2016,7 +2051,7 @@ async def test_a_search_approval_rescues_a_url_strict_provenance_rejected_earlie
     fake_cls = install_crawler([])
     rejected_content, rejected_pages = await fetch._fetch([guessed], config, registry, RunLog())
     assert rejected_pages == []
-    assert rejected_content == fetch._rejection_block(guessed)
+    assert rejected_content == fetch._provenance_rejection_block(guessed)
     assert fake_cls.calls == []
 
     registry.approve(guessed)  # search surfaced it for real
@@ -2122,7 +2157,7 @@ async def test_an_unapproved_blocklisted_url_is_rejected_by_provenance_not_the_b
     content, pages = await fetch._fetch(["https://walled.test/page"], config, registry, run_log)
 
     assert pages == []
-    assert content == fetch._rejection_block("https://walled.test/page")
+    assert content == fetch._provenance_rejection_block("https://walled.test/page")
     assert fake_cls.calls == []
     assert [i.kind for i in run_log.incidents()] == ["provenance_rejected"]
 

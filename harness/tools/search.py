@@ -17,6 +17,7 @@ from harness.config import HarnessConfig
 from harness.guard import fence, guard_blocked_detail, scan
 from harness.runlog import RunLog, or_default
 from harness.sources import SourceRegistry
+from harness.tools.fetch import PROVENANCE_RULE_MARKER
 
 
 class SearchResult(BaseModel):
@@ -404,4 +405,12 @@ def build_search_tool(
 
         return content, outcome
 
+    # R1: appended rather than written into the docstring above, so the provenance rule is
+    # stated in the one phrase `fetch.PROVENANCE_RULE_MARKER` defines — the same words the two
+    # fetch tools and the three tier prompts carry. `search_web` states it because it is the
+    # only way a URL becomes fetchable at all.
+    search_web.description = (
+        f"{search_web.description}\n\nIts results are the only fetchable URLs: fetch_pages and "
+        f"fetch_raw accept {PROVENANCE_RULE_MARKER} or pasted by the user."
+    )
     return search_web

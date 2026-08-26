@@ -192,6 +192,7 @@ def test_typo_in_key_error_names_the_offending_key(tmp_path, monkeypatch):
         ("min_markdown_words", 0),
         ("max_consecutive_failures", 0),
         ("max_reader_dispatches", 0),
+        ("searches_per_researcher", 0),
     ],
 )
 def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_value):
@@ -205,13 +206,15 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
         "min_markdown_words": 30,
         "max_consecutive_failures": 4,
         "max_reader_dispatches": 6,
+        "searches_per_researcher": 4,
     }
-    # `max_reader_dispatches` lives in `[agent]`, which VALID_TOML omits (the omitted-section
-    # default is covered by test_agent_section_omitted_falls_back_to_documented_defaults) --
-    # append a literal default here so the same `.replace()` pattern has something to swap.
+    # `max_reader_dispatches` and `searches_per_researcher` live in `[agent]`, which VALID_TOML
+    # omits (the omitted-section default is covered by
+    # test_agent_section_omitted_falls_back_to_documented_defaults) -- append a literal default
+    # here so the same `.replace()` pattern has something to swap.
     base_toml = VALID_TOML
-    if setting == "max_reader_dispatches":
-        base_toml += "\n[agent]\nmax_reader_dispatches = 6\n"
+    if setting in ("max_reader_dispatches", "searches_per_researcher"):
+        base_toml += f"\n[agent]\n{setting} = {original[setting]}\n"
     toml_content = base_toml.replace(f"{setting} = {original[setting]}", f"{setting} = {bad_value}")
     path = _write(tmp_path, toml_content)
 
@@ -397,6 +400,8 @@ def test_agent_section_omitted_falls_back_to_documented_defaults(tmp_path, monke
     assert config.agent.reports_dir == Path.home() / "deep-research" / "reports"
     assert config.agent.max_retries == 2
     assert config.agent.request_timeout_seconds == 120.0
+    assert config.agent.max_concurrent_researchers == 4
+    assert config.agent.searches_per_researcher == 4
 
 
 def test_synthesis_margin_at_or_above_the_wall_clock_is_rejected(tmp_path, monkeypatch):

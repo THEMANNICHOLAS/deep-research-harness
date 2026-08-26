@@ -238,7 +238,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Time-budget tracer — deadline-aware researcher dispatch
-- [ ] Phase 2: Prompts and tool descriptions state the code's rules
+- [x] Phase 2: Prompts and tool descriptions state the code's rules
 - [ ] Phase 3: Guard requires directive context
 - [ ] Phase 4: Fetch pool and memory threshold as config
 - [ ] Phase 5: Per-role timeouts and transient-only retry
@@ -366,11 +366,11 @@ it, fan-out and search budget are rendered from config, and a provenance rejecti
 - Rewriting prompt sections unrelated to fetching/dispatch.
 
 **Tests (write first, confirm red):**
-- [ ] Placeholder contract per tier (`test_tier_contracts_declare_exactly_their_placeholders`)
+- [x] Placeholder contract per tier (`test_tier_contracts_declare_exactly_their_placeholders`)
   updated; rendered orchestrator/subagent text contains the configured numbers.
-- [ ] Rendered prompts and the three tool descriptions each contain the provenance rule (one
+- [x] Rendered prompts and the three tool descriptions each contain the provenance rule (one
   table-driven test over the rendered strings).
-- [ ] A provenance-rejected URL yields the provenance line, not `_REJECTION_LINE`; a guard-blocked
+- [x] A provenance-rejected URL yields the provenance line, not `_REJECTION_LINE`; a guard-blocked
   URL still yields `_REJECTION_LINE` (extends `tests/test_fetch.py:1915`).
 
 **Steps:**
@@ -379,8 +379,8 @@ it, fan-out and search budget are rendered from config, and a provenance rejecti
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `grep -n "up to 3\|about 4" harness/prompts/*.md` returns nothing.
-- [ ] `docs/architecture.md` notes the provenance rule is now stated to the model (one sentence).
+- [x] `grep -n "up to 3\|about 4" harness/prompts/*.md` returns nothing.
+- [x] `docs/architecture.md` notes the provenance rule is now stated to the model (one sentence).
 
 ### Phase 3: Guard requires directive context
 **Risk:** flagged (!#3)
@@ -566,6 +566,14 @@ Append-only, empty at plan creation. -->
   Phase 5: narrow the except to the `wait_for` branch so a plain model timeout is never reported
   as `research_deadline_reached`.
 
+- 2026-08-25 — Phase 2: `tests/test_fetch.py` `test_rejection_block_names_no_policy` fetches an
+  unapproved URL and so now scans the explanatory provenance block, not the opaque guard block;
+  opacity is still pinned by the exact-string test and the `_rejection_block` equality test →
+  deferred: retarget it at a guard-blocked URL (`https://evil.test`, as its sibling does).
+- 2026-08-25 — Phase 2: `test_orchestrator_prompt_teaches_the_full_delegation_protocol`'s
+  `"search_web" not in rendered` was narrowed to `count == 1` because the provenance marker
+  names `search_web` → no action; noted so the "lead has no search tool" intent stays visible.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
@@ -583,3 +591,16 @@ never add a section below it. -->
 - Drift: `build_agent(deadline=None)` optional — see `## Reconciliations` 2026-08-25.
 - Watch-next: Phase 2 renders `$max_concurrent_researchers` into orchestrator.md; the 3F
   Discoveries entry about `except TimeoutError` narrowing must be acted on in Phase 5.
+
+### 2026-08-25 — Phase 2: Prompts and tool descriptions state the code's rules
+- Done: provenance rule stated in all three prompts and three tool descriptions (shared marker
+  `PROVENANCE_RULE_MARKER` in `harness/tools/fetch.py`); `_provenance_rejection_block` with the
+  frozen explanatory line at the provenance gate; `$max_concurrent_researchers` /
+  `$searches_per_researcher` rendered from config (new `[agent] searches_per_researcher`);
+  Reflection nudge is per-wave; effort scaling taught. 844 pass.
+- Learned: `_install_url_limit_contract` became `_install_fetch_contract` (both fetch tools);
+  `search.py` imports the marker from `fetch.py` (no cycle). `SourceRegistry.approve` pops a
+  stored provenance failure, so the "search for it, then fetch" remedy works.
+- Drift: none.
+- Watch-next: Phase 3 narrows `harness/guard.py` patterns — every existing `attack_*` fixture
+  must still block; run `tests/test_guard.py` first.

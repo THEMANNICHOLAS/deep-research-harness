@@ -719,6 +719,7 @@ def _researcher_spec(
             current_date=date.today().isoformat(),
             max_urls_per_call=config.fetch.max_urls_per_call,
             max_reader_dispatches=config.agent.max_reader_dispatches,
+            searches_per_researcher=config.agent.searches_per_researcher,
         ),
         model=researcher_model,
         tools=researcher_tools,
@@ -744,8 +745,10 @@ def build_agent(
 
     The research question is NOT baked into the system prompt: this signature has no access to
     it. It travels as the initial `HumanMessage` the caller streams in, and the rendered
-    orchestrator prompt carries only `$current_date` — the lead no longer manages URL batching
-    itself (Step 3 moved that detail down onto the researcher/reader tiers).
+    orchestrator prompt carries `$current_date` plus `$max_concurrent_researchers` (R2: the
+    fan-out the lead is told about is the one the middleware enforces) — the lead no longer
+    manages URL batching itself (Step 3 moved that detail down onto the researcher/reader
+    tiers).
 
     `run_log` collects the tools' degraded-coverage incidents; the caller shares one instance
     between this agent and the report so disclosure sees everything (best-effort + disclose).
@@ -776,6 +779,7 @@ def build_agent(
     system_prompt = render(
         "orchestrator",
         current_date=date.today().isoformat(),
+        max_concurrent_researchers=config.agent.max_concurrent_researchers,
     )
 
     shared_log = or_default(run_log)

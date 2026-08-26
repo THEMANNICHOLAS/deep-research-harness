@@ -324,7 +324,7 @@ async def test_fetch_raw_replays_the_stored_verdict_with_zero_crawler_calls(
     assert "blocked — status 403" in message.content
 
 
-async def test_fetch_raw_renders_an_opaque_rejection_for_an_unapproved_url(
+async def test_fetch_raw_renders_the_provenance_rejection_for_an_unapproved_url(
     install_crawler, make_config
 ):
     config = make_config()
@@ -338,7 +338,7 @@ async def test_fetch_raw_renders_an_opaque_rejection_for_an_unapproved_url(
 
     assert fake_cls.calls == []
     assert message.artifact == []
-    assert message.content == fetch._rejection_block("https://never-approved.test")
+    assert message.content == fetch._provenance_rejection_block("https://never-approved.test")
 
 
 # --- Phase 3: persistent domain blocklist (R3/R4) -----------------------------------------
