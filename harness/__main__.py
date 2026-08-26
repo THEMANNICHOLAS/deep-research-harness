@@ -208,9 +208,15 @@ def _final_answer(messages: list[BaseMessage]) -> str:
     NOT `messages[-1].content`: on a cut-short run the last message is usually a
     `ToolMessage` or a content-less tool-call `AIMessage`, which would put raw tool output
     ("Updated todo list to [...]") under `## Answer`. `report.py` renders the empty case.
+
+    Content alone is not enough (R5): a message carrying `tool_calls` is a PLAN, whatever
+    prose it also holds -- "I will now search for ... " alongside a `task` dispatch is the
+    preamble the failed 1800s run published as its answer. Skipping any tool-calling
+    `AIMessage` means a run that ends on one is answerless, which is a FAILED run (no report,
+    nonzero exit) by the standing invariant.
     """
     for message in reversed(messages):
-        if isinstance(message, AIMessage):
+        if isinstance(message, AIMessage) and not message.tool_calls:
             content = _message_text(message)
             if content:
                 return content
@@ -662,7 +668,7 @@ async def main(argv: list[str] | None = None) -> int:
     from langgraph.errors import GraphRecursionError
     from langgraph.types import Command
 
-    from harness.agent import build_agent
+    from harness.agent import ResearchDeadline, build_agent
     from harness.models import ModelError, preflight
 
     # Every role the run will actually call, checked before any agent work. A loop, not a
@@ -831,11 +837,15 @@ async def main(argv: list[str] | None = None) -> int:
                 last_in_flight = in_flight
 
     sink = ActivitySink(on_change=_on_activity_change)
+    # Created here, armed below where the research clock is (D1): the lead's dispatch
+    # middleware reads it, `__main__` alone writes it, so the two cannot disagree about when
+    # the synthesis reserve begins.
+    deadline = ResearchDeadline()
     # Same close/print/exit-1 shape as the preflight loop: `build_agent` resolves every
     # role through `build_chat_model`, so a missing or TODO role raises `ModelError` here —
     # unhandled it would escape as a traceback under the alternate screen (PR #18 review).
     try:
-        agent = build_agent(config, registry, run_log, sink, browser)
+        agent = build_agent(config, registry, run_log, sink, browser, deadline=deadline)
     except ModelError as exc:
         await browser.close()
         renderer.close()
@@ -956,6 +966,17 @@ async def main(argv: list[str] | None = None) -> int:
                                             research_started_at + config.agent.wall_clock_seconds
                                         )
                                         clock_armed = True
+                                        # The same reserve `_margin_reached` checks at turn
+                                        # boundaries, handed to the dispatch path so an
+                                        # in-flight researcher is cut off too (D1). `0`
+                                        # disables the reserve, so the deadline stays unarmed
+                                        # and the middleware never cancels anything.
+                                        if config.agent.synthesis_margin_seconds > 0:
+                                            deadline.arm(
+                                                research_started_at
+                                                + config.agent.wall_clock_seconds
+                                                - config.agent.synthesis_margin_seconds
+                                            )
                                 _note_model_turns(node_update)
                                 # R7's reserve: fire the same bounded synthesis pass the round
                                 # cap uses once elapsed research time crosses the margin

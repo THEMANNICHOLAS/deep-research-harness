@@ -6,6 +6,7 @@ framework's API surface. Same shape as `harness/tools/search.py` — one builder
 closing over `config` and the caller's `registry`, no class.
 """
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import TYPE_CHECKING, Any, Literal
@@ -185,16 +186,57 @@ def _digest_text(result: ToolMessage | Command[Any]) -> str:
     return message.text.strip() if message is not None else ""
 
 
-def _is_reader_dispatch(name: str | None, args: dict[str, Any]) -> bool:
-    """Is this `task` call a dispatch to the reader subagent?
+# The two refusals `_ResearcherDispatchMiddleware` can return, module-level so the wording is
+# stated once. Both are ordinary (non-`status="error"`) ToolMessages, like the reader cap's:
+# a budget verdict is not a subagent failure, and `_task_dispatch_guard` must not retry it.
+_RESEARCH_DEADLINE_REFUSAL = (
+    "Research time budget exhausted: the synthesis reserve for this run has been reached, so "
+    "this researcher dispatch was stopped and no further research will run. Write the final "
+    "answer NOW from what you already have, naming what you could not settle."
+)
+_RESEARCHER_FANOUT_REFUSAL = (
+    "Researcher fan-out limit reached: {max_concurrent} researchers are already in flight "
+    "(the configured `max_concurrent_researchers`). No researcher was dispatched for this "
+    "call. Wait for the researchers already running to report back before dispatching more."
+)
 
-    One predicate for the three sites that all needed to ask this (CLAUDE.md: a third
-    repetition gets factored out) -- `_ReaderDispatchCapMiddleware`'s own early return, its
-    inner history scan, and `_ToolActivityMiddleware`'s reader/researcher split. `.get`-guarded
-    so a malformed or missing `subagent_type` reads as "not a reader dispatch" rather than
-    raising.
+
+class ResearchDeadline:
+    """The instant research must stop, shared mutable state between `__main__` and the lead's
+    dispatch middleware (D1).
+
+    `__main__` owns the run's clock -- it decides when research actually STARTED (the first
+    researcher dispatch, not launch) and arms both the hard `asyncio.timeout` and this. The
+    middleware only reads it, so the two cannot disagree about when the reserve begins.
+
+    Seconds on the EVENT LOOP clock (`asyncio.get_running_loop().time()`), the same clock
+    `__main__` measures elapsed research time on -- NOT wall-clock epoch seconds, and not
+    comparable across loops. Unarmed (`remaining() is None`) means "no time budget", which is
+    what `synthesis_margin_seconds = 0` produces; `remaining()` may be negative once passed.
     """
-    return name == "task" and args.get("subagent_type") == "reader"
+
+    def __init__(self) -> None:
+        self._deadline: float | None = None
+
+    def arm(self, deadline: float) -> None:
+        self._deadline = deadline
+
+    def remaining(self) -> float | None:
+        if self._deadline is None:
+            return None
+        return self._deadline - asyncio.get_running_loop().time()
+
+
+def _is_dispatch_to(name: str | None, args: dict[str, Any], subagent_type: str) -> bool:
+    """Is this `task` call a dispatch to the `subagent_type` subagent?
+
+    One predicate for the four sites that all needed to ask this (CLAUDE.md: a third
+    repetition gets factored out) -- `_ReaderDispatchCapMiddleware`'s own early return, its
+    inner history scan, `_ToolActivityMiddleware`'s reader/researcher split, and
+    `_ResearcherDispatchMiddleware`'s early return. `.get`-guarded so a malformed or missing
+    `subagent_type` reads as "not a dispatch to that tier" rather than raising.
+    """
+    return name == "task" and args.get("subagent_type") == subagent_type
 
 
 class _ReaderDispatchCapMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -241,7 +283,7 @@ class _ReaderDispatchCapMiddleware(AgentMiddleware[Any, Any, Any]):
     ) -> ToolMessage | Command[Any]:
         call = request.tool_call
         args = call["args"] or {}
-        if not _is_reader_dispatch(call["name"], args):
+        if not _is_dispatch_to(call["name"], args, "reader"):
             return await handler(request)
 
         ids: list[str] = []
@@ -250,7 +292,8 @@ class _ReaderDispatchCapMiddleware(AgentMiddleware[Any, Any, Any]):
         for message in messages or []:
             tool_calls = getattr(message, "tool_calls", None) or []
             for tool_call in tool_calls:
-                if not _is_reader_dispatch(tool_call.get("name"), tool_call.get("args") or {}):
+                args_of = tool_call.get("args") or {}
+                if not _is_dispatch_to(tool_call.get("name"), args_of, "reader"):
                     continue
                 call_id = tool_call.get("id")
                 if call_id is not None and call_id not in ids:
@@ -275,6 +318,99 @@ class _ReaderDispatchCapMiddleware(AgentMiddleware[Any, Any, Any]):
                 name="task",
             )
         return await handler(request)
+
+
+class _ResearcherDispatchMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Bound the LEAD's researcher dispatches in two dimensions: the run's time budget (R5/D1)
+    and how many may be in flight at once (R2/D5).
+
+    Installed OUTERMOST on the lead's middleware list, so it wraps `_task_dispatch_guard`
+    rather than sitting inside it: a dispatch cancelled here must never be replayed by
+    `ToolRetryMiddleware`, because re-running a whole researcher is exactly the compounding
+    overrun the deadline exists to stop.
+
+    Time budget. `deadline` is armed by `__main__` when the research clock starts and reads
+    `wall_clock_seconds - synthesis_margin_seconds` (unarmed when the margin is disabled, in
+    which case this middleware is a pure pass-through). A dispatch proposed after it passes is
+    refused without spawning anything; one still running when it passes is cancelled by
+    `asyncio.wait_for`, which raises the builtin `TimeoutError` on 3.11+. Either way the lead
+    gets a ToolMessage for that `tool_call_id`, so its message history stays valid and its
+    next turn can synthesize -- the existing per-chunk `_margin_reached` check remains the
+    turn-boundary path and is untouched.
+
+    Fan-out. `_in_flight` is an instance counter incremented on entry and decremented in a
+    `finally`, NOT a positional scan of message history like the reader cap: the question here
+    is "how many are running RIGHT NOW", and since this middleware wraps each call, the N calls
+    LangGraph gathers from one AIMessage are each visible as they start. It is a CONCURRENCY
+    cap, not a total for the run -- a later wave, dispatched once these return, is allowed.
+
+    Both refusals record a `RunLog` incident for the same reason the reader cap does: a refused
+    or cancelled dispatch thins coverage DURING research, and `## Gaps and disclosures` is
+    built structurally from incidents alone, so without one the loss is invisible in the
+    report.
+    """
+
+    def __init__(
+        self,
+        max_concurrent: int,
+        deadline: ResearchDeadline | None,
+        run_log: RunLog | None = None,
+    ) -> None:
+        super().__init__()
+        self._max_concurrent = max_concurrent
+        self._deadline = deadline
+        self._run_log = or_default(run_log)
+        self._in_flight = 0
+
+    def _deadline_refusal(self, call: Any, detail: str) -> ToolMessage:
+        self._run_log.record("research_deadline_reached", detail)
+        return ToolMessage(content=_RESEARCH_DEADLINE_REFUSAL, tool_call_id=call["id"], name="task")
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        call = request.tool_call
+        args = call["args"] or {}
+        if not _is_dispatch_to(call["name"], args, "researcher"):
+            return await handler(request)
+
+        remaining = self._deadline.remaining() if self._deadline is not None else None
+        if remaining is not None and remaining <= 0:
+            return self._deadline_refusal(
+                call,
+                "a researcher dispatch was refused because the synthesis reserve had already "
+                "been reached; that angle was never researched",
+            )
+
+        if self._in_flight >= self._max_concurrent:
+            self._run_log.record(
+                "researcher_budget_exhausted",
+                f"a researcher dispatch was refused with {self._max_concurrent} already in "
+                "flight (max_concurrent_researchers); the lead was told to wait for the "
+                "running dispatches rather than widening the fan-out",
+            )
+            return ToolMessage(
+                content=_RESEARCHER_FANOUT_REFUSAL.format(max_concurrent=self._max_concurrent),
+                tool_call_id=call["id"],
+                name="task",
+            )
+
+        self._in_flight += 1
+        try:
+            if remaining is None:
+                return await handler(request)
+            return await asyncio.wait_for(handler(request), remaining)
+        except TimeoutError:
+            return self._deadline_refusal(
+                call,
+                "a researcher dispatch was cancelled at the synthesis reserve; that angle's "
+                "findings never reached the lead, though any sources it had already "
+                "registered are still cited",
+            )
+        finally:
+            self._in_flight -= 1
 
 
 class _ReaderDigestMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -401,7 +537,7 @@ class _ToolActivityMiddleware(AgentMiddleware[Any, Any, Any]):
             # must never break the dispatch itself.
             return await handler(request)
         args = request.tool_call["args"] or {}
-        is_reader = _is_reader_dispatch(name, args)
+        is_reader = _is_dispatch_to(name, args, "reader")
 
         retry = self._sink.start_call(call_id, name, _summarize_tool_args(name, args))
 
@@ -602,6 +738,7 @@ def build_agent(
     run_log: RunLog | None = None,
     sink: ActivitySink | None = None,
     browser: "BrowserSession | None" = None,
+    deadline: ResearchDeadline | None = None,
 ) -> Runnable:
     """Compile the lead research agent, driven with `ainvoke`/`astream` (substrate D1).
 
@@ -616,7 +753,8 @@ def build_agent(
     running pane's structured log and reader strip -- the lead tier is deliberately not
     instrumented, so `_middleware` below is unchanged. `browser` (Phase 1, R2) is forwarded
     to `build_tools` unchanged -- this function has no lifecycle over it, `main()` owns
-    start/close.
+    start/close. `deadline` (D1) is the research time budget the lead's dispatch middleware
+    reads; `None` (or an unarmed instance) means no budget, and only the fan-out cap applies.
     """
     model = models.build_chat_model(config, "head")
     _register_no_shell_profile(model)
@@ -667,7 +805,13 @@ def build_agent(
         permissions=[
             FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="allow")
         ],
-        middleware=_middleware(model, backend, shared_log),
+        middleware=_middleware(
+            model,
+            backend,
+            shared_log,
+            config.agent.max_concurrent_researchers,
+            deadline,
+        ),
         subagents=[researcher_spec],
         # One saver per call, holding this run's thread. In-memory keeps the no-database
         # invariant (D5): no durable, cross-invocation checkpointing.
@@ -677,7 +821,11 @@ def build_agent(
 
 
 def _middleware(
-    model: Any, backend: BackendProtocol, run_log: RunLog
+    model: Any,
+    backend: BackendProtocol,
+    run_log: RunLog,
+    max_concurrent_researchers: int,
+    deadline: ResearchDeadline | None,
 ) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build the middleware list with an explicit, broad element type.
 
@@ -696,6 +844,10 @@ def _middleware(
     deeper); the policy itself is documented on the shared helper.
     """
     return [
+        # FIRST, so it is the outermost of these and wraps `_task_dispatch_guard`'s retry:
+        # deepagents appends this list AFTER its own base stack, and earlier entries wrap
+        # later ones. A dispatch this middleware cancels must not be replayed.
+        _ResearcherDispatchMiddleware(max_concurrent_researchers, deadline, run_log),
         TodoListMiddleware(),
         SummarizationMiddleware(
             model=model, backend=backend, trigger=_SUMMARIZATION_TRIGGER, keep=_SUMMARIZATION_KEEP

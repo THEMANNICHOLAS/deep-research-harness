@@ -80,6 +80,15 @@ are never stored here — each provider names an environment variable
   hitting either bound still writes a report naming which one it was. `max_rounds` is
   approximate — it maps onto LangGraph supersteps and buys somewhat fewer rounds than
   its number suggests (see @docs/plans/PLAN-research-loop.md `## Discoveries`).
+- `max_concurrent_researchers` (default 4) caps how many researcher dispatches the lead
+  may have IN FLIGHT at once — a concurrency cap, not a total for the run, so a further
+  wave is allowed once the running ones report back. A surplus dispatch is refused with a
+  message telling the lead to wait for the results it already asked for, and the refusal is
+  disclosed as a `researcher_budget_exhausted` incident.
+- When `synthesis_margin_seconds` is non-zero the same reserve now also applies inside a
+  dispatch: a researcher still running when the margin arrives is cut off and the lead is
+  told to synthesize from what it has (disclosed as `research_deadline_reached`). Set it to
+  `0` to disable the reserve entirely, in which case dispatches are never cut off.
 - `max_rounds` bounds one PASS, not the whole run: every clarification resume grants a
   fresh allowance, so a run that asked two questions may use roughly three times the
   number configured. The wall clock is the only run-level bound once research starts.

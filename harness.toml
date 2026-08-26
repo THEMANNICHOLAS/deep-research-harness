@@ -90,3 +90,8 @@ request_timeout_seconds = 120.0
 # Harness-enforced (R5): a researcher's reader dispatch past this count is refused, not
 # merely advised in prompt prose. The researcher prompt renders this same value.
 max_reader_dispatches = 6
+# Harness-enforced (D5): a CONCURRENCY cap on how many researcher dispatches the lead may
+# have in flight at once — NOT a total for the run, so a second wave is allowed once the
+# first returns. The surplus dispatch is refused with a message telling the lead to wait.
+# Phase 2 of docs/plans/PLAN-research-throughput.md renders this value into the lead prompt.
+max_concurrent_researchers = 4

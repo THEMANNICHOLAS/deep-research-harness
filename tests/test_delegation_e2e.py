@@ -12,7 +12,13 @@ from pydantic import SecretStr
 
 import harness.__main__ as main_module
 from harness.sources import sources_dir
-from tests.conftest import ScriptedChatModel, _FakeMarkdown, _FakeResult, verify_reply
+from tests.conftest import (
+    ConcurrencyTrackingModel,
+    ScriptedChatModel,
+    _FakeMarkdown,
+    _FakeResult,
+    verify_reply,
+)
 from tests.test_verify import _flatten
 
 _URL = "https://example.test/page"
@@ -396,3 +402,91 @@ async def test_verification_reads_the_capture_file_not_the_reader_digest(
     assert _CAPTURE_MARKER in verify_text
     assert _DIGEST_MARKER not in verify_text
     assert _RESEARCHER_MARKER not in verify_text
+
+
+_MARGIN_MARKER = "MARGIN-ANSWER-MARKER-4e81c0"
+
+
+async def test_a_researcher_overrunning_the_synthesis_margin_still_yields_a_report(
+    make_config, make_agent_settings, patch_models_by_role, monkeypatch
+):
+    """R5/D1 through a real `main()` run: a researcher whose model hangs past the synthesis
+    reserve is cut off at the margin instead of running the hard wall clock out. The lead is
+    told to answer now, the run exits 0 with a report whose `## Answer` is the lead's prose,
+    and `research_deadline_reached` is disclosed rather than silently swallowed.
+
+    `wall_clock_seconds=60` with `synthesis_margin_seconds=59` puts the deadline one second
+    after the clock arms while leaving the HARD clock a full minute away -- the plan's risk #2
+    race (margin and hard clock firing together) cannot bite at that separation.
+    """
+    config = make_config(
+        agent=make_agent_settings(wall_clock_seconds=60, synthesis_margin_seconds=59),
+        head_model="head-test-model",
+        researcher_model="researcher-test-model",
+        reader_model="reader-test-model",
+    )
+
+    head_model = ScriptedChatModel(
+        model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script(
+        [
+            _task_call(_RESEARCHER_DESCRIPTION, "researcher"),
+            AIMessage(content=f"No angle came back in time. {_MARGIN_MARKER}"),
+            AIMessage(content=f"No angle came back in time. {_MARGIN_MARKER}"),
+            AIMessage(content="Nothing was checkable against a source."),
+        ]
+    )
+    # Sleeps far past the one-second deadline: the dispatch is cancelled mid-model-call, so
+    # this model never completes a reply at all.
+    researcher_model = ConcurrencyTrackingModel(
+        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="never returned")])
+    researcher_model._sleep_seconds = 30.0
+    reader_model = ScriptedChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="unused")])
+    patch_models_by_role(
+        {
+            "head": head_model,
+            "researcher": researcher_model,
+            "reader": reader_model,
+            "verifier": head_model,
+        }
+    )
+
+    monkeypatch.setattr(main_module, "load_config", lambda: config)
+
+    async def _noop_preflight(cfg, role):
+        return None
+
+    monkeypatch.setattr("harness.models.preflight", _noop_preflight)
+
+    async def _noop_search_preflight(cfg):
+        return None
+
+    monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
+
+    captured: dict = {}
+    real_write_report = main_module.write_report
+
+    def _spy(outcome, cfg):
+        path = real_write_report(outcome, cfg)
+        captured["outcome"] = outcome
+        captured["path"] = path
+        return path
+
+    monkeypatch.setattr(main_module, "write_report", _spy)
+
+    exit_code = await main_module.main(["what does the widget line show?"])
+
+    assert exit_code == 0
+    assert captured["path"].exists()
+    body = captured["path"].read_text(encoding="utf-8")
+    assert _MARGIN_MARKER in body
+    # The cancelled researcher never produced a reply, but the lead still took another turn
+    # -- risk #1: a mid-flight cancellation must not wedge the lead's message history.
+    assert researcher_model._started_count == 1
+    assert researcher_model._call_count == 0
+    assert head_model._call_count >= 2
+    kinds = [i.kind for i in captured["outcome"].incidents]
+    assert "research_deadline_reached" in kinds

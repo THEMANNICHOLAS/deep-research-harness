@@ -21,7 +21,12 @@ from pydantic import PrivateAttr
 
 import harness.__main__ as main_module
 from harness.activity import ActivitySink, active_reader
-from harness.agent import _summarize_tool_args, _summarize_tool_result, build_agent
+from harness.agent import (
+    ResearchDeadline,
+    _summarize_tool_args,
+    _summarize_tool_result,
+    build_agent,
+)
 from harness.config import AgentSettings, HarnessConfig, run_workspace_dir
 from harness.display import PlainRenderer, StageTracker
 from harness.report import (
@@ -638,17 +643,20 @@ async def test_a_reader_crash_becomes_an_error_task_message_after_one_retry(
     assert reader_model._call_count == 2  # initial attempt + exactly one retry
 
 
-def _multi_task_call(descriptions: list[str], call_ids: list[str]) -> AIMessage:
-    """Like `_task_call`, but emits several `task(subagent_type="reader")` calls in ONE
-    AIMessage — the shape `_ReaderDispatchCapMiddleware` must refuse only the surplus of, not
-    the whole batch (see the plan's "position, not a count" rationale).
+def _multi_task_call(
+    descriptions: list[str], call_ids: list[str], subagent_type: str = "reader"
+) -> AIMessage:
+    """Like `_task_call`, but emits several `task` calls in ONE AIMessage — the shape
+    `_ReaderDispatchCapMiddleware` must refuse only the surplus of, not the whole batch (see
+    the plan's "position, not a count" rationale), and the shape the lead's own fan-out cap
+    (`subagent_type="researcher"`) sees as concurrent dispatches.
     """
     return AIMessage(
         content="",
         tool_calls=[
             {
                 "name": "task",
-                "args": {"description": description, "subagent_type": "reader"},
+                "args": {"description": description, "subagent_type": subagent_type},
                 "id": call_id,
             }
             for description, call_id in zip(descriptions, call_ids, strict=True)
@@ -1400,6 +1408,181 @@ async def test_two_researchers_dispatched_in_one_turn_run_concurrently(
     assert researcher_model._call_count == 2
 
 
+def _lead_task_messages(result) -> dict[str, ToolMessage]:
+    """The lead's `task` result ToolMessages, keyed by the `tool_call_id` they answer.
+
+    Same shape the reader-cap tests index by: a refusal and a real digest are both ordinary
+    ToolMessages, so only the id ties a verdict back to the dispatch that earned it.
+    """
+    return {
+        m.tool_call_id: m
+        for m in result["messages"]
+        if isinstance(m, ToolMessage) and m.name == "task"
+    }
+
+
+def _researcher_models(sleep_seconds: float, replies: list[str]):
+    """A `ConcurrencyTrackingModel` researcher plus an unused reader, the pair every lead-tier
+    dispatch test below needs (`patch_models_by_role` wants all three roles).
+    """
+    from pydantic import SecretStr
+
+    researcher_model = ConcurrencyTrackingModel(
+        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    researcher_model._sleep_seconds = sleep_seconds
+    researcher_model.script([AIMessage(content=reply) for reply in replies])
+    reader_model = ScriptedChatModel(
+        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    ).script([AIMessage(content="unused")])
+    return researcher_model, reader_model
+
+
+async def test_a_researcher_dispatch_past_the_deadline_is_refused_and_spawns_nothing(
+    make_config, patch_models_by_role, scripted_model
+):
+    """R5/D1: once the synthesis reserve is reached, a NEW researcher dispatch never starts.
+    The lead gets a plain (non-error) ToolMessage telling it to answer now, and the run log
+    carries `research_deadline_reached` so the report can disclose the thinned coverage.
+    """
+    head_model = scripted_model(
+        [_task_call("Investigate an angle"), AIMessage(content="answer from what I have")]
+    )
+    researcher_model, reader_model = _researcher_models(0.0, ["Report A."])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    deadline = ResearchDeadline()
+    deadline.arm(asyncio.get_running_loop().time() - 1)  # already past
+    run_log = RunLog()
+    graph = build_agent(make_config(), SourceRegistry(), run_log, deadline=deadline)
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    refused = _lead_task_messages(result)["call_task"]
+    assert "time budget" in str(refused.content).lower()
+    assert refused.status != "error"  # a budget verdict, not a failure
+    assert researcher_model._started_count == 0  # no subagent was spawned at all
+    incidents = [i for i in run_log.incidents() if i.kind == "research_deadline_reached"]
+    assert len(incidents) == 1
+
+
+async def test_an_unarmed_deadline_never_cancels_a_researcher_dispatch(
+    make_config, patch_models_by_role, scripted_model
+):
+    """`synthesis_margin_seconds = 0` disables the reserve, so `__main__` never arms the
+    deadline and the middleware must be a pure pass-through — a slow researcher runs to
+    completion rather than being cut off by an implicit zero budget.
+    """
+    head_model = scripted_model([_task_call("Investigate an angle"), AIMessage(content="done")])
+    researcher_model, reader_model = _researcher_models(0.05, ["Report A."])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    run_log = RunLog()
+    graph = build_agent(make_config(), SourceRegistry(), run_log, deadline=ResearchDeadline())
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    settled = _lead_task_messages(result)["call_task"]
+    assert "time budget" not in str(settled.content).lower()
+    assert researcher_model._call_count == 1
+    assert [i for i in run_log.incidents() if i.kind == "research_deadline_reached"] == []
+
+
+async def test_a_cancelled_researcher_dispatch_is_refused_once_and_never_replayed(
+    make_config, patch_models_by_role, scripted_model
+):
+    """The deadline middleware sits OUTSIDE `_task_dispatch_guard` (D1), so a dispatch it
+    cancels is never handed to `ToolRetryMiddleware` — replaying a whole researcher after the
+    time budget ran out is precisely the compounding overrun this exists to stop. The lead's
+    next turn must still run, so the cancelled dispatch cannot leave the thread wedged.
+    """
+    head_model = scripted_model(
+        [_task_call("Investigate an angle"), AIMessage(content="answer from what I have")]
+    )
+    researcher_model, reader_model = _researcher_models(5.0, ["Report A.", "Report A again."])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    deadline = ResearchDeadline()
+    # A full second, not a few ms: compiling the graph and reaching the first dispatch costs
+    # real time, and too tight a budget refuses the dispatch BEFORE it starts -- which is the
+    # other test's case, not this one's.
+    deadline.arm(asyncio.get_running_loop().time() + 1.0)
+    run_log = RunLog()
+    graph = build_agent(make_config(), SourceRegistry(), run_log, deadline=deadline)
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1  # exactly one verdict for the one dispatch
+    assert "time budget" in str(task_messages[0].content).lower()
+    assert task_messages[0].status != "error"
+    # STARTED, not completed: the cancelled call never reached `_call_count`. A retry would
+    # have started the researcher a second time.
+    assert researcher_model._started_count == 1
+    assert [i.kind for i in run_log.incidents()] == ["research_deadline_reached"]
+    assert result["messages"][-1].content == "answer from what I have"
+
+
+async def test_the_surplus_concurrent_researcher_is_refused_and_a_later_wave_is_allowed(
+    make_config, patch_models_by_role, scripted_model, make_agent_settings
+):
+    """D5: `[agent].max_concurrent_researchers` is a CONCURRENCY cap enforced in code, not a
+    total for the run. Three dispatches in one AIMessage under a cap of 2 leave exactly one
+    refused; once the first wave returns, a second wave of two runs normally.
+    """
+    cap = 2
+    wave_a = ["call_a0", "call_a1", "call_a2"]
+    wave_b = ["call_b0", "call_b1"]
+    head_model = scripted_model(
+        [
+            _multi_task_call([f"Angle a{i}" for i in range(3)], wave_a, "researcher"),
+            _multi_task_call([f"Angle b{i}" for i in range(2)], wave_b, "researcher"),
+            AIMessage(content="done"),
+        ]
+    )
+    researcher_model, reader_model = _researcher_models(0.05, [f"Report {i}." for i in range(4)])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    run_log = RunLog()
+    config = make_config(agent=make_agent_settings(max_concurrent_researchers=cap))
+    graph = build_agent(config, SourceRegistry(), run_log)
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    by_id = _lead_task_messages(result)
+    assert set(by_id) == set(wave_a) | set(wave_b)
+    refused = [
+        call_id
+        for call_id, message in by_id.items()
+        if "already in flight" in str(message.content).lower()
+    ]
+    assert refused == [wave_a[cap]]  # only the surplus of the FIRST wave
+    assert by_id[wave_a[cap]].status != "error"  # not a failure `_task_dispatch_guard` retries
+    assert researcher_model._peak_in_flight == cap
+    assert researcher_model._call_count == 4  # 2 in the first wave + 2 in the second
+    incidents = [i for i in run_log.incidents() if i.kind == "researcher_budget_exhausted"]
+    assert len(incidents) == 1
+    assert str(cap) in incidents[0].detail
+
+
 async def test_fetch_raw_is_offered_to_the_researcher_but_not_the_lead_or_reader(
     noop_agent, make_config
 ):
@@ -1947,6 +2130,35 @@ def test_final_answer_is_empty_when_the_run_never_spoke():
     assert main_module._final_answer(messages) == ""
 
 
+def test_final_answer_skips_a_tool_calling_message_even_when_it_has_prose():
+    """R5: the failed 1800s run published the lead's PLANNING PREAMBLE as its answer — an
+    `AIMessage` that says "I will now search..." and carries `tool_calls` in the same message.
+    Content alone cannot distinguish that from a real answer; the presence of `tool_calls` can.
+    """
+    preamble_only = [
+        AIMessage(
+            content="I will now search for the relevant sources and delegate a researcher.",
+            tool_calls=[
+                {"name": "task", "args": {"description": "Angle A"}, "id": "c1"},
+            ],
+        ),
+        ToolMessage(content="Researcher report.", tool_call_id="c1"),
+    ]
+
+    assert main_module._final_answer(preamble_only) == ""
+
+    with_a_real_answer = [
+        AIMessage(content="Acme is cheapest at $4.20/unit [S1]."),
+        AIMessage(
+            content="Let me check one more angle before finishing.",
+            tool_calls=[{"name": "task", "args": {"description": "Angle B"}, "id": "c2"}],
+        ),
+        ToolMessage(content="Researcher report.", tool_call_id="c2"),
+    ]
+
+    assert main_module._final_answer(with_a_real_answer) == "Acme is cheapest at $4.20/unit [S1]."
+
+
 def test_message_text_reads_block_style_content():
     """`AIMessage.content` is `str | list`, and `str(content)` on the list shape is a repr, so a
     provider returning content blocks would put `[{'type': 'text', ...}]` under `## Answer`.
@@ -2292,12 +2504,19 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
 
 
-async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer(
+async def test_main_writes_no_report_when_the_wall_clock_expires_on_a_tool_calling_preamble(
     make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """D2's other wall-clock branch: the same expiry, but the interrupted turn already carried
-    prose alongside its tool call, so a final answer exists — the report is still written,
-    disclosing the cut-short, and the exit code stays 0.
+    """R5 (PLAN-research-throughput.md Phase 1): the interrupted turn carried prose ALONGSIDE
+    its `task(researcher)` dispatch — a plan, not an answer. `_final_answer` skips it, so this
+    expiry is answerless and stays a FAILED run: no report, exit 1, stderr naming the clock.
+
+    This test used to assert the opposite (exit 0 with a cut-short report), which is what
+    published the failed 1800s run's planning preamble as its answer. The "wall clock expires
+    while a real answer exists" branch it used to cover is now unreachable by construction: a
+    tool-call-FREE AIMessage ends the agent loop, so no further work — and therefore no
+    expiry — can follow one inside the clock's scope. "Cut short but answered" is still
+    covered, on the round-cap and synthesis-margin paths that re-enter the graph after a break.
 
     Step 3 (Drift C): the LEAD's own turn carries the prose AND the `task(researcher)` dispatch
     — the slow `search_web` call that stalls the clock lives one tier deeper.
@@ -2330,14 +2549,13 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     )
     elapsed = time.monotonic() - started
 
-    assert exit_code == 0
-    assert len(files) == 1
-    body = files[0].read_text(encoding="utf-8")
-    assert _CUT_SHORT_HEADING in body
-    # Names the WALL CLOCK specifically — see the round-cap test for why the heading is not enough.
-    assert _WALL_CLOCK_TEXT in body
-    assert _ROUND_CAP_TEXT not in body
-    assert "Partial finding: Acme quoted $4.20/unit." in body
+    assert exit_code == 1
+    assert files == [], f"a report was written from a tool-calling preamble: {files}"
+    assert any("wall clock" in line for line in err.splitlines()), err
+    # The preamble prose reached no artifact at all — not the report (there is none) and not
+    # stdout's post-run summary.
+    assert "Partial finding: Acme quoted $4.20/unit." not in out
+    assert "summary:" in out
     # Well under the full 3s sleep: cut off near the 1s bound rather than completed and mislabeled.
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
 
@@ -2368,16 +2586,15 @@ async def test_main_synthesizes_when_the_synthesis_margin_is_crossed(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
-    # The researcher's own final turn, completing the `task` call with no further tool use, so
-    # the ToolMessage it produces is the next thing the LEAD's own top-level stream sees.
-    researcher_done = AIMessage(content="Widgets found at $4.20/unit.")
+    # No researcher final turn is scripted any more: Phase 1 of PLAN-research-throughput.md
+    # arms a dispatch-path deadline at the SAME `wall_clock_seconds - synthesis_margin_seconds`
+    # instant this threshold uses, so the 2s search is cancelled at 1s and the researcher never
+    # gets a second turn — the margin is then crossed at the next turn boundary, as before.
     # The injected `_SYNTHESIZE_NOW` turn reaches the LEAD, not the researcher.
     synthesis_answer = AIMessage(content="Widgets cost about four dollars per unit.")
     # No citation in the answer above, so verification's consolidation call is its only call.
     consolidation = AIMessage(content="Nothing was cited, so nothing was checked.")
-    model = scripted_model(
-        [task_call, search_call, researcher_done, synthesis_answer, consolidation]
-    )
+    model = scripted_model([task_call, search_call, synthesis_answer, consolidation])
     patch_run(monkeypatch, config, model)
     _install_slow_search(monkeypatch, delay_seconds=2)
 
@@ -2396,13 +2613,14 @@ async def test_main_synthesizes_when_the_synthesis_margin_is_crossed(
     assert _WALL_CLOCK_TEXT not in body
     assert _ROUND_CAP_TEXT not in body
     assert "Widgets cost about four dollars per unit." in body
-    # Exactly the LEAD's dispatch turn, the researcher's two turns, the injected synthesis
-    # turn, and the verification consolidation call — nothing extra, nothing dropped.
-    assert len(model._received_messages) == 5
+    # Exactly the LEAD's dispatch turn, the researcher's one turn (its second never runs —
+    # the dispatch is cancelled at the reserve), the injected synthesis turn, and the
+    # verification consolidation call — nothing extra, nothing dropped.
+    assert len(model._received_messages) == 4
     # The synthesis instruction actually reached the model as the resumed thread's last human
     # message (the same technique `test_max_rounds_counts_model_turns_not_supersteps` uses for
     # the round cap), rather than the answer arriving by script-order coincidence.
-    synthesis_call = model._received_messages[3]
+    synthesis_call = model._received_messages[2]
     # The MARGIN's own wording (G3, 3F review), not the round cap's — a margin trip must never
     # tell the lead "the round cap has been reached".
     assert any(
@@ -2502,8 +2720,13 @@ async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_th
     threshold `wall_clock_seconds - 0` equals the wall clock itself, which would make a margin
     cut fire at the same instant the clock expires — instead, a disabled reserve must let the
     run reach the HARD wall clock exactly as it did before this phase (mirrors
-    `test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer` with the
-    new field pinned to its disable value).
+    `test_main_writes_no_report_when_the_wall_clock_expires_on_a_tool_calling_preamble` with
+    the new field pinned to its disable value).
+
+    A disabled reserve also leaves Phase 1's dispatch deadline UNARMED, so the researcher runs
+    until the hard clock takes it — nothing is cut off early. Its turn carries prose alongside
+    a tool call, which R5 no longer accepts as an answer, so the expiry is answerless: the
+    assertions below are about which BOUND ended the run, which is what this test exists for.
     """
     agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
@@ -2532,13 +2755,13 @@ async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_th
     )
     elapsed = time.monotonic() - started
 
-    assert exit_code == 0
-    assert len(files) == 1
-    body = files[0].read_text(encoding="utf-8")
-    assert _CUT_SHORT_HEADING in body
-    assert _WALL_CLOCK_TEXT in body
-    assert _SYNTHESIS_MARGIN_TEXT not in body
-    assert _ROUND_CAP_TEXT not in body
+    assert exit_code == 1
+    assert files == [], f"a report was written despite no final answer: {files}"
+    # The HARD clock ended this run, not a reserve that fired at `wall_clock_seconds - 0`:
+    # stderr names the wall clock, and no synthesis pass was ever announced.
+    assert any("wall clock" in line for line in err.splitlines()), err
+    assert "synthesis margin" not in out
+    assert "asking for a synthesis" not in out
     # Well under the full 3s sleep: cut off near the 1s bound rather than completed and mislabeled.
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire"
 
@@ -2883,8 +3106,9 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
         run_log: Any = None,
         sink: Any = None,
         browser: Any = None,
+        deadline: Any = None,
     ) -> Any:
-        real_agent = real_build_agent(config, registry, run_log, sink, browser)
+        real_agent = real_build_agent(config, registry, run_log, sink, browser, deadline)
 
         class _InterruptingAgent:
             def astream(self, *args: Any, **kwargs: Any) -> Any:
@@ -2935,8 +3159,9 @@ async def test_main_exits_cleanly_on_cancelled_error_mid_stream(
         run_log: Any = None,
         sink: Any = None,
         browser: Any = None,
+        deadline: Any = None,
     ) -> Any:
-        real_agent = real_build_agent(config, registry, run_log, sink, browser)
+        real_agent = real_build_agent(config, registry, run_log, sink, browser, deadline)
 
         class _InterruptingAgent:
             def astream(self, *args: Any, **kwargs: Any) -> Any:
@@ -3055,17 +3280,6 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     write_source_capture(config, registry, source_id, "Acme lists $5.10 per unit.")
     monkeypatch.setattr(main_module, "SourceRegistry", lambda run_id: registry)
 
-    partial = AIMessage(
-        content=f"Acme quoted $4.20 per unit [{source_id}].",
-        tool_calls=[
-            {
-                "name": "write_todos",
-                "args": {"todos": [{"content": "Confirm the quote", "status": "pending"}]},
-                "id": "call_1",
-            }
-        ],
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-    )
     keep_going = AIMessage(
         content="",
         tool_calls=[
@@ -3076,7 +3290,16 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
             }
         ],
     )
-    model = scripted_model([partial, *([keep_going] * 20)])
+    # The cited answer rides on a TOOL-CALL-FREE message, delivered by the bounded synthesis
+    # pass the round cap triggers. A message carrying both prose and `tool_calls` is a plan,
+    # not an answer, and `_final_answer` skips it (R5, PLAN-research-throughput.md Phase 1) —
+    # so the claim under verification has to reach the run the way a real answer does.
+    partial = AIMessage(
+        content=f"Acme quoted $4.20 per unit [{source_id}].",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    # Two capped rounds of tool work, then the synthesis pass's answer.
+    model = scripted_model([keep_going, keep_going, partial])
     patch_run(monkeypatch, config, model)
 
     verify_model = scripted_model(

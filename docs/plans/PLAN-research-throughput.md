@@ -237,7 +237,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R6 | Retry only transient failures; bounded per-role timeouts | Phase 5 |
 
 ## Progress
-- [ ] Phase 1: Time-budget tracer — deadline-aware researcher dispatch
+- [x] Phase 1: Time-budget tracer — deadline-aware researcher dispatch
 - [ ] Phase 2: Prompts and tool descriptions state the code's rules
 - [ ] Phase 3: Guard requires directive context
 - [ ] Phase 4: Fetch pool and memory threshold as config
@@ -296,15 +296,15 @@ never accepted as the final answer.
 - Prompt text changes (Phase 2), search budget, any change to the researcher's own middleware.
 
 **Tests (write first, confirm red):**
-- [ ] A researcher dispatch whose scripted model sleeps past an armed deadline returns the
+- [x] A researcher dispatch whose scripted model sleeps past an armed deadline returns the
   deadline ToolMessage, records `research_deadline_reached`, and the lead's next turn synthesizes;
   the run exits 0 with a report.
-- [ ] With the deadline already passed, a new researcher dispatch is refused without spawning a
+- [x] With the deadline already passed, a new researcher dispatch is refused without spawning a
   subagent; with the deadline unarmed (margin 0) dispatches are never cancelled.
-- [ ] The (N+1)th concurrent researcher dispatch is refused with `researcher_budget_exhausted`
+- [x] The (N+1)th concurrent researcher dispatch is refused with `researcher_budget_exhausted`
   while N are in flight; a later wave after they return is allowed.
-- [ ] A cancelled dispatch is NOT replayed by `_task_dispatch_guard`'s retry.
-- [ ] `_final_answer` skips an `AIMessage` carrying `tool_calls` even when its content is
+- [x] A cancelled dispatch is NOT replayed by `_task_dispatch_guard`'s retry.
+- [x] `_final_answer` skips an `AIMessage` carrying `tool_calls` even when its content is
   non-empty, so a run ending on such a message is answerless (no report, nonzero exit).
 
 **Steps:**
@@ -314,9 +314,9 @@ never accepted as the final answer.
 3. Run the tests; confirm they PASS (green); run the full suite (e2e tests construct `build_agent`).
 
 **Acceptance criteria:**
-- [ ] `docs/backlog.md:213` ("synthesis margin can fire with no reserve left") is removed or
+- [x] `docs/backlog.md:213` ("synthesis margin can fire with no reserve left") is removed or
   rewritten to point at this plan.
-- [ ] `uv run pytest tests/test_delegation_e2e.py` passes unchanged in behavior.
+- [x] `uv run pytest tests/test_delegation_e2e.py` passes unchanged in behavior.
 
 ### Phase 2: Prompts and tool descriptions state the code's rules
 **Risk:** none
@@ -551,8 +551,35 @@ Approved at the Phase 1 3C gate.
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
 
+- 2026-08-25 — Phase 1: `should_write_report`'s `cut_short == "wall_clock" and has_answer` clause
+  (`harness/__main__.py`) lost its only `main()`-level test when two old-policy tests were
+  inverted; the path is a sub-ms race, not dead → deferred; add a deterministic test if one is
+  found.
+- 2026-08-25 — Phase 1: diff budget overrun (587/82 vs ~150-220) is entirely the mandated
+  tests; production+docs landed at 210 lines → deferred (band mis-sized, no scope change).
+- 2026-08-25 — Phase 1: `tests/test_delegation_e2e.py` deadline e2e test duplicates
+  `_run_delegation`'s preflight/write_report patch block (~25 lines) → deferred; extract a
+  `_patch_main_run` helper when the file is next touched.
+- 2026-08-25 — Phase 1: `_ResearcherDispatchMiddleware`'s `except TimeoutError` also wraps the
+  unarmed (`remaining is None`) path; unreachable today because the inner `ToolErrorMiddleware`
+  converts first, but Phase 5 adds timeout types to `_PASS_THROUGH_TASK_FAILURES` → act in
+  Phase 5: narrow the except to the `wait_for` branch so a plain model timeout is never reported
+  as `research_deadline_reached`.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so
 never add a section below it. -->
+
+### 2026-08-25 — Phase 1: Time-budget tracer — deadline-aware researcher dispatch
+- Done: `ResearchDeadline` + `_ResearcherDispatchMiddleware` (deadline cancel/refuse + in-flight
+  fan-out cap, outermost on the lead's `task`), `[agent] max_concurrent_researchers`,
+  `_final_answer` rejects tool-calling AIMessages, backlog entry closed; 5 new tests, 833 pass.
+- Learned: cancellation is safe in deepagents 0.7.5 — `CancelledError` is a `BaseException`, so
+  `ToolRetryMiddleware` never replays it. Four old tests encoded "prose on a tool-calling
+  AIMessage is the answer"; two were rescripted, two inverted to assert exit 1/no report.
+  `_is_reader_dispatch` became `_is_dispatch_to(name, args, subagent_type)`.
+- Drift: `build_agent(deadline=None)` optional — see `## Reconciliations` 2026-08-25.
+- Watch-next: Phase 2 renders `$max_concurrent_researchers` into orchestrator.md; the 3F
+  Discoveries entry about `except TimeoutError` narrowing must be acted on in Phase 5.

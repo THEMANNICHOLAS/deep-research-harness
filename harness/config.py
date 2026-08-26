@@ -143,6 +143,9 @@ class AgentSettings(_StrictModel):
     synthesis_margin_seconds: int = Field(default=240, ge=0)
     # Harness-enforced (R5): refused past this count, not merely advised in prompt prose.
     max_reader_dispatches: int = Field(default=6, gt=0)
+    # Harness-enforced (D5): a CONCURRENCY cap on the lead's in-flight researcher
+    # dispatches, not a total for the run — a later wave is allowed once these return.
+    max_concurrent_researchers: int = Field(default=4, gt=0)
     # Under the user's home dir, not the repo root; overridable per-key from [agent].
     workspace_dir: Path = Field(
         default_factory=lambda: Path.home() / "deep-research" / "workspace"

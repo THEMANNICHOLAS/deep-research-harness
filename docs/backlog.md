@@ -210,20 +210,10 @@ not observed failures — none has been reproduced against a live run.
   incident, so starvation is observable in reports. If reach measurably suffers, the remedy is
   a config-gated link-following mode (sanitized or approval-based) — never a silent widening.
 
-- **The synthesis margin can fire with no reserve left.** `harness/__main__.py` compares only
-  `elapsed >= threshold` and never asks how much of the reserve actually remains, and the
-  margin is only checked between lead turns (risk #4, accepted). A single researcher dispatch
-  that overshoots `wall_clock_seconds` therefore fires the margin with no usable reserve: the
-  hard clock kills the bounded synthesis pass, the `TimeoutError` handler overwrites
-  `cut_short` with `"wall_clock"`, and with no answer the run writes no report — the exact R7
-  failure mode, with nothing recording that the reserve fired too late. Deferred by developer
-  decision 2026-08-21. To address, in rising cost: record the shortfall so the report can say
-  the reserve arrived too late; check the margin inside the dispatch path instead of only at
-  turn boundaries; or detect "fired with no reserve" and disclose instead of starting a
-  doomed pass. The last exceeds D7 and Phase 5's `## Out of scope`, so it needs its own
-  reconciliation. Full evidence in the Phase 5 entry of
-  @docs/plans/PLAN-tool-feedback-and-domain-blocklist.md `## Discoveries`, which also carries
-  two cosmetic test-hygiene items from the same review.
+- **The synthesis margin can fire with no reserve left.** Addressed by Phase 1 of
+  @docs/plans/PLAN-research-throughput.md: the reserve is now also enforced on the dispatch
+  path (`_ResearcherDispatchMiddleware` in @harness/agent.py cancels an in-flight researcher
+  at the margin and discloses `research_deadline_reached`), not only between lead turns.
 
 - **The reader tier has no large-tool-result eviction path.** Dropping `FilesystemMiddleware`
   from `_reader_spec` (R6, @harness/agent.py) removed the scratch workspace and, incidentally,

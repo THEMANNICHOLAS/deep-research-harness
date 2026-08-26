@@ -330,10 +330,17 @@ class ConcurrencyTrackingModel(ScriptedChatModel):
     the other's Task gets its first turn (observed flaky in this suite); `0.05` reliably gives
     both a chance to increment before either decrements. Set it by assigning the private attr
     after construction: `model._sleep_seconds = 0.05`.
+
+    `_started_count` counts calls ENTERED, where `ScriptedChatModel._call_count` counts calls
+    that COMPLETED (it increments inside `_generate`, after the sleep above). The two diverge
+    exactly when a call is cancelled mid-sleep — which is what a deadline-cancelled subagent
+    dispatch looks like from here, so "was this subagent replayed?" can only be asked of the
+    started count.
     """
 
     _in_flight: int = PrivateAttr(default=0)
     _peak_in_flight: int = PrivateAttr(default=0)
+    _started_count: int = PrivateAttr(default=0)
     _sleep_seconds: float = PrivateAttr(default=0.0)
 
     async def _agenerate(
@@ -343,6 +350,7 @@ class ConcurrencyTrackingModel(ScriptedChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
+        self._started_count += 1
         self._in_flight += 1
         self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
         await asyncio.sleep(self._sleep_seconds)
