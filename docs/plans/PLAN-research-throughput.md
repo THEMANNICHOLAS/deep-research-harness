@@ -513,14 +513,14 @@ plausibly transient failures.
 - [x] `docs/guides/setup.md` documents the per-role override and that unset means the agent value.
 
 ## Verification
-- [ ] `uv run pytest` (90% coverage floor is enforced in CI, not locally)
-- [ ] `uv run ruff check .` && `uv run ruff format --check .` && `uv run mypy .`
+- [x] `uv run pytest` (90% coverage floor is enforced in CI, not locally)
+- [x] `uv run ruff check .` && `uv run ruff format --check .` && `uv run mypy .`
 - [ ] Live run on the homelab box: `python -m harness "can you find me cool selfhosted services
   ..."` (the failed run's question) at the default 1800s. Expect: a report whose `## Answer` is
   prose, not a plan; `provenance_rejected` incidents near zero; materially more `[Sn]` digested
   than run 20260825134545; no `guard_blocked` on config/docs pages; the run finishes before the
   hard wall clock or discloses `research_deadline_reached`.
-- [ ] `docs/INDEX.md` Shared Resources row for `harness/agent.py` mentions the dispatch
+- [x] `docs/INDEX.md` Shared Resources row for `harness/agent.py` mentions the dispatch
   middleware; `docs/decisions.md` gets one entry per D1-D6.
 
 ## Risks
@@ -730,3 +730,13 @@ never add a section below it. -->
 - Watch-next: Final verification is operator-side — live homelab run of the failed question at
   1800s (expect prose answer, near-zero `provenance_rejected`, more `[Sn]`), then the
   `docs/INDEX.md` agent.py row (dispatch middleware) and `docs/decisions.md` D1-D6 entries.
+
+### 2026-08-27 — Final verification (docs half)
+- Done: full gate green at d3d6e4b (860 pass, ruff/mypy clean); `docs/INDEX.md` agent.py row names
+  the dispatch middleware; `docs/decisions.md` has one entry per D1-D6.
+- Learned: nothing new.
+- Drift: none.
+- Watch-next: the live homelab run is the only unchecked item — `python -m harness "<the failed
+  run's question>"` at 1800s; compare against run 20260825134545 (prose answer, near-zero
+  `provenance_rejected`, more `[Sn]`, no `guard_blocked` on config/docs pages). Then tick the
+  box, set Status: Complete, and run /pr-review on PR #42.

@@ -262,3 +262,38 @@ sentences each, append-only, newest last.
   `gpt-5.6-luna` preflight chat call (`Internal server error`), surfaced as a
   fail-fast startup abort. `qwen3.7-plus` was already a listed `[roles.head]`
   `choices` slug; swapped in with no other config changes.
+
+- **2026-08-27 — Synthesis reserve enforced inside researcher dispatches (research-throughput D1).**
+  `_ResearcherDispatchMiddleware` wraps the lead's `task` tool: each researcher runs under
+  `asyncio.wait_for(remaining-until-margin)` and, past the margin, new dispatches are refused with
+  a "synthesize now" ToolMessage; both record `research_deadline_reached`. Rejected: a sibling
+  timer cancelling the whole `astream` — loses the in-flight superstep and races the hard clock.
+
+- **2026-08-27 — Guard requires directive context (research-throughput D2).** The bare `system`
+  rules fire only when followed (same/next line, blank lines allowed) by second-person or
+  imperative instruction text, and `exfil_markup` only on the image form or a template-syntax
+  query value, so compose YAML, INI `[system]`, spec lines, shell snippets and `?apikey=` docs
+  links survive. Rejected: dropping the rules (loses `SYSTEM: you are now...`) and skipping
+  fenced regions (an attacker wraps the payload in a fence).
+
+- **2026-08-27 — One run-wide HTTP pool sized by `fetch.max_connections` (research-throughput D3).**
+  `max_concurrency` keeps its per-call dispatcher-permit meaning; `memory_threshold_percent`
+  (crawl4ai's 90.0) replaces a 75.0 constant. Rejected: one crawler per researcher dispatch —
+  tools are built once per run, so it needs a dispatch-scoped registry for the same connections.
+
+- **2026-08-27 — Search-failure abort stays run-wide (research-throughput D4).** No dispatch identity
+  reaches a `@tool`, and run-wide counting is the right detector for "SearXNG is down"; the R4
+  per-researcher clause was trimmed rather than adding a contextvar.
+
+- **2026-08-27 — Researcher fan-out enforced by middleware, search budget prompt-only
+  (research-throughput D5).** `max_concurrent_researchers` is an in-flight CONCURRENCY cap
+  (later waves allowed) refused with `researcher_budget_exhausted`; `searches_per_researcher` is
+  rendered into the prompt only, since the reader-dispatch cap already bounds per-researcher
+  cost. Rejected: prompt-only fan-out — the failed 1800s run showed prose limits do not hold.
+
+- **2026-08-27 — Per-role request timeouts; task retry replays only transient failures
+  (research-throughput D6).** `RoleConfig.request_timeout_seconds` (None → `[agent]` value)
+  bounds researcher/reader at 60s while head/verifier keep 120s. `_NON_RETRYABLE_TASK_FAILURES`
+  adds `openai.BadRequestError` and the builtin `TimeoutError` to the retry exclusion as a
+  separate superset of `_PASS_THROUGH_TASK_FAILURES`, which doubles as the failure handler's
+  propagate list; `openai.APITimeoutError` subclasses `APIConnectionError` and stays retryable.
