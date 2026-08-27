@@ -20,13 +20,13 @@ from langgraph.types import Interrupt
 from pydantic import PrivateAttr
 
 import harness.__main__ as main_module
+import harness.session as session_module
 from harness.activity import ActivitySink, active_reader
 from harness.agent import _summarize_tool_args, _summarize_tool_result, build_agent
 from harness.config import AgentSettings, HarnessConfig, run_workspace_dir
 from harness.display import PlainRenderer, StageTracker
 from harness.report import (
     _CUT_SHORT_HEADING,
-    _NO_ANSWER_TEXT,
     _ROUND_CAP_TEXT,
     _SYNTHESIS_MARGIN_TEXT,
     _WALL_CLOCK_TEXT,
@@ -34,15 +34,20 @@ from harness.report import (
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry
 from tests.conftest import (
+    _SYNTHESIS_PHRASE,
     ConcurrencyTrackingModel,
     ScriptedChatModel,
+    _dispatch_call,
     _FakeMarkdown,
     _FakeResult,
+    _lead_model,
+    _submit_call,
     approve_all,
     drain_stdout,
     install_search_transport,
     patch_model,
     patch_run,
+    patch_run_by_role,
     verify_reply,
     write_source_capture,
 )
@@ -58,6 +63,20 @@ def noop_agent(make_config, monkeypatch, scripted_model):
     model = scripted_model([AIMessage(content="done")])
     patch_model(monkeypatch, model)
     return model, build_agent(make_config(), SourceRegistry())
+
+
+@pytest.fixture
+def noop_researcher_graph(make_config, monkeypatch, scripted_model):
+    """The compiled RESEARCHER graph, over a do-nothing model — the lead's counterpart.
+
+    The researcher is no longer a declared subagent of the lead (D1): it is its own compiled
+    graph, so the tier-structure assertions that used to walk out of the lead's `task` tool
+    start here instead.
+    """
+    from harness.agent import build_researcher_graph
+
+    patch_model(monkeypatch, scripted_model([AIMessage(content="done")]))
+    return build_researcher_graph(make_config(), SourceRegistry())
 
 
 def _tools_by_name(graph):
@@ -162,35 +181,39 @@ async def test_build_agent_delivers_the_rendered_prompt_and_the_question_to_the_
 async def test_build_agent_exposes_the_harness_tools(noop_agent):
     _, graph = noop_agent
 
-    # `search_web`/`fetch_pages` both moved off the lead (Step 3): it delegates through `task`
-    # to the researcher tier rather than researching directly.
-    assert "task" in _tools_by_name(graph)
+    # `search_web`/`fetch_pages` both moved off the lead (Step 3), and `task` with them
+    # (PLAN-interactive-lead-chat D1): the lead starts researchers through its OWN dispatch
+    # tool, which returns before the researcher finishes, and ends research with a report.
+    assert "dispatch_researcher" in _tools_by_name(graph)
+    assert "submit_report" in _tools_by_name(graph)
+    assert "task" not in _tools_by_name(graph)
     assert "search_web" not in _tools_by_name(graph)
     assert "fetch_pages" not in _tools_by_name(graph)
 
 
-async def test_build_agent_disables_the_general_purpose_subagent(noop_agent):  # R4
+async def test_build_agent_disables_the_general_purpose_subagent(  # R4
+    noop_agent, noop_researcher_graph
+):
+    # The lead has no `task` tool at all now (`subagents=[]`), a stronger form of the same
+    # guarantee: with no dispatch mechanism there is no general-purpose subagent to reach.
+    # The researcher, which DOES have `task`, still declares exactly its one nested tier.
     _, graph = noop_agent
 
-    # `task` now exists (backing the declared `researcher` subagent), so the general-purpose
-    # disable is evidenced by the declared-agent list, not by the tool's absence.
-    assert _declared_subagent_names(graph) == {"researcher"}
+    assert "task" not in _tools_by_name(graph)
+    assert _declared_subagent_names(noop_researcher_graph) == {"reader"}
 
 
-async def test_the_researchers_own_task_tool_declares_only_the_reader(noop_agent):  # R4
-    """TEST-FIRST item 3 (lead tool surface): the 3-tier hierarchy is nested, not flattened —
-    the lead's own declared subagent is exactly `{"researcher"}` (previous test), and the
-    researcher's OWN `task` tool, one level deeper, declares exactly `{"reader"}`.
+async def test_the_researchers_own_task_tool_declares_only_the_reader(  # R4
+    noop_researcher_graph,
+):
+    """TEST-FIRST item 3 (tier surface): the hierarchy is nested, not flattened — the
+    researcher's own `task` tool declares exactly `{"reader"}`, and nothing else.
 
     R4 regression (PLAN-prompt-injection-defense.md Phase 5): pins the containment structure
     a fenced/sanitized run still relies on — the researcher can dispatch only to the reader,
     never fan out to another tier of its own choosing.
     """
-    _, graph = noop_agent
-
-    researcher_runnable = _declared_subagents(graph)["researcher"]
-
-    assert _declared_subagent_names(researcher_runnable) == {"reader"}
+    assert _declared_subagent_names(noop_researcher_graph) == {"reader"}
 
 
 def test_lead_interrupt_on_contains_exactly_ask_user():  # R4
@@ -204,17 +227,16 @@ def test_lead_interrupt_on_contains_exactly_ask_user():  # R4
     assert set(_INTERRUPT_ON) == {ASK_USER_TOOL_NAME}
 
 
-async def test_the_nested_readers_tool_surface_excludes_a_filesystem_workspace(noop_agent):
+async def test_the_nested_readers_tool_surface_excludes_a_filesystem_workspace(
+    noop_researcher_graph,
+):
     """R6 (Phase 4 trim): the reader carries only what it needs to read and answer in prose —
     no write tools. Inverts the prior contract (the reader used to get a scratch workspace via
     `FilesystemMiddleware`, restored by hand since nesting through a hand-built
     `SubAgentMiddleware` gets none of `create_deep_agent`'s auto-injected base stack for free);
     `reader.md`'s scratch-workspace promise is removed in the same phase (Step 4).
     """
-    _, graph = noop_agent
-
-    researcher_runnable = _declared_subagents(graph)["researcher"]
-    reader_runnable = _declared_subagents(researcher_runnable)["reader"]
+    reader_runnable = _declared_subagents(noop_researcher_graph)["reader"]
     reader_tool_names = set(_tools_by_name(reader_runnable))
 
     assert reader_tool_names.isdisjoint(
@@ -223,11 +245,12 @@ async def test_the_nested_readers_tool_surface_excludes_a_filesystem_workspace(n
     assert "fetch_pages" in reader_tool_names
 
 
-async def test_build_agent_lead_excludes_search_and_fetch_and_gains_task(
+async def test_build_agent_lead_excludes_search_and_fetch_and_gains_dispatch(
     make_config, patch_models_by_role, scripted_model
 ):
-    """R1 is structural: the lead's tool set physically excludes `search_web`/`fetch_pages` and
-    gains `task`, the delegation mechanism to the researcher subagent (Step 3).
+    """R1 is structural: the lead's tool set physically excludes `search_web`/`fetch_pages`
+    and gains `dispatch_researcher`/`submit_report`, its whole route to research and to a
+    report (D1/D3).
     """
     head_model = scripted_model([AIMessage(content="done")])
     researcher_model = scripted_model([AIMessage(content="researcher done")])
@@ -238,7 +261,8 @@ async def test_build_agent_lead_excludes_search_and_fetch_and_gains_task(
 
     graph = build_agent(make_config(), SourceRegistry())
 
-    assert "task" in _tools_by_name(graph)
+    assert "dispatch_researcher" in _tools_by_name(graph)
+    assert "submit_report" in _tools_by_name(graph)
     assert "search_web" not in _tools_by_name(graph)
     assert "fetch_pages" not in _tools_by_name(graph)
 
@@ -249,8 +273,10 @@ async def test_build_agent_lead_excludes_search_and_fetch_and_gains_task(
 
     assert head_model._bound_tool_names, "bind_tools was never called on the head model"
     for offered in head_model._bound_tool_names:
-        assert "task" in offered
+        assert "dispatch_researcher" in offered
+        assert "submit_report" in offered
         assert "ask_user" in offered
+        assert "task" not in offered
         assert "search_web" not in offered
         assert "fetch_pages" not in offered
 
@@ -347,48 +373,44 @@ def test_deepagents_summarization_never_overrides_message_mutating_hooks(scripte
         )
 
 
-def test_researcher_spec_has_no_interrupt_on(make_config, scripted_model, tmp_path):
-    """Regression pin (D6; deferred from Step 3, developer-approved to land in Step 4): the
-    researcher `SubAgent` spec omits `interrupt_on`, the same as the reader above — a nested
-    researcher has no checkpointer forwarded and cannot interrupt either.
+def test_researcher_middleware_has_no_interrupt_on(make_config, scripted_model, tmp_path):
+    """Regression pin (D6): the researcher tier registers no interrupt — it has no checkpointer
+    and cannot interrupt, so an inherited `ask_user` entry could never fire.
 
-    R4 regression (Phase 5): `interrupt_on` stays confined to the lead alone.
+    R4 regression (Phase 5): `interrupt_on` stays confined to the lead alone. Asserted on the
+    middleware list `build_researcher_graph` passes to `create_deep_agent`, since the researcher
+    is a compiled graph of its own rather than a declared `SubAgent` spec (D1).
     """
     from deepagents.backends.filesystem import FilesystemBackend
+    from langchain.agents.middleware import HumanInTheLoopMiddleware
 
-    from harness.agent import _reader_spec, _researcher_spec, _ToolActivityMiddleware
+    from harness.agent import _reader_spec, _researcher_middleware, _ToolActivityMiddleware
     from harness.tools import build_tools
 
     config = make_config()
     reader_model = scripted_model([AIMessage(content="done")])
-    researcher_model = scripted_model([AIMessage(content="done")])
     tool_sets = build_tools(config, SourceRegistry())
     backend = FilesystemBackend(root_dir=tmp_path / "workspace")
     sink = ActivitySink()
     reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend, sink)
 
-    spec = _researcher_spec(
-        config,
-        researcher_model,
-        tool_sets.researcher,
-        reader_spec,
-        backend,
-        SourceRegistry(),
-        RunLog(),
-        sink,
+    middleware = _researcher_middleware(
+        config, reader_spec, backend, SourceRegistry(), RunLog(), sink
     )
 
-    assert "interrupt_on" not in spec
+    assert not any(isinstance(m, HumanInTheLoopMiddleware) for m in middleware)
+    assert "interrupt_on" not in reader_spec
     # Phase 6 (D-C): registered LAST, so `ToolRetryMiddleware` (outside it) re-invokes the
     # inner handler with the same tool-call id and a retried dispatch is observable as one.
-    assert isinstance(spec["middleware"][-1], _ToolActivityMiddleware)
+    assert isinstance(middleware[-1], _ToolActivityMiddleware)
 
 
 async def test_build_agent_resolves_each_role_from_its_own_key(
     make_config, monkeypatch, scripted_model
 ):
-    """Frozen role keys (Step 2): `build_agent` must resolve the reader `SubAgent` spec's model
-    from the `reader` key and request the `researcher` role, not the retired `subagent` key.
+    """Frozen role keys (Step 2): the reader `SubAgent` spec's model is resolved from the
+    `reader` key and the researcher from the `researcher` key, not the retired `subagent` key.
+    Both are `build_researcher_graph`'s to resolve now (D1) — `build_agent` builds only `head`.
     """
     import harness.agent as agent_module
 
@@ -424,6 +446,9 @@ async def test_build_agent_resolves_each_role_from_its_own_key(
     monkeypatch.setattr(agent_module, "_reader_spec", _spy_reader_spec)
 
     build_agent(make_config(), SourceRegistry())
+    assert requested_roles == ["head"], "the lead must build no model but its own"
+
+    agent_module.build_researcher_graph(make_config(), SourceRegistry())
 
     assert "researcher" in requested_roles
     assert captured["reader_model"] is reader_model
@@ -431,10 +456,11 @@ async def test_build_agent_resolves_each_role_from_its_own_key(
 
 def test_build_agent_raises_model_error_naming_the_missing_role(make_config):
     """Loud rename (Step 2): a config carrying only the retired `head`/`subagent` roles must
-    fail loud with `ModelError` naming the first new role `build_agent` needs, rather than
+    fail loud with `ModelError` naming the first new role the graphs need, rather than
     silently succeeding against the stale `subagent` key. No `patch_models_by_role` here — the
     REAL `harness.models.build_chat_model` must be the one raising, and it does so before any
-    network call for an undeclared role.
+    network call for an undeclared role. Asserted on `build_researcher_graph`, which is where
+    the `researcher` role is resolved now (D1).
     """
     from harness.config import RoleConfig
     from harness.models import ModelError
@@ -451,8 +477,10 @@ def test_build_agent_raises_model_error_naming_the_missing_role(make_config):
         agent=config.agent,
     )
 
+    from harness.agent import build_researcher_graph
+
     with pytest.raises(ModelError) as excinfo:
-        build_agent(broken, SourceRegistry())
+        build_researcher_graph(broken, SourceRegistry())
 
     assert "researcher" in str(excinfo.value)
 
@@ -474,6 +502,9 @@ def test_orchestrator_prompt_names_the_answer_structure_contract():
 async def test_reader_model_profile_excludes_execute(make_config, patch_models_by_role):
     """Risk #1: deepagents resolves a HarnessProfile per SUBAGENT MODEL key — if the reader's
     key is never registered, the no-shell invariant silently breaks for the reader.
+
+    Registered by `build_researcher_graph`, which owns the researcher and reader models now
+    that the lead builds only its own (D1).
     """
     from deepagents._models import get_model_identifier, get_model_provider
     from deepagents.profiles.harness.harness_profiles import _get_harness_profile
@@ -497,7 +528,10 @@ async def test_reader_model_profile_excludes_execute(make_config, patch_models_b
         {"head": head_model, "researcher": researcher_model, "reader": reader_model}
     )
 
+    from harness.agent import build_researcher_graph
+
     build_agent(make_config(), SourceRegistry())
+    build_researcher_graph(make_config(), SourceRegistry())
 
     provider = get_model_provider(reader_model)
     identifier = get_model_identifier(reader_model)
@@ -542,17 +576,15 @@ def _reader_fetch_call(url: str) -> AIMessage:
 
 
 @pytest.fixture
-def build_researcher(make_config, tmp_path):
-    """Factory: compile a standalone researcher subagent runnable, the same way `build_agent`
-    nests it under the lead (Step 3), but invocable directly so a test can drive the
-    researcher's OWN task-to-reader dispatch (retry/error middleware, digest marking) without
-    also scripting a full lead turn around it.
-    """
-    from deepagents.backends.filesystem import FilesystemBackend
-    from deepagents.middleware.subagents import create_sub_agent
+def build_researcher(make_config, tmp_path, patch_models_by_role):
+    """Factory: compile the standalone researcher graph the session dispatches into (D1).
 
-    from harness.agent import _reader_spec, _researcher_spec
-    from harness.tools import build_tools
+    The lead no longer nests the researcher as a declared subagent, so this is now the SAME
+    `build_researcher_graph` a real run uses rather than a hand-assembled spec — the tests
+    below drive the researcher's own task-to-reader dispatch (retry/error middleware, digest
+    marking) without a lead turn around it, exactly as before.
+    """
+    from harness.agent import build_researcher_graph
 
     def _build(
         researcher_model: Any,
@@ -580,27 +612,28 @@ def build_researcher(make_config, tmp_path):
             )
         config = make_config(agent=agent)
         registry = registry if registry is not None else SourceRegistry()
-        backend = FilesystemBackend(root_dir=tmp_path / "workspace")
-        tool_sets = build_tools(config, registry)
-        # `sink` defaults internally rather than on the parameter itself (Contracts:
-        # `_reader_spec`/`_researcher_spec` take it keyword-or-positional with NO default,
-        # so no call site silently forgets one) -- callers that don't care about tool
-        # activity, i.e. every pre-Phase-6 test using this fixture, need not pass one. The
-        # SAME instance goes to both specs: reader-tier attribution (D-D) needs the reader's
-        # own middleware updating the very `ReaderState` the researcher's middleware created.
-        shared_sink = sink if sink is not None else ActivitySink()
-        reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend, shared_sink)
-        researcher_spec = _researcher_spec(
-            config,
-            researcher_model,
-            tool_sets.researcher,
-            reader_spec,
-            backend,
-            registry,
-            run_log if run_log is not None else RunLog(),
-            shared_sink,
+        # `build_researcher_graph` resolves its two models through `build_chat_model`, so the
+        # caller's explicit model objects are installed by role rather than passed positionally.
+        # `head`/`verifier` are never reached from this graph but must resolve for the lookup.
+        patch_models_by_role(
+            {
+                "head": researcher_model,
+                "researcher": researcher_model,
+                "reader": reader_model,
+                "verifier": reader_model,
+            }
         )
-        return create_sub_agent(researcher_spec), registry
+        return (
+            build_researcher_graph(
+                config,
+                registry,
+                run_log if run_log is not None else RunLog(),
+                # The SAME sink reaches both tiers: reader-tier attribution (D-D) needs the
+                # reader's own middleware updating the `ReaderState` the researcher's created.
+                sink if sink is not None else ActivitySink(),
+            ),
+            registry,
+        )
 
     return _build
 
@@ -1255,151 +1288,6 @@ async def test_two_concurrent_readers_attribute_their_own_tool_calls_without_cro
     assert len(reader_ids) == 2  # each call attributed to its OWN reader, never the other's
 
 
-async def test_a_researcher_crash_becomes_an_error_task_message_after_one_retry(
-    make_config, patch_models_by_role, scripted_model
-):
-    """TEST-FIRST item 2: the lead's OWN `task` tool (dispatching to the researcher) carries
-    the same ToolRetryMiddleware(max_retries=1)/ToolErrorMiddleware pair, now guarding a
-    researcher crash — the lead receives a `RESEARCHER FAILED (...)` error ToolMessage after
-    exactly one retry, and the run continues on the lead's next scripted turn.
-    """
-    from pydantic import SecretStr
-
-    head_model = scripted_model(
-        [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
-    )
-    researcher_model = _RaisingChatModel(
-        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
-    )
-    reader_model = scripted_model([AIMessage(content="unused")])
-    patch_models_by_role(
-        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
-    )
-
-    graph = build_agent(make_config(), SourceRegistry())
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
-    )
-
-    task_messages = [
-        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
-    ]
-    assert len(task_messages) == 1
-    assert task_messages[0].status == "error"
-    assert str(task_messages[0].content).startswith("RESEARCHER FAILED")
-    assert researcher_model._call_count == 2  # initial attempt + exactly one retry
-    # The run continued past the failed dispatch onto the lead's next scripted turn.
-    assert result["messages"][-1].content == "done despite the failed angle"
-
-
-async def test_lead_to_researcher_to_reader_digest_reaches_the_lead(
-    make_config, patch_models_by_role, scripted_model, install_crawler
-):
-    """TEST-FIRST item 1: the full 3-tier chain, scripted end to end — the lead dispatches a
-    researcher, the researcher dispatches a reader, the reader's digest reaches the researcher,
-    the researcher's own report reaches the lead, and the digested source is marked `digested`
-    (R7's mechanism moved, not broken, by nesting it one level deeper).
-    """
-    head_model = scripted_model(
-        [
-            _task_call("Investigate the widget defect angle"),
-            AIMessage(content="Final answer citing the researcher's finding [S1]."),
-        ]
-    )
-    researcher_model = scripted_model(
-        [
-            _task_call("Fetch and digest https://a.test", subagent_type="reader"),
-            AIMessage(content="Researcher report: the page confirms the defect [S1]."),
-        ]
-    )
-    reader_model = scripted_model(
-        [
-            _reader_fetch_call("https://a.test"),
-            AIMessage(content="Digest: confirmed defect pattern [S1]."),
-        ]
-    )
-    patch_models_by_role(
-        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
-    )
-    install_crawler(
-        [
-            _FakeResult(
-                "https://a.test",
-                markdown=_FakeMarkdown(raw_markdown="Defect body", fit_markdown="Defect body"),
-            )
-        ]
-    )
-
-    # Phase 4 strict provenance (R2): this scenario never calls `search_web`, so the reader's
-    # directly-fetched URL must arrive pre-approved.
-    registry = SourceRegistry()
-    approve_all(registry, ["https://a.test"])
-    graph = build_agent(make_config(), registry)
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
-    )
-
-    assert result["messages"][-1].content == "Final answer citing the researcher's finding [S1]."
-    source = registry.get("S1")
-    assert source is not None
-    assert source.read_mode == "digested"
-
-
-async def test_two_researchers_dispatched_in_one_turn_run_concurrently(
-    make_config, patch_models_by_role
-):
-    """Acceptance criterion: two researchers dispatched by ONE lead turn (a single AIMessage
-    carrying two `task` tool calls) actually run concurrently, not sequentially — peak in-flight
-    researcher model calls > 1.
-    """
-    from pydantic import SecretStr
-
-    head_model = ScriptedChatModel(
-        model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
-    ).script(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "task",
-                        "args": {"description": "Angle A", "subagent_type": "researcher"},
-                        "id": "call_a",
-                    },
-                    {
-                        "name": "task",
-                        "args": {"description": "Angle B", "subagent_type": "researcher"},
-                        "id": "call_b",
-                    },
-                ],
-            ),
-            AIMessage(content="done"),
-        ]
-    )
-    researcher_model = ConcurrencyTrackingModel(
-        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
-    ).script([AIMessage(content="Report A."), AIMessage(content="Report B.")])
-    # A real, non-zero yield — see the class docstring on why proving CONCURRENCY needs it.
-    researcher_model._sleep_seconds = 0.05
-    reader_model = ScriptedChatModel(
-        model="reader-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
-    ).script([AIMessage(content="unused")])
-    patch_models_by_role(
-        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
-    )
-
-    graph = build_agent(make_config(), SourceRegistry())
-    await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
-    )
-
-    assert researcher_model._peak_in_flight > 1
-    assert researcher_model._call_count == 2
-
-
 async def test_fetch_raw_is_offered_to_the_researcher_but_not_the_lead_or_reader(
     noop_agent, make_config
 ):
@@ -1651,18 +1539,20 @@ async def test_run_outcome_records_token_usage_summed_with_reasoning_split(
         ],
         usage_metadata=usage_a,
     )
-    final = AIMessage(content="Final answer [S1].", usage_metadata=usage_b)
-    model = scripted_model([round_one, final])
+    # D3: the answer is the `submit_report` argument, so the run's second turn IS the tool
+    # call — its usage still has to be summed in.
+    final = _submit_call("Final answer [S1].").model_copy(update={"usage_metadata": usage_b})
+    model = scripted_model([round_one, final, AIMessage(content="Report submitted.")])
     patch_run(monkeypatch, config, model)
 
     captured = {}
-    real_write_report = main_module.write_report
+    real_write_report = session_module.write_report
 
     def _spy(outcome, cfg):
         captured["outcome"] = outcome
         return real_write_report(outcome, cfg)
 
-    monkeypatch.setattr(main_module, "write_report", _spy)
+    monkeypatch.setattr(session_module, "write_report", _spy)
 
     await main_module.main(["question"])
 
@@ -1694,14 +1584,13 @@ async def test_main_prints_the_report_path_as_the_final_line_of_stdout(
     monkeypatch.setattr(BrowserSession, "close", _spy_close)
 
     config = make_config()
-    final = AIMessage(
-        content="Final answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    final = _submit_call("Final answer.").model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    model = scripted_model([final])
+    model = scripted_model([final, AIMessage(content="Report submitted.")])
     patch_run(monkeypatch, config, model)
 
-    await main_module.main(["a question with no tool calls"])
+    await main_module.main(["a question with one submit_report call"])
 
     _, lines = drain_stdout(capsys)
     assert lines, "main() printed nothing"
@@ -1839,8 +1728,9 @@ async def test_main_reports_a_model_error_from_build_agent_cleanly(
     def _broken_build_agent(*args: Any, **kwargs: Any) -> Any:
         raise ModelError("role 'reader' is not declared in [roles]")
 
-    # At the source module: `main` imports `build_agent` at call time (heavy-import deferral).
-    monkeypatch.setattr("harness.agent.build_agent", _broken_build_agent)
+    # At `harness.session`, which imports `build_agent` by value and is where `Session.run`
+    # calls it; `main` itself no longer builds the agent at all.
+    monkeypatch.setattr("harness.session.build_agent", _broken_build_agent)
 
     exit_code = await main_module.main(["a question"])
 
@@ -1929,7 +1819,7 @@ def test_final_answer_skips_trailing_tool_output():
         ToolMessage(content="Updated todo list to [...]", tool_call_id="c1"),
     ]
 
-    assert main_module._final_answer(messages) == "Acme is cheapest at $4.20/unit [S1]."
+    assert session_module._final_answer(messages) == "Acme is cheapest at $4.20/unit [S1]."
 
 
 def test_final_answer_is_empty_when_the_run_never_spoke():
@@ -1944,7 +1834,7 @@ def test_final_answer_is_empty_when_the_run_never_spoke():
         ToolMessage(content="Some search results.", tool_call_id="c1"),
     ]
 
-    assert main_module._final_answer(messages) == ""
+    assert session_module._final_answer(messages) == ""
 
 
 def test_message_text_reads_block_style_content():
@@ -1959,12 +1849,12 @@ def test_message_text_reads_block_style_content():
         ]
     )
 
-    assert main_module._message_text(message) == "Acme quoted $4.20/unit [S1]."
-    assert main_module._final_answer([message]) == "Acme quoted $4.20/unit [S1]."
+    assert session_module._message_text(message) == "Acme quoted $4.20/unit [S1]."
+    assert session_module._final_answer([message]) == "Acme quoted $4.20/unit [S1]."
 
 
 def test_message_text_still_reads_the_plain_string_shape():
-    assert main_module._message_text(AIMessage(content="  Plain prose.  ")) == "Plain prose."
+    assert session_module._message_text(AIMessage(content="  Plain prose.  ")) == "Plain prose."
 
 
 async def test_read_answer_resolves_instead_of_hanging_when_stdin_is_closed(monkeypatch):
@@ -2066,9 +1956,9 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
 ):
     """`max_rounds=1` with a model that never stops proposing tool calls forces the stream
     loop's own turn counter to end the run rather than the graph terminating on its own.
-    `ScriptedChatModel` raises `IndexError` when its script runs out, so far more responses are
-    scripted than the cap (plus its bounded synthesis pass) can consume — proving the cap, not
-    an exhausted script, is what ended it.
+    The model never stops proposing tool calls until the bounded synthesis pass reaches it —
+    proving the cap, not an exhausted script, is what ended the run. Its synthesis reply calls
+    `submit_report` (D3), which is the only route to a report on a cut-short run.
     """
     agent = AgentSettings(
         max_rounds=1, workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports"
@@ -2084,7 +1974,9 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
             }
         ],
     )
-    model = scripted_model([*([keep_going] * 20)])
+    # `_LeadModel` proposes `keep_going` forever until the bounded synthesis pass arrives, so
+    # nothing but the cap can end this run — an exhausted script cannot be the explanation.
+    model = _lead_model(replies=[keep_going], answer="Widgets, as far as the cap allowed.")
     patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["question that never settles"])
@@ -2094,8 +1986,8 @@ async def test_main_cuts_the_run_short_at_the_round_cap(
     assert lines, "main() printed no report path"
     report_path = Path(lines[-1].strip())
     assert report_path.exists()
-    # A run that consumed the whole 20-item script would have driven far more model calls:
-    # this allows the capped round plus the bounded synthesis pass, nothing like 21.
+    # A model that never stops proposing tool calls would run forever without the cap: this
+    # allows the capped round plus the bounded synthesis pass, nothing more.
     assert len(model._received_messages) < 8
     body = report_path.read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING in body
@@ -2124,11 +2016,10 @@ async def test_a_clarification_on_the_capped_round_is_still_asked(
         content="",
         tool_calls=[{"name": "ask_user", "args": {"question": "Which region?"}, "id": "call_1"}],
     )
-    final = AIMessage(
-        content="Final answer after the clarification.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    final = _submit_call("Final answer after the clarification.").model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    model = scripted_model([ask, *([final] * 5)])
+    model = _lead_model(replies=[ask, final], answer="Final answer after the clarification.")
     patch_run(monkeypatch, config, model)
 
     asked = {"value": False}
@@ -2149,18 +2040,19 @@ async def test_a_clarification_on_the_capped_round_is_still_asked(
     assert "Final answer after the clarification." in body
 
 
-@pytest.mark.parametrize(("max_rounds", "expect_cut_short"), [(1, True), (2, False)])
+@pytest.mark.parametrize(("max_rounds", "expect_cut_short"), [(2, True), (3, False)])
 async def test_max_rounds_counts_model_turns_not_supersteps(
     make_config, monkeypatch, scripted_model, tmp_path, capsys, max_rounds, expect_cut_short
 ):
-    """Pins the cap's unit at its exact boundary: a run of one tool round plus the final answer
-    turn is two MODEL TURNS, so it is capped at `max_rounds=1` and completes clean at
-    `max_rounds=2`. Any supersteps-derived mapping (middleware `after_model` nodes cost ~4
-    supersteps per round) would move this boundary and fail one side of the pair.
+    """Pins the cap's unit at its exact boundary: a run of one tool round, the `submit_report`
+    round, and the turn that closes it is three MODEL TURNS, so it is capped at `max_rounds=2`
+    and completes clean at `max_rounds=3`. Any supersteps-derived mapping (middleware
+    `after_model` nodes cost ~4 supersteps per round) would move this boundary and fail one
+    side of the pair.
 
     The capped side also proves the graceful stop: the lead gets one bounded synthesis pass
-    (`_SYNTHESIZE_NOW`) after the capped round's tools finish, so the report still carries a
-    real final answer alongside the round-cap disclosure.
+    (`_SYNTHESIZE_NOW`) after the capped round's tools finish, and calls `submit_report` from
+    it, so the report still carries a real final answer alongside the round-cap disclosure.
     """
     agent = AgentSettings(
         max_rounds=max_rounds,
@@ -2178,15 +2070,13 @@ async def test_max_rounds_counts_model_turns_not_supersteps(
             }
         ],
     )
-    final = AIMessage(
-        content="Answered after exactly one tool round.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    answer = "Answered after exactly one tool round."
+    final = _submit_call(answer).model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    # A third reply for verification's Phase 2 Step 5 consolidation call: the answer cites
-    # nothing, so it is the pass's only model call (`patch_run` binds every role to this one
-    # model), made right after these two agent-loop turns.
-    consolidation = AIMessage(content="Nothing was cited, so nothing was checked.")
-    model = scripted_model([one_round, final, consolidation])
+    # Uncapped, the lead reaches `final` as its own second turn; capped, the cap fires first
+    # and `_LeadModel` submits the same answer from the bounded synthesis pass instead (D3).
+    model = _lead_model(replies=[one_round, final], answer=answer)
     patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["a question needing one round"])
@@ -2202,12 +2092,12 @@ async def test_max_rounds_counts_model_turns_not_supersteps(
         assert _ROUND_CAP_TEXT in body
         # The synthesis instruction actually reached the model as the resumed thread's last
         # human message, rather than the answer arriving by script-order coincidence. It is
-        # the SECOND of exactly two agent-loop model calls (the docstring's own pinned count):
-        # the third, scripted separately above, is verification's consolidation call.
-        last_call = model._received_messages[1]
+        # the THIRD agent-loop model call: the capped round, the round that answers its tool
+        # call, and then the bounded synthesis pass.
+        synthesis_call = model._received_messages[2]
         assert any(
-            main_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
-            for message in last_call
+            session_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
+            for message in synthesis_call
         )
 
 
@@ -2234,7 +2124,7 @@ async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
             }
         ],
     )
-    model = scripted_model([*([keep_going] * 20)])
+    model = _lead_model(replies=[keep_going], answer="Only the pricing page was chased.")
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["question that never settles"])
@@ -2243,9 +2133,10 @@ async def test_a_cut_short_report_carries_the_todos_seen_during_the_run(
     body = Path(lines[-1].strip()).read_text(encoding="utf-8")
     assert _CUT_SHORT_HEADING in body
     assert "Chase the pricing page" in body
-    # The last message here is the write_todos ToolMessage, so `messages[-1].content` would
-    # publish "Updated todo list to [...]" as the run's ANSWER.
-    assert _NO_ANSWER_TEXT in body
+    # The answer is the `submit_report` argument (D3), never the transcript's last message —
+    # which here is a write_todos ToolMessage that would otherwise publish "Updated todo list
+    # to [...]" as the run's ANSWER.
+    assert "Only the pricing page was chased." in body
     assert "Updated todo list" not in body
 
 
@@ -2258,24 +2149,25 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
     The elapsed-time assertion pins the timeout itself: without it, a broad "catch anything,
     call it wall_clock" shortcut that ran the full sleep would still pass.
 
-    Step 3 (Drift C): the clock now arms on the LEAD's `task(subagent_type="researcher")`
-    dispatch, a top-level call `__main__`'s stream loop actually sees — the nested `search_web`
-    call that stalls lives one tier deeper, inside the researcher `patch_run`'s single model
-    also plays.
+    D1: the clock arms on the LEAD's `dispatch_researcher` call, and the lead's turn then ENDS
+    — the loop waits on the event queue while the researcher stalls one tier deeper in a slow
+    `search_web`, and that wait is what the clock cuts.
     """
     # `make_agent_settings` disables the margin -- this test is about the wall clock
     # itself, not the reserve.
     agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
-    task_call = _task_call("Research widgets")
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
-    model = scripted_model([task_call, search_call])
-    patch_run(monkeypatch, config, model)
-    # After the model is built — see `_install_slow_search`'s docstring.
+    head_model = _lead_model(
+        replies=[_dispatch_call("widgets"), AIMessage(content="Dispatched; waiting.")]
+    )
+    researcher_model = scripted_model([search_call])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
+    # After the models are built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=3)
 
     started = time.monotonic()
@@ -2292,37 +2184,34 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
 
 
-async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer(
+async def test_main_keeps_the_report_when_time_passes_after_submit_report(
     make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """D2's other wall-clock branch: the same expiry, but the interrupted turn already carried
-    prose alongside its tool call, so a final answer exists — the report is still written,
-    disclosing the cut-short, and the exit code stays 0.
+    """R6 through `main()`: the wall clock spans first question → report written and STOPS
+    there, so time spent after `submit_report` can never cut the run short.
 
-    Step 3 (Drift C): the LEAD's own turn carries the prose AND the `task(researcher)` dispatch
-    — the slow `search_web` call that stalls the clock lives one tier deeper.
+    The successor to this file's old "wall clock expires with an answer" test: with the clock
+    disarmed at submit (Phase 2), an expiry and an answer can no longer coexist — the lead
+    dispatches (arming the 1s clock), takes the return, submits, and then spends 1.5s in one
+    more turn. An armed clock would have fired inside it and stamped a cut-short disclosure
+    onto the report; a disarmed one leaves an ordinary, complete report and exit 0.
     """
     agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
-    partial_then_task = AIMessage(
-        content="Partial finding: Acme quoted $4.20/unit.",
-        tool_calls=[
-            {
-                "name": "task",
-                "args": {"description": "Research widgets", "subagent_type": "researcher"},
-                "id": "call_task",
-            }
-        ],
+    # Three turns rather than one message carrying both calls: `submit_report` is refused while
+    # a researcher is still running (3F F2), so the dispatch arms the clock, the lead ends that
+    # turn, the researcher's return empties the roster, and only THEN is the answer submitted.
+    dispatch = _dispatch_call("widgets", "call_dispatch")
+    waiting = AIMessage(content="Dispatched; waiting on the angle.")
+    submit = _submit_call("Acme quoted $4.20/unit.")
+    # Call 3 is the reply AFTER the submit: held well past the 1s clock, inside the session's
+    # own task, which is exactly where the timeout would cut it if it were still armed.
+    head_model = _lead_model(
+        replies=[dispatch, waiting, submit], slow_calls=frozenset({3}), delay_seconds=1.5
     )
-    search_call = AIMessage(
-        content="",
-        tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
-    )
-    model = scripted_model([partial_then_task, search_call])
-    patch_run(monkeypatch, config, model)
-    # After the model is built — see `_install_slow_search`'s docstring.
-    _install_slow_search(monkeypatch, delay_seconds=3)
+    researcher_model = scripted_model([AIMessage(content="Nothing conclusive.")])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
 
     started = time.monotonic()
     exit_code, files, out, err = await _run_main(
@@ -2333,13 +2222,11 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     assert exit_code == 0
     assert len(files) == 1
     body = files[0].read_text(encoding="utf-8")
-    assert _CUT_SHORT_HEADING in body
-    # Names the WALL CLOCK specifically — see the round-cap test for why the heading is not enough.
-    assert _WALL_CLOCK_TEXT in body
-    assert _ROUND_CAP_TEXT not in body
-    assert "Partial finding: Acme quoted $4.20/unit." in body
-    # Well under the full 3s sleep: cut off near the 1s bound rather than completed and mislabeled.
-    assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
+    assert _CUT_SHORT_HEADING not in body
+    assert _WALL_CLOCK_TEXT not in body
+    assert "Acme quoted $4.20/unit." in body
+    # The 1s deadline genuinely came due during the run — otherwise nothing was proved.
+    assert elapsed > 1.0, f"run took {elapsed}s — the 1s clock never came due"
 
 
 # --- Phase 5 (parent plan): synthesis reserve (synthesis_margin_seconds) --------------
@@ -2363,22 +2250,31 @@ async def test_main_synthesizes_when_the_synthesis_margin_is_crossed(
     )
     config = make_config(agent=agent)
 
-    task_call = _task_call("Research widgets")
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
-    # The researcher's own final turn, completing the `task` call with no further tool use, so
-    # the ToolMessage it produces is the next thing the LEAD's own top-level stream sees.
+    # The researcher's own final turn, ending its graph with no further tool use — its text
+    # becomes the `ResearcherReturn` the lead's next turn is built from.
     researcher_done = AIMessage(content="Widgets found at $4.20/unit.")
-    # The injected `_SYNTHESIZE_NOW` turn reaches the LEAD, not the researcher.
-    synthesis_answer = AIMessage(content="Widgets cost about four dollars per unit.")
-    # No citation in the answer above, so verification's consolidation call is its only call.
-    consolidation = AIMessage(content="Nothing was cited, so nothing was checked.")
-    model = scripted_model(
-        [task_call, search_call, researcher_done, synthesis_answer, consolidation]
+    head_model = _lead_model(
+        replies=[
+            _dispatch_call("widgets"),
+            AIMessage(content="Dispatched; waiting."),
+            AIMessage(content="Noted the angle."),
+        ],
+        answer="Widgets cost about four dollars per unit.",
     )
-    patch_run(monkeypatch, config, model)
+    researcher_model = scripted_model([search_call, researcher_done])
+    # Its own model, not the head's: the verification pass makes one consolidation call, and
+    # letting it land on `head_model` would fold a verification call into the turn count below
+    # and cost the assertion its exactness.
+    verifier_model = scripted_model([AIMessage(content="The single claim carries no citation.")])
+    patch_run_by_role(
+        monkeypatch,
+        config,
+        {"head": head_model, "researcher": researcher_model, "verifier": verifier_model},
+    )
     _install_slow_search(monkeypatch, delay_seconds=2)
 
     started = time.monotonic()
@@ -2396,21 +2292,22 @@ async def test_main_synthesizes_when_the_synthesis_margin_is_crossed(
     assert _WALL_CLOCK_TEXT not in body
     assert _ROUND_CAP_TEXT not in body
     assert "Widgets cost about four dollars per unit." in body
-    # Exactly the LEAD's dispatch turn, the researcher's two turns, the injected synthesis
-    # turn, and the verification consolidation call — nothing extra, nothing dropped.
-    assert len(model._received_messages) == 5
-    # The synthesis instruction actually reached the model as the resumed thread's last human
-    # message (the same technique `test_max_rounds_counts_model_turns_not_supersteps` uses for
-    # the round cap), rather than the answer arriving by script-order coincidence.
-    synthesis_call = model._received_messages[3]
+    # Exactly the lead's dispatch turn and its follow-up, the return turn that crosses the
+    # margin, the injected synthesis turn and its post-submit turn — nothing extra, nothing
+    # dropped. (Verification makes its own calls on the same model once research is over.)
+    assert len(head_model._received_messages) == 5
+    # The synthesis instruction actually reached the model as the thread's last human message
+    # (the same technique `test_max_rounds_counts_model_turns_not_supersteps` uses for the
+    # round cap), rather than the answer arriving by script-order coincidence.
+    synthesis_call = head_model._received_messages[3]
     # The MARGIN's own wording (G3, 3F review), not the round cap's — a margin trip must never
     # tell the lead "the round cap has been reached".
     assert any(
-        main_module._SYNTHESIZE_NOW_MARGIN in str(getattr(message, "content", ""))
+        session_module._SYNTHESIZE_NOW_MARGIN in str(getattr(message, "content", ""))
         for message in synthesis_call
     )
     assert not any(
-        main_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
+        session_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
         for message in synthesis_call
     )
     # Well under the 4s wall clock: cut off near the ~2s search, not the hard clock.
@@ -2433,17 +2330,22 @@ async def test_main_completes_normally_when_finishing_inside_the_synthesis_margi
     )
     config = make_config(agent=agent)
 
-    task_call = _task_call("Research widgets")
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
     researcher_done = AIMessage(content="Widgets found at $4.20/unit.")
-    # The LEAD's own natural second turn — reached normally, never via a synthesis injection.
-    final_answer = AIMessage(content="Widgets found at $4.20/unit, per the research above.")
-    consolidation = AIMessage(content="Nothing was cited, so nothing was checked.")
-    model = scripted_model([task_call, search_call, researcher_done, final_answer, consolidation])
-    patch_run(monkeypatch, config, model)
+    head_model = _lead_model(
+        replies=[
+            _dispatch_call("widgets"),
+            AIMessage(content="Dispatched; waiting."),
+            # The LEAD's own natural submit — reached normally, never via a synthesis injection.
+            _submit_call("Widgets found at $4.20/unit, per the research above."),
+        ],
+        answer="unused: the synthesis pass never fires here",
+    )
+    researcher_model = scripted_model([search_call, researcher_done])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
     _install_slow_search(monkeypatch, delay_seconds=0)
 
     exit_code, files, out, err = await _run_main(
@@ -2457,9 +2359,9 @@ async def test_main_completes_normally_when_finishing_inside_the_synthesis_margi
     assert _SYNTHESIS_MARGIN_TEXT not in body
     assert "Widgets found at $4.20/unit, per the research above." in body
     assert not any(
-        main_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
-        or main_module._SYNTHESIZE_NOW_MARGIN in str(getattr(message, "content", ""))
-        for batch in model._received_messages
+        session_module._SYNTHESIZE_NOW in str(getattr(message, "content", ""))
+        or session_module._SYNTHESIZE_NOW_MARGIN in str(getattr(message, "content", ""))
+        for batch in head_model._received_messages
         for message in batch
     ), "the synthesis pass fired despite finishing well inside the reserve"
 
@@ -2492,7 +2394,7 @@ def test_margin_reached_boundaries(elapsed, wall_clock, margin, expected):
     clock" (which would race the hard clock for the same run), and that the comparison is
     `>=` so landing exactly on the threshold still triggers the reserve.
     """
-    assert main_module._margin_reached(elapsed, wall_clock, margin) is expected
+    assert session_module._margin_reached(elapsed, wall_clock, margin) is expected
 
 
 async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_the_wall_clock(
@@ -2501,30 +2403,35 @@ async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_th
     """Contracts: `synthesis_margin_seconds = 0` disables the reserve entirely. The naive
     threshold `wall_clock_seconds - 0` equals the wall clock itself, which would make a margin
     cut fire at the same instant the clock expires — instead, a disabled reserve must let the
-    run reach the HARD wall clock exactly as it did before this phase (mirrors
-    `test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer` with the
-    new field pinned to its disable value).
+    run reach the HARD wall clock.
+
+    The arithmetic boundary is pinned directly by `test_margin_reached_boundaries`; this is its
+    end-to-end consequence. With the clock disarmed at `submit_report` (Phase 2, R6) the stall
+    has to happen BEFORE any answer exists, so the hard clock's own outcome applies: no report,
+    exit 1. The stall is an unanswered clarification, not a slow model call — the clock must
+    keep running through a clarifying wait (R6), and that await lives in the session's own task
+    where the timeout can actually cut it.
     """
     agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
-    partial_then_task = AIMessage(
-        content="Partial finding: Acme quoted $4.20/unit.",
+    dispatch = _dispatch_call("widgets", "call_dispatch")
+    waiting = AIMessage(content="Dispatched; waiting on the angle.")
+    ask = AIMessage(
+        content="",
         tool_calls=[
-            {
-                "name": "task",
-                "args": {"description": "Research widgets", "subagent_type": "researcher"},
-                "id": "call_task",
-            }
+            {"name": "ask_user", "args": {"question": "Narrower scope?"}, "id": "call_ask"}
         ],
     )
-    search_call = AIMessage(
-        content="",
-        tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
-    )
-    model = scripted_model([partial_then_task, search_call])
-    patch_run(monkeypatch, config, model)
-    _install_slow_search(monkeypatch, delay_seconds=3)
+    head_model = _lead_model(replies=[dispatch, waiting, ask])
+    researcher_model = scripted_model([AIMessage(content="Nothing conclusive.")])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
+
+    async def _slow_answer(prompt: str = "> ") -> str:
+        await asyncio.sleep(3)
+        return "Narrower."
+
+    monkeypatch.setattr(main_module, "_read_answer", _slow_answer)
 
     started = time.monotonic()
     exit_code, files, out, err = await _run_main(
@@ -2532,13 +2439,17 @@ async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_th
     )
     elapsed = time.monotonic() - started
 
-    assert exit_code == 0
-    assert len(files) == 1
-    body = files[0].read_text(encoding="utf-8")
-    assert _CUT_SHORT_HEADING in body
-    assert _WALL_CLOCK_TEXT in body
-    assert _SYNTHESIS_MARGIN_TEXT not in body
-    assert _ROUND_CAP_TEXT not in body
+    assert exit_code == 1
+    assert files == [], f"a report was written despite no final answer: {files}"
+    assert any("wall clock" in line for line in err.splitlines()), err
+    # The reserve stayed disabled: no synthesis instruction ever reached the lead.
+    reserve_prompts = [
+        message
+        for received in head_model._received_messages
+        for message in received
+        if "synthesis reserve" in str(message.content)
+    ]
+    assert reserve_prompts == []
     # Well under the full 3s sleep: cut off near the 1s bound rather than completed and mislabeled.
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire"
 
@@ -2569,37 +2480,28 @@ async def test_the_synthesis_margin_defers_its_break_until_a_crossing_turns_tool
     )
     config = make_config(agent=agent)
 
-    task_call = _task_call("Research widgets", call_id="call_task_1")
-    researcher_one_done = AIMessage(content="Widgets found at $4.20/unit.")
-    # The LEAD's own second turn: proposing MORE tool work is what makes a margin trip here
-    # dangerous without G1's fix (the crossing turn itself carries unanswered tool_calls).
-    task_call_2 = _task_call("Research pricing further", call_id="call_task_2")
-    researcher_two_done = AIMessage(content="Pricing confirmed at $4.10/unit this week.")
-    synthesis_answer = AIMessage(content="Widgets cost about four dollars per unit.")
-    consolidation = AIMessage(content="Nothing was cited, so nothing was checked.")
-    model = scripted_model(
+    head_model = _lead_model(
+        replies=[
+            _dispatch_call("widgets", "call_dispatch_1"),
+            # The LEAD's own second model call: proposing MORE research is what makes a margin
+            # trip here dangerous without G1's fix (the crossing turn itself carries an
+            # unanswered tool call).
+            _dispatch_call("pricing", "call_dispatch_2"),
+            AIMessage(content="Both angles are running."),
+        ],
+        answer="Widgets cost about four dollars per unit.",
+        # A genuinely slow MODEL call, not a slow search, so the crossing lands on a turn the
+        # lead's own stream sees directly.
+        slow_calls=frozenset({1}),
+        delay_seconds=2.5,
+    )
+    researcher_model = scripted_model(
         [
-            task_call,
-            researcher_one_done,
-            task_call_2,
-            researcher_two_done,
-            synthesis_answer,
-            consolidation,
+            AIMessage(content="Widgets found at $4.20/unit."),
+            AIMessage(content="Pricing confirmed at $4.10/unit this week."),
         ]
     )
-    patch_run(monkeypatch, config, model)
-
-    original_generate = ScriptedChatModel._generate
-
-    def _slow_second_lead_turn(self, messages, stop=None, run_manager=None, **kwargs):
-        # The third scripted call (`_call_count == 2`, checked before it increments) is the
-        # LEAD's own second turn, proposing `task_call_2` — a genuinely slow MODEL call, not a
-        # slow search, so the crossing is observed on a turn the top-level stream sees directly.
-        if self._call_count == 2:
-            time.sleep(2.5)
-        return original_generate(self, messages, stop=stop, run_manager=run_manager, **kwargs)
-
-    monkeypatch.setattr(ScriptedChatModel, "_generate", _slow_second_lead_turn)
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
 
     exit_code, files, out, err = await _run_main(
         ["a question that starts researching"], config, capsys
@@ -2624,8 +2526,8 @@ async def test_the_synthesis_margin_defers_its_break_until_a_crossing_turns_tool
     # `HumanMessage` that must never follow an `AIMessage` with unanswered `tool_calls`.
     synthesis_calls = [
         received
-        for received in model._received_messages
-        if received and "Stop researching now" in str(getattr(received[-1], "content", ""))
+        for received in head_model._received_messages
+        if received and _SYNTHESIS_PHRASE in str(getattr(received[-1], "content", ""))
     ]
     assert synthesis_calls, "no synthesis pass was ever triggered"
     synthesis_thread = synthesis_calls[-1]
@@ -2636,17 +2538,17 @@ async def test_the_synthesis_margin_defers_its_break_until_a_crossing_turns_tool
     # own "cancelled" `ToolMessage` before the next human turn, which satisfies the assertion
     # above EVEN THOUGH the second dispatch never actually ran — so the real defect (the
     # crossing turn's own proposed research getting thrown away instead of awaited) shows up
-    # here instead: the second dispatch's `ToolMessage` must carry the RESEARCHER's actual
-    # finding, not langgraph's auto-cancellation text.
-    task_2_results = [
+    # here instead: the second dispatch's `ToolMessage` must be the session's own "started"
+    # acknowledgement, not langgraph's auto-cancellation text.
+    dispatch_2_results = [
         m
         for m in synthesis_thread
-        if isinstance(m, ToolMessage) and m.tool_call_id == "call_task_2"
+        if isinstance(m, ToolMessage) and m.tool_call_id == "call_dispatch_2"
     ]
-    assert task_2_results, "the second dispatch's tool call was never answered before synthesis"
-    assert "cancelled" not in str(task_2_results[0].content).lower(), (
-        "the margin trip cancelled the second research dispatch instead of waiting for it to "
-        f"finish: {task_2_results[0].content!r}"
+    assert dispatch_2_results, "the second dispatch's tool call was never answered before synthesis"
+    assert str(dispatch_2_results[0].content) == "researcher/2 (pricing) started", (
+        "the margin trip discarded the second research dispatch instead of letting it start: "
+        f"{dispatch_2_results[0].content!r}"
     )
 
 
@@ -2661,7 +2563,9 @@ async def test_a_runaway_synthesis_pass_after_the_margin_keeps_the_margin_label(
 
     Mirrors `test_main_cuts_the_run_short_at_the_round_cap`'s "never stops proposing tool
     calls" shape, but reaches the SAME `GraphRecursionError` via the margin instead of the cap
-    (`max_rounds` stays at its generous default so the cap never fires first).
+    (`max_rounds` stays at its generous default so the cap never fires first). The lead calls
+    `submit_report` on the pass's first turn and THEN runs away, so a report exists to carry
+    the label (D3: no submitted answer would mean no report at all).
     """
     agent = AgentSettings(
         wall_clock_seconds=10,
@@ -2671,11 +2575,6 @@ async def test_a_runaway_synthesis_pass_after_the_margin_keeps_the_margin_label(
     )
     config = make_config(agent=agent)
 
-    task_call = _task_call("Research widgets")
-    # The nested researcher's own (single) turn: a plain final reply, no tool calls -- it does
-    # not have `write_todos` bound (that is a LEAD-only tool), so it must not be handed
-    # `keep_going`.
-    researcher_done = AIMessage(content="Widgets found at $4.20/unit.")
     keep_going = AIMessage(
         content="",
         tool_calls=[
@@ -2686,21 +2585,22 @@ async def test_a_runaway_synthesis_pass_after_the_margin_keeps_the_margin_label(
             }
         ],
     )
-    model = scripted_model([task_call, researcher_done, *([keep_going] * 60)])
-    patch_run(monkeypatch, config, model)
-
-    original_generate = ScriptedChatModel._generate
-
-    def _slow_second_lead_turn(self, messages, stop=None, run_manager=None, **kwargs):
-        # The third scripted call (`_call_count == 2`) is the LEAD's own second turn, the
-        # first `keep_going` -- a slow MODEL turn crosses the margin threshold on a turn that
-        # ALSO proposes a tool call, exactly like the G1 test above, so the break defers until
-        # it is answered.
-        if self._call_count == 2:
-            time.sleep(2.5)
-        return original_generate(self, messages, stop=stop, run_manager=run_manager, **kwargs)
-
-    monkeypatch.setattr(ScriptedChatModel, "_generate", _slow_second_lead_turn)
+    head_model = _lead_model(
+        replies=[_dispatch_call("widgets"), keep_going],
+        answer="Widgets cost about four dollars per unit.",
+        # It submits when the synthesis instruction arrives (D3 — otherwise there is no report
+        # to carry the label at all) and then keeps calling tools, running the bounded pass out
+        # of supersteps: the runaway this test is about.
+        after_submit=keep_going,
+        # A slow MODEL turn crosses the margin on a turn that ALSO proposes tool work, exactly
+        # like the G1 test above, so the break defers until it is answered.
+        slow_calls=frozenset({1}),
+        delay_seconds=2.5,
+    )
+    # The researcher's own single turn: a plain final reply, no tool calls -- it does not have
+    # `write_todos` bound (a LEAD-only tool), so it must not be handed `keep_going`.
+    researcher_model = scripted_model([AIMessage(content="Widgets found at $4.20/unit.")])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
 
     exit_code = await main_module.main(["question that never settles"])
 
@@ -2720,8 +2620,8 @@ async def test_a_runaway_synthesis_pass_after_the_margin_keeps_the_margin_label(
 async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
     make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """The clock arms at the first `task(subagent_type="researcher")` dispatch (Step 3 Drift C),
-    not at process start, so a pre-research `ask_user` wait of any length must not trip it — the
+    """The clock arms at the first `dispatch_researcher` call (D1), not at process start, so a
+    pre-research `ask_user` wait of any length must not trip it — the
     wait (2s) is longer than the configured clock (1s) and the run must still finish clean.
     Paired with the mid-run test below; neither alone pins where the clock starts.
     """
@@ -2731,11 +2631,10 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
         content="",
         tool_calls=[{"name": "ask_user", "args": {"question": "Which scope?"}, "id": "call_1"}],
     )
-    final = AIMessage(
-        content="Final answer, no research needed.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    final = _submit_call("Final answer, no research needed.").model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    model = scripted_model([ask, final])
+    model = scripted_model([ask, final, AIMessage(content="Report submitted.")])
     patch_run(monkeypatch, config, model)
 
     read_answer_called = {"value": False}
@@ -2759,27 +2658,25 @@ async def test_a_pre_research_clarification_does_not_start_the_wall_clock(
     # leading reply: without this, a stale scripted reply the graph consumes as its final
     # answer would end the run before `ask_user` ever fires, and the test would go vacuous.
     assert read_answer_called["value"], "_read_answer was never awaited — ask_user never fired"
-    assert model._call_count == 2, "expected exactly the ask_user call and the final answer"
+    assert model._call_count == 3, (
+        "expected the ask_user call, the submit_report call, and the turn that closes it"
+    )
     assert "Final answer, no research needed." in body
 
 
 async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clock(
     make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """Pairs with the pre-research test above: once research has begun (a `task(researcher)`
-    dispatch, Step 3 Drift C) the clock runs and is not paused for an interrupt, so an
-    unanswered mid-run ask still ends the run at the bound.
+    """Pairs with the pre-research test above: once research has begun (a `dispatch_researcher`
+    call, D1) the clock runs and is not paused for an interrupt, so an unanswered mid-run ask
+    still ends the run at the bound.
 
-    D2: nothing in this scripted run ever produces a final answer on the LEAD's own transcript
-    (`task_call`/`search_call`/`ask` are all content-less tool-call proposals; the researcher's
-    own report becomes a `task` ToolMessage, never an `AIMessage` the lead itself said), so this
-    is the wall-clock NO-answer case — no report, exit 1. The elapsed-time assertion pins the
-    timeout to the wait itself.
+    D3: the lead never calls `submit_report` here, so this is the wall-clock NO-answer case —
+    no report, exit 1. The elapsed-time assertion pins the timeout to the wait itself.
     """
     agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
-    task_call = _task_call("Research widgets")
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
@@ -2791,9 +2688,10 @@ async def test_a_mid_run_clarification_with_no_answer_is_bounded_by_the_wall_clo
             {"name": "ask_user", "args": {"question": "Narrower scope?"}, "id": "call_ask"}
         ],
     )
-    model = scripted_model([task_call, search_call, researcher_report, ask])
-    patch_run(monkeypatch, config, model)
-    # After the model is built — see `_install_slow_search`'s docstring.
+    head_model = _lead_model(replies=[_dispatch_call("widgets"), ask])
+    researcher_model = scripted_model([search_call, researcher_report])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
+    # After the models are built — see `_install_slow_search`'s docstring.
     _install_slow_search(monkeypatch, delay_seconds=0.1)
 
     async def _slow_answer(prompt: str = "> ") -> str:
@@ -2877,14 +2775,8 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
 
     real_build_agent = agent_module.build_agent
 
-    def _build_agent_that_interrupts(
-        config: HarnessConfig,
-        registry: Any,
-        run_log: Any = None,
-        sink: Any = None,
-        browser: Any = None,
-    ) -> Any:
-        real_agent = real_build_agent(config, registry, run_log, sink, browser)
+    def _build_agent_that_interrupts(*args: Any, **kwargs: Any) -> Any:
+        real_agent = real_build_agent(*args, **kwargs)
 
         class _InterruptingAgent:
             def astream(self, *args: Any, **kwargs: Any) -> Any:
@@ -2897,9 +2789,9 @@ async def test_main_exits_cleanly_on_keyboard_interrupt_mid_stream(
 
         return _InterruptingAgent()
 
-    # At the source module: `main` imports `build_agent` at call time (the heavy-import
-    # deferral), so the patched attribute is what that import binds.
-    monkeypatch.setattr(agent_module, "build_agent", _build_agent_that_interrupts)
+    # At `harness.session`, which imports `build_agent` by value and is what `Session.run`
+    # calls; `main` no longer builds the agent itself.
+    monkeypatch.setattr("harness.session.build_agent", _build_agent_that_interrupts)
 
     exit_code, files, out, err = await _run_main(["a question"], config, capsys)
 
@@ -2929,14 +2821,8 @@ async def test_main_exits_cleanly_on_cancelled_error_mid_stream(
 
     real_build_agent = agent_module.build_agent
 
-    def _build_agent_that_interrupts(
-        config: HarnessConfig,
-        registry: Any,
-        run_log: Any = None,
-        sink: Any = None,
-        browser: Any = None,
-    ) -> Any:
-        real_agent = real_build_agent(config, registry, run_log, sink, browser)
+    def _build_agent_that_interrupts(*args: Any, **kwargs: Any) -> Any:
+        real_agent = real_build_agent(*args, **kwargs)
 
         class _InterruptingAgent:
             def astream(self, *args: Any, **kwargs: Any) -> Any:
@@ -2949,7 +2835,7 @@ async def test_main_exits_cleanly_on_cancelled_error_mid_stream(
 
         return _InterruptingAgent()
 
-    monkeypatch.setattr(agent_module, "build_agent", _build_agent_that_interrupts)
+    monkeypatch.setattr("harness.session.build_agent", _build_agent_that_interrupts)
 
     exit_code, files, out, err = await _run_main(["a question"], config, capsys)
 
@@ -2968,10 +2854,10 @@ async def test_main_aborts_and_writes_no_report_when_searxng_fails_repeatedly_mi
     during `search_web` trip `SearchUnavailableError`, which the loop's generic exception
     handler treats like any other hard error — no report, exit 1.
 
-    Step 3 (Drift C): `search_web` now lives on the RESEARCHER, so the abort must propagate up
-    through the lead's own `task` dispatch — proving `_reader_failure_message`'s propagate
-    branch and `_retry_on_non_search_abort`'s exclusion actually let it through rather than
-    stringifying it into a soft `RESEARCHER FAILED` message.
+    D1: `search_web` lives on the RESEARCHER, which the session now runs as its own task, so
+    the abort must reach the session as `Session._fatal` and end the run — proving
+    `_retry_on_non_search_abort`'s exclusion still lets it through rather than the researcher
+    wrapper swallowing it into a soft `RESEARCHER FAILED` return the lead would research past.
     """
     config = make_config(
         agent=AgentSettings(workspace_dir=tmp_path / "workspace", reports_dir=tmp_path / "reports")
@@ -2983,13 +2869,13 @@ async def test_main_aborts_and_writes_no_report_when_searxng_fails_repeatedly_mi
             tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": call_id}],
         )
 
-    # make_config's default max_consecutive_failures is 3 — the lead's task(researcher) dispatch
-    # plus three scripted search rounds (all served by the SAME patched model, one per role) are
-    # exactly enough for the third tool execution to trip the abort before a fourth model call.
-    model = scripted_model(
-        [_task_call("Research widgets"), _search_call("c1"), _search_call("c2"), _search_call("c3")]
+    # make_config's default max_consecutive_failures is 3 — three scripted researcher search
+    # rounds are exactly enough for the third tool execution to trip the abort.
+    head_model = _lead_model(
+        replies=[_dispatch_call("widgets"), AIMessage(content="Dispatched; waiting.")]
     )
-    patch_run(monkeypatch, config, model)
+    researcher_model = scripted_model([_search_call("c1"), _search_call("c2"), _search_call("c3")])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")
@@ -3011,11 +2897,10 @@ async def test_a_run_inside_both_bounds_reports_no_cut_short(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    final = AIMessage(
-        content="Final answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    final = _submit_call("Final answer.").model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    model = scripted_model([final])
+    model = scripted_model([final, AIMessage(content="Report submitted.")])
     patch_run(monkeypatch, config, model)
 
     exit_code = await main_module.main(["a simple question"])
@@ -3055,17 +2940,6 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     write_source_capture(config, registry, source_id, "Acme lists $5.10 per unit.")
     monkeypatch.setattr(main_module, "SourceRegistry", lambda run_id: registry)
 
-    partial = AIMessage(
-        content=f"Acme quoted $4.20 per unit [{source_id}].",
-        tool_calls=[
-            {
-                "name": "write_todos",
-                "args": {"todos": [{"content": "Confirm the quote", "status": "pending"}]},
-                "id": "call_1",
-            }
-        ],
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-    )
     keep_going = AIMessage(
         content="",
         tool_calls=[
@@ -3076,7 +2950,7 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
             }
         ],
     )
-    model = scripted_model([partial, *([keep_going] * 20)])
+    model = _lead_model(replies=[keep_going], answer=f"Acme quoted $4.20 per unit [{source_id}].")
     patch_run(monkeypatch, config, model)
 
     verify_model = scripted_model(
@@ -3195,7 +3069,8 @@ async def test_a_renderer_crash_mid_dispatch_fails_the_run_cleanly_and_writes_no
     make_config, monkeypatch, scripted_model, tmp_path, capsys
 ):
     """A plain renderer exception during a pushed `ToolCall` becomes a `DisplayError`, escapes
-    the `task` dispatch guard, and lands on `main()`'s existing hard-error path.
+    the `task` dispatch guard, and lands on the session's existing hard-error path — carried
+    out of the background researcher task as `Session._fatal` and re-raised in the turn loop.
 
     Pins the whole route the `DisplayError` mechanism exists to create: the run is FAILED
     (exit 1, no report, error on stderr) rather than a soft "READER FAILED" incident inside a
@@ -3207,11 +3082,8 @@ async def test_a_renderer_crash_mid_dispatch_fails_the_run_cleanly_and_writes_no
 
     head_model = scripted_model(
         [
-            _task_call("Angle A", call_id="call_researcher", subagent_type="researcher"),
-            AIMessage(
-                content="Final answer.",
-                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            ),
+            _dispatch_call("Angle A", "call_researcher"),
+            AIMessage(content="Dispatched; waiting for the angle."),
         ]
     )
     researcher_model = scripted_model(

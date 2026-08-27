@@ -192,6 +192,7 @@ def test_typo_in_key_error_names_the_offending_key(tmp_path, monkeypatch):
         ("min_markdown_words", 0),
         ("max_consecutive_failures", 0),
         ("max_reader_dispatches", 0),
+        ("max_researchers", 0),
     ],
 )
 def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_value):
@@ -205,13 +206,14 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
         "min_markdown_words": 30,
         "max_consecutive_failures": 4,
         "max_reader_dispatches": 6,
+        "max_researchers": 4,
     }
-    # `max_reader_dispatches` lives in `[agent]`, which VALID_TOML omits (the omitted-section
-    # default is covered by test_agent_section_omitted_falls_back_to_documented_defaults) --
-    # append a literal default here so the same `.replace()` pattern has something to swap.
+    # These two live in `[agent]`, which VALID_TOML omits (the omitted-section default is
+    # covered by test_agent_section_omitted_falls_back_to_documented_defaults) -- append a
+    # literal default here so the same `.replace()` pattern has something to swap.
     base_toml = VALID_TOML
-    if setting == "max_reader_dispatches":
-        base_toml += "\n[agent]\nmax_reader_dispatches = 6\n"
+    if setting in ("max_reader_dispatches", "max_researchers"):
+        base_toml += f"\n[agent]\n{setting} = {original[setting]}\n"
     toml_content = base_toml.replace(f"{setting} = {original[setting]}", f"{setting} = {bad_value}")
     path = _write(tmp_path, toml_content)
 
@@ -397,6 +399,17 @@ def test_agent_section_omitted_falls_back_to_documented_defaults(tmp_path, monke
     assert config.agent.reports_dir == Path.home() / "deep-research" / "reports"
     assert config.agent.max_retries == 2
     assert config.agent.request_timeout_seconds == 120.0
+    assert config.agent.max_researchers == 4
+
+
+def test_shipped_harness_toml_declares_the_researcher_cap(monkeypatch):
+    """The cap is harness-enforced (D1) -- `dispatch_researcher` refuses past it -- so the
+    shipped config states it outright rather than leaving it to the model default."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "any")
+
+    config = load_config()
+
+    assert config.agent.max_researchers == 4
 
 
 def test_synthesis_margin_at_or_above_the_wall_clock_is_rejected(tmp_path, monkeypatch):

@@ -90,3 +90,6 @@ request_timeout_seconds = 120.0
 # Harness-enforced (R5): a researcher's reader dispatch past this count is refused, not
 # merely advised in prompt prose. The researcher prompt renders this same value.
 max_reader_dispatches = 6
+# The same enforcement one tier up (D1): researchers the lead may run at once. A dispatch past
+# this count is refused outright, never queued.
+max_researchers = 4

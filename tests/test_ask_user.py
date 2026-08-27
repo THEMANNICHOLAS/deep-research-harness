@@ -17,7 +17,15 @@ from harness.display import PlainRenderer
 from harness.input import KeyEvent
 from harness.sources import SourceRegistry
 from harness.tools.ask_user import build_ask_user_tool
-from tests.conftest import drain_stdout, install_search_transport, patch_model, patch_run
+from tests.conftest import (
+    _dispatch_call,
+    _submit_call,
+    drain_stdout,
+    install_search_transport,
+    patch_model,
+    patch_run,
+    patch_run_by_role,
+)
 
 _THREAD = {"configurable": {"thread_id": "test-thread"}}
 
@@ -83,10 +91,16 @@ async def test_the_question_reaches_stdout_and_the_answer_resumes_the_run(
     model = scripted_model(
         [
             AIMessage(content="", tool_calls=[_ask("Metal or album?")]),
-            AIMessage(
-                content="Final answer.",
-                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            _submit_call("Final answer.").model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
             ),
+            AIMessage(content="Report submitted."),
         ]
     )
     queued = _patch_main(monkeypatch, make_config(), model, ["I mean the chemical element."])
@@ -115,10 +129,16 @@ async def test_a_second_clarification_round_asks_again_and_resumes_again(
         [
             AIMessage(content="", tool_calls=[_ask("Metal or album?", "call_1")]),
             AIMessage(content="", tool_calls=[_ask("Which isotope?", "call_2")]),
-            AIMessage(
-                content="Final answer.",
-                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            _submit_call("Final answer.").model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
             ),
+            AIMessage(content="Report submitted."),
         ]
     )
     queued = _patch_main(monkeypatch, make_config(), model, ["The metal.", "Mercury-202."])
@@ -132,8 +152,9 @@ async def test_a_second_clarification_round_asks_again_and_resumes_again(
     assert "Which isotope?" in out
     assert lines[-1].strip().endswith(".md")
 
-    # Three model calls: ask, ask again, answer. A one-round resume loop stops at two.
-    assert model._call_count == 3
+    # Four model calls: ask, ask again, submit_report, and the turn that closes it. A
+    # one-round resume loop stops at two.
+    assert model._call_count == 4
     # Both answers arrived as their own round's tool result, in order.
     assert [m.content for m in _ask_user_results(model._received_messages[2])] == [
         "The metal.",
@@ -157,10 +178,16 @@ async def test_two_questions_in_one_interrupt_get_one_answer_each(
                     _ask("Which isotope?", "call_2"),
                 ],
             ),
-            AIMessage(
-                content="Final answer.",
-                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            _submit_call("Final answer.").model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
             ),
+            AIMessage(content="Report submitted."),
         ]
     )
     queued = _patch_main(monkeypatch, make_config(), model, ["The metal.", "Mercury-202."])
@@ -191,10 +218,16 @@ async def test_an_empty_answer_is_disclosed_rather_than_sent_as_silence(
     model = scripted_model(
         [
             AIMessage(content="", tool_calls=[_ask("Metal or album?")]),
-            AIMessage(
-                content="Final answer.",
-                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            _submit_call("Final answer.").model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
             ),
+            AIMessage(content="Report submitted."),
         ]
     )
     _patch_main(monkeypatch, make_config(), model, ["   "])
@@ -210,10 +243,16 @@ async def test_a_run_that_never_asks_completes_without_interruption(
 ):
     model = scripted_model(
         [
-            AIMessage(
-                content="Final answer.",
-                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            )
+            _submit_call("Final answer.").model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
+            ),
+            AIMessage(content="Report submitted."),
         ]
     )
     _patch_main(monkeypatch, make_config(), model, answers=None)
@@ -278,7 +317,8 @@ def test_the_ask_user_tool_is_shaped_like_the_other_harness_tools(make_config):
 async def test_wall_clock_fires_while_a_question_is_pending(
     make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """The risk #2 test. The wall clock (`asyncio.timeout` in `main`) must keep running while
+    """The risk #2 test. The wall clock (`asyncio.timeout` in `Session.run`) must keep running
+    while
     `ask_user` is awaiting an answer — nothing about answering a question may pause, reschedule,
     or extend it. `_read_answer` is patched with a fake that outlives the bound but never blocks
     the event loop (a plain `asyncio.sleep`), isolating exactly that property: the outer timeout
@@ -288,24 +328,17 @@ async def test_wall_clock_fires_while_a_question_is_pending(
     agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
-    task_call = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "task",
-                "args": {"description": "Research widgets", "subagent_type": "researcher"},
-                "id": "call_task",
-            }
-        ],
-    )
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "widgets"}, "id": "call_search"}],
     )
     researcher_report = AIMessage(content="Researcher report (no citations yet).")
     ask = AIMessage(content="", tool_calls=[_ask("Narrower scope?", "call_ask")])
-    model = scripted_model([task_call, search_call, researcher_report, ask])
-    patch_run(monkeypatch, config, model)
+    # Distinct models per tier (D1): the lead's turn no longer waits on its researcher, so the
+    # two tiers' calls interleave and one shared script would be consumed out of order.
+    head_model = scripted_model([_dispatch_call("widgets"), ask])
+    researcher_model = scripted_model([search_call, researcher_report])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
 
     async def _fast_search(request):
         import httpx

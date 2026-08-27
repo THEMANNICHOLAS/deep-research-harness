@@ -29,11 +29,16 @@ def test_build_tools_returns_the_frozen_tool_set(make_config, monkeypatch):
 
     # Ordered, not a set: `harness/tools/__init__.py`'s builder list is part of the contract.
     # Step 3: `search_web` and `fetch_raw` both moved off the lead onto the researcher — the
-    # lead delegates through `task` instead of researching directly, and the digest-recovery
-    # loop belongs to whoever dispatches readers. `fetch_pages` stays on the reader.
+    # lead delegates instead of researching directly, and the digest-recovery loop belongs to
+    # whoever dispatches readers. `fetch_pages` stays on the reader. The lead's own set is
+    # `ask_user` plus the two session-control tools that replaced deepagents' `task` (D1/D3).
     # R4 regression (PLAN-prompt-injection-defense.md Phase 5): this exact three-tier split is
     # the containment floor the fencing/sanitizing work in this phase builds on top of.
-    assert [tool.name for tool in tool_sets.lead] == ["ask_user"]
+    assert [tool.name for tool in tool_sets.lead] == [
+        "ask_user",
+        "dispatch_researcher",
+        "submit_report",
+    ]
     assert [tool.name for tool in tool_sets.researcher] == ["search_web", "fetch_raw"]
     assert [tool.name for tool in tool_sets.reader] == ["fetch_pages"]
 
@@ -61,6 +66,9 @@ def test_every_tool_exposes_description_and_json_schema(make_config):
     assert "query" in search_props
     assert "max_results" in search_props
     assert "question" in by_name["ask_user"].args_schema.model_json_schema()["properties"]
+    dispatch_props = by_name["dispatch_researcher"].args_schema.model_json_schema()["properties"]
+    assert set(dispatch_props) == {"label", "objective", "output_format", "boundaries"}
+    assert set(by_name["submit_report"].args_schema.model_json_schema()["properties"]) == {"answer"}
     fetch_raw_props = by_name["fetch_raw"].args_schema.model_json_schema()["properties"]
     assert "urls" in fetch_raw_props
     assert "reason" in fetch_raw_props

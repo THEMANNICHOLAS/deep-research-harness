@@ -363,15 +363,25 @@ def patch_model(monkeypatch: pytest.MonkeyPatch, model: Any) -> None:
     monkeypatch.setattr("harness.models.build_chat_model", lambda cfg, role: model)
 
 
-@pytest.fixture
-def patch_models_by_role(monkeypatch: pytest.MonkeyPatch):
-    """Like `patch_model`, but returns a different model per role (e.g. head vs reader)."""
+def patch_models_by_role(monkeypatch: pytest.MonkeyPatch, models: dict[str, Any]) -> None:
+    """Like `patch_model`, but returns a different model per role (e.g. head vs reader).
+
+    A role missing from `models` falls back to `head`, so a test that cares about two roles
+    lists two rather than every role the run happens to build a client for. The ONE definition
+    of that fallback — `patch_run_by_role` and the fixture below both come through here, so a
+    test can never see two different answers for an unlisted role.
+    """
+    monkeypatch.setattr(
+        "harness.models.build_chat_model", lambda cfg, role: models.get(role, models["head"])
+    )
+
+
+@pytest.fixture(name="patch_models_by_role")
+def _patch_models_by_role_fixture(monkeypatch: pytest.MonkeyPatch):
+    """The fixture form of `patch_models_by_role`, with `monkeypatch` already bound."""
 
     def _patch(models: dict[str, Any]) -> None:
-        def _by_role(cfg: Any, role: str) -> Any:
-            return models[role]
-
-        monkeypatch.setattr("harness.models.build_chat_model", _by_role)
+        patch_models_by_role(monkeypatch, models)
 
     return _patch
 
@@ -442,6 +452,90 @@ def patch_run(
     patch_model(monkeypatch, model)
 
 
+# The phrase both synthesis instructions share (`_SYNTHESIZE_NOW_INSTRUCTION`), which is how
+# `_LeadModel` recognizes the bounded synthesis pass without pinning either full wording.
+_SYNTHESIS_PHRASE = "Stop researching now"
+
+
+class _LeadModel(ScriptedChatModel):
+    """A scripted LEAD model that understands the session's two control tools (D1/D3).
+
+    Three things a plain positional script cannot express now that the lead's turns are driven
+    by an event loop rather than one long stream:
+
+    - `_answer`: on seeing the synthesis instruction it calls `submit_report(_answer)`, because
+      a cut-short run writes NO report without that call (D3) and which scripted index the
+      bounded synthesis pass lands on is a langgraph topology detail, not a test's business.
+    - `_after_submit`: what it says once it has submitted — text ends the pass, a tool call
+      keeps it going, which is how the runaway-synthesis case is scripted.
+    - `_slow_calls` / `_delay_seconds`: hold a chosen call long enough that a wall clock armed
+      earlier in the same turn expires while the lead is still inside the model.
+
+    `_replies` are its ordinary turns, in order; the last one repeats.
+    """
+
+    _replies: list = PrivateAttr(default_factory=list)
+    _answer: str = PrivateAttr(default="")
+    _after_submit: Any = PrivateAttr(default=None)
+    _slow_calls: frozenset = PrivateAttr(default=frozenset())
+    _delay_seconds: float = PrivateAttr(default=3.0)
+    _submitted: bool = PrivateAttr(default=False)
+    _plain_calls: int = PrivateAttr(default=0)
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        self._received_messages.append(list(messages))
+        if self._call_count in self._slow_calls:
+            await asyncio.sleep(self._delay_seconds)
+        if self._submitted:
+            reply = self._after_submit or AIMessage(content="Report submitted.")
+        elif any(_SYNTHESIS_PHRASE in str(m.content) for m in messages):
+            self._submitted = True
+            reply = _submit_call(self._answer)
+        else:
+            reply = self._replies[min(self._plain_calls, len(self._replies) - 1)]
+            self._plain_calls += 1
+            if any(call["name"] == "submit_report" for call in reply.tool_calls):
+                self._submitted = True
+        self._call_count += 1
+        # A per-call id, like a real model: the round counter deduplicates by message id, so a
+        # repeated reply object would count as one round no matter how many turns happened.
+        reply = reply.model_copy(deep=True, update={"id": f"lead-{self._call_count}"})
+        return ChatResult(generations=[ChatGeneration(message=reply)])
+
+
+def _lead_model(**private: Any) -> _LeadModel:
+    """A `_LeadModel` on a throwaway endpoint, with its private attrs set."""
+    from pydantic import SecretStr
+
+    model = _LeadModel(
+        model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    for name, value in private.items():
+        setattr(model, f"_{name}", value)
+    return model
+
+
+def patch_run_by_role(
+    monkeypatch: pytest.MonkeyPatch,
+    config: HarnessConfig,
+    models: dict[str, Any],
+    **kwargs: Any,
+) -> None:
+    """`patch_run`, but with a distinct model per role (unlisted roles fall back to `head`).
+
+    Needed by every `main()` test that reaches the researcher tier: a lead turn no longer
+    blocks on its researchers (PLAN-interactive-lead-chat D1), so the two tiers' model calls
+    interleave and one shared script would be consumed in a nondeterministic order.
+
+    `patch_run` first for everything else it neutralizes (config, the preflights), then
+    `patch_models_by_role` over the top — it owns the role lookup and its fallback.
+    """
+    patch_run(monkeypatch, config, models["head"], **kwargs)
+    patch_models_by_role(monkeypatch, models)
+
+
 def install_search_transport(monkeypatch: pytest.MonkeyPatch, handler: Callable[..., Any]) -> None:
     """Route `harness.tools.search`'s `httpx.AsyncClient` through a MockTransport on `handler`.
 
@@ -459,6 +553,48 @@ def install_search_transport(monkeypatch: pytest.MonkeyPatch, handler: Callable[
         return real(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr("harness.tools.search.httpx.AsyncClient", factory)
+
+
+def _dispatch_call(
+    label: str,
+    call_id: str = "call_dispatch",
+    *,
+    objective: str = "",
+    output_format: str = "a short cited report",
+    boundaries: str = "nothing else",
+) -> AIMessage:
+    """One `dispatch_researcher` tool call — the lead's way of starting a researcher (D1).
+
+    Shared, not per-file: the lead lost `task` in PLAN-interactive-lead-chat Phase 1, so every
+    suite that scripts a lead turn (`test_session`, `test_agent`, `test_display`,
+    `test_ask_user`, `test_delegation_e2e`) needs this exact shape — it is the lead-tier
+    replacement for `test_agent.py`'s `_task_call`, which now only ever scripts the
+    researcher's own dispatch to a reader. The tool name is written literally for the same
+    reason `_task_call` writes `"task"`: it is the model-facing wire name.
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "dispatch_researcher",
+                "args": {
+                    "label": label,
+                    "objective": objective or f"Investigate {label}",
+                    "output_format": output_format,
+                    "boundaries": boundaries,
+                },
+                "id": call_id,
+            }
+        ],
+    )
+
+
+def _submit_call(answer: str, call_id: str = "call_submit") -> AIMessage:
+    """One `submit_report` tool call — the ONLY way a lead ends research with a report (D3)."""
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "submit_report", "args": {"answer": answer}, "id": call_id}],
+    )
 
 
 def verify_reply(

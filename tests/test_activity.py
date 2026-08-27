@@ -177,10 +177,14 @@ def test_reopen_reader_restarts_the_rows_elapsed_clock():
 def test_on_change_fires_as_the_last_action_of_every_mutating_method():
     """Fix-pass item 1: the sink PUSHES rather than being drained -- every mutation must call
     `on_change` after its own state update is visible, not before."""
-    calls: list[int] = []
+    calls: list[tuple[int, tuple[str, ...]]] = []
 
     def _on_change() -> None:
-        calls.append(sink.live_reader_count())
+        # Both live views in one probe: the reader count and the researcher roster (R8), so
+        # every mutating method is enumerated here rather than in a second near-identical test.
+        calls.append(
+            (sink.live_reader_count(), tuple(state.status for state in sink.researchers()))
+        )
 
     sink = ActivitySink(on_change=_on_change)
 
@@ -190,14 +194,66 @@ def test_on_change_fires_as_the_last_action_of_every_mutating_method():
     assert len(calls) == 2
 
     reader_id = sink.start_reader("Angle A")
-    assert calls[-1] == 1  # the new reader is already visible when `on_change` fires
+    assert calls[-1][0] == 1  # the new reader is already visible when `on_change` fires
     sink.note_reader_tool(reader_id, "fetch_pages")
     assert len(calls) == 4
     sink.finish_reader(reader_id, failed=False)
-    assert calls[-1] == 0  # the finish is already visible too
+    assert calls[-1][0] == 0  # the finish is already visible too
     sink.reopen_reader(reader_id)
-    assert calls[-1] == 1
+    assert calls[-1][0] == 1
     assert len(calls) == 6
+
+    sink.start_researcher("researcher/1", "pricing")
+    assert calls[-1][1] == ("running",)  # the new researcher is already visible too
+    sink.finish_researcher("researcher/1", failed=True)
+    assert calls[-1][1] == ("failed",)
+    assert len(calls) == 8
+
+
+def test_researchers_records_the_roster_in_start_order_with_its_own_clock():
+    """R8's data: the lead's researchers, in dispatch order, each with the times the roster
+    view renders elapsed from -- the sink's injected clock, exactly like the reader rows."""
+    sink = ActivitySink(clock=_clock_from(0.0, 1.0, 2.0))
+
+    sink.start_researcher("researcher/1", "pricing")
+    sink.start_researcher("researcher/2", "supply chain")
+    sink.finish_researcher("researcher/1", failed=False)
+
+    researchers = sink.researchers()
+    # A list, not a tuple: the Contracts entry says `list[ResearcherState]`.
+    assert isinstance(researchers, list)
+    assert [state.id for state in researchers] == ["researcher/1", "researcher/2"]
+    assert [state.label for state in researchers] == ["pricing", "supply chain"]
+    assert [state.status for state in researchers] == ["done", "running"]
+    assert researchers[0].started_at == 0.0
+    assert researchers[0].finished_at == 2.0
+    assert researchers[1].started_at == 1.0
+    # Still running: nothing has finished it, so it carries no finish time to render.
+    assert researchers[1].finished_at is None
+
+
+def test_finish_researcher_failed_marks_the_row_failed_not_done():
+    """The roster distinguishes a researcher that reported from one that crashed (or was
+    cancelled) -- `done` and `failed` are both finished, and the report's disclosure differs."""
+    sink = ActivitySink()
+    sink.start_researcher("researcher/1", "pricing")
+
+    sink.finish_researcher("researcher/1", failed=True)
+
+    (state,) = sink.researchers()
+    assert state.status == "failed"
+    assert state.finished_at is not None
+
+
+def test_finish_researcher_ignores_an_id_the_sink_never_started():
+    """`Session._cancel_running` finishes whatever is on its roster, which -- in tests, and
+    after a torn-down run -- can hold a task the sink never saw start; mirrors
+    `finish_reader`'s own missing-id guard rather than raising."""
+    sink = ActivitySink()
+
+    sink.finish_researcher("researcher/9", failed=True)
+
+    assert sink.researchers() == []
 
 
 def test_reader_scope_restores_active_reader_on_exception():

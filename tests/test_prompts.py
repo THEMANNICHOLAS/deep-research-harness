@@ -216,25 +216,32 @@ def test_reader_prompt_names_only_the_tools_the_reader_actually_has(make_config,
 
 
 def test_orchestrator_prompt_teaches_the_full_delegation_protocol():
-    """R1's prompt half (Phase 2 Step 3): the lead delegates research angles to the researcher
-    subagent rather than researching directly, and knows what to do when that delegation fails.
+    """R1's prompt half (Phase 2 Step 3, rewritten for D1/D3): the lead delegates research
+    angles rather than researching directly, receives each return as its own message, knows
+    what to do when a delegation fails, and knows that only `submit_report` writes a report.
     """
     rendered = render("orchestrator", current_date="2026-01-01")
 
-    assert 'subagent_type="researcher"' in rendered
+    assert "dispatch_researcher" in rendered
+    assert "submit_report" in rendered
     # The concurrent-researcher bound must appear near the delegation instruction, not merely
-    # anywhere in the prompt (D5) — a stray "3" elsewhere would pass a looser assertion.
-    delegation_pos = rendered.index('subagent_type="researcher"')
-    context = rendered[max(0, delegation_pos - 400) : delegation_pos + 400]
-    assert "3" in context
+    # anywhere in the prompt (D5) — a stray "four" elsewhere would pass a looser assertion.
+    delegation_pos = rendered.index("dispatch_researcher")
+    context = rendered[delegation_pos : delegation_pos + 700]
+    assert "four" in context
 
     assert "never search or fetch a page yourself" in rendered.lower()
+
+    # The return contract the session actually emits (`Session._batch_message`).
+    assert "[researcher/N — label] returned:" in rendered
+    assert "Roster:" in rendered
 
     assert "RESEARCHER FAILED (" in rendered
     assert "empty report" in rendered.lower()
 
-    # The lead no longer searches or fetches directly (R1) — it only delegates.
+    # The lead no longer searches or fetches directly (R1) — it only delegates — and `task` is
+    # gone from its tool surface entirely (D1).
     assert "search_web" not in rendered
     assert "fetch_pages" not in rendered
     assert "fetch_raw" not in rendered
-    assert 'subagent_type="reader"' not in rendered
+    assert "subagent_type" not in rendered
