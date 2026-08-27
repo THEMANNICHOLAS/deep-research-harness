@@ -11,8 +11,16 @@ from langchain_core.messages import AIMessage
 from pydantic import SecretStr
 
 import harness.__main__ as main_module
+import harness.session as session_module
 from harness.sources import sources_dir
-from tests.conftest import ScriptedChatModel, _FakeMarkdown, _FakeResult, verify_reply
+from tests.conftest import (
+    ScriptedChatModel,
+    _dispatch_call,
+    _FakeMarkdown,
+    _FakeResult,
+    _submit_call,
+    verify_reply,
+)
 from tests.test_verify import _flatten
 
 _URL = "https://example.test/page"
@@ -78,12 +86,14 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
         model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script(
         [
-            _task_call(_RESEARCHER_DESCRIPTION, "researcher"),
-            AIMessage(
-                content=(
-                    f"Widget defect reports are documented on the source page [S1]. {_HEAD_MARKER}"
-                )
+            # D1: the dispatch returns at once, so the lead's first turn ends here; the
+            # researcher's report arrives as its own turn, which is where it submits.
+            _dispatch_call("widget defect angle", objective=_RESEARCHER_DESCRIPTION),
+            AIMessage(content="Angle dispatched; waiting for the report."),
+            _submit_call(
+                f"Widget defect reports are documented on the source page [S1]. {_HEAD_MARKER}"
             ),
+            AIMessage(content="Report submitted."),
             verify_reply("supported", "The capture confirms the digest's claim."),
             # Verification's Phase 2 Step 5 consolidation call, made right after the one
             # per-paragraph verify call above (this scenario's answer is a single paragraph).
@@ -155,7 +165,7 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
     monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
 
     captured: dict = {}
-    real_write_report = main_module.write_report
+    real_write_report = session_module.write_report
 
     def _spy(outcome, cfg):
         path = real_write_report(outcome, cfg)
@@ -163,7 +173,7 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
         captured["path"] = path
         return path
 
-    monkeypatch.setattr(main_module, "write_report", _spy)
+    monkeypatch.setattr(session_module, "write_report", _spy)
 
     exit_code = await main_module.main([_QUESTION])
 
@@ -180,10 +190,11 @@ async def _run_delegation(make_config, patch_models_by_role, monkeypatch, instal
 async def test_end_to_end_delegation_loop_digests_and_resolves_citations(
     make_config, patch_models_by_role, monkeypatch, install_crawler
 ):
-    """R1/R4/R5: the lead delegates through `task` to a researcher, which delegates through its
-    OWN `task` to a reader; the reader fetches via the shared `fetch_pages` instance against the
-    fake crawler, the digest comes back up through both tiers, the lead synthesizes from the
-    researcher's report, and the written report resolves `[S1]` and discloses it as digested.
+    """R1/R4/R5: the lead delegates through `dispatch_researcher` to a researcher, which
+    delegates through its OWN `task` to a reader; the reader fetches via the shared
+    `fetch_pages` instance against the fake crawler, the digest comes back up through both
+    tiers, the researcher's report reaches the lead as its own turn, and the written report
+    resolves `[S1]` and discloses it as digested.
     """
     result = await _run_delegation(make_config, patch_models_by_role, monkeypatch, install_crawler)
 
@@ -273,12 +284,18 @@ async def test_report_discloses_a_mixed_digested_and_unread_run(
         model="head-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
     ).script(
         [
-            _task_call(_ANGLE_A_DESCRIPTION, "researcher", call_id="call_angle_a"),
-            _task_call(_ANGLE_B_DESCRIPTION, "researcher", call_id="call_angle_b"),
-            AIMessage(
-                content="Widget defect reports are documented on the source page [S1]. "
-                f"{_HEAD_MARKER}"
+            # One angle per turn, not both at once: the two researchers would otherwise run
+            # concurrently (D1) and consume the single scripted researcher model's replies in
+            # a nondeterministic order. What this test is about — the mixed read-mode
+            # disclosure — is unchanged by dispatching them one after the other.
+            _dispatch_call("defect angle", "call_angle_a", objective=_ANGLE_A_DESCRIPTION),
+            AIMessage(content="Angle A dispatched."),
+            _dispatch_call("recall angle", "call_angle_b", objective=_ANGLE_B_DESCRIPTION),
+            AIMessage(content="Angle B dispatched."),
+            _submit_call(
+                f"Widget defect reports are documented on the source page [S1]. {_HEAD_MARKER}"
             ),
+            AIMessage(content="Report submitted."),
             verify_reply("supported", "The capture confirms the digest's claim."),
         ]
     )
@@ -347,7 +364,7 @@ async def test_report_discloses_a_mixed_digested_and_unread_run(
     monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
 
     captured: dict = {}
-    real_write_report = main_module.write_report
+    real_write_report = session_module.write_report
 
     def _spy(outcome, cfg):
         path = real_write_report(outcome, cfg)
@@ -355,7 +372,7 @@ async def test_report_discloses_a_mixed_digested_and_unread_run(
         captured["path"] = path
         return path
 
-    monkeypatch.setattr(main_module, "write_report", _spy)
+    monkeypatch.setattr(session_module, "write_report", _spy)
 
     exit_code = await main_module.main([_QUESTION_MIXED])
 
@@ -388,9 +405,9 @@ async def test_verification_reads_the_capture_file_not_the_reader_digest(
     result = await _run_delegation(make_config, patch_models_by_role, monkeypatch, install_crawler)
 
     head_model = result["head_model"]
-    # Script order: task call, final synthesis, verify reply, consolidation reply -- the
-    # per-paragraph verify call is the model's third invocation (index 2).
-    verify_messages = head_model._received_messages[2]
+    # Script order: dispatch, the turn that ends it, the submit_report turn, the turn that
+    # closes it, then the verify reply -- the per-paragraph verify call is invocation index 4.
+    verify_messages = head_model._received_messages[4]
     verify_text = _flatten(verify_messages)
 
     assert _CAPTURE_MARKER in verify_text

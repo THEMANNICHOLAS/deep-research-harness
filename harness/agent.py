@@ -1,4 +1,9 @@
-"""Compile the lead research agent: model, tools, workspace backend, and middleware.
+"""Compile the lead research agent and the researcher graph: models, tools, backend, middleware.
+
+Two compiled graphs, not one nested pair (PLAN-interactive-lead-chat D1): `build_agent` is the
+lead, with `subagents=[]` and no `task` tool, and `build_researcher_graph` is the researcher
+tier plus its nested reader, which `harness/session.py` runs as a background `asyncio.Task` per
+`dispatch_researcher` call. The researcher→reader `task` path is unchanged.
 
 The ONLY module that imports `deepagents`: every other module works with plain
 LangChain/pydantic types, so the rest of the harness stays independent of the agent
@@ -59,10 +64,12 @@ from harness.runlog import RunLog, or_default
 from harness.sources import SourceRegistry, pending_digest_scope
 from harness.tools import build_tools
 from harness.tools.ask_user import ASK_USER_TOOL_NAME
+from harness.tools.dispatch import DISPATCH_RESEARCHER_TOOL_NAME
 from harness.tools.search import SearchUnavailableError
 
 if TYPE_CHECKING:
     from harness.browser import BrowserSession
+    from harness.session import Session
 
 # The summarizer's policy, deliberately not config-driven (D7). `trigger` sits above the
 # profile fallback of 170,000: generous for a reasoning model that spends heavily on output,
@@ -112,14 +119,24 @@ def _task_failure_handler(
         # `.get`: the args are model-supplied, and a malformed call must still get a label
         # rather than raising a KeyError out of the error handler itself.
         subagent_type = str(request.tool_call["args"].get("subagent_type", "task"))
-        label = subagent_type.upper()
-        run_log.record(
-            "subagent_failed",
-            f"{subagent_type} dispatch failed ({type(exc).__name__}): {exc}",
-        )
-        return f"{label} FAILED ({type(exc).__name__}): {exc}"
+        return subagent_failure_text(run_log, subagent_type, exc)
 
     return _handle
+
+
+def subagent_failure_text(run_log: RunLog, subagent_type: str, exc: Exception) -> str:
+    """Record a swallowed subagent crash and render the `... FAILED (...)` text for its tier.
+
+    Split out of `_task_failure_handler` so `harness/session.py` — which now runs the
+    researcher tier itself, outside any `task` tool call and so outside
+    `ToolErrorMiddleware` — produces the byte-identical `RESEARCHER FAILED (` prefix the lead
+    prompt's contract keys off, and records the same incident, without pasting either.
+    """
+    run_log.record(
+        "subagent_failed",
+        f"{subagent_type} dispatch failed ({type(exc).__name__}): {exc}",
+    )
+    return f"{subagent_type.upper()} FAILED ({type(exc).__name__}): {exc}"
 
 
 # The two exceptions that must never be retried NOR converted to a soft "... FAILED"
@@ -139,12 +156,16 @@ def _retry_on_non_search_abort(exc: Exception) -> bool:
     return not isinstance(exc, _PASS_THROUGH_TASK_FAILURES)
 
 
-def _task_dispatch_guard(run_log: RunLog) -> list[AgentMiddleware[Any, Any, Any]]:
-    """The ToolError/ToolRetry pair guarding one tier's `task` dispatch (D2).
+def _task_dispatch_guard(
+    run_log: RunLog, tool_name: str = "task"
+) -> list[AgentMiddleware[Any, Any, Any]]:
+    """The ToolError/ToolRetry pair guarding one tier's subagent-dispatch tool (D2).
 
     One definition for the two dispatch sites — the lead dispatching a researcher
-    (`_middleware`) and the researcher dispatching a reader (`_researcher_spec`) — so the
-    retry policy cannot drift between them. `ToolErrorMiddleware` defined first (outermost)
+    (`_middleware`, now guarding `dispatch_researcher` rather than `task`) and the researcher
+    dispatching a reader (`_researcher_middleware`) — so the retry policy cannot drift between
+    them. `tool_name` is what those two sites differ by and nothing else.
+    `ToolErrorMiddleware` defined first (outermost)
     catches whatever exception exhausts `ToolRetryMiddleware` (inner, `on_failure="error"` so
     the exhausted exception reaches the outer catch rather than being swallowed into a
     "continue" message) and converts it to a `status="error"` ToolMessage. `max_retries=1`:
@@ -156,10 +177,10 @@ def _task_dispatch_guard(run_log: RunLog) -> list[AgentMiddleware[Any, Any, Any]
     `_task_failure_handler`'s propagate branch.
     """
     return [
-        ToolErrorMiddleware(on_error=_task_failure_handler(run_log), tools=["task"]),
+        ToolErrorMiddleware(on_error=_task_failure_handler(run_log), tools=[tool_name]),
         ToolRetryMiddleware(
             max_retries=1,
-            tools=["task"],
+            tools=[tool_name],
             on_failure="error",
             initial_delay=0.0,
             jitter=False,
@@ -211,8 +232,8 @@ class _ReaderDispatchCapMiddleware(AgentMiddleware[Any, Any, Any]):
 
     Reading the count from the researcher's own history assumes deepagents' own summarizer
     never rewrites `state["messages"]` -- it DOES run on the researcher tier (via
-    `create_deep_agent`'s auto-injected base stack, not the hand-written list above it in
-    `_researcher_spec`'s `middleware=`). `_DeepAgentsSummarizationMiddleware` implements only
+    `create_deep_agent`'s auto-injected base stack, not the hand-written `_researcher_middleware`
+    list `build_researcher_graph` passes it). `_DeepAgentsSummarizationMiddleware` implements only
     `wrap_model_call`/`awrap_model_call`, tracking eviction in a private field rather than
     `before_model`/`after_model` and never issuing a `RemoveMessage` -- a deliberate divergence
     from LangChain's own `SummarizationMiddleware`, which rewrites the list with
@@ -544,56 +565,56 @@ def _reader_spec(
     )
 
 
-def _researcher_spec(
+def _researcher_middleware(
     config: HarnessConfig,
-    researcher_model: BaseChatModel,
-    researcher_tools: list[BaseTool],
     reader_spec: SubAgent,
     backend: BackendProtocol,
     registry: SourceRegistry,
     run_log: RunLog,
     sink: ActivitySink,
-) -> SubAgent:
-    """Build the declared `researcher` `SubAgent` spec (Step 3): the lead's only route to
-    `search_web` and (through its own nested `reader` declaration) page reading.
+) -> list[AgentMiddleware[Any, Any, Any]]:
+    """The researcher tier's middleware stack (Step 3), in dispatch order.
 
-    `interrupt_on` is deliberately left unset (D6): interrupts are pinned off below the lead —
-    a nested researcher has no checkpointer forwarded and cannot interrupt.
-
-    `middleware`: `SubAgentMiddleware` nests the reader tier under THIS researcher's own
-    `task` tool; `_ReaderDispatchCapMiddleware` (R5, Phase 4) sits immediately after it and
-    before `_task_dispatch_guard`, so a refused dispatch short-circuits the retry guard, the
-    digest scope, and the activity sink — nothing scopes a reader that never ran, and the
-    refusal's own `RunLog` incident is the one trace it leaves;
-    `_task_dispatch_guard` guards a crashed (or aborted, Drift C) reader dispatch, the same
-    shared pair as the lead's own guard on dispatching a researcher; `_ReaderDigestMiddleware`
-    marks a source `digested` only when a reader's digest actually reaches this researcher
-    (R7's mechanism moved, not broken); and `_ToolActivityMiddleware` (Phase 6, D-C) is
-    appended LAST (innermost) so a retried `task` dispatch to the reader arrives as a second
-    start for the same `tool_call["id"]`.
+    `SubAgentMiddleware` nests the reader tier under THIS researcher's own `task` tool;
+    `_ReaderDispatchCapMiddleware` (R5, Phase 4) sits immediately after it and before
+    `_task_dispatch_guard`, so a refused dispatch short-circuits the retry guard, the digest
+    scope, and the activity sink — nothing scopes a reader that never ran, and the refusal's
+    own `RunLog` incident is the one trace it leaves; `_task_dispatch_guard` guards a crashed
+    (or aborted, Drift C) reader dispatch, the same shared pair the lead uses on its own
+    dispatch tool; `_ReaderDigestMiddleware` marks a source `digested` only when a reader's
+    digest actually reaches this researcher (R7's mechanism moved, not broken); and
+    `_ToolActivityMiddleware` (Phase 6, D-C) is appended LAST (innermost) so a retried `task`
+    dispatch to the reader arrives as a second start for the same `tool_call["id"]`.
     """
-    return SubAgent(
-        name="researcher",
-        description=(
-            "Researches one assigned angle of the question: searches the web and delegates "
-            "page reading to the reader, returning a source-cited report of its findings."
-        ),
-        system_prompt=render(
-            "subagent",
-            current_date=date.today().isoformat(),
-            max_urls_per_call=config.fetch.max_urls_per_call,
-            max_reader_dispatches=config.agent.max_reader_dispatches,
-        ),
-        model=researcher_model,
-        tools=researcher_tools,
-        middleware=[
-            SubAgentMiddleware(backend=backend, subagents=[reader_spec]),
-            _ReaderDispatchCapMiddleware(config.agent.max_reader_dispatches, run_log),
-            *_task_dispatch_guard(run_log),
-            _ReaderDigestMiddleware(registry),
-            _ToolActivityMiddleware(sink),
-        ],
+    return [
+        SubAgentMiddleware(backend=backend, subagents=[reader_spec]),
+        _ReaderDispatchCapMiddleware(config.agent.max_reader_dispatches, run_log),
+        *_task_dispatch_guard(run_log),
+        _ReaderDigestMiddleware(registry),
+        _ToolActivityMiddleware(sink),
+    ]
+
+
+def _researcher_prompt(config: HarnessConfig) -> str:
+    """The researcher's rendered system prompt — one home for the render call."""
+    return render(
+        "subagent",
+        current_date=date.today().isoformat(),
+        max_urls_per_call=config.fetch.max_urls_per_call,
+        max_reader_dispatches=config.agent.max_reader_dispatches,
     )
+
+
+def _backend(config: HarnessConfig, registry: SourceRegistry) -> FilesystemBackend:
+    """The run's filesystem backend, rooted at THIS run's workspace subdirectory.
+
+    Not the shared workspace: an agent can only reach its own notes, and two concurrent runs
+    cannot read each other's. Shared by the lead and the researcher graph so both tiers write
+    into the same run directory the report later reads notes from.
+    """
+    workspace = run_workspace_dir(config, registry.run_id)
+    workspace.mkdir(parents=True, exist_ok=True)
+    return FilesystemBackend(root_dir=workspace)
 
 
 def build_agent(
@@ -602,6 +623,7 @@ def build_agent(
     run_log: RunLog | None = None,
     sink: ActivitySink | None = None,
     browser: "BrowserSession | None" = None,
+    session: "Session | None" = None,
 ) -> Runnable:
     """Compile the lead research agent, driven with `ainvoke`/`astream` (substrate D1).
 
@@ -610,30 +632,24 @@ def build_agent(
     orchestrator prompt carries only `$current_date` — the lead no longer manages URL batching
     itself (Step 3 moved that detail down onto the researcher/reader tiers).
 
+    `subagents=[]` (PLAN-interactive-lead-chat D1): the lead has no `task` tool at all. It
+    starts researchers through `dispatch_researcher`, which hands `session` a background
+    `asyncio.Task` over `build_researcher_graph`'s compiled graph and returns at once, so a
+    lead turn ends without waiting on them. The researcher and reader models are therefore
+    built by that function, not here — only the head model is resolved (and profiled) here.
+
     `run_log` collects the tools' degraded-coverage incidents; the caller shares one instance
     between this agent and the report so disclosure sees everything (best-effort + disclose).
     `sink` (Phase 6, D-C) collects the researcher/reader tiers' observed tool calls for the
     running pane's structured log and reader strip -- the lead tier is deliberately not
-    instrumented, so `_middleware` below is unchanged. `browser` (Phase 1, R2) is forwarded
-    to `build_tools` unchanged -- this function has no lifecycle over it, `main()` owns
-    start/close.
+    instrumented. `browser` (Phase 1, R2) is forwarded to `build_tools` unchanged -- this
+    function has no lifecycle over it, `main()` owns start/close.
     """
     model = models.build_chat_model(config, "head")
     _register_no_shell_profile(model)
 
-    researcher_model = models.build_chat_model(config, "researcher")
-    _register_no_shell_profile(researcher_model)
-
-    reader_model = models.build_chat_model(config, "reader")
-    _register_no_shell_profile(reader_model)
-
-    # Rooted at THIS run's subdirectory, not the shared workspace: the agent can only
-    # reach its own notes, and two concurrent runs cannot read each other's.
-    workspace = run_workspace_dir(config, registry.run_id)
-    workspace.mkdir(parents=True, exist_ok=True)
-    backend = FilesystemBackend(root_dir=workspace)
-
-    tool_sets = build_tools(config, registry, run_log, browser)
+    backend = _backend(config, registry)
+    tool_sets = build_tools(config, registry, run_log, browser, session)
 
     system_prompt = render(
         "orchestrator",
@@ -641,20 +657,6 @@ def build_agent(
     )
 
     shared_log = or_default(run_log)
-    # The SAME sink goes to both specs (D-D): reader-tier attribution needs the reader's own
-    # middleware updating the very `ReaderState` the researcher's middleware created.
-    shared_sink = activity.or_default(sink)
-    reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend, shared_sink)
-    researcher_spec = _researcher_spec(
-        config,
-        researcher_model,
-        tool_sets.researcher,
-        reader_spec,
-        backend,
-        registry,
-        shared_log,
-        shared_sink,
-    )
 
     return create_deep_agent(
         model=model,
@@ -667,8 +669,8 @@ def build_agent(
         permissions=[
             FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="allow")
         ],
-        middleware=_middleware(model, backend, shared_log),
-        subagents=[researcher_spec],
+        middleware=_middleware(model, backend, shared_log, DISPATCH_RESEARCHER_TOOL_NAME),
+        subagents=[],
         # One saver per call, holding this run's thread. In-memory keeps the no-database
         # invariant (D5): no durable, cross-invocation checkpointing.
         checkpointer=InMemorySaver(),
@@ -676,8 +678,62 @@ def build_agent(
     )
 
 
+def build_researcher_graph(
+    config: HarnessConfig,
+    registry: SourceRegistry,
+    run_log: RunLog | None = None,
+    sink: ActivitySink | None = None,
+    browser: "BrowserSession | None" = None,
+) -> Runnable:
+    """Compile the researcher tier as a standalone graph, once per session (D1).
+
+    Everything `SubAgentMiddleware` used to assemble around the declared `researcher` spec is
+    reproduced here explicitly, because nothing assembles it any more: the researcher's own
+    prompt and toolset, the nested reader `SubAgentMiddleware`, the reader dispatch cap, the
+    task guard, the digest promotion and the activity sink (Risk #1). `create_deep_agent`
+    supplies the rest of the base stack — filesystem middleware over `backend`, the
+    summarizer, and the tool-call patcher — exactly as the top-level `subagents=` path did.
+
+    `checkpointer=None` and no `interrupt_on` (D6): interrupts stay pinned to the lead, and
+    each `ainvoke` of this graph is one researcher's whole life — there is no thread to resume.
+    The graph is re-entrant: `Session` invokes the SAME compiled graph concurrently, once per
+    dispatch, and each invocation carries its own `messages` state.
+
+    `session` is deliberately not forwarded to `build_tools`: the researcher must never see
+    `dispatch_researcher` or `submit_report`.
+    """
+    researcher_model = models.build_chat_model(config, "researcher")
+    _register_no_shell_profile(researcher_model)
+
+    reader_model = models.build_chat_model(config, "reader")
+    _register_no_shell_profile(reader_model)
+
+    backend = _backend(config, registry)
+    tool_sets = build_tools(config, registry, run_log, browser)
+
+    shared_log = or_default(run_log)
+    # The SAME sink goes to both tiers (D-D): reader-tier attribution needs the reader's own
+    # middleware updating the very `ReaderState` the researcher's middleware created.
+    shared_sink = activity.or_default(sink)
+    reader_spec = _reader_spec(config, reader_model, tool_sets.reader, backend, shared_sink)
+
+    return create_deep_agent(
+        model=researcher_model,
+        tools=tool_sets.researcher,
+        system_prompt=_researcher_prompt(config),
+        backend=backend,
+        permissions=[
+            FilesystemPermission(operations=["read", "write"], paths=["/**"], mode="allow")
+        ],
+        middleware=_researcher_middleware(
+            config, reader_spec, backend, registry, shared_log, shared_sink
+        ),
+        checkpointer=None,
+    )
+
+
 def _middleware(
-    model: Any, backend: BackendProtocol, run_log: RunLog
+    model: Any, backend: BackendProtocol, run_log: RunLog, guarded_tool: str = "task"
 ) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build the middleware list with an explicit, broad element type.
 
@@ -690,8 +746,9 @@ def _middleware(
     issues a destructive `RemoveMessage(REMOVE_ALL_MESSAGES)` with no recovery path for a
     dropped `[Sn]`-to-finding association, which D7/R3/R7 depend on.
 
-    `_task_dispatch_guard` (D2) scopes to the `task` tool only and here guards the LEAD's
-    dispatch of a RESEARCHER (Step 3 relocated `_ReaderDigestMiddleware` down onto the
+    `_task_dispatch_guard` (D2) scopes to ONE tool and here guards the LEAD's dispatch of a
+    RESEARCHER — `guarded_tool`, which `build_agent` passes as `dispatch_researcher` now that
+    the lead has no `task` tool (Step 3 relocated `_ReaderDigestMiddleware` down onto the
     researcher's own middleware, since its subject — a reader's digest — is nested one level
     deeper); the policy itself is documented on the shared helper.
     """
@@ -700,5 +757,5 @@ def _middleware(
         SummarizationMiddleware(
             model=model, backend=backend, trigger=_SUMMARIZATION_TRIGGER, keep=_SUMMARIZATION_KEEP
         ),
-        *_task_dispatch_guard(run_log),
+        *_task_dispatch_guard(run_log, guarded_tool),
     ]

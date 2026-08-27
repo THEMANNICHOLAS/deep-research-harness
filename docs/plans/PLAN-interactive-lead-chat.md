@@ -237,7 +237,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 | R8 | live researcher roster in TUI | Phase 2 (data), Phase 5 (view) |
 
 ## Progress
-- [ ] Phase 1: Session tracer — dispatch tool, return injection, submit_report
+- [x] Phase 1: Session tracer — dispatch tool, return injection, submit_report
 - [ ] Phase 2: Budgets, roster data and run exits inside the session
 - [ ] Phase 3: Composer — queued user messages and post-report chat
 - [ ] Phase 4: ask_user with choices
@@ -295,15 +295,15 @@ through `dispatch_researcher`, receives each return as its own message, and ends
 - Touching `subagent.md`/`reader.md` beyond nothing; the researcher→reader `task` path.
 
 **Tests (write first, confirm red):**
-- [ ] A lead turn calling `dispatch_researcher` twice ends the turn immediately with two
+- [x] A lead turn calling `dispatch_researcher` twice ends the turn immediately with two
   "started" results and two running tasks.
-- [ ] A researcher completing produces exactly one `ResearcherReturn` and the next lead input
+- [x] A researcher completing produces exactly one `ResearcherReturn` and the next lead input
   is a `HumanMessage` matching the return-message contract; a second return while the first
   turn runs waits for the next turn.
-- [ ] `submit_report(answer)` ends research and `write_report` receives `RunOutcome.answer ==
+- [x] `submit_report(answer)` ends research and `write_report` receives `RunOutcome.answer ==
   answer`; the session's `run()` returns the outcome.
-- [ ] Cap and closed refusals return the contract strings and dispatch nothing.
-- [ ] The compiled researcher graph carries the nested reader and `fetch_pages` only on the reader.
+- [x] Cap and closed refusals return the contract strings and dispatch nothing.
+- [x] The compiled researcher graph carries the nested reader and `fetch_pages` only on the reader.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -315,7 +315,7 @@ through `dispatch_researcher`, receives each return as its own message, and ends
 **Acceptance criteria:**
 - [ ] `uv run python -m harness "test question"` on a TTY with real models: transcript shows
   two "started" lines, then per-researcher return narration, then a report path.
-- [ ] `grep -n 'subagent_type' harness/__main__.py` → no matches.
+- [x] `grep -n 'subagent_type' harness/__main__.py` → no matches.
 
 ### Phase 2: Budgets, roster data and run exits inside the session
 **Risk:** flagged (!#2)
@@ -615,9 +615,41 @@ correction. Empty at plan creation. -->
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
+- 2026-08-25 — Phase 1: diff budget overrun — ~2,600 insertions / 14 files against a ~500-750 /
+  8-file band. ~500 lines are the approved wholesale move of budgets + report gate from
+  `__main__.py` into `session.py`; the rest is the new `Session` surface plus rescripting ~15
+  tests that drove the lead through `task`. → deferred (recorded for Phase 2-6 budget calibration).
+- 2026-08-25 — Phase 1: Risk #5 live tuning pass not yet run — scripted tests cannot exercise the
+  head model's behaviour on the new `dispatch_researcher`/`submit_report` prompt. → deferred to
+  the developer's first live `uv run python -m harness "<question>"`; record the wording that
+  produced dispatch → per-return narration → `submit_report` here.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
 /implement's Step 2 reads the plan up to this heading plus only the log's final entry, so
 never add a section below it. -->
+
+### 2026-08-25 — Phase 1: Session tracer — dispatch tool, return injection, submit_report
+- Done: `harness/session.py` (`Session`, `ResearcherReturn`/`UserMessage`, D2 turn loop, D3
+  termination) and `harness/tools/dispatch.py` (`dispatch_researcher`, `submit_report`); lead
+  runs with `subagents=[]`; `build_researcher_graph` compiles the researcher standalone
+  (`_researcher_spec` deleted, its pieces became `_researcher_middleware`/`_researcher_prompt`/
+  `_backend`); `__main__.py` 1216 → ~570 lines; orchestrator.md rewritten for the new tools.
+  838 tests, 96% coverage, gates clean.
+- Learned: budgets (wall clock, round cap, synthesis margin) AND the report gate were MOVED into
+  `Session` in this phase (orchestrator scoping decision) — Phase 2 does not relocate them, it
+  changes their semantics (arm on first successful dispatch, disarm at `submit_report`,
+  post-report never cuts short) and adds `agent.max_researchers` (today `_MAX_RESEARCHERS = 4`
+  in session.py) plus roster data. Report is written iff `submit_report` was called and
+  `cut_short != "error"`. 3F fixes: `submit_report` refuses while researchers run except during
+  a forced synthesis pass (`_forced_synthesis`); `_cancel_running` records a
+  `researcher_cancelled` incident per dropped researcher; pass-through exceptions
+  (search-abort/DisplayError) set `_fatal` without a fabricated `RESEARCHER FAILED`. Headless
+  idle lead gets one `_SUBMIT_NOW` nudge then fails (Phase 3 replaces idle with wait-for-user).
+  Gathered `dispatch_researcher` ToolMessages come back in completion order, not call order —
+  never assert positionally. `tests/conftest.py` now has `_dispatch_call`/`_submit_call`,
+  `_LeadModel` (auto-submits on the synthesis phrase), `patch_run_by_role`, `patch_models_by_role`.
+- Drift: none.
+- Watch-next: the live TTY acceptance criterion (two "started" lines → per-return narration →
+  report path) and Risk #5's prompt tuning are unrun — needs real models; see `## Discoveries`.

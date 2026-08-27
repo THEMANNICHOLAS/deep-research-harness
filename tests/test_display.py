@@ -15,6 +15,7 @@ from rich.console import Console
 
 import harness.__main__ as main_module
 import harness.display
+import harness.session as session_module
 from harness.activity import ActivitySink
 from harness.config import AgentSettings
 from harness.display import (
@@ -42,11 +43,15 @@ from harness.display import (
 )
 from harness.sources import SourceRegistry
 from tests.conftest import (
+    _dispatch_call,
     _FakeMarkdown,
     _FakeResult,
+    _lead_model,
+    _submit_call,
     drain_stdout,
     install_search_transport,
     patch_run,
+    patch_run_by_role,
     verify_reply,
     write_source_capture,
 )
@@ -257,11 +262,11 @@ async def test_a_direct_answer_skips_the_clarifying_and_researching_lines(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    final = AIMessage(
-        content="Final answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    # D3: the answer is delivered by `submit_report`, then one more turn closes the tool call.
+    final = _submit_call("Final answer.").model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    model = scripted_model([final])
+    model = scripted_model([final, AIMessage(content="Report submitted.")])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["a question with no tool calls"])
@@ -282,10 +287,10 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
     UNCHANGED second item is printed again too, which the old per-item flattening would not
     have done.
 
-    Step 3: "research activity visible in the TUI" now manifests as the LEAD's
-    `task(subagent_type="researcher")` dispatch line — the researcher's own nested `search_web`
-    call (`patch_run` binds one model to every role, so it plays here too) never reaches the
-    top-level stream at all, so only ONE activity line is expected, not one per internal tool.
+    "Research activity visible in the TUI" manifests as the LEAD's `dispatch_researcher` line
+    (D1) — the researcher's own nested `search_web` call runs in a separate graph and never
+    reaches the lead's stream at all, so only ONE activity line is expected, not one per
+    internal tool.
     """
     config = make_config()
     plan_search_and_replan: list[Any] = [
@@ -304,31 +309,8 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
                 },
             ],
         ),
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "task",
-                    "args": {
-                        "description": "Search for the answer",
-                        "subagent_type": "researcher",
-                    },
-                    "id": "call_task",
-                }
-            ],
-        ),
-        # The RESEARCHER's own turns (same patched model plays every role): search, then report.
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "search_web",
-                    "args": {"query": "the answer"},
-                    "id": "call_search",
-                }
-            ],
-        ),
-        AIMessage(content="Researcher report: the answer is 42."),
+        _dispatch_call("Search for the answer", "call_dispatch"),
+        AIMessage(content="Angle dispatched."),
         AIMessage(
             content="",
             tool_calls=[
@@ -345,18 +327,20 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
             ],
         ),
     ]
-    final = AIMessage(
-        content="Final answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    final = _submit_call("Final answer.").model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    model = scripted_model([*plan_search_and_replan, final])
-    patch_run(monkeypatch, config, model)
+    head_model = scripted_model(
+        [*plan_search_and_replan, final, AIMessage(content="Report submitted.")]
+    )
+    researcher_model = scripted_model([AIMessage(content="Researcher report: the answer is 42.")])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
     _install_stub_search(monkeypatch)
 
     await main_module.main(["a question needing research"])
 
     out, lines = drain_stdout(capsys)
-    assert '  task(researcher): "Search for the answer"' in out
+    assert "  dispatch_researcher: Search for the answer" in out
     assert "  [pending] Search for the answer" in lines
     assert "  [completed] Search for the answer" in lines
     assert lines.count("  [pending] Write the summary") == 2
@@ -379,7 +363,7 @@ def test_todo_items_prefers_in_flight_over_sources_over_none():
     sink_with_readers = ActivitySink()
     sink_with_readers.start_reader("Angle A")
     sink_with_readers.start_reader("Angle B")
-    items = main_module._todo_items(todos, registry, sink_with_readers)
+    items = session_module._todo_items(todos, registry, sink_with_readers)
     in_progress = next(i for i in items if i.status == "in_progress")
     pending = next(i for i in items if i.status == "pending")
     assert in_progress.meta == "2 in flight"
@@ -387,12 +371,12 @@ def test_todo_items_prefers_in_flight_over_sources_over_none():
 
     # No live readers, but sources have been read -> falls back to the sources count.
     sink_idle = ActivitySink()
-    items = main_module._todo_items(todos, registry, sink_idle)
+    items = session_module._todo_items(todos, registry, sink_idle)
     in_progress = next(i for i in items if i.status == "in_progress")
     assert in_progress.meta == "4 sources"
 
     # Neither live readers nor read sources -> no meta at all.
-    items = main_module._todo_items(todos, SourceRegistry(), sink_idle)
+    items = session_module._todo_items(todos, SourceRegistry(), sink_idle)
     in_progress = next(i for i in items if i.status == "in_progress")
     assert in_progress.meta is None
 
@@ -420,19 +404,14 @@ async def test_todos_meta_refreshes_on_live_reader_count_change_and_only_then(
                     }
                 ],
             ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "task",
-                        "args": {
-                            "description": "Read the source",
-                            "subagent_type": "researcher",
-                        },
-                        "id": "call_researcher",
-                    }
-                ],
-            ),
+            _dispatch_call("Read the source", "call_dispatch"),
+            AIMessage(content="Angle dispatched."),
+            _submit_call("Final answer about the topic."),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    researcher_model = scripted_model(
+        [
             AIMessage(
                 content="",
                 tool_calls=[
@@ -443,12 +422,15 @@ async def test_todos_meta_refreshes_on_live_reader_count_change_and_only_then(
                     }
                 ],
             ),
-            AIMessage(content="Reader digest text."),
             AIMessage(content="Researcher summary text."),
-            AIMessage(content="Final answer about the topic."),
         ]
     )
-    patch_run(monkeypatch, config, model)
+    reader_model = scripted_model([AIMessage(content="Reader digest text.")])
+    patch_run_by_role(
+        monkeypatch,
+        config,
+        {"head": model, "researcher": researcher_model, "reader": reader_model},
+    )
 
     recorder = _RecordingRenderer()
     monkeypatch.setattr(main_module, "build_renderer", lambda: recorder)
@@ -484,19 +466,43 @@ async def test_the_source_count_is_emitted_only_when_the_registry_grows(
     actually grows mid-run rather than being pre-populated.
     """
     config = make_config()
+    # One angle per lead turn, not two at once: the two researchers would otherwise run
+    # concurrently (D1) and consume the single researcher script out of order. The point of
+    # this test — a registry that grows at two different points in the stream — is unchanged.
     model = scripted_model(
         [
-            _task_call("Investigate angle A", call_id="call_r1", subagent_type="researcher"),
+            _dispatch_call("angle A", "call_r1"),
+            AIMessage(content="Angle A dispatched."),
+            _dispatch_call("angle B", "call_r2"),
+            AIMessage(content="Angle B dispatched."),
+            _submit_call("Final answer summarizing both pages.").model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
+            ),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    researcher_model = scripted_model(
+        [
             _task_call(
                 "Fetch and digest https://a.test", call_id="call_reader_a", subagent_type="reader"
             ),
-            _reader_fetch_call("https://a.test"),
-            AIMessage(content="Digest A."),
             AIMessage(content="Researcher A report: finding confirmed."),
-            _task_call("Investigate angle B", call_id="call_r2", subagent_type="researcher"),
             _task_call(
                 "Fetch and digest https://b.test", call_id="call_reader_b", subagent_type="reader"
             ),
+            AIMessage(content="Researcher B report: finding confirmed."),
+        ]
+    )
+    reader_model = scripted_model(
+        [
+            _reader_fetch_call("https://a.test"),
+            AIMessage(content="Digest A."),
             # Not `_reader_fetch_call` (hardcodes id="call_fetch", already used for a.test's
             # fetch above -- a REUSED tool-call id across two different dispatches, sharing one
             # thread, corrupted the graph's message history and silently broke this fetch).
@@ -511,11 +517,6 @@ async def test_the_source_count_is_emitted_only_when_the_registry_grows(
                 ],
             ),
             AIMessage(content="Digest B."),
-            AIMessage(content="Researcher B report: finding confirmed."),
-            AIMessage(
-                content="Final answer summarizing both pages.",
-                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            ),
         ]
     )
     # `_pair` (fetch.py) matches a result to its URL by the result's OWN `.url` attribute, not
@@ -536,7 +537,12 @@ async def test_the_source_count_is_emitted_only_when_the_registry_grows(
     # A real (not no-op'd) browser preflight: it constructs its warm crawler through the very
     # same `_crawler_class()` seam `install_crawler` just faked, which is what makes the
     # HTTP-first fetch below actually succeed instead of failing with no browser to escalate to.
-    patch_run(monkeypatch, config, model, run_browser_preflight=True)
+    patch_run_by_role(
+        monkeypatch,
+        config,
+        {"head": model, "researcher": researcher_model, "reader": reader_model},
+        run_browser_preflight=True,
+    )
 
     # Counts every `SourceRegistry.count()` call regardless of instance -- `main()` builds its
     # own registry internally, so there is no instance to wrap directly. This is the exact
@@ -1484,11 +1490,11 @@ async def test_a_full_run_prints_a_summary_above_the_report_path(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    final = AIMessage(
-        content="Final answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    # D3: the answer is delivered by `submit_report`, then one more turn closes the tool call.
+    final = _submit_call("Final answer.").model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    model = scripted_model([final])
+    model = scripted_model([final, AIMessage(content="Report submitted.")])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["a question with no tool calls"])
@@ -1503,11 +1509,11 @@ async def test_a_full_run_prints_the_report_block_with_the_bare_path_last(
     make_config, monkeypatch, scripted_model, capsys
 ):
     config = make_config()
-    final = AIMessage(
-        content="Final answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    # D3: the answer is delivered by `submit_report`, then one more turn closes the tool call.
+    final = _submit_call("Final answer.").model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    model = scripted_model([final])
+    model = scripted_model([final, AIMessage(content="Report submitted.")])
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["a question with no tool calls"])
@@ -1569,13 +1575,12 @@ async def test_a_failing_report_write_still_closes_the_display(
     def _unwritable(outcome: Any, cfg: Any) -> Any:
         raise OSError("reports dir is not writable")
 
-    monkeypatch.setattr(main_module, "write_report", _unwritable)
+    monkeypatch.setattr(session_module, "write_report", _unwritable)
 
-    final = AIMessage(
-        content="Final answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    final = _submit_call("Final answer.").model_copy(
+        update={"usage_metadata": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
     )
-    model = scripted_model([final])
+    model = scripted_model([final, AIMessage(content="Report submitted.")])
     patch_run(monkeypatch, config, model)
 
     with pytest.raises(OSError, match="reports dir is not writable"):
@@ -1641,7 +1646,9 @@ async def test_a_round_cap_cut_short_run_shows_the_reason_in_the_summary(
             }
         ],
     )
-    model = scripted_model([*([keep_going] * 20)])
+    # A lead that keeps proposing tool calls until the bounded synthesis pass reaches it, then
+    # submits — the only route to a report on a cut-short run (D3).
+    model = _lead_model(replies=[keep_going], answer="Only what the cap allowed.")
     patch_run(monkeypatch, config, model)
 
     await main_module.main(["question that never settles"])
@@ -1841,34 +1848,34 @@ async def test_a_dead_search_backend_is_disclosed_on_the_terminal_and_in_the_rep
     developer through the CLI as a warning line AND through the report's gaps section — not
     only through model-facing tool output the model may never repeat.
 
-    Step 3: `search_web` lives on the researcher now, so the lead first dispatches one
-    (`patch_run` binds one model to every role, so the same script plays both turns) — a
-    single failure does not trip `SearchUnavailableError` (the default
-    `max_consecutive_failures` is 3), so the researcher reports back and the lead still
-    produces a best-effort answer.
+    `search_web` lives on the researcher, so the lead first dispatches one — a single failure
+    does not trip `SearchUnavailableError` (the default `max_consecutive_failures` is 3), so
+    the researcher reports back and the lead still submits a best-effort answer.
     """
     config = make_config()
-    task_call = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "task",
-                "args": {"description": "Search for the answer", "subagent_type": "researcher"},
-                "id": "call_task",
-            }
-        ],
-    )
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "the answer"}, "id": "call_search"}],
     )
     researcher_report = AIMessage(content="Researcher report: no sources found.")
-    final = AIMessage(
-        content="Best-effort answer without sources.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    head_model = scripted_model(
+        [
+            _dispatch_call("Search for the answer"),
+            AIMessage(content="Angle dispatched."),
+            _submit_call("Best-effort answer without sources.").model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
+            ),
+            AIMessage(content="Report submitted."),
+        ]
     )
-    model = scripted_model([task_call, search_call, researcher_report, final])
-    patch_run(monkeypatch, config, model)
+    researcher_model = scripted_model([search_call, researcher_report])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
 
     async def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")
@@ -1914,27 +1921,30 @@ async def test_a_full_run_frame_shows_the_counter_alongside_alerts_and_todos(
             }
         ],
     )
-    task_call = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "task",
-                "args": {"description": "Search for the answer", "subagent_type": "researcher"},
-                "id": "call_task",
-            }
-        ],
-    )
     search_call = AIMessage(
         content="",
         tool_calls=[{"name": "search_web", "args": {"query": "the answer"}, "id": "call_search"}],
     )
     researcher_report = AIMessage(content="Researcher report: no sources found.")
-    final = AIMessage(
-        content="Best-effort answer.",
-        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    head_model = scripted_model(
+        [
+            todos_call,
+            _dispatch_call("Search for the answer"),
+            AIMessage(content="Angle dispatched."),
+            _submit_call("Best-effort answer.").model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
+            ),
+            AIMessage(content="Report submitted."),
+        ]
     )
-    model = scripted_model([todos_call, task_call, search_call, researcher_report, final])
-    patch_run(monkeypatch, config, model)
+    researcher_model = scripted_model([search_call, researcher_report])
+    patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
 
     async def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")
