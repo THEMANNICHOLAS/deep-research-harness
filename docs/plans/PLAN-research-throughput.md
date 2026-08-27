@@ -244,7 +244,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Time-budget tracer — deadline-aware researcher dispatch
 - [x] Phase 2: Prompts and tool descriptions state the code's rules
 - [x] Phase 3: Guard requires directive context
-- [ ] Phase 4: Fetch pool and memory threshold as config
+- [x] Phase 4: Fetch pool and memory threshold as config
 - [ ] Phase 5: Per-role timeouts and transient-only retry
 - [ ] Final verification
 
@@ -454,9 +454,9 @@ is configuration, both with defaults for the 16GB+/4+ core box.
   `SemaphoreDispatcher`.
 
 **Tests (write first, confirm red):**
-- [ ] The warm HTTP crawler is built with `max_connections == config.fetch.max_connections` and
+- [x] The warm HTTP crawler is built with `max_connections == config.fetch.max_connections` and
   the dispatchers with `memory_threshold_percent == config.fetch.memory_threshold_percent`.
-- [ ] Config rejects `memory_threshold_percent` outside (0, 100] and unknown `[fetch]` keys still
+- [x] Config rejects `memory_threshold_percent` outside (0, 100] and unknown `[fetch]` keys still
   fail (strict model).
 
 **Steps:**
@@ -465,7 +465,7 @@ is configuration, both with defaults for the 16GB+/4+ core box.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `grep -n _MEMORY_THRESHOLD_PERCENT harness/` returns nothing.
+- [x] `grep -n _MEMORY_THRESHOLD_PERCENT harness/` returns nothing.
 
 ### Phase 5: Per-role timeouts and transient-only retry
 **Risk:** flagged (!#5)
@@ -620,6 +620,14 @@ Append-only, empty at plan creation. -->
   #3's recall cost → watch live `guard_blocked`; add `reveal|forget|send|summarize this page`
   when a fixture from a real page fires one.
 
+- 2026-08-27 — Phase 4 (3F review, fixed): `tests/conftest.py` `http_strategies` comment still
+  named `max_concurrency` (D6) as the source of `max_connections`; repointed at D3.
+- 2026-08-27 — Phase 4 (3F review, deferred): crawl4ai 0.9.2's `MemoryAdaptiveDispatcher` has a
+  fixed `memory_wait_timeout=600` — a box held above `memory_threshold_percent` for ten minutes
+  raises `MemoryError` out of the browser/PDF passes and fails the batch. Pre-existing; raising
+  75 -> 90 makes it less likely, an operator lowering the key far makes it more so. Add one
+  sentence to setup.md's `[fetch]` bullet when it is next touched.
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
@@ -666,3 +674,16 @@ never add a section below it. -->
 - Drift: exfil link fixture — see `## Reconciliations` 2026-08-25 Phase 3.
 - Watch-next: Phase 4's impl plan was drafted in `docs/plans/.impl/` (deleted at session end;
   3C rewrites it). Phase 5 must read the two 2026-08-27 Discoveries above before planning.
+
+### 2026-08-27 — Phase 4: Fetch pool and memory threshold as config
+- Done: `[fetch] max_connections` (24) and `memory_threshold_percent` (90.0) added; warm pool
+  and both dispatchers read them; `_MEMORY_THRESHOLD_PERCENT` deleted; toml + setup.md name
+  permits-per-call vs run-wide pool. 854 pass; ruff/mypy clean.
+- Learned: 3F confirmed the threshold really throttles in crawl4ai 0.9.2 and that values below
+  its fixed `recovery_threshold_percent=85` still recover (the recovery branch is an `elif`).
+  `memory_wait_timeout=600` is a pre-existing MemoryError path — logged in Discoveries.
+- Drift: none.
+- Watch-next: Phase 5 must read the two `2026-08-27 — Phase 5 prep` Discoveries first and
+  reconcile the `**Reuse:**` "extend `_PASS_THROUGH_TASK_FAILURES`" line (separate
+  `_NON_RETRYABLE_TASK_FAILURES` tuple); also narrow `_ResearcherDispatchMiddleware`'s
+  `except TimeoutError` to the `wait_for` branch (Phase 1 Discovery).

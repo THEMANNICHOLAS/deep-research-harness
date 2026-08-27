@@ -70,9 +70,12 @@ are never stored here — each provider names an environment variable
 - `[roles.head]` / `[roles.researcher]` / `[roles.reader]` / `[roles.verifier]` — which
   provider + model ID each role resolves to. All four must resolve; `head` is required at
   load time, the rest fail loud (`ModelError`) at build/preflight time if undeclared.
-- `[fetch]` — per-page timeout, fetch concurrency, the per-page character cap, and the
-  maximum URLs one `fetch_pages` call may request (`max_urls_per_call`; a call carrying
-  more is rejected without fetching anything).
+- `[fetch]` — per-page timeout, fetch concurrency (`max_concurrency`, permits per fetch
+  call), the run-wide HTTP connection pool (`max_connections`, default 24, shared by every
+  concurrent researcher), the dispatcher's memory threshold (`memory_threshold_percent`,
+  default 90; lower both on a smaller box — see PLAN-research-throughput risk #4), the
+  per-page character cap, and the maximum URLs one `fetch_pages` call may request
+  (`max_urls_per_call`; a call carrying more is rejected without fetching anything).
 - `[search]` — the SearXNG base URL and default result count.
 - `[agent]` — `max_rounds` (default 20) and `wall_clock_seconds` (default 1800), the
   run's two ceilings. The wall clock starts at the first `search_web`/`fetch_pages`

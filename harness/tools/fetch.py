@@ -40,10 +40,6 @@ FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error", "pd
 _BLOCKED_STATUSES = frozenset({401, 403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
 
-# 75%, not crawl4ai's default 90%: each concurrent crawl is a real browser page, and this
-# box also hosts SearXNG and Chromium.
-_MEMORY_THRESHOLD_PERCENT = 75.0
-
 
 def _crawler_class() -> Any:
     """The crawler class `_fetch` constructs — the one seam tests patch to avoid a browser.
@@ -93,9 +89,9 @@ def _build_http_crawler(config: HarnessConfig, run_id: str) -> Any:
     - `downloads_path` containment: unset, crawl4ai writes every non-`text/html` body under
       `~/.crawl4ai/downloads`, outside the workspace and never cleaned (see
       `run_downloads_dir`).
-    - D6: the HTTP pass reuses `max_concurrency` rather than adding a knob. The shared
-      dispatcher never runs more crawls than this at once, so a larger connection pool
-      than that would go unused.
+    - D3 (PLAN-research-throughput): the pool is run-wide and shared by every concurrent
+      researcher, so it is sized by its own key, `max_connections`, not the per-call permit
+      count `max_concurrency`.
     Goes through the `_crawler_class`/`_http_crawler_parts` seams, so tests that patch
     either seam cover both call sites.
     """
@@ -107,7 +103,7 @@ def _build_http_crawler(config: HarnessConfig, run_id: str) -> Any:
             browser_config=http_config_cls(
                 downloads_path=str(run_downloads_dir(config, run_id)),
             ),
-            max_connections=config.fetch.max_concurrency,
+            max_connections=config.fetch.max_connections,
         ),
         config=BrowserConfig(verbose=False),
     )
@@ -594,7 +590,7 @@ async def _fetch(
     )
     dispatcher = MemoryAdaptiveDispatcher(
         max_session_permit=config.fetch.max_concurrency,
-        memory_threshold_percent=_MEMORY_THRESHOLD_PERCENT,
+        memory_threshold_percent=config.fetch.memory_threshold_percent,
         rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
     )
 
@@ -733,7 +729,7 @@ async def _fetch(
         )
         pdf_dispatcher = MemoryAdaptiveDispatcher(
             max_session_permit=config.fetch.max_concurrency,
-            memory_threshold_percent=_MEMORY_THRESHOLD_PERCENT,
+            memory_threshold_percent=config.fetch.memory_threshold_percent,
             rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
         )
         async with _crawler_class()(

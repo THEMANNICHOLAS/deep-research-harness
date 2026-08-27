@@ -135,7 +135,7 @@ def _make_fake_crawler_class(
         constructed_kinds: list[str] = []
         # The `_FakeHTTPCrawlerStrategy` instance passed at construction, one per HTTP
         # construction -- how a test reaches its `.kwargs` to assert `max_connections` was
-        # wired from `config.fetch.max_concurrency` (D6).
+        # wired from `config.fetch.max_connections` (D3, PLAN-research-throughput).
         http_strategies: list[object] = []
         calls: list[SimpleNamespace] = []
         closed: list[object] = []
@@ -631,6 +631,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         per_page_char_cap: int = 12000,
         max_urls_per_call: int = 5,
         min_markdown_words: int = 50,
+        max_connections: int = 24,
+        memory_threshold_percent: float = 90.0,
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
         max_consecutive_failures: int = 3,
@@ -667,6 +669,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
                 per_page_char_cap=per_page_char_cap,
                 max_urls_per_call=max_urls_per_call,
                 min_markdown_words=min_markdown_words,
+                max_connections=max_connections,
+                memory_threshold_percent=memory_threshold_percent,
             ),
             search=SearchSettings(
                 base_url=base_url,

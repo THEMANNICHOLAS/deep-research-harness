@@ -96,6 +96,12 @@ class FetchSettings(_StrictModel):
     # where 0 or a negative is nonsense.
     page_timeout_ms: int = Field(default=15000, gt=0)
     max_concurrency: int = Field(default=5, gt=0)
+    # D3 (PLAN-research-throughput): the run-wide warm HTTP pool. Distinct from
+    # `max_concurrency`, which is the per-call dispatcher permit count.
+    max_connections: int = Field(default=24, gt=0)
+    # crawl4ai's own default; was a 75.0 constant. Risk #4: on a box smaller than 16GB
+    # also hosting SearXNG and Chromium, lower this in harness.toml.
+    memory_threshold_percent: float = Field(default=90.0, gt=0, le=100)
     # ~30k tokens of one page at roughly 4 chars per token. A character cap, not a token
     # cap: exact token counting would need a tokenizer and a choice of whose, and four model
     # roles are declared. Raised from 12000 now that page reading is delegated, so a long

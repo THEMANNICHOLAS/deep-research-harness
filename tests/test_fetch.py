@@ -380,7 +380,7 @@ async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_confi
 
 
 async def test_dispatcher_is_memory_bounded_and_rate_limited(install_crawler, make_config):
-    config = make_config()
+    config = make_config(memory_threshold_percent=63.5)
     registry = SourceRegistry()
     approve_all(registry, ["https://a.test"])
     results = [
@@ -391,8 +391,8 @@ async def test_dispatcher_is_memory_bounded_and_rate_limited(install_crawler, ma
     await fetch._fetch(["https://a.test"], config, registry, RunLog())
 
     dispatcher = fake_cls.calls[0].dispatcher
-    # 75%, not crawl4ai's 90% default: each permit is a real browser page.
-    assert dispatcher.memory_threshold_percent == 75.0
+    # The threshold is configuration, not a constant (D3; risk #4 makes it the operator knob).
+    assert dispatcher.memory_threshold_percent == 63.5
     # Not a retry count: 0.9.2 re-fetches nothing on a 429/503. It caps how many times a domain's
     # backoff delay doubles, and that sleep holds a concurrency permit.
     assert dispatcher.rate_limiter is not None
@@ -704,7 +704,7 @@ async def test_an_http_discovered_pdf_content_type_reroutes_through_the_pdf_batc
     """D2's arxiv case: an extensionless PDF URL is exempt from the thin check by content
     type, so it reroutes straight from the HTTP pass to the PDF batch and never reaches the
     (Chromium-navigation-failed-on-it-already) browser."""
-    config = make_config()
+    config = make_config(memory_threshold_percent=63.5)
     registry = SourceRegistry()
     approve_all(registry, ["https://arxiv.test/abs/1234"])
     http_results = [
@@ -728,6 +728,8 @@ async def test_an_http_discovered_pdf_content_type_reroutes_through_the_pdf_batc
 
     assert [call.is_http for call in fake_cls.calls] == [True, False]
     assert fake_cls.calls[1].is_pdf is True
+    # D3: the PDF dispatcher reads the same configured threshold as the HTML one.
+    assert fake_cls.calls[1].dispatcher.memory_threshold_percent == 63.5
     assert pages[0].outcome == "fetched"
     assert pages[0].markdown == "Extracted arxiv text"
 
@@ -763,11 +765,12 @@ async def test_rejected_urls_are_never_http_fetched(install_crawler, make_config
     assert fetch._rejection_block("https://walled.test/page") in content
 
 
-async def test_the_http_strategy_is_wired_with_the_configured_max_concurrency(
+async def test_the_http_strategy_is_wired_with_the_configured_max_connections(
     install_crawler, make_config
 ):
-    """D6: the HTTP pass reuses `max_concurrency` rather than adding a new knob."""
-    config = make_config(max_concurrency=7)
+    """PLAN-research-throughput D3: the pool is run-wide and sized by `fetch.max_connections`,
+    distinct from the per-call permit `max_concurrency`."""
+    config = make_config(max_concurrency=7, max_connections=11)
     registry = SourceRegistry()
     approve_all(registry, ["https://a.test"])
     http_results = [
@@ -780,7 +783,7 @@ async def test_the_http_strategy_is_wired_with_the_configured_max_concurrency(
 
     await fetch._fetch(["https://a.test"], config, registry, RunLog())
 
-    assert fake_cls.http_strategies[0].kwargs["max_connections"] == 7
+    assert fake_cls.http_strategies[0].kwargs["max_connections"] == 11
 
 
 async def test_http_downloads_are_contained_in_the_run_workspace(install_crawler, make_config):
