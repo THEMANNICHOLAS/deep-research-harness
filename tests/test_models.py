@@ -93,6 +93,29 @@ def test_valid_role_resolves_to_client_with_model_and_base_url(make_config):
     assert client.openai_api_base == "https://example.test/v1"
 
 
+def test_role_timeout_overrides_the_agent_default(make_config):
+    """D6: a role's own `request_timeout_seconds` wins over `[agent]`'s global value, so a slow
+    researcher call is bounded without shortening the head's legitimately long synthesis."""
+    config = make_config()
+    config.roles["researcher"] = RoleConfig(
+        provider="opencode", model="test-model", request_timeout_seconds=60.0
+    )
+
+    client = build_chat_model(config, "researcher")
+
+    assert client.request_timeout == 60.0
+
+
+def test_role_without_timeout_uses_the_agent_default(make_config):
+    """A role that leaves `request_timeout_seconds` unset (head, verifier) still gets the
+    `[agent]` value — `None` means "fall back", not "no timeout"."""
+    config = make_config(agent=AgentSettings(request_timeout_seconds=33.0))
+
+    client = build_chat_model(config, "head")
+
+    assert client.request_timeout == 33.0
+
+
 def test_unknown_role_raises_model_error_naming_role(make_config):
     config = make_config()
 

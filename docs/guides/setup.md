@@ -69,7 +69,9 @@ are never stored here — each provider names an environment variable
 - `[providers.<name>]` — a model provider's `base_url` and the env var holding its key.
 - `[roles.head]` / `[roles.researcher]` / `[roles.reader]` / `[roles.verifier]` — which
   provider + model ID each role resolves to. All four must resolve; `head` is required at
-  load time, the rest fail loud (`ModelError`) at build/preflight time if undeclared.
+  load time, the rest fail loud (`ModelError`) at build/preflight time if undeclared. Each role
+  may also set `request_timeout_seconds` (seconds, per request); unset means the `[agent]`
+  `request_timeout_seconds` value applies — the shipped file sets 60 for researcher and reader.
 - `[fetch]` — per-page timeout, fetch concurrency (`max_concurrency`, permits per fetch
   call), the run-wide HTTP connection pool (`max_connections`, default 24, shared by every
   concurrent researcher), the dispatcher's memory threshold (`memory_threshold_percent`,

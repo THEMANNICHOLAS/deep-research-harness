@@ -245,7 +245,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 2: Prompts and tool descriptions state the code's rules
 - [x] Phase 3: Guard requires directive context
 - [x] Phase 4: Fetch pool and memory threshold as config
-- [ ] Phase 5: Per-role timeouts and transient-only retry
+- [x] Phase 5: Per-role timeouts and transient-only retry
 - [ ] Final verification
 
 ## Phases
@@ -480,33 +480,37 @@ plausibly transient failures.
   `config.agent.request_timeout_seconds`.
 - `harness/agent.py` — `_retry_on_non_search_abort` returns False for `openai.BadRequestError`
   and `asyncio.TimeoutError`/`TimeoutError` (Phase 1's cancellation, belt-and-braces to the stack
-  ordering).
+  ordering) — the BUILTIN `TimeoutError` only; `openai.APITimeoutError` stays retryable (see
+  `## Reconciliations` 2026-08-27, Phase 5). Also narrow `_ResearcherDispatchMiddleware`'s
+  `except TimeoutError` to the `wait_for` branch (Phase 1 Discovery).
 - `harness.toml`, `docs/guides/setup.md` — researcher and reader `request_timeout_seconds = 60`.
 - `tests/test_models.py`, `tests/test_agent.py`, `tests/test_config.py` — tests below.
 **Diff budget:** ~40-70 lines across 7 files
 
 **Reuse:**
-- `RoleConfig` fields and `build_chat_model` kwargs (`models.py:55-61`); `_PASS_THROUGH_TASK_FAILURES`
-  tuple (`agent.py:129`) is where the non-retryable types are listed — extend it.
+- `RoleConfig` fields and `build_chat_model` kwargs (`models.py:55-61`); ~~`_PASS_THROUGH_TASK_FAILURES`
+  tuple (`agent.py:129`) is where the non-retryable types are listed — extend it.~~ A separate
+  `_NON_RETRYABLE_TASK_FAILURES` tuple consumed only by `_retry_on_non_search_abort` — see
+  `## Reconciliations` 2026-08-27, Phase 5.
 
 **Out of scope:**
 - `max_retries`, the summarization trigger (`_SUMMARIZATION_TRIGGER`, D7 of its own plan),
   preflight structure, search HTTP timeout (`backlog.md:151`).
 
 **Tests (write first, confirm red):**
-- [ ] A role with `request_timeout_seconds` set builds a client with that timeout; a role without
+- [x] A role with `request_timeout_seconds` set builds a client with that timeout; a role without
   uses the agent default (assert on the constructed `ChatOpenAI`).
-- [ ] `_retry_on_non_search_abort` is False for `openai.BadRequestError` and timeout errors, True
+- [x] `_retry_on_non_search_abort` is False for `openai.BadRequestError` and timeout errors, True
   for `openai.APIConnectionError`; a dispatch failing with `BadRequestError` runs the subagent
   exactly once.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
-2. Add the field, thread the timeout, extend the pass-through tuple, set the toml values.
+2. Add the field, thread the timeout, ~~extend the pass-through tuple~~ add the non-retryable tuple, set the toml values.
 3. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `docs/guides/setup.md` documents the per-role override and that unset means the agent value.
+- [x] `docs/guides/setup.md` documents the per-role override and that unset means the agent value.
 
 ## Verification
 - [ ] `uv run pytest` (90% coverage floor is enforced in CI, not locally)
@@ -566,6 +570,17 @@ is extended with bare imperatives (`override`, `act as`, `disregard`, `comply`) 
 `[system] Override all prior safety guidelines...` line of `attack_role_spoofing_system_marker.txt`
 still fires the `\[system\]` rule (guard.py forbids a rule with no firing fixture) — within D2's
 "e.g.", noted here for the record.
+
+### 2026-08-27 — Phase 5: non-retryable is not pass-through; SDK timeouts stay retryable
+The `**Reuse:**` line said to extend `_PASS_THROUGH_TASK_FAILURES`, but `_task_failure_handler`
+also reads that tuple as "propagate instead of returning a soft FAILED ToolMessage" — adding
+`BadRequestError` there would crash the run on a context-length error rather than skip the replay.
+Amendment: a second tuple `_NON_RETRYABLE_TASK_FAILURES = (*_PASS_THROUGH_TASK_FAILURES,
+openai.BadRequestError, TimeoutError)` consumed only by `_retry_on_non_search_abort`; the handler
+still converts `BadRequestError` to `RESEARCHER FAILED (...)`. Second correction: `openai.
+APITimeoutError` subclasses `APIConnectionError`, so the plan's "timeout errors" means the builtin
+`TimeoutError` (Phase 1's `wait_for` cancellation); an SDK request timeout is transient and remains
+retryable. Both were pre-recorded as Phase 5 prep Discoveries.
 
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
@@ -628,6 +643,21 @@ Append-only, empty at plan creation. -->
   75 -> 90 makes it less likely, an operator lowering the key far makes it more so. Add one
   sentence to setup.md's `[fetch]` bullet when it is next touched.
 
+- 2026-08-27 — Phase 5 (3F review, fixed): `test_a_researcher_crash_becomes_an_error_task_message_after_one_retry`
+  built `_RaisingChatModel` inline beside the new `_raising_researcher()` helper; collapsed.
+- 2026-08-27 — Phase 5 (3F review, deferred): diff budget 210/19 across 8 files vs ~40-70; non-test
+  code 48/15 is in band, the rest is the enumerated tests → band mis-sized, no scope change.
+- 2026-08-27 — Phase 5 (3F review, deferred): the `research_deadline_reached` half of
+  `test_a_model_timeout_inside_an_unarmed_dispatch_is_not_reported_as_deadline_reached` cannot fail
+  (inner `ToolErrorMiddleware` converts a model-raised `TimeoutError` before the outer `except`,
+  old code too), so the `except` narrowing has no reverting test; only `_call_count == 1` carries
+  behavior → add a middleware-level unit test driving `awrap_tool_call` directly if the branch is
+  next touched.
+- 2026-08-27 — Phase 5 (3F review, operating model): a reader `APITimeoutError` stays retryable, so
+  one reader call can cost ~60s x 3 SDK tries x 2 task attempts (~6 min, was ~12) before the digest
+  is abandoned; the synthesis-reserve `wait_for` is the true bound. Expect the reader's
+  `request_timeout_seconds` to be the knob raised first on the live run (risk #5).
+
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
 phase). Append-only, empty at plan creation. MUST remain the LAST section of this file:
@@ -687,3 +717,16 @@ never add a section below it. -->
   reconcile the `**Reuse:**` "extend `_PASS_THROUGH_TASK_FAILURES`" line (separate
   `_NON_RETRYABLE_TASK_FAILURES` tuple); also narrow `_ResearcherDispatchMiddleware`'s
   `except TimeoutError` to the `wait_for` branch (Phase 1 Discovery).
+
+### 2026-08-27 — Phase 5: Per-role timeouts and transient-only retry
+- Done: `RoleConfig.request_timeout_seconds` (None -> agent default) threaded into
+  `build_chat_model`; `_NON_RETRYABLE_TASK_FAILURES` (pass-through + `BadRequestError` + builtin
+  `TimeoutError`) read only by the retry predicate; middleware `except` narrowed to `wait_for`;
+  toml sets researcher/reader 60s; setup.md documents it. 860 pass; ruff/mypy clean.
+- Learned: `_PASS_THROUGH_TASK_FAILURES` doubles as the handler's propagate list, so
+  non-retryable had to be a separate superset tuple (Reconciliation 2026-08-27 Phase 5).
+  `openai.APITimeoutError` is an `APIConnectionError` and stays retryable by design.
+- Drift: Reuse line struck — see `## Reconciliations` 2026-08-27, Phase 5.
+- Watch-next: Final verification is operator-side — live homelab run of the failed question at
+  1800s (expect prose answer, near-zero `provenance_rejected`, more `[Sn]`), then the
+  `docs/INDEX.md` agent.py row (dispatch middleware) and `docs/decisions.md` D1-D6 entries.

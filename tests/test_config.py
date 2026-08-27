@@ -22,6 +22,7 @@ model = "glm-5.2"
 [roles.researcher]
 provider = "cerebras"
 model = "gemma-4-31b"
+request_timeout_seconds = 60.0
 
 [fetch]
 page_timeout_ms = 20000
@@ -83,6 +84,8 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
     assert config.roles["head"].model == "glm-5.2"
     assert config.roles["researcher"].provider == "cerebras"
     assert config.roles["researcher"].model == "gemma-4-31b"
+    assert config.roles["researcher"].request_timeout_seconds == 60.0
+    assert config.roles["head"].request_timeout_seconds is None
 
     assert config.fetch.page_timeout_ms == 20000
     assert config.fetch.max_concurrency == 8
@@ -234,6 +237,24 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
     assert setting in str(excinfo.value)
 
 
+def test_role_request_timeout_must_be_positive(tmp_path, monkeypatch):
+    """D6: `request_timeout_seconds` bounds one request — 0 or negative would make every call
+    to that role fail instantly."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    # `model = "glm-5.2"` is the head role's line and appears once, so this appends the bad key
+    # to `[roles.head]` alone.
+    toml_content = VALID_TOML.replace(
+        'model = "glm-5.2"', 'model = "glm-5.2"\nrequest_timeout_seconds = 0'
+    )
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "request_timeout_seconds" in str(excinfo.value)
+
+
 def test_memory_threshold_above_100_is_rejected(tmp_path, monkeypatch):
     """`memory_threshold_percent` is a percentage: above 100 the dispatcher would never pause."""
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
@@ -282,7 +303,8 @@ def test_literal_api_key_in_the_file_is_rejected(tmp_path, monkeypatch):
             "roles",
             [
                 '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\n\n',
-                '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n',
+                '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n'
+                "request_timeout_seconds = 60.0\n\n",
             ],
         ),
     ],
@@ -371,7 +393,9 @@ def test_missing_researcher_role_still_loads(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
     toml_content = VALID_TOML.replace(
-        '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n', ""
+        '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n'
+        "request_timeout_seconds = 60.0\n\n",
+        "",
     )
     assert toml_content != VALID_TOML, "fixture drifted from VALID_TOML — update the block"
     path = _write(tmp_path, toml_content)

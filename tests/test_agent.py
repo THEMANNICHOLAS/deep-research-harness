@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import openai
 import pytest
 from deepagents.backends.protocol import SandboxBackendProtocol
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -23,6 +24,7 @@ import harness.__main__ as main_module
 from harness.activity import ActivitySink, active_reader
 from harness.agent import (
     ResearchDeadline,
+    _retry_on_non_search_abort,
     _summarize_tool_args,
     _summarize_tool_result,
     build_agent,
@@ -518,12 +520,37 @@ async def test_reader_model_profile_excludes_execute(make_config, patch_models_b
 
 
 class _RaisingChatModel(ScriptedChatModel):
-    """Raises on every call, recording each invocation — drives the task-tool retry path."""
+    """Raises on every call, recording each invocation — drives the task-tool retry path.
+
+    `_failure` is what it raises: the default `RuntimeError` is the generic subagent crash, and
+    the D6 tests swap in a deterministic `openai.BadRequestError` or the builtin `TimeoutError`
+    to prove those are converted but NOT replayed.
+    """
+
+    _failure: Exception = PrivateAttr(default_factory=lambda: RuntimeError("boom"))
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         self._received_messages.append(list(messages))
         self._call_count += 1
-        raise RuntimeError("boom")
+        raise self._failure
+
+
+def _bad_request_error(message: str = "context length exceeded") -> openai.BadRequestError:
+    """An `openai.BadRequestError` built the way the SDK builds one — a 4xx error carries the
+    httpx response (and its request) it was raised from."""
+    request = httpx.Request("POST", "https://example.test/v1")
+    return openai.BadRequestError(message, response=httpx.Response(400, request=request), body=None)
+
+
+def _raising_researcher(failure: Exception) -> _RaisingChatModel:
+    """A researcher-role model that raises `failure` on every call."""
+    from pydantic import SecretStr
+
+    model = _RaisingChatModel(
+        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
+    )
+    model._failure = failure
+    return model
 
 
 def _task_call(
@@ -1273,14 +1300,10 @@ async def test_a_researcher_crash_becomes_an_error_task_message_after_one_retry(
     researcher crash — the lead receives a `RESEARCHER FAILED (...)` error ToolMessage after
     exactly one retry, and the run continues on the lead's next scripted turn.
     """
-    from pydantic import SecretStr
-
     head_model = scripted_model(
         [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
     )
-    researcher_model = _RaisingChatModel(
-        model="researcher-test-model", base_url="https://example.test/v1", api_key=SecretStr("x")
-    )
+    researcher_model = _raising_researcher(RuntimeError("boom"))
     reader_model = scripted_model([AIMessage(content="unused")])
     patch_models_by_role(
         {"head": head_model, "researcher": researcher_model, "reader": reader_model}
@@ -1300,6 +1323,56 @@ async def test_a_researcher_crash_becomes_an_error_task_message_after_one_retry(
     assert str(task_messages[0].content).startswith("RESEARCHER FAILED")
     assert researcher_model._call_count == 2  # initial attempt + exactly one retry
     # The run continued past the failed dispatch onto the lead's next scripted turn.
+    assert result["messages"][-1].content == "done despite the failed angle"
+
+
+def test_retry_predicate_replays_only_transient_failures():
+    """D6/R6: replaying a whole researcher is only worth paying for when the failure might come
+    out differently. `openai.BadRequestError` (context length, malformed request) is
+    deterministic and the builtin `TimeoutError` is Phase 1's own dispatch cancellation, so
+    neither is replayed. `openai.APITimeoutError` is deliberately still retryable — it
+    subclasses `APIConnectionError` and a re-request may well succeed.
+    """
+    request = httpx.Request("POST", "https://example.test/v1")
+
+    assert _retry_on_non_search_abort(_bad_request_error()) is False
+    assert _retry_on_non_search_abort(TimeoutError()) is False
+    assert _retry_on_non_search_abort(openai.APIConnectionError(request=request)) is True
+    assert _retry_on_non_search_abort(openai.APITimeoutError(request=request)) is True
+    assert _retry_on_non_search_abort(RuntimeError("boom")) is True
+
+
+async def test_a_researcher_bad_request_is_not_replayed(
+    make_config, patch_models_by_role, scripted_model
+):
+    """D6: the non-retryable tuple is a SUPERSET of the pass-through one, not the same tuple —
+    a deterministic `BadRequestError` is still converted to a soft `RESEARCHER FAILED (...)`
+    ToolMessage and the run continues, it is just never replayed through a second whole
+    researcher that would fail identically.
+    """
+    head_model = scripted_model(
+        [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
+    )
+    researcher_model = _raising_researcher(_bad_request_error())
+    reader_model = scripted_model([AIMessage(content="unused")])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    graph = build_agent(make_config(), SourceRegistry())
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    task_messages = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0].status == "error"
+    assert str(task_messages[0].content).startswith("RESEARCHER FAILED")
+    assert "BadRequestError" in str(task_messages[0].content)
+    assert researcher_model._call_count == 1  # converted, but NOT retried
     assert result["messages"][-1].content == "done despite the failed angle"
 
 
@@ -1496,6 +1569,40 @@ async def test_an_unarmed_deadline_never_cancels_a_researcher_dispatch(
     assert "time budget" not in str(settled.content).lower()
     assert researcher_model._call_count == 1
     assert [i for i in run_log.incidents() if i.kind == "research_deadline_reached"] == []
+
+
+async def test_a_model_timeout_inside_an_unarmed_dispatch_is_not_reported_as_deadline_reached(
+    make_config, patch_models_by_role, scripted_model
+):
+    """Phase 1 Discovery: `_ResearcherDispatchMiddleware`'s `except TimeoutError` is scoped to
+    the `asyncio.wait_for` branch, so on an UNARMED run a `TimeoutError` raised by the model
+    call itself is an ordinary subagent failure — `subagent_failed`, never
+    `research_deadline_reached` on a run that has no deadline to reach. And per D6 it is not
+    replayed.
+    """
+    head_model = scripted_model(
+        [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
+    )
+    researcher_model = _raising_researcher(TimeoutError())
+    reader_model = scripted_model([AIMessage(content="unused")])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    run_log = RunLog()
+    graph = build_agent(make_config(), SourceRegistry(), run_log, deadline=ResearchDeadline())
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    settled = _lead_task_messages(result)["call_task"]
+    assert settled.status == "error"
+    assert str(settled.content).startswith("RESEARCHER FAILED")
+    assert researcher_model._call_count == 1  # TimeoutError is non-retryable (D6)
+    kinds = [i.kind for i in run_log.incidents()]
+    assert "subagent_failed" in kinds
+    assert "research_deadline_reached" not in kinds
 
 
 async def test_a_cancelled_researcher_dispatch_is_refused_once_and_never_replayed(

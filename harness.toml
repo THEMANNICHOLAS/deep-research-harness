@@ -41,10 +41,15 @@ choices = [
 [roles.researcher]
 provider = "opencode"
 model = "deepseek-v4-pro"
+# D6: bounds one slow researcher/reader call; head and verifier keep the [agent] default (their
+# long calls are legitimate). Risk #5: raise the reader's if live runs show APITimeoutError on
+# digests.
+request_timeout_seconds = 60.0
 
 [roles.reader]
 provider = "opencode"
 model = "deepseek-v4-flash"
+request_timeout_seconds = 60.0  # see roles.researcher above (D6)
 
 # D4: verification runs on a model that did not write the report.
 [roles.verifier]

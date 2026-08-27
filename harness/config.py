@@ -75,6 +75,10 @@ class RoleConfig(_StrictModel):
     # Only `head` sets this today (the `/model` picker) — every other role omits it and
     # stays valid, since `None` is a legitimate "no picker" state, not an oversight.
     choices: list[str] | None = None
+    # D6 (PLAN-research-throughput): per-role request timeout; None falls back to
+    # `agent.request_timeout_seconds`. Set low for the researcher/reader so one slow call cannot
+    # eat the run's budget, unset for the head/verifier whose long calls are legitimate.
+    request_timeout_seconds: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _validate_choices(self) -> "RoleConfig":

@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import TYPE_CHECKING, Any, Literal
 
+import openai
 from deepagents import (
     FilesystemPermission,
     GeneralPurposeSubagentProfile,
@@ -129,15 +130,24 @@ def _task_failure_handler(
 # C's mid-run abort; `DisplayError` is Phase 6's, and see its own docstring for why.
 _PASS_THROUGH_TASK_FAILURES = (SearchUnavailableError, DisplayError)
 
+# Non-retryable is a SUPERSET of pass-through, not the same tuple: these are still converted
+# to a soft "... FAILED" ToolMessage by `_task_failure_handler` (the run continues), they are
+# just not worth a whole subagent replay. `openai.BadRequestError` is deterministic (context
+# length, malformed request) and would fail identically; the builtin `TimeoutError` is Phase
+# 1's `asyncio.wait_for` cancellation at the synthesis reserve (D6, R6). `openai.APITimeoutError`
+# is deliberately absent -- it subclasses `APIConnectionError` and IS transient.
+_NON_RETRYABLE_TASK_FAILURES = (*_PASS_THROUGH_TASK_FAILURES, openai.BadRequestError, TimeoutError)
+
 
 def _retry_on_non_search_abort(exc: Exception) -> bool:
-    """Exclude the pass-through failures from the task-tool retry (Drift C; Phase 6).
+    """Exclude the pass-through failures from the task-tool retry (Drift C; Phase 6), and with
+    them the deterministic and timeout failures a replay cannot improve on (D6).
 
     Retrying would waste a whole researcher (or reader) re-run before the abort ever reaches
     `_task_failure_handler`'s propagate branch. `ToolRetryMiddleware.retry_on` accepts this
     predicate form alongside its default exception-tuple shape.
     """
-    return not isinstance(exc, _PASS_THROUGH_TASK_FAILURES)
+    return not isinstance(exc, _NON_RETRYABLE_TASK_FAILURES)
 
 
 def _task_dispatch_guard(run_log: RunLog) -> list[AgentMiddleware[Any, Any, Any]]:
@@ -152,9 +162,10 @@ def _task_dispatch_guard(run_log: RunLog) -> list[AgentMiddleware[Any, Any, Any]
     retrying `task` re-runs the whole subagent, so the budget already doubles at one retry.
     `initial_delay=0.0, jitter=False`: this retry exists for subagent crashes, not transient
     network waits, so it should be deterministic and test-fast rather than backed off.
-    `retry_on` excludes `SearchUnavailableError` (Drift C) so a mid-run search abort is not
-    wastefully retried through a whole subagent re-run before it reaches
-    `_task_failure_handler`'s propagate branch.
+    `retry_on` excludes `_NON_RETRYABLE_TASK_FAILURES` -- `SearchUnavailableError` (Drift C) so a
+    mid-run search abort is not wastefully retried through a whole subagent re-run before it
+    reaches `_task_failure_handler`'s propagate branch, plus the deterministic and timeout
+    failures a replay cannot improve on (D6).
     """
     return [
         ToolErrorMiddleware(on_error=_task_failure_handler(run_log), tools=["task"]),
@@ -401,14 +412,18 @@ class _ResearcherDispatchMiddleware(AgentMiddleware[Any, Any, Any]):
         try:
             if remaining is None:
                 return await handler(request)
-            return await asyncio.wait_for(handler(request), remaining)
-        except TimeoutError:
-            return self._deadline_refusal(
-                call,
-                "a researcher dispatch was cancelled at the synthesis reserve; that angle's "
-                "findings never reached the lead, though any sources it had already "
-                "registered are still cited",
-            )
+            # The `except` is scoped to the `wait_for` branch alone, so a `TimeoutError` raised
+            # by the model call itself on an UNARMED run reaches `_task_dispatch_guard` as an
+            # ordinary failure rather than being mislabelled a deadline hit.
+            try:
+                return await asyncio.wait_for(handler(request), remaining)
+            except TimeoutError:
+                return self._deadline_refusal(
+                    call,
+                    "a researcher dispatch was cancelled at the synthesis reserve; that angle's "
+                    "findings never reached the lead, though any sources it had already "
+                    "registered are still cited",
+                )
         finally:
             self._in_flight -= 1
 
