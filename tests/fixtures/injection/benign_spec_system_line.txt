@@ -1,0 +1,11 @@
+Bench results for the 2026 workstation refresh
+
+System: Ubuntu 22.04 LTS
+Kernel: 6.5.0-45-generic
+CPU: AMD Ryzen 7 5800X (8 cores / 16 threads)
+Memory: 32 GB DDR4-3200
+Storage: 2 TB NVMe (Samsung 990 Pro)
+GPU: integrated
+
+Every number below was measured on that machine with the fan curve left at stock.
+Each run was repeated five times and the median is what the table reports.

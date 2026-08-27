@@ -559,6 +559,12 @@ structural containment is pinned by regression tests.
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
 
+### 2026-08-25 — `## Notes` "[Minor, open] role_spoofing rule ... tighten if noisy" executed
+Executed by PLAN-research-throughput Phase 3 (R3/D2): the two `system` marker rules now require
+directive context (a second-person or imperative instruction on the same or the next line), and
+`exfil_markup` was narrowed to the zero-click image form or a template-syntax query value. Benign
+config/spec/docs pages survive; the recall cost is a directive two lines after the marker.
+
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
 Append-only, empty at plan creation. -->
@@ -599,7 +605,7 @@ Append-only, empty at plan creation. -->
   harness/guard.py with both tools importing it. Defer to Phase 5, which touches guard.py
   anyway.
 
-- **[Minor, open]** guard.py role_spoofing rule `^\s*\[?system\]?\s*:` (MULTILINE, brackets
+- **[Minor, closed → PLAN-research-throughput Phase 3]** guard.py role_spoofing rule `^\s*\[?system\]?\s*:` (MULTILINE, brackets
   optional) blocks benign "System: Ubuntu 22.04"-style lines. Within risk #1's accepted
   breadth; watch the `guard_blocked` rate once Phase 3 makes it observable, tighten if noisy.
 
