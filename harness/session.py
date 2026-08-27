@@ -15,9 +15,10 @@ narration turn can never be mistaken for a final answer.
 
 Two ceilings still bound the run (R7), moved here unchanged in substance: a round cap counted
 in MODEL TURNS by `_note_model_turns` (`recursion_limit` survives only as a runaway backstop),
-and a wall clock armed at the first `dispatch_researcher` call. Crossing either, or the
-synthesis reserve measured back from the clock, buys one bounded pass in which the lead is told
-to call `submit_report` from what it already has.
+and a wall clock that spans the RESEARCH alone (R6) — armed at the first `dispatch_researcher`
+the harness accepts, disarmed the moment `submit_report` is, so no time spent after the report
+can cut the run short. Crossing either, or the synthesis reserve measured back from the clock,
+buys one bounded pass in which the lead is told to call `submit_report` from what it has.
 """
 
 import asyncio
@@ -73,11 +74,6 @@ if TYPE_CHECKING:
     from harness.browser import BrowserSession
 
 _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-
-# How many researchers may run at once (D1). A module constant in Phase 1; Phase 2 moves it to
-# `[agent] max_researchers` in config. The refusal is the harness's, not the prompt's — a lead
-# that ignores the advice still cannot exceed it.
-_MAX_RESEARCHERS = 4
 
 # What the lead is told when either bound (the round cap or the synthesis margin) lands
 # mid-research (R7): one bounded pass to turn what was already reported into a final answer,
@@ -325,10 +321,6 @@ class Session:
 
         self.events: asyncio.Queue[SessionEvent] = asyncio.Queue()
         self.running: dict[str, asyncio.Task[None]] = {}
-        self.done: list[str] = []
-        # id -> label, kept for the whole run: a cancelled researcher is disclosed by NAME
-        # (3F F2), and by then its task is gone from `running`.
-        self._labels: dict[str, str] = {}
         self.answer: str | None = None
         self.agent: Runnable
         # One stable thread for the whole session: the checkpointer requires an id, and every
@@ -347,7 +339,10 @@ class Session:
         self.cut_short_detail: str | None = None
 
         self._clock: asyncio.Timeout | None = None
-        self._clock_armed = False
+        # EVER armed, not currently armed: this guards `_arm_clock`'s early return, so a clock
+        # disarmed by `submit_report` can never be re-armed by a later dispatch. What is
+        # ticking right now is the `clock_armed` property, read off the timeout itself.
+        self._clock_ever_armed = False
         self._research_started_at: float | None = None
 
         # R7's round accounting, run-level (clarification resumes do not refresh it).
@@ -378,7 +373,9 @@ class Session:
         """
         if self.answer is not None:
             return "refused: research is closed — the report is written"
-        if len(self.running) >= _MAX_RESEARCHERS:
+        # The refusal is the harness's, not the prompt's — a lead that ignores the advice
+        # still cannot exceed `[agent] max_researchers`.
+        if len(self.running) >= self._config.agent.max_researchers:
             return f"refused: {len(self.running)} researchers already running — wait for a return"
 
         self._next_id += 1
@@ -386,7 +383,9 @@ class Session:
         brief = (
             f"Objective: {objective}\n\nOutput format: {output_format}\n\nBoundaries: {boundaries}"
         )
-        self._labels[researcher_id] = label
+        # Before the task exists, so the roster row is already open when the researcher's very
+        # first tool call pushes an activity change through the same sink.
+        self._sink.start_researcher(researcher_id, label)
         self.running[researcher_id] = asyncio.create_task(
             self._run_researcher(researcher_id, label, brief)
         )
@@ -402,22 +401,39 @@ class Session:
         synthesis pass: it is bounded and is the run's last chance to produce a report, so a
         submit there is accepted and the cancellations are disclosed instead.
         """
+        if self.answer is not None:
+            return "refused: research is closed — the report is written"
         if self.running and not self._forced_synthesis:
             return (
                 f"refused: {len(self.running)} researchers still running — wait for their returns"
             )
         self.answer = answer
+        # R6: the clock spans first question → report written. Research is over at this line, so
+        # everything the session spends after it — verification, the report itself, and the
+        # post-report chat Phase 3 adds — is unclocked and can no longer cut the run short.
+        if self._clock is not None:
+            self._clock.reschedule(None)
         return "report accepted — research is closed"
 
     # --- researchers ------------------------------------------------------------------------
 
+    @property
+    def clock_armed(self) -> bool:
+        """Whether the wall clock is ticking right now (R6).
+
+        Read off the timeout rather than kept as a second flag, so it cannot disagree with the
+        object that would actually fire: armed at the first ACCEPTED dispatch, disarmed at
+        `submit_report`, and False both before either and for a run that never dispatched.
+        """
+        return self._clock is not None and self._clock.when() is not None
+
     def _arm_clock(self) -> None:
-        """Arm the wall clock at the first dispatch (R7; re-keyed off `task` by D1)."""
-        if self._clock_armed or self._clock is None:
+        """Arm the wall clock at the first accepted dispatch (R6; re-keyed off `task` by D1)."""
+        if self._clock_ever_armed or self._clock is None:
             return
         self._research_started_at = asyncio.get_running_loop().time()
         self._clock.reschedule(self._research_started_at + self._config.agent.wall_clock_seconds)
-        self._clock_armed = True
+        self._clock_ever_armed = True
 
     async def _invoke_researcher(self, brief: str) -> str:
         state = await self._graph.ainvoke(
@@ -444,33 +460,58 @@ class Session:
         """
         started = time.monotonic()
         findings = ""
+        failed = False
         try:
             try:
                 findings = await self._invoke_researcher(brief)
             except Exception as exc:
                 if _retry_on_non_search_abort(exc):
-                    findings = await self._retry_researcher(brief)
+                    findings, failed = await self._retry_researcher(brief)
                 else:
                     self._fatal = exc
+                    failed = True
         finally:
             self.running.pop(researcher_id, None)
 
-        self.done.append(researcher_id)
+        # `failed` is carried out of the frames that know, rather than sniffed from `findings`
+        # or `self._fatal` afterwards: the findings text is the LEAD's contract, not a status
+        # field, and a pass-through failure raised by ANOTHER researcher would set `_fatal` and
+        # mislabel this one.
+        self._finish_roster_row(researcher_id, failed=failed)
         self.events.put_nowait(
             ResearcherReturn(researcher_id, label, findings, time.monotonic() - started)
         )
 
-    async def _retry_researcher(self, brief: str) -> str:
-        """The one retry a crashed researcher gets; a second crash becomes its findings."""
+    def _finish_roster_row(self, researcher_id: str, *, failed: bool) -> None:
+        """Close this researcher's roster row without ever letting the display abort the run.
+
+        The sink pushes straight to the renderer, so this can raise `DisplayError` — and on
+        both paths that close a row, an escape would be worse than the bug it reports. Here it
+        would strand the `ResearcherReturn` below and hang the loop on a queue nothing will
+        ever fill; in `_cancel_running` it would escape `run()`'s own `finally`, past every
+        handler, as a traceback. Recorded as `_fatal` instead, which the loop raises as the
+        failed run a display bug deserves.
+        """
         try:
-            return await self._invoke_researcher(brief)
+            self._sink.finish_researcher(researcher_id, failed=failed)
+        except Exception as exc:  # noqa: BLE001 — nothing may escape; see the docstring
+            self._fatal = exc
+
+    async def _retry_researcher(self, brief: str) -> tuple[str, bool]:
+        """The one retry a crashed researcher gets; a second crash becomes its findings.
+
+        Returns the findings AND whether the researcher failed — the roster's `done`/`failed`
+        split (R8), which only this frame can tell apart.
+        """
+        try:
+            return await self._invoke_researcher(brief), False
         except Exception as exc:
             # A pass-through failure on the RETRY is still the run's abort, not the
             # researcher's fault — same split as the first attempt (3F F3).
             if not _retry_on_non_search_abort(exc):
                 self._fatal = exc
-                return ""
-            return subagent_failure_text(self._run_log, "researcher", exc)
+                return "", True
+            return subagent_failure_text(self._run_log, "researcher", exc), True
 
     async def _cancel_running(self) -> None:
         """Cancel every live researcher and wait for it, before the run is torn down (Risk #2).
@@ -482,12 +523,15 @@ class Session:
         it in `## Gaps and disclosures` by name rather than leaving the reader to notice a
         planned angle that no paragraph cites.
         """
+        labels = {state.id: state.label for state in self._sink.researchers()}
         cancelled = list(self.running.items())
         for researcher_id, task in cancelled:
             task.cancel()
+            # It never returned, so the roster shows it as `failed`, not `done`.
+            self._finish_roster_row(researcher_id, failed=True)
             self._run_log.record(
                 "researcher_cancelled",
-                f"{researcher_id} ({self._labels.get(researcher_id, 'no label')}) was cancelled "
+                f"{researcher_id} ({labels.get(researcher_id, 'no label')}) was cancelled "
                 "before it returned — its findings never reached the lead",
             )
         if cancelled:
@@ -637,7 +681,9 @@ class Session:
         # research time crosses the margin threshold. The threshold decision itself lives in
         # `_margin_reached` (including the `== 0` disable), which is where its boundaries are
         # tested — see that docstring for why it is not inline.
-        if not self._margin_hit and self._research_started_at is not None:
+        # `answer is None`: once submit_report is accepted research is closed (R6) — a slow closing
+        # reply crossing the margin must not stamp `synthesis_margin` onto a complete report.
+        if not self._margin_hit and self.answer is None and self._research_started_at is not None:
             elapsed = asyncio.get_running_loop().time() - self._research_started_at
             if _margin_reached(
                 elapsed,
@@ -803,8 +849,11 @@ class Session:
                 parts.append(f"[{event.id} — {event.label}] returned:\n{event.findings}")
             else:
                 parts.append(event.text)
-        done = ", ".join(self.done) or "none"
-        running = ", ".join(self.running) or "none"
+        roster = self._sink.researchers()
+        # Finished is finished: a researcher that crashed is off the roster and nothing more is
+        # coming from it, so the lead reads it under `done` rather than waiting on it forever.
+        done = ", ".join(state.id for state in roster if state.status != "running") or "none"
+        running = ", ".join(state.id for state in roster if state.status == "running") or "none"
         return "\n\n".join(parts) + f"\nRoster: done {done} · running {running}"
 
     def _drain_events(self) -> list[SessionEvent]:

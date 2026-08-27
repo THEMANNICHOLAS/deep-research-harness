@@ -238,7 +238,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 
 ## Progress
 - [x] Phase 1: Session tracer — dispatch tool, return injection, submit_report
-- [ ] Phase 2: Budgets, roster data and run exits inside the session
+- [x] Phase 2: Budgets, roster data and run exits inside the session
 - [ ] Phase 3: Composer — queued user messages and post-report chat
 - [ ] Phase 4: ask_user with choices
 - [ ] Phase 5: Chat TUI — transcript, task dock, researcher roster
@@ -349,12 +349,12 @@ through `dispatch_researcher`, receives each return as its own message, and ends
 - Changing `CutShortReason` values or report wording.
 
 **Tests (write first, confirm red):**
-- [ ] Clock arms on the first successful dispatch (not on a refusal) and stops at
+- [x] Clock arms on the first successful dispatch (not on a refusal) and stops at
   `submit_report`; time passing after the report never cuts short.
-- [ ] Answer-less wall-clock expiry and Ctrl-C → `run()` returns None, no report file, exit 1;
+- [x] Answer-less wall-clock expiry and Ctrl-C → `run()` returns None, no report file, exit 1;
   wall-clock expiry after `submit_report` → report kept.
-- [ ] Synthesis margin injects the submit_report instruction once; round cap still cuts short.
-- [ ] Roster records transition running → done/failed and the `Roster:` line lists them.
+- [x] Synthesis margin injects the submit_report instruction once; round cap still cuts short.
+- [x] Roster records transition running → done/failed and the `Roster:` line lists them.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -363,7 +363,7 @@ through `dispatch_researcher`, receives each return as its own message, and ends
 4. Run the tests; confirm they PASS (green).
 
 **Acceptance criteria:**
-- [ ] `test_main_welcome.py` and all prior `__main__` tests still pass or are moved, not deleted.
+- [x] `test_main_welcome.py` and all prior `__main__` tests still pass or are moved, not deleted.
 
 ### Phase 3: Composer — queued user messages and post-report chat
 **Risk:** flagged (!#3)
@@ -623,6 +623,31 @@ Append-only, empty at plan creation. -->
   head model's behaviour on the new `dispatch_researcher`/`submit_report` prompt. → deferred to
   the developer's first live `uv run python -m harness "<question>"`; record the wording that
   produced dispatch → per-return narration → `submit_report` here.
+- 2026-08-27 — Phase 2: `cut_short == "wall_clock"` WITH an answer is now unreachable in
+  production (the clock is disarmed the moment `submit_report` is accepted), but `report.py`
+  still renders that combination and `test_report.py` covers it directly. → deferred: drop the
+  dead rendering branch when `CutShortReason` is next touched (Phase 2 forbade changing it).
+- 2026-08-27 — Phase 2: `Session._finish_roster_row` (not in the plan) wraps the sink write that
+  sits between a researcher's completion and its `events.put_nowait`; a renderer crash there
+  becomes `_fatal` instead of stranding the return and hanging the loop. → acted (kept; it is
+  the same fail-as-a-display-bug rule `on_activity_change` already applies).
+- 2026-08-27 — Phase 2: the roster hook lives in `Session` (dispatch/finish/cancel call the sink
+  directly), not as a lead-tier middleware in `agent.py` as the plan's file list suggested —
+  the session owns the researcher task lifecycle and `_ToolActivityMiddleware`'s docstring
+  keeps the lead tier uninstrumented. → acted.
+- 2026-08-27 — Phase 2 3F Minors (deferred, no question asked per developer instruction):
+  (a) `Session._finish_roster_row`'s docstring claims `_fatal` is raised by the loop for both
+  call sites, but the `_cancel_running` site runs in `run()`'s `finally` after the loop exited,
+  so a `DisplayError` there is silently dropped while `_finish` may still write the report →
+  narrow the docstring or check `_fatal` before the report gate; (b)
+  `tests/test_config.py::test_shipped_harness_toml_declares_the_researcher_cap` cannot fail if the
+  key is deleted from `harness.toml` (default is also 4) → assert on the parsed TOML text; (c)
+  the Phase 2 test bullet "wall-clock expiry after `submit_report` → report kept" is
+  unreachable by construction once the clock is disarmed at submit — the two `test_agent.py`
+  tests were re-premised (`test_main_keeps_the_report_when_time_passes_after_submit_report`;
+  the margin-zero test now asserts exit 1 / no report). This is Contracts-vs-Tests drift that
+  needs a `## Reconciliations` entry re-approved by the developer → PENDING developer
+  re-approval on return (not written unilaterally).
 
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
@@ -653,3 +678,25 @@ never add a section below it. -->
 - Drift: none.
 - Watch-next: the live TTY acceptance criterion (two "started" lines → per-return narration →
   report path) and Risk #5's prompt tuning are unrun — needs real models; see `## Discoveries`.
+
+### 2026-08-27 — Phase 2: Budgets, roster data and run exits inside the session
+- Done: `[agent] max_researchers` (default 4, `gt=0`) in config + harness.toml, read by
+  `Session.dispatch`; `ResearcherState` + `ActivitySink.start_researcher/finish_researcher/
+  researchers()` (list, start order), fed by `Session` on dispatch/finish/cancel — the
+  `Roster:` line is built from the sink; `submit_report` disarms the hard clock
+  (`_clock.reschedule(None)`), is refused once an answer exists, and the synthesis-margin check
+  is gated on `answer is None` (3F Major fix); `Session.clock_armed` property; session-level
+  Ctrl-C test (cancels the `run()` task — a `KeyboardInterrupt` raised inside a langgraph node
+  kills pytest itself). 848 tests, 96% coverage, gates clean.
+- Learned: `cut_short == "wall_clock"` with an answer is unreachable now (report.py branch is
+  dead); `_finish_roster_row` guards the sink write between a researcher's completion and its
+  `events.put_nowait`. `_cancel_running` is confirmed safe for Risk #2: cancels, closes roster
+  rows, one `researcher_cancelled` incident each, `gather(return_exceptions=True)`, and
+  `BrowserSession.arun_many` catches `Exception` not `BaseException`, so a mid-crawl
+  `CancelledError` does not consume the one browser relaunch.
+- Drift: pending — see the 2026-08-27 3F Minors entry in `## Discoveries` (c): the plan's Phase
+  2 test bullet contradicts the disarm-at-submit contract; a `## Reconciliations` entry awaits
+  developer re-approval.
+- Watch-next: Phase 3 replaces the headless idle backstop (`_SUBMIT_NOW` nudge then fail) with
+  wait-for-user; the post-report loop must keep `dispatch`/`submit` refusing. Resolve the
+  pending Reconciliation first.

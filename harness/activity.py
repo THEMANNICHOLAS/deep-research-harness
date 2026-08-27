@@ -1,7 +1,9 @@
 """Per-run tool-activity sink (Phase 6, D-A).
 
 The producer is `harness/agent.py`'s `_ToolActivityMiddleware`, wrapping every researcher- and
-reader-tier tool call; the consumer is `harness/__main__.py`, which builds `ToolCall`/
+reader-tier tool call -- plus `harness/session.py` for the researcher roster, which no
+middleware can see because the lead tier is deliberately uninstrumented and the session owns
+dispatch itself; the consumer is `harness/session.py`, which builds `ToolCall`/
 `ReadersUpdated` events (`harness/display.py`) from `records()`/`readers()`. Lives in its own
 module, mirroring `harness/runlog.py`, for the same reason that one does: neither producer nor
 consumer needs to import the other, and — since `harness/agent.py`'s docstring says it is "the
@@ -21,6 +23,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Literal
 
 _ACTIVE_READER: ContextVar[str | None] = ContextVar("active_reader", default=None)
 
@@ -43,6 +46,24 @@ class ReaderState:
     brief: str  # one-line summary of the task call's `description` arg (`brief_summary`)
     status_text: str
     done: bool
+
+
+@dataclass(frozen=True)
+class ResearcherState:
+    """One of the lead's researchers, as the roster (R8) and the `Roster:` line see it.
+
+    The researcher tier's counterpart to `ReaderState`, but stamped with raw times rather than
+    a rendered `status_text`: a reader row's elapsed time is frozen at each transition, while a
+    running researcher's is re-rendered on every frame from `started_at`, and the report's
+    roster line needs the status alone. `id` and `label` are the session's, not the sink's --
+    it already numbers `researcher/N` when it dispatches.
+    """
+
+    id: str
+    label: str
+    started_at: float
+    finished_at: float | None  # None => still running
+    status: Literal["running", "done", "failed"]
 
 
 class DisplayError(Exception):
@@ -116,6 +137,8 @@ class ActivitySink:
         self._on_change = on_change
         self._records: list[ToolCallRecord] = []
         self._readers: dict[str, ReaderState] = {}
+        # Insertion-ordered, so `researchers()` is in dispatch order for free.
+        self._researchers: dict[str, ResearcherState] = {}
         self._started: dict[str, float] = {}
         self._seen_call_ids: set[str] = set()
         # The most recent start's (tool, arg_summary, retry) for each call id, so `finish_call`
@@ -228,6 +251,40 @@ class ActivitySink:
         )
         self._notify()
 
+    def start_researcher(self, researcher_id: str, label: str) -> None:
+        """Open a roster row for a researcher the session has just dispatched (R8).
+
+        Takes the id rather than minting one, unlike `start_reader`: `Session.dispatch` already
+        numbers `researcher/N` because it names the researcher in the tool's own reply, and a
+        second counter here would be a second answer to the same question.
+        """
+        self._researchers[researcher_id] = ResearcherState(
+            id=researcher_id,
+            label=label,
+            started_at=self._clock(),
+            finished_at=None,
+            status="running",
+        )
+        self._notify()
+
+    def finish_researcher(self, researcher_id: str, *, failed: bool) -> None:
+        """Close a roster row: `done` if it reported, `failed` if it crashed or was cancelled.
+
+        Silent on an unknown id, like `finish_reader`: the session finishes whatever is on its
+        own roster when a run is torn down, which can include a task the sink never saw start.
+        """
+        current = self._researchers.get(researcher_id)
+        if current is None:
+            return
+        self._researchers[researcher_id] = ResearcherState(
+            id=current.id,
+            label=current.label,
+            started_at=current.started_at,
+            finished_at=self._clock(),
+            status="failed" if failed else "done",
+        )
+        self._notify()
+
     def _notify(self) -> None:
         if self._on_change is not None:
             self._on_change()
@@ -239,6 +296,10 @@ class ActivitySink:
     def readers(self) -> tuple[ReaderState, ...]:
         """Every reader dispatched so far, in dispatch order -- a copy, immutable snapshot."""
         return tuple(self._readers.values())
+
+    def researchers(self) -> list[ResearcherState]:
+        """Every researcher dispatched so far, in dispatch order -- a copy, immutable snapshot."""
+        return list(self._researchers.values())
 
     def live_reader_count(self) -> int:
         return sum(1 for reader in self._readers.values() if not reader.done)

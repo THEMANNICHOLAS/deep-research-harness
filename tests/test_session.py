@@ -7,6 +7,7 @@ as its own `HumanMessage` turn, and ends research with `submit_report`.
 """
 
 import asyncio
+import time
 from datetime import datetime
 from typing import Any
 
@@ -15,9 +16,10 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import PrivateAttr, SecretStr
 
+from harness.activity import ActivitySink
 from harness.display import PlainRenderer, StageTracker
 from harness.runlog import RunLog
-from harness.session import _MAX_RESEARCHERS, ResearcherReturn, Session
+from harness.session import ResearcherReturn, Session, UserMessage
 from harness.sources import SourceRegistry
 from harness.tools.search import SearchUnavailableError
 from tests.conftest import (
@@ -26,6 +28,7 @@ from tests.conftest import (
     _dispatch_call,
     _FakeMarkdown,
     _FakeResult,
+    _lead_model,
     _submit_call,
     approve_all,
 )
@@ -91,6 +94,11 @@ class _KeyedResearcherModel(ScriptedChatModel):
                 if gate is not None:
                     await gate.wait()
                 self._call_count += 1
+                # An exception as the "reply" scripts a researcher that CRASHES, which the
+                # roster must show as `failed` rather than `done` -- the same keying, so a
+                # crashing and a reporting researcher can run side by side deterministically.
+                if isinstance(reply, Exception):
+                    raise reply
                 return ChatResult(
                     generations=[ChatGeneration(message=AIMessage(content=reply, id=f"res-{key}"))]
                 )
@@ -106,6 +114,9 @@ def make_session(make_config, make_agent_settings):
         # Overridable like `registry`/`config`: a test asserting on incidents from a FAILED run
         # has no `RunOutcome` to read them off, so it passes in the log it will inspect.
         run_log = config_overrides.pop("run_log", None) or RunLog()
+        # Overridable for the same reason as `run_log`: the researcher roster (R8) lives in the
+        # sink, so a test asserting on it needs the very sink the session was handed.
+        sink = config_overrides.pop("sink", None)
         config = config_overrides.pop("config", None) or make_config(
             agent=make_agent_settings(**config_overrides)
         )
@@ -121,7 +132,7 @@ def make_session(make_config, make_agent_settings):
             renderer,
             StageTracker(renderer),
             question,
-            sink=None,
+            sink=sink,
             # `None`, not an unstarted `BrowserSession`: `main` owns that lifecycle and the
             # session only forwards it, so a test that fetches drives `install_crawler`'s
             # browser-free seam exactly as the pre-session fetch tests did.
@@ -238,7 +249,8 @@ async def test_each_return_is_its_own_lead_turn_carrying_the_roster(make_session
     }
     three_models(head, researcher)
 
-    session = make_session()
+    sink = ActivitySink()
+    session = make_session(sink=sink)
     run = asyncio.create_task(session.run())
     try:
         await _wait_for(lambda: len(session.running) == 2, "both researchers dispatched")
@@ -247,7 +259,10 @@ async def test_each_return_is_its_own_lead_turn_carrying_the_roster(make_session
         await _wait_for(lambda: len(head._entered) == 3, "the lead's return turn to start")
         # The lead is now held inside its third model call; release researcher 2 into the gap.
         gate_b.set()
-        await _wait_for(lambda: session.done == ["researcher/1", "researcher/2"], "both returns")
+        await _wait_for(
+            lambda: [state.status for state in sink.researchers()] == ["done", "done"],
+            "both returns",
+        )
         head_gate.set()
 
         await _wait_for(lambda: head._call_count >= 4, "the second return's own lead turn")
@@ -327,18 +342,19 @@ async def test_a_lead_that_never_submits_writes_no_report(make_session, three_mo
 
 async def test_dispatch_refuses_at_the_cap_and_once_research_is_closed(make_session):
     """D1's cap refusal and D3's closed refusal are contract strings, and neither starts a
-    researcher.
+    researcher. The cap itself is `[agent] max_researchers`, read from config rather than
+    baked into the module, so a run can be tightened without a code change.
     """
-    session = make_session()
+    session = make_session(max_researchers=2)
     parked = asyncio.Event()
-    for index in range(_MAX_RESEARCHERS):
+    for index in range(2):
         session.running[f"researcher/{index + 1}"] = asyncio.create_task(parked.wait())
     try:
         assert (
             session.dispatch("e", "objective", "format", "boundaries")
-            == f"refused: {_MAX_RESEARCHERS} researchers already running — wait for a return"
+            == "refused: 2 researchers already running — wait for a return"
         )
-        assert len(session.running) == _MAX_RESEARCHERS
+        assert len(session.running) == 2
     finally:
         parked.set()
         await asyncio.gather(*session.running.values())
@@ -691,3 +707,248 @@ async def test_a_search_abort_fails_the_run_without_blaming_the_researcher(
     # No retry: a pass-through failure burns a whole researcher re-run for nothing.
     assert researcher._call_count == 1
     assert [incident.kind for incident in run_log.incidents()] == []
+
+
+# --- Phase 2: budgets, roster data and run exits ------------------------------------------
+
+
+async def test_the_wall_clock_arms_on_a_successful_dispatch_and_not_on_a_refusal(
+    make_session, three_models
+):
+    """R6: the clock measures RESEARCH, so a dispatch the harness refused must leave it
+    disarmed — only a researcher that actually started may begin the countdown.
+
+    A regression pin on Phase 1's behaviour as much as a Phase 2 test: `_arm_clock` is called
+    after both refusal branches have already returned, and nothing else says so.
+    """
+    gate_b = asyncio.Event()
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            _dispatch_call("pricing", "call_p"),
+            AIMessage(content="Nothing started — the roster is full."),
+            _dispatch_call("supply", "call_s"),
+            AIMessage(content="The supply angle is running."),
+            _submit_call("Widgets cost $4.20 each."),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {"Investigate supply": (gate_b, "Supply findings.")}
+    three_models(head, researcher)
+
+    session = make_session(max_researchers=2)
+    parked = asyncio.Event()
+    # The cap is already full when the run starts, so the lead's FIRST dispatch is refused.
+    for index in (0, 1):
+        session.running[f"parked/{index}"] = asyncio.create_task(parked.wait())
+
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: head._call_count >= 2, "the refused dispatch's turn to end")
+        assert session.clock_armed is False
+
+        # Free one slot and wake the loop; this dispatch is accepted, and arms the clock.
+        session.running.pop("parked/1")
+        session.events.put_nowait(UserMessage("try that angle again"))
+        await _wait_for(lambda: head._call_count >= 4, "the accepted dispatch's turn to end")
+        assert session.clock_armed is True
+    finally:
+        session.running.pop("parked/0", None)
+        parked.set()
+        gate_b.set()
+        await run
+
+
+async def test_submit_report_disarms_the_clock_so_later_time_never_cuts_the_run_short(
+    make_session, three_models
+):
+    """R6/D3: the clock spans first question → report written, and stops there. A slow turn
+    AFTER the answer is submitted runs past the wall clock without cutting the run short — the
+    report is kept and `cut_short` stays None.
+    """
+    answer = "Acme widgets are cheapest at $4.20 per unit."
+    # Call 3 is the reply AFTER `submit_report`; 1.5s against a 1s clock means an armed clock
+    # would certainly have fired inside it.
+    head = _lead_model(
+        replies=[
+            _dispatch_call("pricing", "call_p"),
+            AIMessage(content="Dispatched."),
+            _submit_call(answer),
+        ],
+        answer=answer,
+        slow_calls=frozenset({3}),
+        delay_seconds=1.5,
+    )
+    researcher = _model(ScriptedChatModel, "researcher-test").script(
+        [AIMessage(content="Pricing findings.")]
+    )
+    three_models(head, researcher)
+
+    session = make_session(wall_clock_seconds=1)
+    started = time.monotonic()
+    run = asyncio.create_task(session.run())
+    await _wait_for(lambda: session.clock_armed, "the clock to arm at the dispatch")
+    outcome = await run
+    elapsed = time.monotonic() - started
+
+    assert outcome is not None
+    assert outcome.answer == answer
+    assert session.cut_short is None
+    assert session.clock_armed is False
+    # The deadline really did pass: without it, a disarm that never happened would still pass.
+    assert elapsed > 1.0, f"the run finished in {elapsed}s — the 1s clock never came due"
+
+
+async def test_ctrl_c_mid_run_writes_no_report_and_cancels_every_running_researcher(
+    make_session, three_models, monkeypatch
+):
+    """R5: a quit before a report exists is a FAILED run — nothing written, `run()` returns
+    None, and every researcher still in flight is cancelled AND awaited (Risk #2), each
+    disclosed as its own incident. `test_agent.py` pins the exit code through `main()`; this
+    pins the session that decides it.
+
+    Delivered by cancelling the run task, not by raising `KeyboardInterrupt` inside a scripted
+    model: a `KeyboardInterrupt` raised inside a langgraph node's own `asyncio.Task` is
+    re-raised straight out of the event loop by `Task.__step` and never reaches the awaiting
+    session at all. A real Ctrl+C has been observed to surface here as `CancelledError` (see
+    `Session.run`'s abort clause), which is exactly what this delivers.
+    """
+    supply_gate, routing_gate = asyncio.Event(), asyncio.Event()
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _dispatch_call("pricing", "call_p").tool_calls[0],
+                    _dispatch_call("supply", "call_s").tool_calls[0],
+                    _dispatch_call("routing", "call_r").tool_calls[0],
+                ],
+            ),
+            AIMessage(content="All three angles are running."),
+            AIMessage(content="Noted the pricing angle."),
+        ]
+    )
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {
+        "Investigate pricing": (None, "Pricing findings."),
+        "Investigate supply": (supply_gate, "Supply findings."),
+        "Investigate routing": (routing_gate, "Routing findings."),
+    }
+    three_models(head, researcher)
+
+    written: list[Any] = []
+    monkeypatch.setattr("harness.session.write_report", lambda outcome, config: written.append(1))
+
+    sink = ActivitySink()
+    run_log = RunLog()
+    session = make_session(run_log=run_log, sink=sink)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(
+            lambda: head._call_count >= 3 and len(session.running) == 2,
+            "the first return narrated with two researchers still in flight",
+        )
+        # One turn of the loop, so the abort lands on the wait between turns rather than
+        # mid-stream — where a Ctrl+C at a terminal spends nearly all of its time.
+        await asyncio.sleep(0.05)
+        run.cancel()
+        outcome = await run
+    finally:
+        supply_gate.set()
+        routing_gate.set()
+
+    assert outcome is None
+    assert written == []
+    assert session.cut_short == "error"
+    assert session.cut_short_detail == "user abort (Ctrl+C)"
+    # Cancelled AND awaited: nothing is left running behind the failed run.
+    assert session.running == {}
+    cancelled = [
+        incident for incident in run_log.incidents() if incident.kind == "researcher_cancelled"
+    ]
+    assert len(cancelled) == 2
+    assert {incident.detail.split()[0] for incident in cancelled} == {
+        "researcher/2",
+        "researcher/3",
+    }
+    # A cancelled researcher never returned, so the roster shows it as failed, not done.
+    assert [state.status for state in sink.researchers()] == ["done", "failed", "failed"]
+
+
+async def test_the_roster_tracks_every_researcher_and_feeds_the_leads_roster_line(
+    make_session, three_models
+):
+    """R2/R8: the sink is the roster's one source of truth — one researcher reporting, one
+    crashing and one still running are three rows with the right ids, labels and times, and the
+    `Roster:` line the next lead turn reads is built from exactly those rows.
+    """
+    supply_gate, routing_gate = asyncio.Event(), asyncio.Event()
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _dispatch_call("pricing", "call_p").tool_calls[0],
+                    _dispatch_call("supply", "call_s").tool_calls[0],
+                    _dispatch_call("routing", "call_r").tool_calls[0],
+                ],
+            ),
+            AIMessage(content="All three angles are running."),
+            AIMessage(content="Noted the pricing angle."),
+            AIMessage(content="Noted the supply angle."),
+            _submit_call("Widgets cost $4.20 each."),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {
+        "Investigate pricing": (None, "Pricing findings."),
+        "Investigate supply": (supply_gate, RuntimeError("boom")),
+        "Investigate routing": (routing_gate, "Routing findings."),
+    }
+    three_models(head, researcher)
+
+    sink = ActivitySink()
+    session = make_session(sink=sink)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: head._call_count >= 3, "the pricing return's own lead turn")
+        supply_gate.set()
+        await _wait_for(lambda: head._call_count >= 4, "the crashed supply return's lead turn")
+
+        roster = sink.researchers()
+        assert [(state.id, state.label, state.status) for state in roster] == [
+            ("researcher/1", "pricing", "done"),
+            ("researcher/2", "supply", "failed"),
+            ("researcher/3", "routing", "running"),
+        ]
+        # Every row is stamped at dispatch; only the two that finished carry a finish time.
+        assert [state.finished_at is None for state in roster] == [False, False, True]
+        assert all(state.started_at <= (state.finished_at or state.started_at) for state in roster)
+    finally:
+        supply_gate.set()
+        routing_gate.set()
+        await run
+
+    # The line the lead actually read: a FAILED researcher is done, not still running.
+    supply_turn = head._received_messages[3][-1]
+    assert isinstance(supply_turn, HumanMessage)
+    assert str(supply_turn.content).splitlines()[-1] == (
+        "Roster: done researcher/1, researcher/2 · running researcher/3"
+    )
+
+
+async def test_the_synthesis_margin_never_fires_after_submit_report(make_session):
+    """Phase 2 3F Major: `submit_report` closes research for the reserve as well as the hard
+    clock. A slow closing reply that crosses the margin must not stamp `synthesis_margin` onto a
+    complete report, and a second submit must not overwrite the accepted answer.
+    """
+    session = make_session(wall_clock_seconds=100, synthesis_margin_seconds=50)
+    assert session.submit("Final answer.") == "report accepted — research is closed"
+    # Pretend research started deep inside the margin window, then stream one more update.
+    session._research_started_at = asyncio.get_running_loop().time() - 90
+    session._handle_node_update({"messages": [AIMessage(content="Closing remarks.")]})
+    assert session.cut_short is None
+    assert session._margin_hit is False
+    assert session.submit("Overwrite.") == "refused: research is closed — the report is written"
+    assert session.answer == "Final answer."

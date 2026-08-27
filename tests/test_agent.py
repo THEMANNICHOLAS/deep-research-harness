@@ -2184,17 +2184,17 @@ async def test_main_writes_no_report_when_the_wall_clock_expires_with_no_answer(
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
 
 
-async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer(
+async def test_main_keeps_the_report_when_time_passes_after_submit_report(
     make_config, make_agent_settings, monkeypatch, scripted_model, tmp_path, capsys
 ):
-    """D2's other wall-clock branch: the same expiry, but the interrupted turn already carried
-    prose alongside its tool call, so a final answer exists — the report is still written,
-    disclosing the cut-short, and the exit code stays 0.
+    """R6 through `main()`: the wall clock spans first question → report written and STOPS
+    there, so time spent after `submit_report` can never cut the run short.
 
-    D3 reshapes WHEN this can happen: `submit_report` is the only source of an answer, and it
-    ends research at the next loop boundary, so the clock has to expire INSIDE the submitting
-    turn — here the lead dispatches (arming the clock), takes the researcher's return, submits
-    on that turn, then asks a clarifying question nobody answers before the 1s clock fires.
+    The successor to this file's old "wall clock expires with an answer" test: with the clock
+    disarmed at submit (Phase 2), an expiry and an answer can no longer coexist — the lead
+    dispatches (arming the 1s clock), takes the return, submits, and then spends 1.5s in one
+    more turn. An armed clock would have fired inside it and stamped a cut-short disclosure
+    onto the report; a disarmed one leaves an ordinary, complete report and exit 0.
     """
     agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
@@ -2204,25 +2204,14 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     # turn, the researcher's return empties the roster, and only THEN is the answer submitted.
     dispatch = _dispatch_call("widgets", "call_dispatch")
     waiting = AIMessage(content="Dispatched; waiting on the angle.")
-    submit = _submit_call("Partial finding: Acme quoted $4.20/unit.")
-    # The stall is an unanswered clarification, not a slow model call: the clock must keep
-    # running through a clarifying wait (R6), and that await lives in the session's own task
-    # where the timeout can actually cut it.
-    ask = AIMessage(
-        content="",
-        tool_calls=[
-            {"name": "ask_user", "args": {"question": "Narrower scope?"}, "id": "call_ask"}
-        ],
+    submit = _submit_call("Acme quoted $4.20/unit.")
+    # Call 3 is the reply AFTER the submit: held well past the 1s clock, inside the session's
+    # own task, which is exactly where the timeout would cut it if it were still armed.
+    head_model = _lead_model(
+        replies=[dispatch, waiting, submit], slow_calls=frozenset({3}), delay_seconds=1.5
     )
-    head_model = _lead_model(replies=[dispatch, waiting, submit], after_submit=ask)
     researcher_model = scripted_model([AIMessage(content="Nothing conclusive.")])
     patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
-
-    async def _slow_answer(prompt: str = "> ") -> str:
-        await asyncio.sleep(3)
-        return "Narrower."
-
-    monkeypatch.setattr(main_module, "_read_answer", _slow_answer)
 
     started = time.monotonic()
     exit_code, files, out, err = await _run_main(
@@ -2233,13 +2222,11 @@ async def test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_a
     assert exit_code == 0
     assert len(files) == 1
     body = files[0].read_text(encoding="utf-8")
-    assert _CUT_SHORT_HEADING in body
-    # Names the WALL CLOCK specifically — see the round-cap test for why the heading is not enough.
-    assert _WALL_CLOCK_TEXT in body
-    assert _ROUND_CAP_TEXT not in body
-    assert "Partial finding: Acme quoted $4.20/unit." in body
-    # Well under the full 3s sleep: cut off near the 1s bound rather than completed and mislabeled.
-    assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire early"
+    assert _CUT_SHORT_HEADING not in body
+    assert _WALL_CLOCK_TEXT not in body
+    assert "Acme quoted $4.20/unit." in body
+    # The 1s deadline genuinely came due during the run — otherwise nothing was proved.
+    assert elapsed > 1.0, f"run took {elapsed}s — the 1s clock never came due"
 
 
 # --- Phase 5 (parent plan): synthesis reserve (synthesis_margin_seconds) --------------
@@ -2416,29 +2403,27 @@ async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_th
     """Contracts: `synthesis_margin_seconds = 0` disables the reserve entirely. The naive
     threshold `wall_clock_seconds - 0` equals the wall clock itself, which would make a margin
     cut fire at the same instant the clock expires — instead, a disabled reserve must let the
-    run reach the HARD wall clock exactly as it did before this phase (mirrors
-    `test_main_writes_a_cut_short_report_when_the_wall_clock_expires_with_an_answer` with the
-    new field pinned to its disable value).
+    run reach the HARD wall clock.
+
+    The arithmetic boundary is pinned directly by `test_margin_reached_boundaries`; this is its
+    end-to-end consequence. With the clock disarmed at `submit_report` (Phase 2, R6) the stall
+    has to happen BEFORE any answer exists, so the hard clock's own outcome applies: no report,
+    exit 1. The stall is an unanswered clarification, not a slow model call — the clock must
+    keep running through a clarifying wait (R6), and that await lives in the session's own task
+    where the timeout can actually cut it.
     """
     agent = make_agent_settings(wall_clock_seconds=1)
     config = make_config(agent=agent)
 
-    # Three turns rather than one message carrying both calls: `submit_report` is refused while
-    # a researcher is still running (3F F2), so the dispatch arms the clock, the lead ends that
-    # turn, the researcher's return empties the roster, and only THEN is the answer submitted.
     dispatch = _dispatch_call("widgets", "call_dispatch")
     waiting = AIMessage(content="Dispatched; waiting on the angle.")
-    submit = _submit_call("Partial finding: Acme quoted $4.20/unit.")
-    # The stall is an unanswered clarification, not a slow model call: the clock must keep
-    # running through a clarifying wait (R6), and that await lives in the session's own task
-    # where the timeout can actually cut it.
     ask = AIMessage(
         content="",
         tool_calls=[
             {"name": "ask_user", "args": {"question": "Narrower scope?"}, "id": "call_ask"}
         ],
     )
-    head_model = _lead_model(replies=[dispatch, waiting, submit], after_submit=ask)
+    head_model = _lead_model(replies=[dispatch, waiting, ask])
     researcher_model = scripted_model([AIMessage(content="Nothing conclusive.")])
     patch_run_by_role(monkeypatch, config, {"head": head_model, "researcher": researcher_model})
 
@@ -2454,13 +2439,17 @@ async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_th
     )
     elapsed = time.monotonic() - started
 
-    assert exit_code == 0
-    assert len(files) == 1
-    body = files[0].read_text(encoding="utf-8")
-    assert _CUT_SHORT_HEADING in body
-    assert _WALL_CLOCK_TEXT in body
-    assert _SYNTHESIS_MARGIN_TEXT not in body
-    assert _ROUND_CAP_TEXT not in body
+    assert exit_code == 1
+    assert files == [], f"a report was written despite no final answer: {files}"
+    assert any("wall clock" in line for line in err.splitlines()), err
+    # The reserve stayed disabled: no synthesis instruction ever reached the lead.
+    reserve_prompts = [
+        message
+        for received in head_model._received_messages
+        for message in received
+        if "synthesis reserve" in str(message.content)
+    ]
+    assert reserve_prompts == []
     # Well under the full 3s sleep: cut off near the 1s bound rather than completed and mislabeled.
     assert elapsed < 2.5, f"run took {elapsed}s — the wall clock did not actually fire"
 
