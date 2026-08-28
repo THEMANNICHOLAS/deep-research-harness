@@ -40,7 +40,7 @@ choices = [
 
 [roles.researcher]
 provider = "opencode"
-model = "deepseek-v4-pro"
+model = "glm-5.3-flash"
 # D6: bounds one slow researcher/reader call; head and verifier keep the [agent] default (their
 # long calls are legitimate). Risk #5: raise the reader's if live runs show APITimeoutError on
 # digests.

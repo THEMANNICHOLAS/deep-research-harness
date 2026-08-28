@@ -67,11 +67,11 @@ not the ceiling).
 - Fetch/extraction: crawl4ai over crawl4ai-managed Playwright/Chromium.
 - Search: self-hosted SearXNG (JSON API).
 - Models: OpenCode API serves four roles — `[roles.head]` = `kimi-k3`,
-  `[roles.researcher]` = `deepseek-v4-pro`, `[roles.reader]` = `deepseek-v4-flash`,
+  `[roles.researcher]` = `glm-5.3-flash`, `[roles.reader]` = `deepseek-v4-flash`,
   `[roles.verifier]` = `qwen3.7-plus`. Config-swappable; no other provider is
   declared today. The DeepSeek line required a region opt-in on the OpenCode
   workspace dashboard for the `-flash` tier — without it the endpoint 403s (see
-  docs/decisions.md); `-pro` worked without a fresh opt-in in a live check.
+  docs/decisions.md).
 - Deployment: homelab Linux machine, operated over SSH.
 
 ## Patterns

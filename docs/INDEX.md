@@ -25,7 +25,7 @@
   and will not work), crawl4ai over
   crawl4ai-managed Playwright/Chromium (Lightpanda was tried and retired — see
   docs/decisions.md), OpenCode API for all four model roles — `kimi-k3` for the head,
-  `deepseek-v4-pro` for the researcher, `deepseek-v4-flash` for the reader, and
+  `glm-5.3-flash` for the researcher, `deepseek-v4-flash` for the reader, and
   `qwen3.7-plus` for the verifier. API **keys** live
   in `.env`; **endpoints, model IDs and limits** live in `harness.toml` (see
   docs/guides/setup.md). Neither is ever hardcoded.

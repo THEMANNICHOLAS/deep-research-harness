@@ -297,3 +297,9 @@ sentences each, append-only, newest last.
   adds `openai.BadRequestError` and the builtin `TimeoutError` to the retry exclusion as a
   separate superset of `_PASS_THROUGH_TASK_FAILURES`, which doubles as the failure handler's
   propagate list; `openai.APITimeoutError` subclasses `APIConnectionError` and stays retryable.
+
+- **2026-08-27 — `[roles.researcher]` moved from `deepseek-v4-pro` to `glm-5.3-flash`
+  (developer request).** `[roles.reader]` was already `deepseek-v4-flash` and stays; no other
+  config changed. The slug is live on the OpenCode workspace (it serves the developer's own
+  tooling), but `preflight` has not been run against it from this harness — the first run
+  surfaces it fail-fast if the workspace needs an opt-in.
