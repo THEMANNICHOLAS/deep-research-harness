@@ -149,25 +149,6 @@ def _pending_tool_call_ids(message: AIMessage) -> set[str]:
     return {call_id for call in message.tool_calls if isinstance(call_id := call.get("id"), str)}
 
 
-def _margin_reached(elapsed: float, wall_clock_seconds: int, margin_seconds: int) -> bool:
-    """Whether elapsed research time has crossed R7's synthesis reserve.
-
-    Extracted from the stream loop for ONE reason: testability. The loop's own margin check is
-    only reachable through a full run, and at the `margin_seconds == 0` boundary `asyncio`'s
-    timeout cancellation always wins the race against app-level code, so a full-run test
-    resolves to a wall-clock cut whether or not the disable guard is present — it cannot tell
-    a correct implementation from one missing the guard. As pure arithmetic the boundary is
-    directly assertable instead.
-
-    `margin_seconds <= 0` means DISABLED, and must never be read as "a threshold equal to the
-    wall clock": that would fire the reserve at the same instant the hard clock expires, racing
-    it for the same run.
-    """
-    if margin_seconds <= 0:
-        return False
-    return elapsed >= wall_clock_seconds - margin_seconds
-
-
 def _sum_usage(messages: list[BaseMessage]) -> UsageMetadata:
     """Sum `usage_metadata` across every `AIMessage` in the final state."""
     usages = [
@@ -961,38 +942,28 @@ async def main(argv: list[str] | None = None) -> int:
                                     for call in calls:
                                         renderer.emit(Activity(_describe_tool_call(call)))
                                     if not clock_armed:
+                                        # The HARD clock only. The synthesis-reserve deadline
+                                        # the dispatch middleware reads is armed by that
+                                        # middleware itself, at the first dispatch it wraps
+                                        # -- arming it from this consumer would race the
+                                        # tools superstep starting (issue #43 #2).
                                         research_started_at = asyncio.get_running_loop().time()
                                         clock.reschedule(
                                             research_started_at + config.agent.wall_clock_seconds
                                         )
                                         clock_armed = True
-                                        # The same reserve `_margin_reached` checks at turn
-                                        # boundaries, handed to the dispatch path so an
-                                        # in-flight researcher is cut off too (D1). `0`
-                                        # disables the reserve, so the deadline stays unarmed
-                                        # and the middleware never cancels anything.
-                                        if config.agent.synthesis_margin_seconds > 0:
-                                            deadline.arm(
-                                                research_started_at
-                                                + config.agent.wall_clock_seconds
-                                                - config.agent.synthesis_margin_seconds
-                                            )
                                 _note_model_turns(node_update)
                                 # R7's reserve: fire the same bounded synthesis pass the round
-                                # cap uses once elapsed research time crosses the margin
-                                # threshold. The threshold decision itself lives in
-                                # `_margin_reached` (including the `== 0` disable), which is
-                                # where its boundaries are tested — see that docstring for why
-                                # it is not inline.
-                                if not margin_hit and research_started_at is not None:
-                                    elapsed = (
-                                        asyncio.get_running_loop().time() - research_started_at
-                                    )
-                                    if _margin_reached(
-                                        elapsed,
-                                        config.agent.wall_clock_seconds,
-                                        config.agent.synthesis_margin_seconds,
-                                    ):
+                                # cap uses once the dispatch deadline has passed. Reading the
+                                # deadline the middleware armed (`remaining()` is None until
+                                # the first researcher dispatch, and always None when the
+                                # margin is disabled) -- not re-deriving the threshold here --
+                                # is the point (issue #43 #5): the turn boundary and the
+                                # dispatch path fire at the same instant, from one piece of
+                                # state.
+                                if not margin_hit:
+                                    remaining = deadline.remaining()
+                                    if remaining is not None and remaining <= 0:
                                         margin_hit = True
                                         # Same bookkeeping as the cap, through the shared
                                         # `_pending_tool_call_ids`: if THIS crossing update

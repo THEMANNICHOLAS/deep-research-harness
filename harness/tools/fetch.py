@@ -277,6 +277,27 @@ def _write_source_file(captures_dir: Path, page: FetchedPage, run_log: RunLog) -
 _DO_NOT_RETRY_LINE = "do not retry this URL — it gets one fetch attempt per run, now spent"
 
 
+def _truncate(text: str, cap: int) -> str:
+    """`text` capped at `cap` characters, cut at the latest paragraph break or heading start
+    (a heading with no body is noise); no boundary, or one at 0 that would empty the block,
+    takes the full cap. Overlong text gains a truncation notice.
+
+    ONE home for the cap cut (issue #43 follow-up): the guard scan runs on the SAME
+    truncated body the model will see, so the verdict covers exactly the text that reaches
+    the context and the scan's cost is bounded by the cap even on a hostile page — instead
+    of a second, unbounded copy of the page feeding `scan` before `_render`'s cut.
+    """
+    if len(text) <= cap:
+        return text
+    window = text[:cap]
+    boundary = max([window.rfind("\n\n"), *(m.start() for m in _HEADING_LINE.finditer(window))])
+    cut = boundary if boundary > 0 else cap
+    return (
+        window[:cut].rstrip()
+        + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
+    )
+
+
 def _render(page: FetchedPage, cap: int) -> str:
     """Render one page's model-facing block: heading, outcome line, capped markdown.
 
@@ -306,18 +327,7 @@ def _render(page: FetchedPage, cap: int) -> str:
         status_bits.append(page.error)
     lines.append(" — ".join(status_bits))
 
-    text = page.markdown
-    if len(text) > cap:
-        window = text[:cap]
-        # Cut at the latest paragraph break or heading start (a heading with no body is noise).
-        # No boundary, or one at 0 that would empty the block, takes the full cap.
-        boundary = max([window.rfind("\n\n"), *(m.start() for m in _HEADING_LINE.finditer(window))])
-        cut = boundary if boundary > 0 else cap
-        text = (
-            window[:cut].rstrip()
-            + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
-        )
-    lines.append(fence(text))
+    lines.append(fence(_truncate(page.markdown, cap)))
     if page.outcome != "fetched":
         lines.append(_DO_NOT_RETRY_LINE)
 
@@ -500,6 +510,8 @@ async def _fetch(
     direct caller and existing test still rides.
     """
     blocklist = resolve_blocklist(blocklist, config.blocklist.path)
+    # One read, hoisted: the guard scan's truncation below and `_render`'s cut share it.
+    cap = config.fetch.per_page_char_cap
     from crawl4ai import (
         BrowserConfig,
         CacheMode,
@@ -663,8 +675,11 @@ async def _fetch(
             # same way), and `_write_source_file` puts it on the capture's first line where
             # verify.py reads it. A blocked page vanishes entirely: no FetchedPage, no Sn, no
             # capture file — it now renders an opaque, reason-free rejection block instead (D1).
+            # The body is scanned AFTER `_truncate`, on exactly the text the model will see:
+            # the model never reads past the cap, so scanning full page markdown bought
+            # nothing but unbounded regex cost on a hostile page (issue #43 follow-up).
             if config.guard.enabled:
-                scan_result = scan(_page_text(markdown, title))
+                scan_result = scan(_page_text(_truncate(markdown, cap), title))
                 if scan_result.blocked:
                     # A guard block is a policy verdict, not a site refusal (R3/D3) — it
                     # deliberately does not feed the blocklist, and `continue`s before the
@@ -764,11 +779,12 @@ async def _fetch(
             title = _title_of(result)
 
             # D5: same guard site as the HTML batch — scan markdown and title (stripped, not
-            # raw — `scan` strips invisibles for itself) before classify/mint. A blocked page
+            # raw — `scan` strips invisibles for itself) before classify/mint, on the
+            # cap-truncated body the model will see (issue #43 follow-up). A blocked page
             # vanishes entirely and now renders an opaque, reason-free rejection block instead
             # (D1).
             if config.guard.enabled:
-                scan_result = scan(_page_text(markdown, title))
+                scan_result = scan(_page_text(_truncate(markdown, cap), title))
                 if scan_result.blocked:
                     _record_guard_block(url, scan_result.signals, registry, run_log)
                     continue
@@ -815,7 +831,6 @@ async def _fetch(
     for page in pages:
         _write_source_file(captures_dir, page, run_log)
 
-    cap = config.fetch.per_page_char_cap
     blocks: list[str] = []
     for url in requested:
         attempted = pages_by_url.get(url)

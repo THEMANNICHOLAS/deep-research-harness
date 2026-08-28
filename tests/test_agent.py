@@ -24,6 +24,7 @@ import harness.__main__ as main_module
 from harness.activity import ActivitySink, active_reader
 from harness.agent import (
     ResearchDeadline,
+    _research_reserve,
     _retry_on_non_search_abort,
     _summarize_tool_args,
     _summarize_tool_result,
@@ -566,6 +567,32 @@ def _task_call(
             }
         ],
     )
+
+
+async def _run_with_a_failing_researcher(
+    make_config, patch_models_by_role, scripted_model, failure: Exception, run_log=None
+):
+    """Arrange/act shared by the researcher-failure tests (issue #43 #8: the third verbatim
+    copy got factored out): a lead that dispatches one researcher whose model raises
+    `failure`, run to the lead's next scripted turn. Returns `(result, researcher_model)`
+    — what each test asserts about them (retry count, message status, incidents) is the
+    part that differs. `run_log` passes through for the tests that assert on incidents.
+    """
+    head_model = scripted_model(
+        [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
+    )
+    researcher_model = _raising_researcher(failure)
+    reader_model = scripted_model([AIMessage(content="unused")])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    graph = build_agent(make_config(), SourceRegistry(), run_log)
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+    return result, researcher_model
 
 
 def _reader_fetch_call(url: str) -> AIMessage:
@@ -1300,27 +1327,14 @@ async def test_a_researcher_crash_becomes_an_error_task_message_after_one_retry(
     researcher crash — the lead receives a `RESEARCHER FAILED (...)` error ToolMessage after
     exactly one retry, and the run continues on the lead's next scripted turn.
     """
-    head_model = scripted_model(
-        [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
-    )
-    researcher_model = _raising_researcher(RuntimeError("boom"))
-    reader_model = scripted_model([AIMessage(content="unused")])
-    patch_models_by_role(
-        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    result, researcher_model = await _run_with_a_failing_researcher(
+        make_config, patch_models_by_role, scripted_model, RuntimeError("boom")
     )
 
-    graph = build_agent(make_config(), SourceRegistry())
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
-    )
-
-    task_messages = [
-        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
-    ]
-    assert len(task_messages) == 1
-    assert task_messages[0].status == "error"
-    assert str(task_messages[0].content).startswith("RESEARCHER FAILED")
+    task_messages = _lead_task_messages(result)
+    assert list(task_messages) == ["call_task"]
+    assert task_messages["call_task"].status == "error"
+    assert str(task_messages["call_task"].content).startswith("RESEARCHER FAILED")
     assert researcher_model._call_count == 2  # initial attempt + exactly one retry
     # The run continued past the failed dispatch onto the lead's next scripted turn.
     assert result["messages"][-1].content == "done despite the failed angle"
@@ -1329,9 +1343,10 @@ async def test_a_researcher_crash_becomes_an_error_task_message_after_one_retry(
 def test_retry_predicate_replays_only_transient_failures():
     """D6/R6: replaying a whole researcher is only worth paying for when the failure might come
     out differently. `openai.BadRequestError` (context length, malformed request) is
-    deterministic and the builtin `TimeoutError` is Phase 1's own dispatch cancellation, so
-    neither is replayed. `openai.APITimeoutError` is deliberately still retryable — it
-    subclasses `APIConnectionError` and a re-request may well succeed.
+    deterministic and the builtin `TimeoutError` covers a timeout raised inside a dispatch
+    (a model call's own timeout), so neither is replayed. `openai.APITimeoutError` is
+    deliberately still retryable — it subclasses `APIConnectionError` and a re-request may
+    well succeed.
     """
     request = httpx.Request("POST", "https://example.test/v1")
 
@@ -1342,6 +1357,20 @@ def test_retry_predicate_replays_only_transient_failures():
     assert _retry_on_non_search_abort(RuntimeError("boom")) is True
 
 
+def test_the_transient_timeout_types_this_stack_raises_are_still_retried():
+    """Issue #43 #9's low-confidence note, resolved: since Python 3.10 `socket.timeout` IS the
+    builtin `TimeoutError` (non-retryable here), so a bare one could hide a genuinely
+    transient OS-level network failure. It cannot reach this predicate from the network —
+    verified against the dependency tree, every stack raises its own timeout type, none
+    subclassing the builtin: httpx's `TimeoutException` family (the transport under both
+    direct fetches and the openai SDK) and the SDK's `APITimeoutError`. Those must stay
+    retryable — this pin is what breaks if a future dependency leaks a bare builtin
+    `TimeoutError` from its network path instead of wrapping it.
+    """
+    assert _retry_on_non_search_abort(httpx.ConnectTimeout("timed out")) is True
+    assert _retry_on_non_search_abort(httpx.ReadTimeout("timed out")) is True
+
+
 async def test_a_researcher_bad_request_is_not_replayed(
     make_config, patch_models_by_role, scripted_model
 ):
@@ -1350,28 +1379,15 @@ async def test_a_researcher_bad_request_is_not_replayed(
     ToolMessage and the run continues, it is just never replayed through a second whole
     researcher that would fail identically.
     """
-    head_model = scripted_model(
-        [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
-    )
-    researcher_model = _raising_researcher(_bad_request_error())
-    reader_model = scripted_model([AIMessage(content="unused")])
-    patch_models_by_role(
-        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    result, researcher_model = await _run_with_a_failing_researcher(
+        make_config, patch_models_by_role, scripted_model, _bad_request_error()
     )
 
-    graph = build_agent(make_config(), SourceRegistry())
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
-    )
-
-    task_messages = [
-        m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "task"
-    ]
-    assert len(task_messages) == 1
-    assert task_messages[0].status == "error"
-    assert str(task_messages[0].content).startswith("RESEARCHER FAILED")
-    assert "BadRequestError" in str(task_messages[0].content)
+    task_messages = _lead_task_messages(result)
+    assert list(task_messages) == ["call_task"]
+    assert task_messages["call_task"].status == "error"
+    assert str(task_messages["call_task"].content).startswith("RESEARCHER FAILED")
+    assert "BadRequestError" in str(task_messages["call_task"].content)
     assert researcher_model._call_count == 1  # converted, but NOT retried
     assert result["messages"][-1].content == "done despite the failed angle"
 
@@ -1546,11 +1562,12 @@ async def test_a_researcher_dispatch_past_the_deadline_is_refused_and_spawns_not
 
 
 async def test_an_unarmed_deadline_never_cancels_a_researcher_dispatch(
-    make_config, patch_models_by_role, scripted_model
+    make_config, make_agent_settings, patch_models_by_role, scripted_model
 ):
-    """`synthesis_margin_seconds = 0` disables the reserve, so `__main__` never arms the
-    deadline and the middleware must be a pure pass-through — a slow researcher runs to
-    completion rather than being cut off by an implicit zero budget.
+    """`synthesis_margin_seconds = 0` disables the reserve (`_research_reserve` returns None),
+    so the dispatch middleware never arms the deadline and must be a pure pass-through — a
+    slow researcher runs to completion rather than being cut off by an implicit zero budget.
+    The margin-0 config is explicit: `make_config()`'s default margin would self-arm.
     """
     head_model = scripted_model([_task_call("Investigate an angle"), AIMessage(content="done")])
     researcher_model, reader_model = _researcher_models(0.05, ["Report A."])
@@ -1558,8 +1575,10 @@ async def test_an_unarmed_deadline_never_cancels_a_researcher_dispatch(
         {"head": head_model, "researcher": researcher_model, "reader": reader_model}
     )
 
+    deadline = ResearchDeadline()
     run_log = RunLog()
-    graph = build_agent(make_config(), SourceRegistry(), run_log, deadline=ResearchDeadline())
+    config = make_config(agent=make_agent_settings())
+    graph = build_agent(config, SourceRegistry(), run_log, deadline=deadline)
     result = await graph.ainvoke(
         {"messages": [HumanMessage(content="research this")]},
         config={"configurable": {"thread_id": "test-thread"}},
@@ -1568,7 +1587,75 @@ async def test_an_unarmed_deadline_never_cancels_a_researcher_dispatch(
     settled = _lead_task_messages(result)["call_task"]
     assert "time budget" not in str(settled.content).lower()
     assert researcher_model._call_count == 1
+    assert deadline.remaining() is None  # never armed: no reserve to enforce
     assert [i for i in run_log.incidents() if i.kind == "research_deadline_reached"] == []
+
+
+async def test_the_middleware_arms_an_unarmed_deadline_at_the_first_dispatch(
+    make_config, make_agent_settings, patch_models_by_role, scripted_model
+):
+    """Issue #43 #2: the deadline is armed by the middleware itself, at the first researcher
+    dispatch it wraps — not by `__main__`'s stream consumer, which can lose the race against
+    the tools superstep starting. After one dispatch has run, an unarmed deadline is armed
+    `wall_clock - margin` out.
+    """
+    head_model = scripted_model([_task_call("Investigate an angle"), AIMessage(content="done")])
+    researcher_model, reader_model = _researcher_models(0.0, ["Report A."])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    deadline = ResearchDeadline()
+    config = make_config(
+        agent=make_agent_settings(wall_clock_seconds=600, synthesis_margin_seconds=100)
+    )
+    graph = build_agent(config, SourceRegistry(), RunLog(), deadline=deadline)
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    remaining = deadline.remaining()
+    assert remaining is not None
+    # Armed at the first dispatch, ~500s out (wall 600 - margin 100), minus negligible run time.
+    assert 450 < remaining <= 500
+
+
+async def test_a_first_wave_dispatch_is_bounded_even_when_nothing_else_armed_the_deadline(
+    make_config, make_agent_settings, patch_models_by_role, scripted_model
+):
+    """The heart of issue #43 #2: the same dispatch that arms the deadline already runs under
+    its `wait_for`, so the first wave can never run unbounded — the state a stream consumer
+    that lost the race against the tools superstep would otherwise leave the run in. The
+    reserve (1s of a 2s wall clock) is shorter than the researcher's run, so the dispatch
+    must be cancelled at the reserve and refused, never completed.
+    """
+    head_model = scripted_model(
+        [_task_call("Investigate an angle"), AIMessage(content="answer from what I have")]
+    )
+    researcher_model, reader_model = _researcher_models(2.0, ["Report A."])
+    patch_models_by_role(
+        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
+    )
+
+    deadline = ResearchDeadline()
+    run_log = RunLog()
+    config = make_config(
+        agent=make_agent_settings(wall_clock_seconds=2, synthesis_margin_seconds=1)
+    )
+    graph = build_agent(config, SourceRegistry(), run_log, deadline=deadline)
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="research this")]},
+        config={"configurable": {"thread_id": "test-thread"}},
+    )
+
+    settled = _lead_task_messages(result)["call_task"]
+    assert "time budget" in str(settled.content).lower()
+    assert settled.status != "error"  # a budget verdict, not a failure
+    assert researcher_model._started_count == 1  # spawned, then cancelled mid-run
+    assert deadline.remaining() is not None and deadline.remaining() <= 0
+    kinds = [i.kind for i in run_log.incidents()]
+    assert "research_deadline_reached" in kinds
 
 
 async def test_a_model_timeout_inside_an_unarmed_dispatch_is_not_reported_as_deadline_reached(
@@ -1580,20 +1667,9 @@ async def test_a_model_timeout_inside_an_unarmed_dispatch_is_not_reported_as_dea
     `research_deadline_reached` on a run that has no deadline to reach. And per D6 it is not
     replayed.
     """
-    head_model = scripted_model(
-        [_task_call("Investigate an angle"), AIMessage(content="done despite the failed angle")]
-    )
-    researcher_model = _raising_researcher(TimeoutError())
-    reader_model = scripted_model([AIMessage(content="unused")])
-    patch_models_by_role(
-        {"head": head_model, "researcher": researcher_model, "reader": reader_model}
-    )
-
     run_log = RunLog()
-    graph = build_agent(make_config(), SourceRegistry(), run_log, deadline=ResearchDeadline())
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content="research this")]},
-        config={"configurable": {"thread_id": "test-thread"}},
+    result, researcher_model = await _run_with_a_failing_researcher(
+        make_config, patch_models_by_role, scripted_model, TimeoutError(), run_log=run_log
     )
 
     settled = _lead_task_messages(result)["call_task"]
@@ -1603,6 +1679,7 @@ async def test_a_model_timeout_inside_an_unarmed_dispatch_is_not_reported_as_dea
     kinds = [i.kind for i in run_log.incidents()]
     assert "subagent_failed" in kinds
     assert "research_deadline_reached" not in kinds
+    assert result["messages"][-1].content == "done despite the failed angle"
 
 
 async def test_a_cancelled_researcher_dispatch_is_refused_once_and_never_replayed(
@@ -2792,34 +2869,31 @@ async def test_main_completes_normally_when_finishing_inside_the_synthesis_margi
 
 
 @pytest.mark.parametrize(
-    ("elapsed", "wall_clock", "margin", "expected"),
+    ("wall_clock", "margin", "expected"),
     [
-        # margin 0 DISABLES the reserve. These are the cases a full-run test cannot
+        # margin 0 DISABLES the reserve (None). These are the cases a full-run test cannot
         # distinguish: at this boundary asyncio's timeout cancellation always wins the race,
         # so the run reports a wall-clock cut whether or not the disable guard exists.
         # `wall_clock - 0` would be a threshold of 1, which every elapsed here meets.
-        (1.0, 1, 0, False),
-        (5.0, 1, 0, False),
-        (0.0, 1, 0, False),
+        (1, 0, None),
+        (600, 0, None),
         # A negative margin is nonsense config-side (`ge=0`) but must not invert the rule.
-        (5.0, 4, -1, False),
-        # Enabled: threshold is wall_clock - margin, crossed at or past it.
-        (1.0, 4, 3, True),
-        (0.9, 4, 3, False),
-        (2.0, 4, 3, True),
-        # Exactly AT the threshold counts as reached (`>=`), so the reserve is not skipped by
-        # a run that lands precisely on it.
-        (1560.0, 1800, 240, True),
-        (1559.9, 1800, 240, False),
+        (4, -1, None),
+        # Enabled: the threshold is wall_clock - margin, and both the dispatch path (arming
+        # the deadline) and the turn-boundary check derive from this one value (issue #43 #5).
+        (4, 3, 1.0),
+        (1800, 240, 1560.0),
     ],
 )
-def test_margin_reached_boundaries(elapsed, wall_clock, margin, expected):
+def test_research_reserve_boundaries(wall_clock, margin, expected):
     """R7's threshold decision, isolated. Pins the two things the full-run margin tests
     cannot: that `margin == 0` means DISABLED rather than "a threshold equal to the wall
-    clock" (which would race the hard clock for the same run), and that the comparison is
-    `>=` so landing exactly on the threshold still triggers the reserve.
+    clock" (which would race the hard clock for the same run), and that the single value
+    feeding both the dispatch deadline and the turn-boundary check is `wall_clock - margin`.
+    The `remaining() <= 0` comparison fires exactly AT the instant, so landing precisely on
+    the threshold still triggers the reserve.
     """
-    assert main_module._margin_reached(elapsed, wall_clock, margin) is expected
+    assert _research_reserve(wall_clock, margin) == expected
 
 
 async def test_synthesis_margin_seconds_zero_disables_the_reserve_and_reaches_the_wall_clock(

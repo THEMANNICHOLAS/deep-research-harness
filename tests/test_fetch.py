@@ -1803,6 +1803,61 @@ async def test_guard_disabled_bypasses_scanning_and_the_attack_page_fetches_norm
     assert [i for i in run_log.incidents() if i.kind == "guard_blocked"] == []
 
 
+async def test_the_guard_scans_the_capped_body_the_model_sees(  # issue #43 follow-up
+    install_crawler, make_config, tmp_path
+):
+    """The scan input is the cap-truncated body, not full page markdown: the model never
+    sees past the cap, so scanning the tail bought nothing but unbounded regex cost on a
+    hostile page. The same attack blocks from inside the cap and passes from beyond it —
+    the beyond-cap page still fetches, and its render carries the truncation notice.
+    """
+    config = make_config(per_page_char_cap=200, agent=AgentSettings(workspace_dir=tmp_path))
+    attack_markdown = _attack_markdown()
+
+    # Attack first: inside the cap, the guard must block exactly as before.
+    registry = SourceRegistry()
+    approve_all(registry, ["https://head.test"])
+    head_results = [
+        _FakeResult(
+            "https://head.test",
+            markdown=_FakeMarkdown(
+                raw_markdown=attack_markdown + "\n\n" + _not_thin("body text."),
+                fit_markdown=attack_markdown + "\n\n" + _not_thin("body text."),
+            ),
+        )
+    ]
+    install_crawler(head_results)
+    head_log = RunLog()
+    head_tool = fetch.build_fetch_tool(config, registry, head_log)
+
+    head_message = await head_tool.ainvoke(_tool_call(["https://head.test"], "call-cap-head"))
+
+    assert head_message.artifact == []
+    assert fetch._rejection_block("https://head.test") in head_message.content
+    head_incidents = [i for i in head_log.incidents() if i.kind == "guard_blocked"]
+    assert len(head_incidents) == 1
+
+    # Attack last: beyond the cap, out of the scan (and the model's) view entirely.
+    registry = SourceRegistry()
+    approve_all(registry, ["https://tail.test"])
+    padded = _not_thin("A long ordinary introduction.") + "\n\n" + attack_markdown
+    tail_results = [
+        _FakeResult(
+            "https://tail.test",
+            markdown=_FakeMarkdown(raw_markdown=padded, fit_markdown=padded),
+        )
+    ]
+    install_crawler(tail_results)
+    tail_log = RunLog()
+    tail_tool = fetch.build_fetch_tool(config, registry, tail_log)
+
+    tail_message = await tail_tool.ainvoke(_tool_call(["https://tail.test"], "call-cap-tail"))
+
+    assert [page.url for page in tail_message.artifact] == ["https://tail.test"]
+    assert "truncated at the 200-character cap" in tail_message.content
+    assert [i for i in tail_log.incidents() if i.kind == "guard_blocked"] == []
+
+
 async def test_survivor_markdown_zero_width_chars_stripped(  # D5/D3
     install_crawler, make_config, tmp_path
 ):
