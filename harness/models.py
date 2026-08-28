@@ -52,12 +52,19 @@ def build_chat_model(config: HarnessConfig, role: str) -> BaseChatModel:
             f"from {provider_config.api_key_env!r} — set that environment variable"
         )
 
+    # D6: the role's own timeout when it sets one, else the `[agent]` default.
+    timeout = (
+        role_config.request_timeout_seconds
+        if role_config.request_timeout_seconds is not None
+        else config.agent.request_timeout_seconds
+    )
+
     return ChatOpenAI(
         model=role_config.model,
         base_url=provider_config.base_url,
         api_key=SecretStr(provider_config.api_key),
         max_retries=config.agent.max_retries,
-        timeout=config.agent.request_timeout_seconds,
+        timeout=timeout,
     )
 
 

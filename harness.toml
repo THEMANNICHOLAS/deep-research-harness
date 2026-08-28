@@ -40,11 +40,16 @@ choices = [
 
 [roles.researcher]
 provider = "opencode"
-model = "deepseek-v4-pro"
+model = "glm-5.3-flash"
+# D6: bounds one slow researcher/reader call; head and verifier keep the [agent] default (their
+# long calls are legitimate). Risk #5: raise the reader's if live runs show APITimeoutError on
+# digests.
+request_timeout_seconds = 60.0
 
 [roles.reader]
 provider = "opencode"
 model = "deepseek-v4-flash"
+request_timeout_seconds = 60.0  # see roles.researcher above (D6)
 
 # D4: verification runs on a model that did not write the report.
 [roles.verifier]
@@ -53,7 +58,9 @@ model = "qwen3.7-plus"
 
 [fetch]
 page_timeout_ms = 15000
-max_concurrency = 5
+max_concurrency = 5  # per-call dispatcher permits
+max_connections = 24  # run-wide warm HTTP pool shared by all researchers (D3); NOT per call
+memory_threshold_percent = 90.0  # crawl4ai default; lower on a <16GB box also running SearXNG + Chromium
 per_page_char_cap = 120000  # ~30k tokens per source at ~4 chars/token
 max_urls_per_call = 5  # bounds one fetch_pages call, not the run (R9/D11)
 min_markdown_words = 50  # below this, an HTTP-fetched page escalates to Chromium once (R6/D2)
@@ -90,3 +97,11 @@ request_timeout_seconds = 120.0
 # Harness-enforced (R5): a researcher's reader dispatch past this count is refused, not
 # merely advised in prompt prose. The researcher prompt renders this same value.
 max_reader_dispatches = 6
+# Harness-enforced (D5): a CONCURRENCY cap on how many researcher dispatches the lead may
+# have in flight at once — NOT a total for the run, so a second wave is allowed once the
+# first returns. The surplus dispatch is refused with a message telling the lead to wait.
+# This value is rendered into the lead prompt, so the model is told the limit it is held to.
+max_concurrent_researchers = 4
+# Prompt-only (D5): a budget rendered into the researcher prompt, NOT enforced — nothing
+# counts a researcher's searches. max_reader_dispatches above is what bounds cost in code.
+searches_per_researcher = 4

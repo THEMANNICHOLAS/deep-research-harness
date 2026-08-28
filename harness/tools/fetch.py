@@ -40,10 +40,6 @@ FetchOutcome = Literal["fetched", "blocked", "timeout", "non_html", "error", "pd
 _BLOCKED_STATUSES = frozenset({401, 403, 429, 503})
 _EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "script", "style", "form", "noscript"]
 
-# 75%, not crawl4ai's default 90%: each concurrent crawl is a real browser page, and this
-# box also hosts SearXNG and Chromium.
-_MEMORY_THRESHOLD_PERCENT = 75.0
-
 
 def _crawler_class() -> Any:
     """The crawler class `_fetch` constructs — the one seam tests patch to avoid a browser.
@@ -93,9 +89,9 @@ def _build_http_crawler(config: HarnessConfig, run_id: str) -> Any:
     - `downloads_path` containment: unset, crawl4ai writes every non-`text/html` body under
       `~/.crawl4ai/downloads`, outside the workspace and never cleaned (see
       `run_downloads_dir`).
-    - D6: the HTTP pass reuses `max_concurrency` rather than adding a knob. The shared
-      dispatcher never runs more crawls than this at once, so a larger connection pool
-      than that would go unused.
+    - D3 (PLAN-research-throughput): the pool is run-wide and shared by every concurrent
+      researcher, so it is sized by its own key, `max_connections`, not the per-call permit
+      count `max_concurrency`.
     Goes through the `_crawler_class`/`_http_crawler_parts` seams, so tests that patch
     either seam cover both call sites.
     """
@@ -107,7 +103,7 @@ def _build_http_crawler(config: HarnessConfig, run_id: str) -> Any:
             browser_config=http_config_cls(
                 downloads_path=str(run_downloads_dir(config, run_id)),
             ),
-            max_connections=config.fetch.max_concurrency,
+            max_connections=config.fetch.max_connections,
         ),
         config=BrowserConfig(verbose=False),
     )
@@ -281,6 +277,27 @@ def _write_source_file(captures_dir: Path, page: FetchedPage, run_log: RunLog) -
 _DO_NOT_RETRY_LINE = "do not retry this URL — it gets one fetch attempt per run, now spent"
 
 
+def _truncate(text: str, cap: int) -> str:
+    """`text` capped at `cap` characters, cut at the latest paragraph break or heading start
+    (a heading with no body is noise); no boundary, or one at 0 that would empty the block,
+    takes the full cap. Overlong text gains a truncation notice.
+
+    ONE home for the cap cut (issue #43 follow-up): the guard scan runs on the SAME
+    truncated body the model will see, so the verdict covers exactly the text that reaches
+    the context and the scan's cost is bounded by the cap even on a hostile page — instead
+    of a second, unbounded copy of the page feeding `scan` before `_render`'s cut.
+    """
+    if len(text) <= cap:
+        return text
+    window = text[:cap]
+    boundary = max([window.rfind("\n\n"), *(m.start() for m in _HEADING_LINE.finditer(window))])
+    cut = boundary if boundary > 0 else cap
+    return (
+        window[:cut].rstrip()
+        + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
+    )
+
+
 def _render(page: FetchedPage, cap: int) -> str:
     """Render one page's model-facing block: heading, outcome line, capped markdown.
 
@@ -310,18 +327,7 @@ def _render(page: FetchedPage, cap: int) -> str:
         status_bits.append(page.error)
     lines.append(" — ".join(status_bits))
 
-    text = page.markdown
-    if len(text) > cap:
-        window = text[:cap]
-        # Cut at the latest paragraph break or heading start (a heading with no body is noise).
-        # No boundary, or one at 0 that would empty the block, takes the full cap.
-        boundary = max([window.rfind("\n\n"), *(m.start() for m in _HEADING_LINE.finditer(window))])
-        cut = boundary if boundary > 0 else cap
-        text = (
-            window[:cut].rstrip()
-            + f"\n\n_[truncated at the {cap}-character cap — the rest of this page was omitted]_"
-        )
-    lines.append(fence(text))
+    lines.append(fence(_truncate(page.markdown, cap)))
     if page.outcome != "fetched":
         lines.append(_DO_NOT_RETRY_LINE)
 
@@ -349,14 +355,38 @@ _EMPTY_REQUEST_TEXT = "No URLs were requested, so nothing was fetched."
 
 
 def _rejection_block(url: str) -> str:
-    """The opaque, reason-free block rendered for any policy-rejected URL (D1).
+    """The opaque, reason-free block rendered for a guard- or blocklist-rejected URL (D1).
 
-    Guard blocks, provenance rejections (and, from Phase 3, blocklisted hostnames) all render
-    this one line, because naming which policy fired would tell an adversarial page — or
-    anyone reading the transcript — exactly what the guard caught. The rejecting policy and
-    its reason go ONLY to `RunLog` incidents, never here.
+    Guard blocks and blocklisted hostnames render this one line, because naming which policy
+    fired would tell an adversarial page — or anyone reading the transcript — exactly what
+    the guard caught. The rejecting policy and its reason go ONLY to `RunLog` incidents.
+
+    Provenance is the one rejection that does NOT come through here (R1): it is the model's
+    own mistake rather than the page's, so it is explained — see `_provenance_rejection_block`.
     """
     return f"## {url}\n\n{_REJECTION_LINE}"
+
+
+# The one phrase every surface that states the provenance rule must carry verbatim (R1) —
+# the three tool descriptions here and in fallback/search, and the three tier prompts. Defined
+# once so the rule cannot be worded three different ways in three places.
+PROVENANCE_RULE_MARKER = "only URLs returned by search_web"
+
+_PROVENANCE_REJECTION_LINE = (
+    "rejected — this URL did not come from a search_web result or the user; search for it "
+    "first, then fetch the URL the search returns"
+)
+
+
+def _provenance_rejection_block(url: str) -> str:
+    """The block rendered for a URL rejected by strict provenance (R1).
+
+    Unlike `_rejection_block`, this names the reason and the remedy. A guard rejection stays
+    opaque because the adversary is the page; here the adversary is nobody — the model
+    guessed a URL or lifted it from a page's own links, and a rejection it cannot interpret
+    is one it repeats (the ~110 provenance rejections of run 20260825134545).
+    """
+    return f"## {url}\n\n{_PROVENANCE_REJECTION_LINE}"
 
 
 def _provenance_rejected_detail(url: str) -> str:
@@ -480,6 +510,8 @@ async def _fetch(
     direct caller and existing test still rides.
     """
     blocklist = resolve_blocklist(blocklist, config.blocklist.path)
+    # One read, hoisted: the guard scan's truncation below and `_render`'s cut share it.
+    cap = config.fetch.per_page_char_cap
     from crawl4ai import (
         BrowserConfig,
         CacheMode,
@@ -525,15 +557,15 @@ async def _fetch(
     # Phase 4 strict provenance (D2/R2): a URL is fetchable only if it arrived from a
     # `search_web` result or explicit user approval (`__main__` at run start) — never from a
     # page's own in-body links. Rejection is per-URL: one unapproved URL never fails the rest
-    # of the batch, and a rejected URL never reaches the crawler at all — and now also renders
-    # the opaque D1 rejection block.
+    # of the batch, and a rejected URL never reaches the crawler at all — and now renders the
+    # explaining block (R1), the one rejection that tells the model what it did wrong.
     approved_urls: list[str] = []
     for url in urls:
         if registry.is_approved(url):
             approved_urls.append(url)
         else:
             run_log.record("provenance_rejected", _provenance_rejected_detail(url))
-            registry.record_failure(url, _rejection_block(url))
+            registry.record_failure(url, _provenance_rejection_block(url))
     urls = approved_urls
 
     # R4 pre-crawl backstop — placement is load-bearing (Phase 1 `## Discoveries`): this MUST
@@ -570,7 +602,7 @@ async def _fetch(
     )
     dispatcher = MemoryAdaptiveDispatcher(
         max_session_permit=config.fetch.max_concurrency,
-        memory_threshold_percent=_MEMORY_THRESHOLD_PERCENT,
+        memory_threshold_percent=config.fetch.memory_threshold_percent,
         rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
     )
 
@@ -643,8 +675,11 @@ async def _fetch(
             # same way), and `_write_source_file` puts it on the capture's first line where
             # verify.py reads it. A blocked page vanishes entirely: no FetchedPage, no Sn, no
             # capture file — it now renders an opaque, reason-free rejection block instead (D1).
+            # The body is scanned AFTER `_truncate`, on exactly the text the model will see:
+            # the model never reads past the cap, so scanning full page markdown bought
+            # nothing but unbounded regex cost on a hostile page (issue #43 follow-up).
             if config.guard.enabled:
-                scan_result = scan(_page_text(markdown, title))
+                scan_result = scan(_page_text(_truncate(markdown, cap), title))
                 if scan_result.blocked:
                     # A guard block is a policy verdict, not a site refusal (R3/D3) — it
                     # deliberately does not feed the blocklist, and `continue`s before the
@@ -709,7 +744,7 @@ async def _fetch(
         )
         pdf_dispatcher = MemoryAdaptiveDispatcher(
             max_session_permit=config.fetch.max_concurrency,
-            memory_threshold_percent=_MEMORY_THRESHOLD_PERCENT,
+            memory_threshold_percent=config.fetch.memory_threshold_percent,
             rate_limiter=RateLimiter(max_retries=_RATE_LIMIT_MAX_RETRIES),
         )
         async with _crawler_class()(
@@ -744,11 +779,12 @@ async def _fetch(
             title = _title_of(result)
 
             # D5: same guard site as the HTML batch — scan markdown and title (stripped, not
-            # raw — `scan` strips invisibles for itself) before classify/mint. A blocked page
+            # raw — `scan` strips invisibles for itself) before classify/mint, on the
+            # cap-truncated body the model will see (issue #43 follow-up). A blocked page
             # vanishes entirely and now renders an opaque, reason-free rejection block instead
             # (D1).
             if config.guard.enabled:
-                scan_result = scan(_page_text(markdown, title))
+                scan_result = scan(_page_text(_truncate(markdown, cap), title))
                 if scan_result.blocked:
                     _record_guard_block(url, scan_result.signals, registry, run_log)
                     continue
@@ -795,7 +831,6 @@ async def _fetch(
     for page in pages:
         _write_source_file(captures_dir, page, run_log)
 
-    cap = config.fetch.per_page_char_cap
     blocks: list[str] = []
     for url in requested:
         attempted = pages_by_url.get(url)
@@ -886,19 +921,24 @@ def build_fetch_tool(
                 note_digest_candidate(page.source_id)
         return content, pages
 
-    return _install_url_limit_contract(fetch_pages, max_urls)
+    return _install_fetch_contract(fetch_pages, max_urls)
 
 
-def _install_url_limit_contract(fetch_tool: BaseTool, max_urls: int) -> BaseTool:
-    """Append the config-driven URL cap to `fetch_tool` and install its validation explainer.
+def _install_fetch_contract(fetch_tool: BaseTool, max_urls: int) -> BaseTool:
+    """Append the two enforced contract sentences to `fetch_tool` and install its explainer.
 
     Shared by `build_fetch_tool` and `build_fallback_tool` — the wording is policy, and two
-    hand-pasted copies could drift. Appended rather than written into the docstring: the limit
-    is config, and a literal would go stale the moment an operator changed it (D2).
+    hand-pasted copies could drift. Appended rather than written into the docstring: the URL
+    limit is config, and a literal would go stale the moment an operator changed it (D2); the
+    provenance rule is one phrase (`PROVENANCE_RULE_MARKER`) shared with the tier prompts and
+    `search_web`, so the rule is stated identically wherever the model can read it (R1).
     """
     fetch_tool.description = (
         f"{fetch_tool.description}\n\nAt most {max_urls} URLs may be requested per call; "
-        "a call carrying more is rejected without fetching anything."
+        "a call carrying more is rejected without fetching anything. "
+        f"Fetch {PROVENANCE_RULE_MARKER} or pasted by the user; a URL found inside a fetched "
+        "page is not fetchable until a search_web result returns it — such a URL is rejected "
+        "with a message saying so."
     )
 
     # `exc` is `object`: langchain may hand over a pydantic v1 or v2 `ValidationError`. A

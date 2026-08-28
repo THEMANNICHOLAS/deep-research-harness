@@ -22,6 +22,7 @@ model = "glm-5.2"
 [roles.researcher]
 provider = "cerebras"
 model = "gemma-4-31b"
+request_timeout_seconds = 60.0
 
 [fetch]
 page_timeout_ms = 20000
@@ -29,6 +30,8 @@ max_concurrency = 8
 per_page_char_cap = 9000
 max_urls_per_call = 3
 min_markdown_words = 30
+max_connections = 12
+memory_threshold_percent = 80.0
 
 [search]
 base_url = "http://localhost:8080"
@@ -81,12 +84,16 @@ def test_valid_toml_loads_full_config(tmp_path, monkeypatch):
     assert config.roles["head"].model == "glm-5.2"
     assert config.roles["researcher"].provider == "cerebras"
     assert config.roles["researcher"].model == "gemma-4-31b"
+    assert config.roles["researcher"].request_timeout_seconds == 60.0
+    assert config.roles["head"].request_timeout_seconds is None
 
     assert config.fetch.page_timeout_ms == 20000
     assert config.fetch.max_concurrency == 8
     assert config.fetch.per_page_char_cap == 9000
     assert config.fetch.max_urls_per_call == 3
     assert config.fetch.min_markdown_words == 30
+    assert config.fetch.max_connections == 12
+    assert config.fetch.memory_threshold_percent == 80.0
 
     assert config.search.base_url == "http://localhost:8080"
     assert config.search.default_max_results == 7
@@ -105,6 +112,8 @@ def test_omitted_limits_fall_back_to_defaults(tmp_path, monkeypatch):
     assert config.fetch.per_page_char_cap == 120000
     assert config.fetch.max_urls_per_call == 5
     assert config.fetch.min_markdown_words == 50
+    assert config.fetch.max_connections == 24
+    assert config.fetch.memory_threshold_percent == 90.0
     assert config.search.default_max_results == 10
     assert config.search.max_consecutive_failures == 3
 
@@ -190,8 +199,11 @@ def test_typo_in_key_error_names_the_offending_key(tmp_path, monkeypatch):
         ("per_page_char_cap", 0),
         ("max_urls_per_call", 0),
         ("min_markdown_words", 0),
+        ("max_connections", 0),
+        ("memory_threshold_percent", 0),
         ("max_consecutive_failures", 0),
         ("max_reader_dispatches", 0),
+        ("searches_per_researcher", 0),
     ],
 )
 def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_value):
@@ -203,15 +215,19 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
         "per_page_char_cap": 9000,
         "max_urls_per_call": 3,
         "min_markdown_words": 30,
+        "max_connections": 12,
+        "memory_threshold_percent": 80.0,
         "max_consecutive_failures": 4,
         "max_reader_dispatches": 6,
+        "searches_per_researcher": 4,
     }
-    # `max_reader_dispatches` lives in `[agent]`, which VALID_TOML omits (the omitted-section
-    # default is covered by test_agent_section_omitted_falls_back_to_documented_defaults) --
-    # append a literal default here so the same `.replace()` pattern has something to swap.
+    # `max_reader_dispatches` and `searches_per_researcher` live in `[agent]`, which VALID_TOML
+    # omits (the omitted-section default is covered by
+    # test_agent_section_omitted_falls_back_to_documented_defaults) -- append a literal default
+    # here so the same `.replace()` pattern has something to swap.
     base_toml = VALID_TOML
-    if setting == "max_reader_dispatches":
-        base_toml += "\n[agent]\nmax_reader_dispatches = 6\n"
+    if setting in ("max_reader_dispatches", "searches_per_researcher"):
+        base_toml += f"\n[agent]\n{setting} = {original[setting]}\n"
     toml_content = base_toml.replace(f"{setting} = {original[setting]}", f"{setting} = {bad_value}")
     path = _write(tmp_path, toml_content)
 
@@ -219,6 +235,39 @@ def test_non_positive_limits_are_rejected(tmp_path, monkeypatch, setting, bad_va
         load_config(path)
 
     assert setting in str(excinfo.value)
+
+
+def test_role_request_timeout_must_be_positive(tmp_path, monkeypatch):
+    """D6: `request_timeout_seconds` bounds one request — 0 or negative would make every call
+    to that role fail instantly."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    # `model = "glm-5.2"` is the head role's line and appears once, so this appends the bad key
+    # to `[roles.head]` alone.
+    toml_content = VALID_TOML.replace(
+        'model = "glm-5.2"', 'model = "glm-5.2"\nrequest_timeout_seconds = 0'
+    )
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "request_timeout_seconds" in str(excinfo.value)
+
+
+def test_memory_threshold_above_100_is_rejected(tmp_path, monkeypatch):
+    """`memory_threshold_percent` is a percentage: above 100 the dispatcher would never pause."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
+    monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
+    toml_content = VALID_TOML.replace(
+        "memory_threshold_percent = 80.0", "memory_threshold_percent = 100.5"
+    )
+    path = _write(tmp_path, toml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "memory_threshold_percent" in str(excinfo.value)
 
 
 def test_literal_api_key_in_the_file_is_rejected(tmp_path, monkeypatch):
@@ -254,7 +303,8 @@ def test_literal_api_key_in_the_file_is_rejected(tmp_path, monkeypatch):
             "roles",
             [
                 '[roles.head]\nprovider = "opencode"\nmodel = "glm-5.2"\n\n',
-                '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n',
+                '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n'
+                "request_timeout_seconds = 60.0\n\n",
             ],
         ),
     ],
@@ -343,7 +393,9 @@ def test_missing_researcher_role_still_loads(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("CEREBRAS_API_KEY", "cerebras-secret")
     toml_content = VALID_TOML.replace(
-        '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n\n', ""
+        '[roles.researcher]\nprovider = "cerebras"\nmodel = "gemma-4-31b"\n'
+        "request_timeout_seconds = 60.0\n\n",
+        "",
     )
     assert toml_content != VALID_TOML, "fixture drifted from VALID_TOML — update the block"
     path = _write(tmp_path, toml_content)
@@ -397,6 +449,8 @@ def test_agent_section_omitted_falls_back_to_documented_defaults(tmp_path, monke
     assert config.agent.reports_dir == Path.home() / "deep-research" / "reports"
     assert config.agent.max_retries == 2
     assert config.agent.request_timeout_seconds == 120.0
+    assert config.agent.max_concurrent_researchers == 4
+    assert config.agent.searches_per_researcher == 4
 
 
 def test_synthesis_margin_at_or_above_the_wall_clock_is_rejected(tmp_path, monkeypatch):

@@ -1,0 +1,13 @@
+# /etc/collector/collector.ini
+#
+# Rendered by the provisioning role. Edit the template, not this file.
+
+[system]
+hostname = collector-03
+timezone = UTC
+log_level = info
+
+[network]
+listen_addr = 0.0.0.0
+listen_port = 9443
+tls_cert = /etc/collector/tls/fullchain.pem

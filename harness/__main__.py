@@ -149,25 +149,6 @@ def _pending_tool_call_ids(message: AIMessage) -> set[str]:
     return {call_id for call in message.tool_calls if isinstance(call_id := call.get("id"), str)}
 
 
-def _margin_reached(elapsed: float, wall_clock_seconds: int, margin_seconds: int) -> bool:
-    """Whether elapsed research time has crossed R7's synthesis reserve.
-
-    Extracted from the stream loop for ONE reason: testability. The loop's own margin check is
-    only reachable through a full run, and at the `margin_seconds == 0` boundary `asyncio`'s
-    timeout cancellation always wins the race against app-level code, so a full-run test
-    resolves to a wall-clock cut whether or not the disable guard is present — it cannot tell
-    a correct implementation from one missing the guard. As pure arithmetic the boundary is
-    directly assertable instead.
-
-    `margin_seconds <= 0` means DISABLED, and must never be read as "a threshold equal to the
-    wall clock": that would fire the reserve at the same instant the hard clock expires, racing
-    it for the same run.
-    """
-    if margin_seconds <= 0:
-        return False
-    return elapsed >= wall_clock_seconds - margin_seconds
-
-
 def _sum_usage(messages: list[BaseMessage]) -> UsageMetadata:
     """Sum `usage_metadata` across every `AIMessage` in the final state."""
     usages = [
@@ -208,9 +189,15 @@ def _final_answer(messages: list[BaseMessage]) -> str:
     NOT `messages[-1].content`: on a cut-short run the last message is usually a
     `ToolMessage` or a content-less tool-call `AIMessage`, which would put raw tool output
     ("Updated todo list to [...]") under `## Answer`. `report.py` renders the empty case.
+
+    Content alone is not enough (R5): a message carrying `tool_calls` is a PLAN, whatever
+    prose it also holds -- "I will now search for ... " alongside a `task` dispatch is the
+    preamble the failed 1800s run published as its answer. Skipping any tool-calling
+    `AIMessage` means a run that ends on one is answerless, which is a FAILED run (no report,
+    nonzero exit) by the standing invariant.
     """
     for message in reversed(messages):
-        if isinstance(message, AIMessage):
+        if isinstance(message, AIMessage) and not message.tool_calls:
             content = _message_text(message)
             if content:
                 return content
@@ -662,7 +649,7 @@ async def main(argv: list[str] | None = None) -> int:
     from langgraph.errors import GraphRecursionError
     from langgraph.types import Command
 
-    from harness.agent import build_agent
+    from harness.agent import ResearchDeadline, build_agent
     from harness.models import ModelError, preflight
 
     # Every role the run will actually call, checked before any agent work. A loop, not a
@@ -831,11 +818,15 @@ async def main(argv: list[str] | None = None) -> int:
                 last_in_flight = in_flight
 
     sink = ActivitySink(on_change=_on_activity_change)
+    # Created here, armed below where the research clock is (D1): the lead's dispatch
+    # middleware reads it, `__main__` alone writes it, so the two cannot disagree about when
+    # the synthesis reserve begins.
+    deadline = ResearchDeadline()
     # Same close/print/exit-1 shape as the preflight loop: `build_agent` resolves every
     # role through `build_chat_model`, so a missing or TODO role raises `ModelError` here —
     # unhandled it would escape as a traceback under the alternate screen (PR #18 review).
     try:
-        agent = build_agent(config, registry, run_log, sink, browser)
+        agent = build_agent(config, registry, run_log, sink, browser, deadline=deadline)
     except ModelError as exc:
         await browser.close()
         renderer.close()
@@ -951,6 +942,11 @@ async def main(argv: list[str] | None = None) -> int:
                                     for call in calls:
                                         renderer.emit(Activity(_describe_tool_call(call)))
                                     if not clock_armed:
+                                        # The HARD clock only. The synthesis-reserve deadline
+                                        # the dispatch middleware reads is armed by that
+                                        # middleware itself, at the first dispatch it wraps
+                                        # -- arming it from this consumer would race the
+                                        # tools superstep starting (issue #43 #2).
                                         research_started_at = asyncio.get_running_loop().time()
                                         clock.reschedule(
                                             research_started_at + config.agent.wall_clock_seconds
@@ -958,20 +954,16 @@ async def main(argv: list[str] | None = None) -> int:
                                         clock_armed = True
                                 _note_model_turns(node_update)
                                 # R7's reserve: fire the same bounded synthesis pass the round
-                                # cap uses once elapsed research time crosses the margin
-                                # threshold. The threshold decision itself lives in
-                                # `_margin_reached` (including the `== 0` disable), which is
-                                # where its boundaries are tested — see that docstring for why
-                                # it is not inline.
-                                if not margin_hit and research_started_at is not None:
-                                    elapsed = (
-                                        asyncio.get_running_loop().time() - research_started_at
-                                    )
-                                    if _margin_reached(
-                                        elapsed,
-                                        config.agent.wall_clock_seconds,
-                                        config.agent.synthesis_margin_seconds,
-                                    ):
+                                # cap uses once the dispatch deadline has passed. Reading the
+                                # deadline the middleware armed (`remaining()` is None until
+                                # the first researcher dispatch, and always None when the
+                                # margin is disabled) -- not re-deriving the threshold here --
+                                # is the point (issue #43 #5): the turn boundary and the
+                                # dispatch path fire at the same instant, from one piece of
+                                # state.
+                                if not margin_hit:
+                                    remaining = deadline.remaining()
+                                    if remaining is not None and remaining <= 0:
                                         margin_hit = True
                                         # Same bookkeeping as the cap, through the shared
                                         # `_pending_tool_call_ids`: if THIS crossing update

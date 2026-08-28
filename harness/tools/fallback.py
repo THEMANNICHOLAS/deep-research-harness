@@ -19,7 +19,7 @@ from harness.sources import SourceRegistry, normalize_url, sources_dir
 from harness.tools.fetch import (
     FetchedPage,
     _fetch,
-    _install_url_limit_contract,
+    _install_fetch_contract,
     _render,
 )
 
@@ -130,4 +130,4 @@ def build_fallback_tool(
         """
         return await _fetch_raw(urls, reason, config, registry, log, domain_blocklist, browser)
 
-    return _install_url_limit_contract(fetch_raw, max_urls)
+    return _install_fetch_contract(fetch_raw, max_urls)

@@ -5,6 +5,7 @@ from string import Template
 import pytest
 
 from harness.prompts import PromptError, render, required_variables
+from harness.tools.fetch import PROVENANCE_RULE_MARKER
 
 # The frozen delegation-tier contracts (R5). Both tiers are wired: `subagent` is the
 # researcher's live system prompt, `reader` the reader's.
@@ -115,16 +116,62 @@ def test_shipped_prompts_render_with_their_declared_variables(name):
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
-        ("subagent", {"current_date", "max_urls_per_call", "max_reader_dispatches"}),
+        ("orchestrator", {"current_date", "max_concurrent_researchers"}),
+        (
+            "subagent",
+            {
+                "current_date",
+                "max_urls_per_call",
+                "max_reader_dispatches",
+                "searches_per_researcher",
+            },
+        ),
         ("reader", {"current_date", "max_urls_per_call"}),
     ],
 )
 def test_tier_contracts_declare_exactly_their_placeholders(name, expected):
     # A tier receives its task through the delegation call at run time, never by substitution, so
-    # neither contract declares a task or facet placeholder. Only `subagent` additionally
-    # declares the enforced reader-dispatch cap (R5, Phase 4) so the harness value and the
-    # prompt's own budget claim cannot disagree; the reader prompt does not mention the cap.
+    # no contract declares a task or facet placeholder. `subagent` additionally declares the
+    # enforced reader-dispatch cap (R5, Phase 4) so the harness value and the prompt's own budget
+    # claim cannot disagree; the reader prompt does not mention the cap. `orchestrator` and
+    # `subagent` each declare their own budget (R2, Phase 2): the enforced researcher fan-out and
+    # the advisory per-researcher search budget.
     assert required_variables(name) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "variable", "extra"),
+    [
+        ("orchestrator", "max_concurrent_researchers", {}),
+        (
+            "subagent",
+            "searches_per_researcher",
+            {"max_urls_per_call": 5, "max_reader_dispatches": 6},
+        ),
+    ],
+)
+def test_dispatch_and_search_budgets_render_from_config_not_prose(name, variable, extra):
+    """R2: changing the config changes what the model is told. The old prompts hard-coded
+    "up to 3" researchers and "about 4" searches; a rendered prompt that still carries those
+    literals is one an operator cannot move.
+    """
+    rendered = render(name, current_date="2026-01-01", **{variable: 9}, **extra)
+
+    assert "9" in rendered
+    assert "up to 3" not in rendered
+    assert "about 4" not in rendered
+
+
+@pytest.mark.parametrize("name", ["orchestrator", "subagent", "reader"])
+def test_every_tier_prompt_states_the_provenance_rule(name):
+    """R1: the code rejects any URL that did not come from `search_web` (or the user), so
+    every tier must be told that rule in the prompt it reads -- the lead because it plans the
+    research, the researcher and reader because they are the ones whose fetches are rejected.
+    """
+    rendered = _render_shipped(name)
+
+    assert "search_web" in rendered
+    assert PROVENANCE_RULE_MARKER in rendered
 
 
 @pytest.mark.parametrize("name", TIER_CONTRACTS)
@@ -166,7 +213,11 @@ def test_subagent_prompt_teaches_reader_delegation_recovery_and_budget():
     from harness.prompts import _PROMPTS_DIR
 
     rendered = render(
-        "subagent", current_date="2026-01-01", max_urls_per_call=5, max_reader_dispatches=6
+        "subagent",
+        current_date="2026-01-01",
+        max_urls_per_call=5,
+        max_reader_dispatches=6,
+        searches_per_researcher=4,
     )
 
     # Reading is delegated: the reader dispatch carries the per-call URL cap and the facet.
@@ -219,7 +270,7 @@ def test_orchestrator_prompt_teaches_the_full_delegation_protocol():
     """R1's prompt half (Phase 2 Step 3): the lead delegates research angles to the researcher
     subagent rather than researching directly, and knows what to do when that delegation fails.
     """
-    rendered = render("orchestrator", current_date="2026-01-01")
+    rendered = render("orchestrator", current_date="2026-01-01", max_concurrent_researchers=3)
 
     assert 'subagent_type="researcher"' in rendered
     # The concurrent-researcher bound must appear near the delegation instruction, not merely
@@ -233,8 +284,11 @@ def test_orchestrator_prompt_teaches_the_full_delegation_protocol():
     assert "RESEARCHER FAILED (" in rendered
     assert "empty report" in rendered.lower()
 
-    # The lead no longer searches or fetches directly (R1) — it only delegates.
-    assert "search_web" not in rendered
+    # The lead no longer searches or fetches directly (R1) — it only delegates. `search_web`
+    # is named once, and only inside the provenance rule saying what researchers may fetch
+    # (Phase 2/R1); a second mention would mean the prompt is describing a tool the lead has.
+    assert rendered.count("search_web") == 1
+    assert PROVENANCE_RULE_MARKER in rendered
     assert "fetch_pages" not in rendered
     assert "fetch_raw" not in rendered
     assert 'subagent_type="reader"' not in rendered

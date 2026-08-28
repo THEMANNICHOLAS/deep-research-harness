@@ -11,7 +11,7 @@ from harness.browser import BrowserSession
 from harness.config import AgentSettings, BlocklistSettings, GuardSettings, run_downloads_dir
 from harness.runlog import RunLog
 from harness.sources import SourceRegistry, sources_dir
-from harness.tools import fetch
+from harness.tools import fallback, fetch, search
 from tests.conftest import (
     CHALLENGE_FIXTURES_DIR,
     _challenge_fixtures,
@@ -380,7 +380,7 @@ async def test_config_limits_reach_the_crawl4ai_call(install_crawler, make_confi
 
 
 async def test_dispatcher_is_memory_bounded_and_rate_limited(install_crawler, make_config):
-    config = make_config()
+    config = make_config(memory_threshold_percent=63.5)
     registry = SourceRegistry()
     approve_all(registry, ["https://a.test"])
     results = [
@@ -391,8 +391,8 @@ async def test_dispatcher_is_memory_bounded_and_rate_limited(install_crawler, ma
     await fetch._fetch(["https://a.test"], config, registry, RunLog())
 
     dispatcher = fake_cls.calls[0].dispatcher
-    # 75%, not crawl4ai's 90% default: each permit is a real browser page.
-    assert dispatcher.memory_threshold_percent == 75.0
+    # The threshold is configuration, not a constant (D3; risk #4 makes it the operator knob).
+    assert dispatcher.memory_threshold_percent == 63.5
     # Not a retry count: 0.9.2 re-fetches nothing on a 429/503. It caps how many times a domain's
     # backoff delay doubles, and that sleep holds a concurrency permit.
     assert dispatcher.rate_limiter is not None
@@ -704,7 +704,7 @@ async def test_an_http_discovered_pdf_content_type_reroutes_through_the_pdf_batc
     """D2's arxiv case: an extensionless PDF URL is exempt from the thin check by content
     type, so it reroutes straight from the HTTP pass to the PDF batch and never reaches the
     (Chromium-navigation-failed-on-it-already) browser."""
-    config = make_config()
+    config = make_config(memory_threshold_percent=63.5)
     registry = SourceRegistry()
     approve_all(registry, ["https://arxiv.test/abs/1234"])
     http_results = [
@@ -728,6 +728,8 @@ async def test_an_http_discovered_pdf_content_type_reroutes_through_the_pdf_batc
 
     assert [call.is_http for call in fake_cls.calls] == [True, False]
     assert fake_cls.calls[1].is_pdf is True
+    # D3: the PDF dispatcher reads the same configured threshold as the HTML one.
+    assert fake_cls.calls[1].dispatcher.memory_threshold_percent == 63.5
     assert pages[0].outcome == "fetched"
     assert pages[0].markdown == "Extracted arxiv text"
 
@@ -759,15 +761,16 @@ async def test_rejected_urls_are_never_http_fetched(install_crawler, make_config
 
     assert len(fake_cls.calls) == 1
     assert fake_cls.calls[0].urls == ["https://ok.test/page"]
-    assert fetch._rejection_block("https://unapproved.test/page") in content
+    assert fetch._provenance_rejection_block("https://unapproved.test/page") in content
     assert fetch._rejection_block("https://walled.test/page") in content
 
 
-async def test_the_http_strategy_is_wired_with_the_configured_max_concurrency(
+async def test_the_http_strategy_is_wired_with_the_configured_max_connections(
     install_crawler, make_config
 ):
-    """D6: the HTTP pass reuses `max_concurrency` rather than adding a new knob."""
-    config = make_config(max_concurrency=7)
+    """PLAN-research-throughput D3: the pool is run-wide and sized by `fetch.max_connections`,
+    distinct from the per-call permit `max_concurrency`."""
+    config = make_config(max_concurrency=7, max_connections=11)
     registry = SourceRegistry()
     approve_all(registry, ["https://a.test"])
     http_results = [
@@ -780,7 +783,7 @@ async def test_the_http_strategy_is_wired_with_the_configured_max_concurrency(
 
     await fetch._fetch(["https://a.test"], config, registry, RunLog())
 
-    assert fake_cls.http_strategies[0].kwargs["max_connections"] == 7
+    assert fake_cls.http_strategies[0].kwargs["max_connections"] == 11
 
 
 async def test_http_downloads_are_contained_in_the_run_workspace(install_crawler, make_config):
@@ -1012,6 +1015,26 @@ def test_both_prose_surfaces_state_the_url_limit(make_config):
     assert expected in fetch_pages.description
     schema = fetch_pages.args_schema.model_json_schema()
     assert expected in schema["properties"]["urls"]["description"]
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(fetch.build_fetch_tool, id="fetch_pages"),
+        pytest.param(fallback.build_fallback_tool, id="fetch_raw"),
+        pytest.param(search.build_search_tool, id="search_web"),
+    ],
+)
+def test_every_url_tool_description_states_the_provenance_rule(build, make_config):
+    """R1: the provenance rule is enforced in `_fetch`, so it must be readable from every tool
+    whose behavior it governs -- the two fetchers it rejects for, and `search_web`, which is
+    the only way to earn a fetchable URL. One shared marker phrase, defined once in fetch.py,
+    so the three descriptions cannot drift into stating three different rules.
+    """
+    tool = build(make_config(), SourceRegistry())
+
+    assert "search_web" in tool.description
+    assert fetch.PROVENANCE_RULE_MARKER in tool.description
 
 
 def test_the_schema_url_limit_follows_the_configured_value(make_config):
@@ -1780,6 +1803,61 @@ async def test_guard_disabled_bypasses_scanning_and_the_attack_page_fetches_norm
     assert [i for i in run_log.incidents() if i.kind == "guard_blocked"] == []
 
 
+async def test_the_guard_scans_the_capped_body_the_model_sees(  # issue #43 follow-up
+    install_crawler, make_config, tmp_path
+):
+    """The scan input is the cap-truncated body, not full page markdown: the model never
+    sees past the cap, so scanning the tail bought nothing but unbounded regex cost on a
+    hostile page. The same attack blocks from inside the cap and passes from beyond it —
+    the beyond-cap page still fetches, and its render carries the truncation notice.
+    """
+    config = make_config(per_page_char_cap=200, agent=AgentSettings(workspace_dir=tmp_path))
+    attack_markdown = _attack_markdown()
+
+    # Attack first: inside the cap, the guard must block exactly as before.
+    registry = SourceRegistry()
+    approve_all(registry, ["https://head.test"])
+    head_results = [
+        _FakeResult(
+            "https://head.test",
+            markdown=_FakeMarkdown(
+                raw_markdown=attack_markdown + "\n\n" + _not_thin("body text."),
+                fit_markdown=attack_markdown + "\n\n" + _not_thin("body text."),
+            ),
+        )
+    ]
+    install_crawler(head_results)
+    head_log = RunLog()
+    head_tool = fetch.build_fetch_tool(config, registry, head_log)
+
+    head_message = await head_tool.ainvoke(_tool_call(["https://head.test"], "call-cap-head"))
+
+    assert head_message.artifact == []
+    assert fetch._rejection_block("https://head.test") in head_message.content
+    head_incidents = [i for i in head_log.incidents() if i.kind == "guard_blocked"]
+    assert len(head_incidents) == 1
+
+    # Attack last: beyond the cap, out of the scan (and the model's) view entirely.
+    registry = SourceRegistry()
+    approve_all(registry, ["https://tail.test"])
+    padded = _not_thin("A long ordinary introduction.") + "\n\n" + attack_markdown
+    tail_results = [
+        _FakeResult(
+            "https://tail.test",
+            markdown=_FakeMarkdown(raw_markdown=padded, fit_markdown=padded),
+        )
+    ]
+    install_crawler(tail_results)
+    tail_log = RunLog()
+    tail_tool = fetch.build_fetch_tool(config, registry, tail_log)
+
+    tail_message = await tail_tool.ainvoke(_tool_call(["https://tail.test"], "call-cap-tail"))
+
+    assert [page.url for page in tail_message.artifact] == ["https://tail.test"]
+    assert "truncated at the 200-character cap" in tail_message.content
+    assert [i for i in tail_log.incidents() if i.kind == "guard_blocked"] == []
+
+
 async def test_survivor_markdown_zero_width_chars_stripped(  # D5/D3
     install_crawler, make_config, tmp_path
 ):
@@ -1852,7 +1930,7 @@ async def test_an_unapproved_url_is_rejected_pre_crawl_and_never_reaches_the_cra
     content, pages = await fetch._fetch(["https://never-approved.test"], config, registry, run_log)
 
     assert pages == []
-    assert content == fetch._rejection_block("https://never-approved.test")
+    assert content == fetch._provenance_rejection_block("https://never-approved.test")
     assert fake_cls.calls == []
     assert registry.all() == []
 
@@ -1891,7 +1969,7 @@ async def test_mixed_batch_approved_urls_fetch_while_the_unapproved_one_is_rejec
     assert fake_cls.calls[0].urls == ["https://approved-a.test", "https://approved-b.test"]
     assert [page.url for page in pages] == ["https://approved-a.test", "https://approved-b.test"]
     assert all(page.outcome == "fetched" for page in pages)
-    assert fetch._rejection_block("https://not-approved.test") in content
+    assert fetch._provenance_rejection_block("https://not-approved.test") in content
 
     incidents = [i for i in run_log.incidents() if i.kind == "provenance_rejected"]
     assert len(incidents) == 1
@@ -1916,13 +1994,25 @@ def test_the_rejection_block_wording_is_pinned():  # D1
     )
 
 
-async def test_provenance_and_guard_rejection_blocks_both_come_from_the_shared_builder(  # D1
+def test_the_provenance_rejection_block_wording_is_pinned():  # R1
+    """The second golden assertion: the provenance block's exact text, frozen in the plan's
+    Contracts because it is what teaches the model the rule it broke. Every other assertion
+    goes through `_provenance_rejection_block`, so this is the only copy of the string.
+    """
+    assert fetch._provenance_rejection_block("https://x.test") == (
+        "## https://x.test\n\nrejected — this URL did not come from a search_web result or "
+        "the user; search for it first, then fetch the URL the search returns"
+    )
+
+
+async def test_provenance_and_guard_rejections_say_different_amounts_of_truth(  # R1
     install_crawler, make_config
 ):
-    """D1's consequence: all rejection paths funnel through one block-builder, so the wording
-    cannot drift into revealing WHICH policy rejected the URL. Proving each path's output IS
-    `_rejection_block(url)` is what makes the blocks identical-but-for-the-URL structural
-    rather than a coincidence two hand-rolled strings currently share.
+    """R1 splits D1's single block in two. A guard (or blocklist) rejection stays opaque --
+    naming the policy would tell an adversarial page exactly what fired. A provenance
+    rejection is the MODEL's own mistake, not the page's, so it says why and what to do
+    instead: a model that cannot see the rule it broke keeps breaking it (the ~110 provenance
+    rejections of run 20260825134545).
     """
     config = make_config()
     registry = SourceRegistry()
@@ -1941,8 +2031,11 @@ async def test_provenance_and_guard_rejection_blocks_both_come_from_the_shared_b
     )
 
     # Left: rejected by provenance, pre-crawl. Right: dropped by the guard, post-crawl.
-    assert fetch._rejection_block("https://unapproved.test") in content
+    assert fetch._provenance_rejection_block("https://unapproved.test") in content
     assert fetch._rejection_block("https://evil.test") in content
+    # The provenance block does not merely wrap the opaque line with extra prose: the two
+    # rejections share no wording at all.
+    assert fetch._REJECTION_LINE not in fetch._provenance_rejection_block("https://unapproved.test")
 
 
 async def test_rejection_block_names_no_policy(install_crawler, make_config):  # D1
@@ -1969,8 +2062,8 @@ async def test_a_batch_where_every_url_is_rejected_returns_blocks_not_an_empty_s
     )
 
     assert content != ""
-    assert fetch._rejection_block("https://one-unapproved.test") in content
-    assert fetch._rejection_block("https://two-unapproved.test") in content
+    assert fetch._provenance_rejection_block("https://one-unapproved.test") in content
+    assert fetch._provenance_rejection_block("https://two-unapproved.test") in content
     assert fake_cls.calls == []
 
 
@@ -2016,7 +2109,7 @@ async def test_a_search_approval_rescues_a_url_strict_provenance_rejected_earlie
     fake_cls = install_crawler([])
     rejected_content, rejected_pages = await fetch._fetch([guessed], config, registry, RunLog())
     assert rejected_pages == []
-    assert rejected_content == fetch._rejection_block(guessed)
+    assert rejected_content == fetch._provenance_rejection_block(guessed)
     assert fake_cls.calls == []
 
     registry.approve(guessed)  # search surfaced it for real
@@ -2122,7 +2215,7 @@ async def test_an_unapproved_blocklisted_url_is_rejected_by_provenance_not_the_b
     content, pages = await fetch._fetch(["https://walled.test/page"], config, registry, run_log)
 
     assert pages == []
-    assert content == fetch._rejection_block("https://walled.test/page")
+    assert content == fetch._provenance_rejection_block("https://walled.test/page")
     assert fake_cls.calls == []
     assert [i.kind for i in run_log.incidents()] == ["provenance_rejected"]
 

@@ -75,6 +75,10 @@ class RoleConfig(_StrictModel):
     # Only `head` sets this today (the `/model` picker) — every other role omits it and
     # stays valid, since `None` is a legitimate "no picker" state, not an oversight.
     choices: list[str] | None = None
+    # D6 (PLAN-research-throughput): per-role request timeout; None falls back to
+    # `agent.request_timeout_seconds`. Set low for the researcher/reader so one slow call cannot
+    # eat the run's budget, unset for the head/verifier whose long calls are legitimate.
+    request_timeout_seconds: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _validate_choices(self) -> "RoleConfig":
@@ -96,6 +100,12 @@ class FetchSettings(_StrictModel):
     # where 0 or a negative is nonsense.
     page_timeout_ms: int = Field(default=15000, gt=0)
     max_concurrency: int = Field(default=5, gt=0)
+    # D3 (PLAN-research-throughput): the run-wide warm HTTP pool. Distinct from
+    # `max_concurrency`, which is the per-call dispatcher permit count.
+    max_connections: int = Field(default=24, gt=0)
+    # crawl4ai's own default; was a 75.0 constant. Risk #4: on a box smaller than 16GB
+    # also hosting SearXNG and Chromium, lower this in harness.toml.
+    memory_threshold_percent: float = Field(default=90.0, gt=0, le=100)
     # ~30k tokens of one page at roughly 4 chars per token. A character cap, not a token
     # cap: exact token counting would need a tokenizer and a choice of whose, and four model
     # roles are declared. Raised from 12000 now that page reading is delegated, so a long
@@ -143,6 +153,13 @@ class AgentSettings(_StrictModel):
     synthesis_margin_seconds: int = Field(default=240, ge=0)
     # Harness-enforced (R5): refused past this count, not merely advised in prompt prose.
     max_reader_dispatches: int = Field(default=6, gt=0)
+    # Harness-enforced (D5): a CONCURRENCY cap on the lead's in-flight researcher
+    # dispatches, not a total for the run — a later wave is allowed once these return.
+    max_concurrent_researchers: int = Field(default=4, gt=0)
+    # Prompt-only (D5): rendered into the researcher prompt as its search budget, never
+    # enforced — no per-researcher identity reaches `search_web` to count against. The
+    # enforced `max_reader_dispatches` above is what actually bounds a researcher's cost.
+    searches_per_researcher: int = Field(default=4, gt=0)
     # Under the user's home dir, not the repo root; overridable per-key from [agent].
     workspace_dir: Path = Field(
         default_factory=lambda: Path.home() / "deep-research" / "workspace"

@@ -135,7 +135,7 @@ def _make_fake_crawler_class(
         constructed_kinds: list[str] = []
         # The `_FakeHTTPCrawlerStrategy` instance passed at construction, one per HTTP
         # construction -- how a test reaches its `.kwargs` to assert `max_connections` was
-        # wired from `config.fetch.max_concurrency` (D6).
+        # wired from `config.fetch.max_connections` (D3, PLAN-research-throughput).
         http_strategies: list[object] = []
         calls: list[SimpleNamespace] = []
         closed: list[object] = []
@@ -330,10 +330,17 @@ class ConcurrencyTrackingModel(ScriptedChatModel):
     the other's Task gets its first turn (observed flaky in this suite); `0.05` reliably gives
     both a chance to increment before either decrements. Set it by assigning the private attr
     after construction: `model._sleep_seconds = 0.05`.
+
+    `_started_count` counts calls ENTERED, where `ScriptedChatModel._call_count` counts calls
+    that COMPLETED (it increments inside `_generate`, after the sleep above). The two diverge
+    exactly when a call is cancelled mid-sleep — which is what a deadline-cancelled subagent
+    dispatch looks like from here, so "was this subagent replayed?" can only be asked of the
+    started count.
     """
 
     _in_flight: int = PrivateAttr(default=0)
     _peak_in_flight: int = PrivateAttr(default=0)
+    _started_count: int = PrivateAttr(default=0)
     _sleep_seconds: float = PrivateAttr(default=0.0)
 
     async def _agenerate(
@@ -343,6 +350,7 @@ class ConcurrencyTrackingModel(ScriptedChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
+        self._started_count += 1
         self._in_flight += 1
         self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
         await asyncio.sleep(self._sleep_seconds)
@@ -623,6 +631,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
         per_page_char_cap: int = 12000,
         max_urls_per_call: int = 5,
         min_markdown_words: int = 50,
+        max_connections: int = 24,
+        memory_threshold_percent: float = 90.0,
         base_url: str = "http://searx.test",
         default_max_results: int = 10,
         max_consecutive_failures: int = 3,
@@ -659,6 +669,8 @@ def make_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
                 per_page_char_cap=per_page_char_cap,
                 max_urls_per_call=max_urls_per_call,
                 min_markdown_words=min_markdown_words,
+                max_connections=max_connections,
+                memory_threshold_percent=memory_threshold_percent,
             ),
             search=SearchSettings(
                 base_url=base_url,

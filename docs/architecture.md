@@ -39,7 +39,11 @@ developer. The reader always receives the facet it is supporting, never a bare
 URL — a reader handed a URL without knowing why it mattered is the documented
 telephone-game failure. Delegation costs 3-10x the tokens of a single agent and
 compounds per level, which is why runs carry a round cap and wall clock, and each
-researcher's prompt carries a search/dispatch budget.
+researcher's prompt carries a search/dispatch budget. The provenance rule — only
+URLs returned by `search_web` or pasted by the user are fetchable — is enforced in
+`fetch_pages`/`fetch_raw` AND stated to every tier in its prompt and in the tool
+descriptions, and a provenance rejection tells the model why it fired and what to
+do instead, while guard and blocklist rejections stay deliberately opaque.
 
 Every run owns a `<workspace_dir>/<run_id>/` subdirectory — the agent's
 `FilesystemBackend` is rooted there, and its notes, captured sources and evicted

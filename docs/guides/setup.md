@@ -69,10 +69,15 @@ are never stored here — each provider names an environment variable
 - `[providers.<name>]` — a model provider's `base_url` and the env var holding its key.
 - `[roles.head]` / `[roles.researcher]` / `[roles.reader]` / `[roles.verifier]` — which
   provider + model ID each role resolves to. All four must resolve; `head` is required at
-  load time, the rest fail loud (`ModelError`) at build/preflight time if undeclared.
-- `[fetch]` — per-page timeout, fetch concurrency, the per-page character cap, and the
-  maximum URLs one `fetch_pages` call may request (`max_urls_per_call`; a call carrying
-  more is rejected without fetching anything).
+  load time, the rest fail loud (`ModelError`) at build/preflight time if undeclared. Each role
+  may also set `request_timeout_seconds` (seconds, per request); unset means the `[agent]`
+  `request_timeout_seconds` value applies — the shipped file sets 60 for researcher and reader.
+- `[fetch]` — per-page timeout, fetch concurrency (`max_concurrency`, permits per fetch
+  call), the run-wide HTTP connection pool (`max_connections`, default 24, shared by every
+  concurrent researcher), the dispatcher's memory threshold (`memory_threshold_percent`,
+  default 90; lower both on a smaller box — see PLAN-research-throughput risk #4), the
+  per-page character cap, and the maximum URLs one `fetch_pages` call may request
+  (`max_urls_per_call`; a call carrying more is rejected without fetching anything).
 - `[search]` — the SearXNG base URL and default result count.
 - `[agent]` — `max_rounds` (default 20) and `wall_clock_seconds` (default 1800), the
   run's two ceilings. The wall clock starts at the first `search_web`/`fetch_pages`
@@ -80,6 +85,18 @@ are never stored here — each provider names an environment variable
   hitting either bound still writes a report naming which one it was. `max_rounds` is
   approximate — it maps onto LangGraph supersteps and buys somewhat fewer rounds than
   its number suggests (see @docs/plans/PLAN-research-loop.md `## Discoveries`).
+- `max_concurrent_researchers` (default 4) caps how many researcher dispatches the lead
+  may have IN FLIGHT at once — a concurrency cap, not a total for the run, so a further
+  wave is allowed once the running ones report back. A surplus dispatch is refused with a
+  message telling the lead to wait for the results it already asked for, and the refusal is
+  disclosed as a `researcher_budget_exhausted` incident. Both this key and
+  `searches_per_researcher` (default 4, advisory: rendered into the researcher prompt as a
+  search budget, never counted or enforced) are rendered into the prompts that read them, so
+  changing either changes what the model is told.
+- When `synthesis_margin_seconds` is non-zero the same reserve now also applies inside a
+  dispatch: a researcher still running when the margin arrives is cut off and the lead is
+  told to synthesize from what it has (disclosed as `research_deadline_reached`). Set it to
+  `0` to disable the reserve entirely, in which case dispatches are never cut off.
 - `max_rounds` bounds one PASS, not the whole run: every clarification resume grants a
   fresh allowance, so a run that asked two questions may use roughly three times the
   number configured. The wall clock is the only run-level bound once research starts.
