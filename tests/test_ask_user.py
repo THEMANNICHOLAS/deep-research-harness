@@ -10,11 +10,13 @@ import time
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from pydantic import ValidationError
 
 import harness.__main__ as main_module
 from harness.agent import build_agent
 from harness.display import ComposerDraft, PlainRenderer
 from harness.input import KeyEvent
+from harness.session import _NO_ANSWER_GIVEN
 from harness.sources import SourceRegistry
 from harness.tools.ask_user import build_ask_user_tool
 from tests.conftest import (
@@ -31,9 +33,12 @@ from tests.conftest import (
 _THREAD = {"configurable": {"thread_id": "test-thread"}}
 
 
-def _ask(question: str, call_id: str = "call_1") -> dict:
+def _ask(question: str, call_id: str = "call_1", choices: list[str] | None = None) -> dict:
     """One `ask_user` tool call, in the shape a real model emits."""
-    return {"name": "ask_user", "args": {"question": question}, "id": call_id}
+    args: dict = {"question": question}
+    if choices is not None:
+        args["choices"] = choices
+    return {"name": "ask_user", "args": args, "id": call_id}
 
 
 def _patch_main(monkeypatch, config, model, answers=None):
@@ -236,7 +241,7 @@ async def test_an_empty_answer_is_disclosed_rather_than_sent_as_silence(
     assert await main_module.main(["Tell me about mercury"]) == 0
 
     results = _ask_user_results(model._received_messages[1])
-    assert [m.content for m in results] == [main_module._NO_ANSWER_GIVEN]
+    assert [m.content for m in results] == [_NO_ANSWER_GIVEN]
 
 
 async def test_a_run_that_never_asks_completes_without_interruption(
@@ -312,6 +317,69 @@ def test_the_ask_user_tool_is_shaped_like_the_other_harness_tools(make_config):
     assert "question" in tool.args_schema.model_json_schema()["properties"]
 
 
+# --- Phase 4: up to four answer choices (R4) -----------------------------------------------
+
+
+def test_the_ask_user_schema_takes_up_to_four_optional_choices(make_config):
+    """R4's cap, enforced where the model meets it. One test, not four: a missing `choices`
+    field would make a "rejects five" test pass vacuously (`extra="forbid"` rejects any
+    unknown key), so the accept and reject cases have to be asserted together.
+    """
+    schema = build_ask_user_tool(make_config()).args_schema
+
+    assert schema(question="Which region?").choices is None
+    assert schema(question="Which region?", choices=None).choices is None
+    assert schema(question="Which region?", choices=["a", "b", "c", "d"]).choices == [
+        "a",
+        "b",
+        "c",
+        "d",
+    ]
+    with pytest.raises(ValidationError):
+        schema(question="Which region?", choices=["a", "b", "c", "d", "e"])
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        # A bare digit inside the offered range is the choice it numbers.
+        ("2", "b"),
+        # Anything else is free text, verbatim -- the choices are an offer, not a menu lock.
+        ("other idea", "other idea"),
+        # Out of range is NOT silently clamped or mapped: three choices, "7" typed, "7" sent.
+        ("7", "7"),
+    ],
+)
+async def test_a_digit_answer_resolves_to_its_choice_and_anything_else_is_free_text(
+    make_config, monkeypatch, scripted_model, typed, expected
+):
+    model = scripted_model(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[_ask("Which reading?", choices=["a", "b", "c"])],
+            ),
+            _submit_call("Final answer.").model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
+            ),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    queued = _patch_main(monkeypatch, make_config(), model, [typed])
+
+    assert await main_module.main(["Tell me about mercury"]) == 0
+    assert queued == []
+
+    results = _ask_user_results(model._received_messages[1])
+    assert [m.content for m in results] == [expected]
+
+
 # --- Phase 5: in-place overlay, the two clocks (risk #2) -----------------------------------
 
 
@@ -323,7 +391,7 @@ async def test_wall_clock_fires_while_a_question_is_pending(
     `ask_user` is awaiting an answer — nothing about answering a question may pause, reschedule,
     or extend it. `_read_answer` is patched with a fake that outlives the bound but never blocks
     the event loop (a plain `asyncio.sleep`), isolating exactly that property: the outer timeout
-    scope around `_answer_questions` must still fire on schedule with the question pending
+    scope around `Session._collect_answers` must still fire on schedule with the question pending
     inside it, not only after `_read_answer` eventually returns on its own.
     """
     agent = make_agent_settings(wall_clock_seconds=1)
@@ -467,7 +535,7 @@ async def test_the_composers_answer_resolves_an_open_ask_user_and_bypasses_the_q
 
 async def test_an_empty_line_answers_an_open_ask_user_instead_of_being_dropped(monkeypatch):
     """The other half of `_send`'s routing rule: an empty line is dropped for the lead but
-    ACCEPTED as an answer — `_answer_questions` turns it into `_NO_ANSWER_GIVEN`, so the
+    ACCEPTED as an answer — `Session._collect_answers` turns it into `_NO_ANSWER_GIVEN`, so the
     developer can decline a question.
     """
 

@@ -15,6 +15,7 @@ import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langgraph.types import Interrupt
 from pydantic import PrivateAttr, SecretStr
 
 from harness.activity import ActivitySink
@@ -22,6 +23,7 @@ from harness.display import (
     AgentText,
     Alert,
     PlainRenderer,
+    Question,
     ReportWritten,
     RunFinished,
     StageStarted,
@@ -55,6 +57,15 @@ async def _wait_for(predicate, description: str) -> None:
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError(f"timed out waiting for: {description}")
         await asyncio.sleep(0.01)
+
+
+def _typed(answer: str) -> Any:
+    """An `answer_source` handing back one scripted line, as the composer or stdin would."""
+
+    async def _answer() -> str:
+        return answer
+
+    return _answer
 
 
 def _model(cls: type, name: str) -> Any:
@@ -154,11 +165,15 @@ def make_session(make_config, make_agent_settings):
         # renderer the session emits into, not printed text it has to parse back. Popped
         # BEFORE the config is built, since everything left over is an `AgentSettings` field.
         renderer = config_overrides.pop("renderer", None) or PlainRenderer()
+        # Popped like `renderer`, and for the same reason: the one thing `main` owns about a
+        # clarifying question is where the answer TEXT comes from (the composer, or the stdin
+        # bridge). The overlay, the pause, URL approval and digit resolution are `Session`'s.
+        answer_source = config_overrides.pop("answer_source", None)
         config = config_overrides.pop("config", None) or make_config(
             agent=make_agent_settings(**config_overrides)
         )
 
-        async def _never_asked(interrupt: Any) -> list[dict[str, Any]]:
+        async def _never_asked() -> str:
             raise AssertionError("no clarifying question was expected in this test")
 
         return Session(
@@ -173,7 +188,7 @@ def make_session(make_config, make_agent_settings):
             # session only forwards it, so a test that fetches drives `install_crawler`'s
             # browser-free seam exactly as the pre-session fetch tests did.
             browser=None,
-            answer_interrupt=_never_asked,
+            answer_source=answer_source or _never_asked,
             started_at=datetime.now(),
             interactive=interactive,
         )
@@ -1433,6 +1448,211 @@ async def test_a_keyboard_interrupt_during_a_chat_turn_is_a_clean_quit(
     ], "the interrupt was disclosed as a failed turn instead of ending the chat"
 
 
+async def test_a_clarifying_answer_is_trimmed_and_any_url_in_it_becomes_fetchable(make_session):
+    """Moved here with the code it covers (Phase 4). An answer is user-supplied text exactly
+    like the opening question, so a URL pasted into it must be approved — the natural reply to
+    "which page do you mean?" IS that URL, and without approval every later fetch of it is
+    provenance_rejected. Trimming belongs here too, not to the stdin bridge that read it.
+    """
+    registry = SourceRegistry()
+    session = make_session(
+        registry=registry,
+        answer_source=_typed("  this one: https://example.test/docs/page  "),
+    )
+    interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which page?"}}]})
+
+    decisions = await session._collect_answers(interrupt)
+
+    url = "https://example.test/docs/page"
+    assert decisions == [{"type": "respond", "message": f"this one: {url}"}]
+    assert registry.is_approved(url)
+
+
+async def test_a_clarifying_question_can_arrive_without_a_question_argument(make_session):
+    """Exercises the `description` and `str(args)` fallbacks of `args["question"] or
+    description or str(args)`: nothing guarantees deepagents keeps putting the prompt under
+    `args`, and those fallbacks are all that stand between a schema change and an empty prompt
+    at the terminal. Driven through `_collect_answers` directly, since no real model can be
+    scripted into that shape.
+    """
+    renderer = RecordingRenderer()
+    session = make_session(renderer=renderer, answer_source=_typed("answered"))
+    interrupt = Interrupt(
+        value={
+            "action_requests": [
+                {"name": "ask_user", "args": {}, "description": "Metal or album?"},
+                {"name": "ask_user", "args": {"topic": "isotope"}},
+            ]
+        }
+    )
+
+    decisions = await session._collect_answers(interrupt)
+
+    asked = [event.text for event in renderer.events if isinstance(event, Question)]
+    assert asked[0] == "Metal or album?", "the description fallback never fired"
+    assert "isotope" in asked[1], "the str(args) fallback never fired"
+    assert [decision["message"] for decision in decisions] == ["answered", "answered"]
+
+
+async def test_only_the_first_four_choices_are_offered_and_resolvable(make_session):
+    """R4 caps `ask_user` at four choices, but the interrupt path never runs the tool's
+    `args_schema` — `HumanInTheLoopMiddleware` answers with a `respond` decision and SKIPS
+    tool execution — so the schema's `max_length=4` is only a model-facing hint and the
+    session must clamp what a misbehaving lead actually sent. A fifth-or-later choice is
+    neither rendered nor digit-resolvable: "5" against six sent choices is free text.
+    """
+    renderer = RecordingRenderer()
+    session = make_session(renderer=renderer, answer_source=_typed("5"))
+    interrupt = Interrupt(
+        value={
+            "action_requests": [
+                {"args": {"question": "Pick one", "choices": ["a", "b", "c", "d", "e", "f"]}}
+            ]
+        }
+    )
+
+    decisions = await session._collect_answers(interrupt)
+
+    question = next(event for event in renderer.events if isinstance(event, Question))
+    assert question.choices == ("a", "b", "c", "d"), "the fifth and sixth choices were offered"
+    assert decisions == [{"type": "respond", "message": "5"}], (
+        "a digit past the clamped range resolved to a hidden choice"
+    )
+
+
+async def test_the_stage_returns_to_researching_after_a_mid_research_answer(
+    make_session, three_models
+):
+    """Phase 4 made mid-research questions legal, but the `clarifying` stage advance was only
+    ever left behind: nothing re-entered `researching` until the NEXT dispatch, so the live
+    header read "clarifying" while researchers kept running and `stage_timings` recorded a
+    truncated `researching`. Answered-with-researchers-still-running must advance back.
+    """
+    gate = asyncio.Event()
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            AIMessage(content="", tool_calls=[_dispatch_call("a", "call_a").tool_calls[0]]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ask_user",
+                        "args": {"question": "Broad or deep?"},
+                        "id": "call_ask",
+                    }
+                ],
+            ),
+            AIMessage(content="Going deep."),
+            _submit_call("Widgets cost $4.20 each."),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {"Investigate a": (gate, "Angle a findings.")}
+    three_models(head, researcher)
+
+    asked = asyncio.Event()
+
+    async def _answer() -> str:
+        asked.set()
+        return "deep"
+
+    renderer = RecordingRenderer()
+    session = make_session(answer_source=_answer, renderer=renderer)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(asked.is_set, "the lead's mid-research clarifying question")
+        assert session.running, "the researcher had already ended before the question was asked"
+        # The answer resolves WHILE the researcher is still gated: the stage must go back to
+        # researching, not sit on clarifying until the next dispatch.
+        await _wait_for(
+            lambda: any(
+                isinstance(event, StageStarted) and event.stage == "researching"
+                for event in renderer.events[
+                    next(i for i, e in enumerate(renderer.events) if isinstance(e, Question)) :
+                ]
+            ),
+            "the stage to return to researching after the answer",
+        )
+    finally:
+        gate.set()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+        run.cancel()
+
+    assert outcome is not None
+
+
+async def test_a_mid_run_question_resolves_a_digit_while_researchers_keep_running(
+    make_session, three_models
+):
+    """R4: the lead may ask at any point, not only before research starts. The pending
+    question must not stall a researcher already running -- the whole reason the interrupt is
+    handled inside the turn rather than around the loop -- and a digit inside the offered
+    range must reach the model as the CHOICE it numbers, never as the digit itself.
+    """
+    gate = asyncio.Event()
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            AIMessage(content="", tool_calls=[_dispatch_call("a", "call_a").tool_calls[0]]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ask_user",
+                        "args": {"question": "Which region?", "choices": ["EU", "US"]},
+                        "id": "call_ask",
+                    }
+                ],
+            ),
+            AIMessage(content="Focusing on US."),
+            _submit_call("Widgets cost $4.20 each."),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {"Investigate a": (gate, "Angle a findings.")}
+    three_models(head, researcher)
+
+    asked, release = asyncio.Event(), asyncio.Event()
+
+    async def _answer() -> str:
+        asked.set()
+        await release.wait()
+        return "2"
+
+    renderer = RecordingRenderer()
+    session = make_session(answer_source=_answer, renderer=renderer)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(asked.is_set, "the lead's mid-run clarifying question")
+        assert session.running, "the researcher had already ended before the question was asked"
+        # The property under test: the researcher runs to completion WHILE the answer is
+        # still outstanding. A question that blocked the loop would never let this settle.
+        gate.set()
+        await _wait_for(
+            lambda: not session.running,
+            "the researcher to finish while the question was still pending",
+        )
+        release.set()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        gate.set()
+        release.set()
+        run.cancel()
+
+    assert outcome is not None
+    state = await session.agent.aget_state({"configurable": {"thread_id": session.thread_id}})
+    answered = [
+        str(message.content)
+        for message in state.values["messages"]
+        if isinstance(message, ToolMessage) and message.name == "ask_user"
+    ]
+    assert answered == ["US"], "the digit reached the model instead of the choice it numbered"
+    assert [event for event in renderer.events if isinstance(event, Question)] == [
+        Question("Which region?", choices=("EU", "US"))
+    ]
+
+
 async def test_a_post_report_question_does_not_reopen_the_clarifying_stage(
     make_session, three_models, monkeypatch, tmp_path
 ):
@@ -1470,7 +1690,7 @@ async def test_a_post_report_question_does_not_reopen_the_clarifying_stage(
         return [{"type": "respond", "args": "the cheap one"}]
 
     monkeypatch.setattr(session, "_stream_pass", _questioning_stream_pass)
-    monkeypatch.setattr(session, "_answer_interrupt", _answer)
+    monkeypatch.setattr(session, "_collect_answers", _answer)
 
     run = asyncio.create_task(session.run())
     try:

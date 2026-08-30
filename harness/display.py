@@ -65,6 +65,10 @@ class Activity:
 @dataclass(frozen=True)
 class Question:
     text: str
+    # Up to four offered answers (R4), numbered from 1 in the order given; empty means the
+    # question is free-form. A tuple, like every other event payload here, so the event stays
+    # hashable and cannot be mutated after it is emitted.
+    choices: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -318,6 +322,8 @@ class PlainRenderer:
             out(f"{event.stage} done ({event.elapsed_seconds:.1f}s)")
         elif isinstance(event, Question):
             out(event.text)
+            for index, choice in enumerate(event.choices, 1):
+                out(f"  {index}. {choice}")
         elif isinstance(event, Alert):
             # `event.text` is already bounded — `Alert.__post_init__` is the one bounding site.
             out(f"warning: {event.text}")
@@ -522,6 +528,7 @@ class RichRenderer:
         self._tool_calls: dict[str, ToolCall] = {}
         self._readers: tuple[ReaderItem, ...] = ()
         self._overlay_question: str | None = None
+        self._overlay_choices: tuple[str, ...] = ()
         # The composer is ALWAYS rendered, so `None` means "nothing typed yet" rather than
         # "no composer": `_build_renderable` falls back to an empty draft, which paints the
         # bare `> ` prompt row.
@@ -629,24 +636,39 @@ class RichRenderer:
 
     def _build_ask_overlay(self) -> Panel:
         assert self._overlay_question is not None
-        body = Group(
+        rows: list[RenderableType] = [
             # `Text(...)`, not the raw string: the question is model-authored, and `Panel`
             # renders console markup -- a bracketed path (`[/var/log]`) would raise
             # `MarkupError` and end the run instead of asking, and a `[a]`-style option label
             # would be parsed as an unknown style and silently dropped from the question the
-            # developer is answering.
-            Text(self._overlay_question),
-            # No answer row here (3F Minor b): the answer is typed into the session composer,
-            # which stays live below the overlay — a draft row of its own would sit there
-            # permanently empty, because nothing emits overlay-answering keystrokes as events.
-            Text("Enter to submit", style=_MUTED),
-            # "clock", not the mockup's "stage clock": what freezes is the RUN elapsed time
-            # shown on the stage line, not a per-stage timer. Worth being exact, because the
-            # WALL clock keeps counting through this pause -- a run can be cut short at a wall
-            # time this display never reached.
-            Text("clock paused while the agent waits", style=_MUTED),
-        )
-        return Panel(body, border_style=_CYAN, title="ask_user")
+            # developer is answering. Every choice is model-authored too, and wrapped for the
+            # same reason.
+            Text(self._overlay_question)
+        ]
+        if self._overlay_choices:
+            rows.extend(
+                Text(f"  {index}. {choice}")
+                for index, choice in enumerate(self._overlay_choices, 1)
+            )
+            # In the PANEL, not the footer: the digits mean something only while this overlay
+            # is open, so the hint has to vanish with it rather than sit over a composer line
+            # that is back to taking ordinary messages.
+            rows.append(
+                Text(
+                    f"answer with 1-{len(self._overlay_choices)} or type freely",
+                    style=_MUTED,
+                )
+            )
+        # No answer row here (3F Minor b): the answer is typed into the session composer,
+        # which stays live below the overlay — a draft row of its own would sit there
+        # permanently empty, because nothing emits overlay-answering keystrokes as events.
+        rows.append(Text("Enter to submit", style=_MUTED))
+        # "clock", not the mockup's "stage clock": what freezes is the RUN elapsed time
+        # shown on the stage line, not a per-stage timer. Worth being exact, because the
+        # WALL clock keeps counting through this pause -- a run can be cut short at a wall
+        # time this display never reached.
+        rows.append(Text("clock paused while the agent waits", style=_MUTED))
+        return Panel(Group(*rows), border_style=_CYAN, title="ask_user")
 
     def _build_activity_group(self) -> Group:
         header = self._build_stage_header()
@@ -756,6 +778,7 @@ class RichRenderer:
             # as long as the overlay is open (risk #2's OTHER clock -- the wall clock in
             # `__main__` is untouched here).
             self._overlay_question = event.text
+            self._overlay_choices = event.choices
             self._elapsed.pause()
             if self._live is None:
                 self._start_live()
@@ -763,6 +786,7 @@ class RichRenderer:
                 self._live.refresh()
         elif isinstance(event, QuestionAnswered):
             self._overlay_question = None
+            self._overlay_choices = ()
             self._elapsed.resume()
             if self._live is not None:
                 self._live.refresh()

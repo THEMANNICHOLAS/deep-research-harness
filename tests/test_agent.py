@@ -16,7 +16,6 @@ import httpx
 import pytest
 from deepagents.backends.protocol import SandboxBackendProtocol
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langgraph.types import Interrupt
 from pydantic import PrivateAttr
 
 import harness.__main__ as main_module
@@ -24,7 +23,6 @@ import harness.session as session_module
 from harness.activity import ActivitySink, active_reader
 from harness.agent import _summarize_tool_args, _summarize_tool_result, build_agent
 from harness.config import AgentSettings, HarnessConfig, run_workspace_dir
-from harness.display import PlainRenderer, StageTracker
 from harness.report import (
     _CUT_SHORT_HEADING,
     _ROUND_CAP_TEXT,
@@ -1920,35 +1918,13 @@ async def test_read_answer_runs_on_a_daemon_thread(monkeypatch):
 
 
 async def test_read_answer_returns_what_was_typed(monkeypatch):
-    """The thread-based read must not mangle the answer, and `_answer_questions`' normalization
-    must still see it whole.
+    """The thread-based read must hand the line back untouched — trimming it is
+    `Session._collect_answers`' job (tests/test_session.py), and a bridge that stripped or
+    re-wrapped the text would hide an answer the developer actually typed.
     """
     monkeypatch.setattr("builtins.input", lambda prompt="": "  Yes, region EU-West  ")
-    interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which region?"}}]})
-    renderer = PlainRenderer()
 
-    decisions = await main_module._answer_questions(
-        interrupt, renderer, SourceRegistry(), StageTracker(renderer)
-    )
-
-    assert decisions == [{"type": "respond", "message": "Yes, region EU-West"}]
-
-
-async def test_a_url_pasted_into_a_clarifying_answer_becomes_fetchable(monkeypatch):
-    """Phase 4 (R2): an answer is user-supplied text like the question itself, so a URL pasted
-    into it must be approved — the natural reply to "which page do you mean?" is that URL, and
-    without approval every later fetch of it is provenance_rejected.
-    """
-    monkeypatch.setattr(
-        "builtins.input", lambda prompt="": "this one: https://example.test/docs/page"
-    )
-    interrupt = Interrupt(value={"action_requests": [{"args": {"question": "Which page?"}}]})
-    registry = SourceRegistry()
-    renderer = PlainRenderer()
-
-    await main_module._answer_questions(interrupt, renderer, registry, StageTracker(renderer))
-
-    assert registry.is_approved("https://example.test/docs/page")
+    assert await main_module._read_answer() == "  Yes, region EU-West  "
 
 
 async def test_main_cuts_the_run_short_at_the_round_cap(
@@ -2981,45 +2957,6 @@ async def test_a_cut_short_run_still_checks_a_claim_against_its_captured_source(
     assert "One paragraph was not supported: the capture reads $5.10." in body
     # And R1's citation resolution still happened on the same partial answer.
     assert "https://example.test/pricing" in body
-
-
-async def test_a_clarifying_question_can_arrive_without_a_question_argument(
-    make_config, monkeypatch, capsys
-):
-    """Exercises the `description` and `str(args)` fallbacks of `args["question"] or description or
-    str(args)`: nothing guarantees deepagents keeps putting the prompt under `args`, and those
-    fallbacks are all that stand between a schema change and an empty prompt at the terminal.
-    Driven through `_answer_questions` directly, since no real model can be scripted into that
-    shape.
-    """
-
-    async def _record(*_args: object, **_kwargs: object) -> str:
-        return "answered"
-
-    monkeypatch.setattr(main_module, "_read_answer", _record)
-
-    interrupt = Interrupt(
-        value={
-            "action_requests": [
-                {"name": "ask_user", "args": {}, "description": "Metal or album?"},
-                {"name": "ask_user", "args": {"topic": "isotope"}},
-            ]
-        }
-    )
-
-    renderer = PlainRenderer()
-    decisions = await main_module._answer_questions(
-        interrupt, renderer, SourceRegistry(), StageTracker(renderer)
-    )
-
-    out, _ = drain_stdout(capsys)
-    asked = [line for line in out.splitlines() if line.strip()]
-    metal_line = next(line for line in asked if line == "Metal or album?")
-    isotope_line = next(line for line in asked if "isotope" in line)
-    assert asked.index(metal_line) < asked.index(isotope_line), (
-        "the description fallback never fired, or fired out of order"
-    )
-    assert [d["message"] for d in decisions] == ["answered", "answered"]
 
 
 async def test_a_display_error_from_the_activity_sink_is_not_retried_or_blamed_on_the_reader(

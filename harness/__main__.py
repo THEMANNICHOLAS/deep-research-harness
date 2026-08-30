@@ -7,9 +7,10 @@ builds one `Session`, awaits `run()`, and maps its result onto an exit code: an 
 `None` is 1 with the reason on stderr. The report path is the final line of stdout — frozen,
 because R1 depends on it. Nothing may print after it.
 
-The lead may ask clarifying questions via `ask_user` (R2, D5): the run interrupts, this module
-prints each question and reads an answer (`_answer_questions`, handed to the session as its
-`answer_interrupt` callback), and the session resumes the same thread with it.
+The lead may ask clarifying questions via `ask_user` (R4, D5). The whole interrupt round trip
+belongs to `Session._collect_answers`; this module owns only WHERE the answer text is read
+from, handed over as the session's `answer_source` — `Composer.answer` with a keyboard, the
+stdin `_read_answer` bridge without one.
 
 With a terminal, `main` also runs a `Composer` beside the session (Phase 3): one `KeyReader`
 thread feeds the welcome screen and then the composer, whose lines are queued as `UserMessage`s
@@ -36,7 +37,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
 from rich.console import Console, RenderableType
@@ -47,8 +48,6 @@ from harness.config import ConfigError, load_config
 from harness.display import (
     Activity,
     ComposerDraft,
-    Question,
-    QuestionAnswered,
     Renderer,
     StageTracker,
     WelcomeScreen,
@@ -66,14 +65,10 @@ if TYPE_CHECKING:
     # Annotation-only: the runtime imports of langgraph and the agent/model stack are
     # deferred into `main` — they cost several seconds, and `--help` or a config error
     # should not pay them (see the deferred-import block there).
-    from langgraph.types import Interrupt
 
     from harness.config import HarnessConfig
     from harness.report import RunOutcome
     from harness.session import Session
-
-# What the model is told when the developer answers a clarifying question with nothing.
-_NO_ANSWER_GIVEN = "(The developer gave no answer to this question.)"
 
 # Roles preflighted before any agent work, in the order they are checked. Adding a role to
 # the config means adding it here — nothing else in `main` knows the list. All four roles:
@@ -221,8 +216,8 @@ class Composer:
         """Route one submitted line: a pending clarifying answer first, then the lead.
 
         An empty line is dropped for the lead (a stray Enter is not a message) but ACCEPTED as
-        an answer, where `_answer_questions` already turns it into `_NO_ANSWER_GIVEN` — the
-        developer must be able to decline a question.
+        an answer, where `Session._collect_answers` already turns it into `_NO_ANSWER_GIVEN`
+        — the developer must be able to decline a question.
         """
         if self._answer is not None and not self._answer.done():
             self._answer.set_result(text)
@@ -263,7 +258,7 @@ async def _read_answer(prompt: str = "> ") -> str:
             # stdin is closed or unreadable (piped from /dev/null, run under a service
             # manager). Resolve with nothing rather than dying before `_resolve` is
             # scheduled, which left `await future` pending forever with no report at all.
-            # `_answer_questions` turns "" into `_NO_ANSWER_GIVEN`, so the model is told
+            # `Session._collect_answers` turns "" into `_NO_ANSWER_GIVEN`, so the model is told
             # the question went unanswered and the run proceeds to a report like any other.
             answer = ""
 
@@ -282,49 +277,6 @@ async def _read_answer(prompt: str = "> ") -> str:
 
     threading.Thread(target=_worker, daemon=True).start()
     return await future
-
-
-async def _answer_questions(
-    interrupt: Interrupt,
-    renderer: Renderer,
-    registry: SourceRegistry,
-    tracker: StageTracker,
-    composer: Composer | None = None,
-) -> list[dict[str, Any]]:
-    """Render each pending `ask_user` question and collect one answer per action request.
-
-    One decision per request, in the same order — the middleware raises `ValueError` on a
-    count mismatch.
-
-    An answer is user-supplied text exactly like the initial question, so any URL pasted into
-    it is approved here (Phase 4, D2/R2) — the natural reply to "which page do you mean?" is
-    the URL itself, and without this it stayed provenance-rejected for the rest of the run.
-
-    The overlay is in-frame now (Phase 5): no `suspend()`. `tracker.pause()`/`resume()` and
-    the `QuestionAnswered` emit sit around `_read_answer` in a `finally`, so a `KeyboardInterrupt`
-    or a wall-clock cancellation mid-question cannot leave the displayed clock paused and the
-    overlay stuck open. The WALL clock (`asyncio.timeout` in `main`) is a different clock
-    entirely (risk #2) and nothing here touches it.
-    """
-    decisions: list[dict[str, Any]] = []
-    for request in interrupt.value["action_requests"]:
-        args = request.get("args", {})
-        question = args.get("question") or request.get("description") or str(args)
-        renderer.emit(Question(question))
-        tracker.pause()
-        try:
-            # With a terminal the composer is already reading keys, so the answer comes from
-            # the same line the developer types everything else into; headless runs read stdin.
-            answer = await (composer.answer() if composer is not None else _read_answer())
-        finally:
-            tracker.resume()
-            renderer.emit(QuestionAnswered())
-        for url in extract_urls(answer):
-            registry.approve(url)
-        # Best-effort + disclose: a bare Enter must not reach the model as an empty tool
-        # result, which reads as "answered with nothing said" and hides the open ambiguity.
-        decisions.append({"type": "respond", "message": answer.strip() or _NO_ANSWER_GIVEN})
-    return decisions
 
 
 # --- Welcome screen (Phase 2, PLAN-tui-redesign) --------------------------------------------
@@ -638,12 +590,10 @@ async def main(argv: list[str] | None = None) -> int:
             question,
             sink=sink,
             browser=browser,
-            # `_answer_questions` keeps its `renderer`/`registry`/`tracker` arguments and stays in
-            # this module (Phase 4 moves the interrupt handling itself); the session only needs
-            # "given an interrupt, get me the decisions".
-            answer_interrupt=lambda interrupt: _answer_questions(
-                interrupt, renderer, registry, tracker, composer
-            ),
+            # A thunk, not `composer.answer` itself, for the same reason as the sink above:
+            # the composer does not exist yet. `_read_answer` is looked up on this module at
+            # call time too, which is the seam the headless tests patch.
+            answer_source=lambda: composer.answer() if composer is not None else _read_answer(),
             started_at=started_at,
             # A key source is what makes a session interactive: with one, an idle lead waits for
             # the developer and the chat continues past the report; without one, the run is

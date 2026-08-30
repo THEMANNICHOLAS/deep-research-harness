@@ -19,6 +19,11 @@ and a wall clock that spans the RESEARCH alone (R6) — armed at the first `disp
 the harness accepts, disarmed the moment `submit_report` is, so no time spent after the report
 can cut the run short. Crossing either, or the synthesis reserve measured back from the clock,
 buys one bounded pass in which the lead is told to call `submit_report` from what it has.
+
+The lead may also `ask_user` at any point (R4). That interrupt is answered inside the turn by
+`_collect_answers`, which renders the question and its numbered choices, pauses the displayed
+stage clock, and resumes the same thread with the answer — `__main__` supplies only the
+`answer_source` the text is read from.
 """
 
 import asyncio
@@ -51,6 +56,8 @@ from harness.display import (
     Activity,
     AgentText,
     Alert,
+    Question,
+    QuestionAnswered,
     ReaderItem,
     ReadersUpdated,
     Renderer,
@@ -67,7 +74,7 @@ from harness.display import (
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
 from harness.runlog import RunLog
-from harness.sources import SourceRegistry
+from harness.sources import SourceRegistry, extract_urls
 from harness.tools.dispatch import DISPATCH_RESEARCHER_TOOL_NAME
 from harness.verify import VerificationResult, verify_paragraphs
 
@@ -77,6 +84,9 @@ if TYPE_CHECKING:
     from harness.browser import BrowserSession
 
 _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+# What the model is told when the developer answers a clarifying question with nothing.
+_NO_ANSWER_GIVEN = "(The developer gave no answer to this question.)"
 
 # What the lead is told when either bound (the round cap or the synthesis margin) lands
 # mid-research (R7): one bounded pass to turn what was already reported into a final answer,
@@ -300,6 +310,26 @@ def _describe_tool_call(call: dict[str, Any]) -> str:
     return f"{DISPATCH_RESEARCHER_TOOL_NAME}: {brief_summary(str(args.get('label', '')))}"
 
 
+def _resolve_answer(answer: str, choices: tuple[str, ...]) -> str:
+    """One typed line -> what the model is told, applying R4's digit rule.
+
+    A lone digit numbering an OFFERED choice resolves to that choice's text; anything else is
+    free text verbatim — "5" against three choices, "12", "2x". The choices are an offer, not
+    a menu lock, and an out-of-range number is never clamped onto a choice the developer did
+    not pick. Best-effort + disclose: a bare Enter must not reach the model as an empty tool
+    result, which reads as "answered with nothing said" and hides the open ambiguity.
+    """
+    text = answer.strip()
+    if not text:
+        return _NO_ANSWER_GIVEN
+    # Membership in the rendered labels, not `int(text)`: `"²".isdigit()` is True while
+    # `int("²")` raises, and a pasted answer is arbitrary text.
+    numbers = [str(index) for index in range(1, len(choices) + 1)]
+    if text in numbers:
+        return choices[numbers.index(text)]
+    return text
+
+
 class Session:
     """One research session: the lead, its researchers, and the run's single report gate.
 
@@ -319,7 +349,7 @@ class Session:
         *,
         sink: ActivitySink | None,
         browser: "BrowserSession | None",
-        answer_interrupt: Callable[[Interrupt], Awaitable[list[dict[str, Any]]]],
+        answer_source: Callable[[], Awaitable[str]],
         started_at: datetime,
         interactive: bool = False,
     ) -> None:
@@ -331,7 +361,7 @@ class Session:
         self._question = question
         self._sink = activity.or_default(sink)
         self._browser = browser
-        self._answer_interrupt = answer_interrupt
+        self._answer_source = answer_source
         self._started_at = started_at
         self._interactive = interactive
 
@@ -917,12 +947,57 @@ class Session:
                 # `interrupts[0]`, not all of them: the lead is a single agent node, so at most
                 # one is ever pending, and `Command(resume=...)` delivers ONE value — fanning
                 # several into one decisions list would mis-pair them.
-                decisions = await self._answer_interrupt(interrupts[0])
+                decisions = await self._collect_answers(interrupts[0])
+                # A mid-research answer hands the header back to the researchers still
+                # running; without this the stage sat on `clarifying` until the NEXT
+                # dispatch and `stage_timings` recorded a truncated `researching`.
+                if self.answer is None and self.running:
+                    self._tracker.advance("researching")
                 stream_input = Command(resume={"decisions": decisions})
                 continue
             if self._cap_hit or self._overrun or self._margin_hit:
                 await self._synthesis_pass()
             return
+
+    async def _collect_answers(self, interrupt: Interrupt) -> list[dict[str, Any]]:
+        """Ask each pending `ask_user` question and collect one answer per action request.
+
+        One decision per request, in the same order — the middleware raises `ValueError` on a
+        count mismatch.
+
+        Only WHERE the text comes from belongs to `__main__` (`answer_source`: the composer
+        while a keyboard exists, the stdin bridge otherwise); everything around it is the
+        session's, because the session already owns the renderer, the registry and the stage
+        tracker this needs.
+
+        An answer is user-supplied text exactly like the initial question, so any URL pasted
+        into it is approved here (D2/R2) — the natural reply to "which page do you mean?" is
+        the URL itself, and without this it stayed provenance-rejected for the rest of the run.
+
+        `tracker.pause()`/`resume()` and the `QuestionAnswered` emit sit around the read in a
+        `finally`, so a `KeyboardInterrupt` or a wall-clock cancellation mid-question cannot
+        leave the displayed clock paused and the overlay stuck open. The WALL clock is a
+        different clock entirely and nothing here touches it.
+        """
+        decisions: list[dict[str, Any]] = []
+        for request in interrupt.value["action_requests"]:
+            args = request.get("args", {})
+            question = args.get("question") or request.get("description") or str(args)
+            # Clamped HERE, not only in the schema: the interrupt path never executes the
+            # tool, so `args_schema`'s `max_length=4` is a model-facing hint — a lead that
+            # sends six choices anyway must not get six numbered rows (R4).
+            choices = tuple(args.get("choices") or ())[:4]
+            self._renderer.emit(Question(question, choices=choices))
+            self._tracker.pause()
+            try:
+                answer = await self._answer_source()
+            finally:
+                self._tracker.resume()
+                self._renderer.emit(QuestionAnswered())
+            for url in extract_urls(answer):
+                self._registry.approve(url)
+            decisions.append({"type": "respond", "message": _resolve_answer(answer, choices)})
+        return decisions
 
     def _batch_message(self, batch: list[SessionEvent]) -> str:
         """Fold one drained event batch into the single `HumanMessage` the lead sees (R2).

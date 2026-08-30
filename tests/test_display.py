@@ -143,6 +143,17 @@ def test_plain_renderer_emits_the_expected_line(capsys, event: DisplayEvent, exp
     assert lines == [expected_line]
 
 
+def test_plain_renderer_prints_the_question_then_its_numbered_choices(capsys):
+    """R4 on the headless path: the choices are part of the question, so a non-TTY run that
+    printed only the question would offer the developer numbers with nothing to number."""
+    renderer = PlainRenderer()
+
+    renderer.emit(Question("Which region?", choices=("EU", "US")))
+
+    out, lines = drain_stdout(capsys)
+    assert lines == ["Which region?", "  1. EU", "  2. US"]
+
+
 def test_plain_renderer_prints_todos_updated_as_sequential_lines_with_no_alt_screen(capsys):
     renderer = PlainRenderer()
     todos = (
@@ -818,6 +829,31 @@ def test_overlay_retracts_on_question_answered():
     assert "Which region?" not in frame
     assert "clock paused while the agent waits" not in frame
     assert 'search_web: "a query"' in frame
+
+
+def test_overlay_renders_numbered_choices_and_the_answer_hint():
+    """R4: up to four choices are shown numbered inside the overlay, with the hint that says
+    a number picks one and anything else is still accepted -- in the panel, not the footer,
+    so it disappears with the overlay rather than lingering over an ordinary composer line.
+    """
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(Question("Which region?", choices=("EU", "US")))
+    text = _strip_ansi(buffer.getvalue())
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.QuestionAnswered())
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "Which region?" in text
+    assert "1. EU" in text
+    assert "2. US" in text
+    assert "answer with 1-2 or type freely" in text
+    # The retraction clears the choices with the question -- see
+    # `test_overlay_retracts_on_question_answered` for the no-choices case.
+    assert "1. EU" not in frame
+    assert "Which region?" not in frame
 
 
 def test_rich_renderer_displayed_clock_excludes_the_paused_interval():

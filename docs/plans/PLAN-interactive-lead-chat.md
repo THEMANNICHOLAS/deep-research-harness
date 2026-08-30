@@ -240,7 +240,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 1: Session tracer — dispatch tool, return injection, submit_report
 - [x] Phase 2: Budgets, roster data and run exits inside the session
 - [x] Phase 3: Composer — queued user messages and post-report chat
-- [ ] Phase 4: ask_user with choices
+- [x] Phase 4: ask_user with choices
 - [ ] Phase 5: Chat TUI — transcript, task dock, researcher roster
 - [ ] Phase 6: Slash commands — /sources, /model, /new
 - [ ] Phase 7: Prompts, docs and supersession
@@ -441,8 +441,8 @@ from the composer, and the run resumes.
 - Researcher/reader tiers asking anything.
 
 **Tests (write first, confirm red):**
-- [ ] Schema rejects >4 choices; a question with choices renders them numbered.
-- [ ] An interrupt mid-run pauses the turn; "2" resumes with the second choice's text; free text
+- [x] Schema rejects >4 choices; a question with choices renders them numbered.
+- [x] An interrupt mid-run pauses the turn; "2" resumes with the second choice's text; free text
   resumes verbatim; researchers keep running meanwhile.
 
 **Steps:**
@@ -776,3 +776,25 @@ never add a section below it. -->
   is still unrun — needs real models, along with Phase 1's live pass. Phase 4 moves interrupt
   handling into `Session` and should fold `composer.answer()` digits; watch Discoveries (a) —
   no keyboard escape while a post-report turn hangs — when touching that seam.
+
+### 2026-08-30 — Phase 4: ask_user with choices
+- Done: `AskUserInput.choices: list[str] | None` (`max_length=4`) + docstring lifting the
+  pre-research-only restriction; the interrupt round-trip moved from `__main__._answer_questions`
+  into `Session._collect_answers` (URL approval, `_NO_ANSWER_GIVEN`, question fallbacks all
+  moved with it), with `answer_source: Callable[[], Awaitable[str]]` replacing
+  `answer_interrupt` — `__main__` supplies only where the text comes from (composer.answer on a
+  TTY, the stdin `_read_answer` bridge headless); digit 1-N resolves to the choice text via
+  `_resolve_answer`, anything else is verbatim; overlay renders numbered choices + an
+  `answer with 1-N or type freely` hint; orchestrator.md `# Clarification` rewritten. Review
+  fixes: choices clamped to four in `_collect_answers` (the interrupt path never executes the
+  tool, so the schema cap is only a model-facing hint), the stage header returns to
+  `researching` after a mid-research answer with researchers still running, `answer_source`'s
+  unreachable `| None` branch dropped. 879 tests, gates clean.
+- Learned: `HumanInTheLoopMiddleware._process_decision` SKIPS tool execution for `respond`
+  decisions — `args_schema` validation never runs on the interrupt path, so any R-contract on
+  ask_user's arguments must be enforced in `_collect_answers`. `interrupts[0]` assumes the
+  lead is the only node with `interrupt_on`; that breaks if a second tier ever gets it.
+- Drift: none.
+- Watch-next: Phase 5 (chat TUI) restructures `_build_renderable` — the transcript bound
+  (Discoveries 2026-08-30 (c)) is owed there, and the `clarifying`/`researching` stage
+  handoff just added should be re-checked against the new task dock.
