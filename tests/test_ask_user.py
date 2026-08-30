@@ -13,11 +13,12 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 import harness.__main__ as main_module
 from harness.agent import build_agent
-from harness.display import PlainRenderer
+from harness.display import ComposerDraft, PlainRenderer
 from harness.input import KeyEvent
 from harness.sources import SourceRegistry
 from harness.tools.ask_user import build_ask_user_tool
 from tests.conftest import (
+    RecordingRenderer,
     _dispatch_call,
     _submit_call,
     drain_stdout,
@@ -372,21 +373,156 @@ async def test_wall_clock_fires_while_a_question_is_pending(
     assert elapsed < 2.5, f"run took {elapsed}s -- the wall clock did not fire while pending"
 
 
-async def test_ctrl_c_while_the_overlay_is_open_restores_the_terminal(monkeypatch):
-    """R6: an interrupt key while `_read_answer`'s TTY branch is reading must propagate as
-    `KeyboardInterrupt` (so `main()`'s existing Ctrl+C teardown runs) and must restore the
-    terminal on the way out, via `harness.input.restore_terminal` (step 1) rather than a raw
-    mode left dangling on a parked daemon thread.
+def _type(text: str) -> list[KeyEvent]:
+    return [KeyEvent("char", ch) for ch in text]
+
+
+class _QuitRecordingSession:
+    """The two members `Composer` touches on a session, and nothing else."""
+
+    def __init__(self) -> None:
+        self.quits = 0
+        self.events: asyncio.Queue = asyncio.Queue()
+
+    def request_quit(self) -> None:
+        self.quits += 1
+
+    def receive_user_message(self, text: str) -> None:
+        # Raw text, not a `UserMessage`: the fake pins the COMPOSER half of the bridge
+        # (routing and the empty-line rule); the session method's own wrapping of a line as
+        # a `UserMessage` is pinned in test_session.py.
+        self.events.put_nowait(text)
+
+
+async def test_enter_queues_a_user_message_and_empty_lines_are_dropped(monkeypatch):
+    """3F Major 3, the bridge itself: Enter sends the composer's line to the session, and a
+    stray or whitespace-only Enter queues nothing — the session tests inject `UserMessage`s
+    directly, so without this the keyboard→queue wiring this phase exists to build is green
+    by absence.
     """
-    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    typed = [*_type("hi"), KeyEvent("enter"), *_type("  "), KeyEvent("enter"), KeyEvent("enter")]
 
-    # Stands in for real terminal input on the (should-be-unused, TTY branch) daemon thread of
-    # the non-TTY fallback path, so this test cannot hang waiting on the real stdin if the
-    # implementation has not yet branched on `isatty()`.
-    def _unreachable_input() -> str:
-        raise EOFError
+    def _fake_read_keys():
+        yield from typed
 
-    monkeypatch.setattr("builtins.input", _unreachable_input)
+    monkeypatch.setattr(main_module, "read_keys", _fake_read_keys)
+
+    session = _QuitRecordingSession()
+    renderer = RecordingRenderer()
+    reader = main_module.KeyReader()
+    try:
+        composer = main_module.Composer(reader, renderer, session)
+        await asyncio.wait_for(composer.run(), 5)
+    finally:
+        reader.close()
+
+    queued = [session.events.get_nowait() for _ in range(session.events.qsize())]
+    assert queued == ["hi"], "Enter did not queue exactly the typed line"
+
+    # `RecordingRenderer`, not `PlainRenderer` (which drops `ComposerDraft`): the repaint is
+    # the only thing that puts the typed line on screen, so without this the composer could
+    # emit nothing at all — or emit a stale buffer — and stay green. One draft per key, plus
+    # the empty one painted before the first key, each carrying the buffer AFTER that key.
+    drafts = [event for event in renderer.events if isinstance(event, ComposerDraft)]
+    assert drafts == [
+        ComposerDraft("", 0, 0),
+        ComposerDraft("h", 0, 1),
+        ComposerDraft("hi", 0, 2),
+        ComposerDraft("", 0, 0),
+        ComposerDraft(" ", 0, 1),
+        ComposerDraft("  ", 0, 2),
+        ComposerDraft("", 0, 0),
+        ComposerDraft("", 0, 0),
+    ]
+
+
+async def test_the_composers_answer_resolves_an_open_ask_user_and_bypasses_the_queue(monkeypatch):
+    """3F Major 3: while an `ask_user` question is open, Enter answers it — the line must
+    NOT also reach the lead's queue — and once answered, the next line goes to the lead.
+    """
+
+    def _fake_read_keys():
+        yield KeyEvent("char", "2")
+        yield KeyEvent("enter")
+        yield from _type("and the caveat?")
+        yield KeyEvent("enter")
+
+    monkeypatch.setattr(main_module, "read_keys", _fake_read_keys)
+
+    session = _QuitRecordingSession()
+    reader = main_module.KeyReader()
+    try:
+        composer = main_module.Composer(reader, PlainRenderer(), session)
+        run_task = asyncio.create_task(composer.run())
+        # `answer()` sets its future before awaiting, so the composer's first Enter resolves
+        # it rather than racing the queue.
+        assert await asyncio.wait_for(composer.answer(), 5) == "2"
+        await asyncio.wait_for(run_task, 5)
+    finally:
+        reader.close()
+
+    queued = [session.events.get_nowait() for _ in range(session.events.qsize())]
+    assert queued == ["and the caveat?"], "the answer leaked to the lead, or the reply did not"
+
+
+async def test_an_empty_line_answers_an_open_ask_user_instead_of_being_dropped(monkeypatch):
+    """The other half of `_send`'s routing rule: an empty line is dropped for the lead but
+    ACCEPTED as an answer — `_answer_questions` turns it into `_NO_ANSWER_GIVEN`, so the
+    developer can decline a question.
+    """
+
+    def _fake_read_keys():
+        yield KeyEvent("enter")
+
+    monkeypatch.setattr(main_module, "read_keys", _fake_read_keys)
+
+    session = _QuitRecordingSession()
+    reader = main_module.KeyReader()
+    try:
+        composer = main_module.Composer(reader, PlainRenderer(), session)
+        run_task = asyncio.create_task(composer.run())
+        assert await asyncio.wait_for(composer.answer(), 5) == ""
+        await asyncio.wait_for(run_task, 5)
+    finally:
+        reader.close()
+
+    assert session.events.empty()
+
+
+async def test_a_closed_key_source_declines_the_open_question_and_quits(monkeypatch):
+    """Round 2, item 2: the reader's `None` sentinel strands the composer's consumers.
+
+    The key thread ends (EOF on stdin, or `close()`) with no key ever typed. Returning on the
+    sentinel alone leaves a pending `ask_user` answer unresolved — the run then waits forever
+    on a line nobody can type — and leaves an idle interactive session parked at `events.get()`
+    with no key source left to wake it. An empty answer is the same "declined" a bare Enter
+    gives, and the quit is what `Session.request_quit` turns into a clean or failed ending.
+    """
+    monkeypatch.setattr(main_module, "read_keys", lambda: iter(()))
+
+    session = _QuitRecordingSession()
+    reader = main_module.KeyReader()
+    try:
+        composer = main_module.Composer(reader, PlainRenderer(), session)
+        # `answer()` creates its future synchronously, before `run()` gets its first step, so
+        # the question is open by the time the composer sees the sentinel.
+        run_task = asyncio.create_task(composer.run())
+        assert await asyncio.wait_for(composer.answer(), 5) == ""
+        await asyncio.wait_for(run_task, 5)
+    finally:
+        reader.close()
+
+    assert session.quits == 1, "the closed key source never woke the session"
+    assert session.events.empty()
+
+
+async def test_ctrl_c_at_the_composer_quits_the_session_and_restores_the_terminal(monkeypatch):
+    """R6, moved to the composer (Phase 3): an interrupt key no longer raises
+    `KeyboardInterrupt` out of a per-question read — the composer asks the SESSION to quit,
+    which is what decides whether that is a failed run or a clean exit. The terminal is
+    restored by the key reader's own `close()`, not by a raw mode left dangling on a parked
+    daemon thread.
+    """
 
     def _fake_read_keys():
         yield KeyEvent("interrupt")
@@ -398,14 +534,20 @@ async def test_ctrl_c_while_the_overlay_is_open_restores_the_terminal(monkeypatc
     restore_calls: list[None] = []
     monkeypatch.setattr(input_module, "_restore", lambda: restore_calls.append(None), raising=False)
 
-    with pytest.raises(KeyboardInterrupt):
-        await main_module._read_answer(PlainRenderer())
+    session = _QuitRecordingSession()
+    reader = main_module.KeyReader()
+    try:
+        composer = main_module.Composer(reader, PlainRenderer(), session)
+        await asyncio.wait_for(composer.run(), 5)
+    finally:
+        reader.close()
 
+    assert session.quits == 1
     assert restore_calls == [None], "the terminal restore did not run"
 
 
-async def test_the_overlay_key_loop_leaves_the_event_loop_free(monkeypatch):
-    """Risk #2's actual content, and the property no other test pins: the TTY key path must read
+async def test_the_key_reader_leaves_the_event_loop_free(monkeypatch):
+    """Risk #2's actual content, and the property no other test pins: the key path must read
     keys OFF the loop thread.
 
     The wall-clock tripwire above patches `_read_answer` away wholesale, and the Ctrl+C test's
@@ -416,18 +558,9 @@ async def test_the_overlay_key_loop_leaves_the_event_loop_free(monkeypatch):
     The fake key source BLOCKS without yielding, standing in for a human who has not typed yet.
     Read on a worker thread, the loop stays free and `wait_for` times out -- what we assert.
     Read on the loop thread, the loop is wedged, the timer cannot fire, and the coroutine instead
-    runs to completion and returns an answer, so `pytest.raises` fails. The watchdog releases the
+    runs to completion and returns a key, so `pytest.raises` fails. The watchdog releases the
     block either way, so a blocking implementation fails the suite rather than hanging it.
     """
-    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-
-    # Belt-and-braces, as in the Ctrl+C test: if the implementation ever stopped branching on
-    # `isatty()`, this makes the non-TTY path fail loudly instead of parking on real stdin.
-    def _unreachable_input() -> str:
-        raise EOFError
-
-    monkeypatch.setattr("builtins.input", _unreachable_input)
-
     blocked = threading.Event()
 
     def _fake_read_keys():
@@ -436,14 +569,16 @@ async def test_the_overlay_key_loop_leaves_the_event_loop_free(monkeypatch):
 
     monkeypatch.setattr(main_module, "read_keys", _fake_read_keys)
 
+    reader = main_module.KeyReader()
     watchdog = threading.Timer(2.0, blocked.set)
     watchdog.start()
     try:
         with pytest.raises(TimeoutError):
-            await asyncio.wait_for(main_module._read_answer(PlainRenderer()), 0.2)
+            await asyncio.wait_for(reader.get(), 0.2)
     finally:
         watchdog.cancel()
         blocked.set()
+        reader.close()
 
 
 async def test_read_answer_non_tty_falls_back_to_the_input_bridge(monkeypatch):
@@ -469,7 +604,7 @@ async def test_read_answer_non_tty_falls_back_to_the_input_bridge(monkeypatch):
 
     monkeypatch.setattr(main_module, "read_keys", _fake_read_keys)
 
-    answer = await main_module._read_answer(PlainRenderer())
+    answer = await main_module._read_answer()
 
     assert answer == "an answer"
     assert input_calls == [None]

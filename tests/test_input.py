@@ -29,6 +29,8 @@ def _reader(sequence: str) -> Callable[[], str]:
         # Ctrl+Backspace on xterm-likes (plain Backspace sends \x7f there) — word delete.
         ("\x08", KeyEvent("word_backspace", None)),
         ("\x03", KeyEvent("interrupt", None)),
+        # Ctrl+D: end of input, which the composer reads as "quit" (Phase 3, R5).
+        ("\x04", KeyEvent("eof", None)),
         ("\x1b[A", KeyEvent("up", None)),
         ("\x1b[B", KeyEvent("down", None)),
         ("\x1b[C", KeyEvent("right", None)),
@@ -55,6 +57,8 @@ def test_decode_posix(byte_sequence: str, expected: KeyEvent | None):
         # and inserted a literal DEL character into the buffer (PR #25 review).
         ("\x7f", KeyEvent("word_backspace", None)),
         ("\x03", KeyEvent("interrupt", None)),
+        # Ctrl+D: `getwch()` returns the same byte as POSIX, so both decoders agree (Phase 3).
+        ("\x04", KeyEvent("eof", None)),
         ("\xe0H", KeyEvent("up", None)),
         ("\xe0P", KeyEvent("down", None)),
         ("\xe0K", KeyEvent("left", None)),

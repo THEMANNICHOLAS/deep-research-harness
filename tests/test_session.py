@@ -11,19 +11,29 @@ import time
 from datetime import datetime
 from typing import Any
 
+import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import PrivateAttr, SecretStr
 
 from harness.activity import ActivitySink
-from harness.display import PlainRenderer, StageTracker
+from harness.display import (
+    AgentText,
+    Alert,
+    PlainRenderer,
+    ReportWritten,
+    RunFinished,
+    StageStarted,
+    StageTracker,
+)
 from harness.runlog import RunLog
-from harness.session import ResearcherReturn, Session, UserMessage
+from harness.session import _SUBMIT_NOW, ResearcherReturn, Session, UserMessage
 from harness.sources import SourceRegistry
 from harness.tools.search import SearchUnavailableError
 from tests.conftest import (
     ConcurrencyTrackingModel,
+    RecordingRenderer,
     ScriptedChatModel,
     _dispatch_call,
     _FakeMarkdown,
@@ -105,6 +115,25 @@ class _KeyedResearcherModel(ScriptedChatModel):
         raise AssertionError(f"no scripted researcher reply matched: {text!r}")
 
 
+class _FailingChatModel(ScriptedChatModel):
+    """A `ScriptedChatModel` whose Nth call raises, standing in for a provider outage.
+
+    `_failures` is keyed by call index and consulted BEFORE the script, so a failing call
+    consumes its index (and records its messages, like every other call) without reaching
+    `_script`. Success calls delegate to the base class untouched.
+    """
+
+    _failures: dict[int, Exception] = PrivateAttr(default_factory=dict)
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        failure = self._failures.get(self._call_count)
+        if failure is not None:
+            self._received_messages.append(list(messages))
+            self._call_count += 1
+            raise failure
+        return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
 @pytest.fixture
 def make_session(make_config, make_agent_settings):
     """Build a `Session` from exactly what `__main__.main` holds when it hands off today."""
@@ -117,10 +146,17 @@ def make_session(make_config, make_agent_settings):
         # Overridable for the same reason as `run_log`: the researcher roster (R8) lives in the
         # sink, so a test asserting on it needs the very sink the session was handed.
         sink = config_overrides.pop("sink", None)
+        # Popped like `sink`: `interactive` is a `Session` argument, not an `AgentSettings`
+        # field, so it must never reach `make_agent_settings`. False by default, which is what
+        # every headless (non-TTY) run passes and what every pre-Phase-3 test assumes.
+        interactive = config_overrides.pop("interactive", False)
+        # Overridable like `sink`: a test asserting on what the run DISPLAYED needs the very
+        # renderer the session emits into, not printed text it has to parse back. Popped
+        # BEFORE the config is built, since everything left over is an `AgentSettings` field.
+        renderer = config_overrides.pop("renderer", None) or PlainRenderer()
         config = config_overrides.pop("config", None) or make_config(
             agent=make_agent_settings(**config_overrides)
         )
-        renderer = PlainRenderer()
 
         async def _never_asked(interrupt: Any) -> list[dict[str, Any]]:
             raise AssertionError("no clarifying question was expected in this test")
@@ -139,6 +175,7 @@ def make_session(make_config, make_agent_settings):
             browser=None,
             answer_interrupt=_never_asked,
             started_at=datetime.now(),
+            interactive=interactive,
         )
 
     return _make
@@ -322,6 +359,9 @@ async def test_submit_report_ends_research_and_carries_the_answer_into_the_repor
 async def test_a_lead_that_never_submits_writes_no_report(make_session, three_models, monkeypatch):
     """D3/R5: no `submit_report` means no report at all — the run fails rather than salvaging
     whatever prose came last.
+
+    Pinned to `interactive=False` (Phase 3): the nudge-then-fail path is the HEADLESS one. An
+    interactive session has a composer to wait on instead, so it never nudges.
     """
     head = _model(ScriptedChatModel, "head-test").script(
         [AIMessage(content="I think that covers it."), AIMessage(content="Still nothing to add.")]
@@ -331,7 +371,7 @@ async def test_a_lead_that_never_submits_writes_no_report(make_session, three_mo
     written: list[Any] = []
     monkeypatch.setattr("harness.session.write_report", lambda outcome, config: written.append(1))
 
-    session = make_session()
+    session = make_session(interactive=False)
     outcome = await session.run()
 
     assert outcome is None
@@ -952,3 +992,574 @@ async def test_the_synthesis_margin_never_fires_after_submit_report(make_session
     assert session._margin_hit is False
     assert session.submit("Overwrite.") == "refused: research is closed — the report is written"
     assert session.answer == "Final answer."
+
+
+# --- Phase 3: the composer's queued messages and post-report chat --------------------------
+
+
+async def test_a_message_typed_during_a_turn_lands_in_the_next_turn_after_the_returns(
+    make_session, three_models, capsys
+):
+    """R1/R2: text typed while a lead turn is in flight is never lost and never interrupts the
+    model call — it drains into the FOLLOWING turn, after any returns that arrived before it,
+    inside the one `HumanMessage` that batch becomes.
+
+    Two head gates hold the lead inside a turn on demand, which is what makes "typed DURING a
+    turn" a deterministic state rather than a race.
+    """
+    gate_a, gate_b = asyncio.Event(), asyncio.Event()
+    turn_one, turn_two = asyncio.Event(), asyncio.Event()
+    head = _model(_GatedChatModel, "head-test").script(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _dispatch_call("a", "call_a").tool_calls[0],
+                    _dispatch_call("b", "call_b").tool_calls[0],
+                ],
+            ),
+            AIMessage(content="Both angles are running."),
+            AIMessage(content="Noted the return and your redirect."),
+            AIMessage(content="Noted your second note."),
+            _submit_call("Widgets cost $4.20 each."),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    head._gates = {1: turn_one, 2: turn_two}
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {
+        "Investigate a": (gate_a, "Angle a findings."),
+        "Investigate b": (gate_b, "Angle b findings."),
+    }
+    three_models(head, researcher)
+
+    sink = ActivitySink()
+    session = make_session(sink=sink, interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: len(head._entered) == 2, "the lead held inside turn 1")
+        gate_a.set()
+        await _wait_for(
+            lambda: any(state.status == "done" for state in sink.researchers()),
+            "researcher/1's return to be queued",
+        )
+        # Typed while turn 1 is still inside its model call, AFTER the return was queued.
+        session.events.put_nowait(UserMessage("skip the routing angle"))
+        turn_one.set()
+
+        await _wait_for(lambda: len(head._entered) == 3, "the batched turn to start")
+        session.events.put_nowait(UserMessage("and check the tariff angle"))
+        turn_two.set()
+        await _wait_for(lambda: head._call_count >= 4, "the second message's own turn")
+
+        gate_b.set()
+        await _wait_for(lambda: session.answer is not None, "the lead's report")
+        session.request_quit()
+        await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        for gate in (gate_a, gate_b, turn_one, turn_two):
+            gate.set()
+        run.cancel()
+
+    batched = head._received_messages[2][-1]
+    assert isinstance(batched, HumanMessage)
+    lines = str(batched.content).splitlines()
+    assert lines[0] == "[researcher/1 — a] returned:"
+    assert lines[1] == "Angle a findings."
+    # The typed line comes AFTER the return it arrived behind, in arrival order.
+    assert lines.index("skip the routing angle") > lines.index("Angle a findings.")
+    assert lines[-1] == "Roster: done researcher/1 · running researcher/2"
+    assert [line for line in lines if line.startswith("Roster:")] == [lines[-1]]
+
+    # The second message rode the NEXT turn, alone — not appended to the one already running.
+    second = head._received_messages[3][-1]
+    assert isinstance(second, HumanMessage)
+    assert str(second.content) == (
+        "and check the tariff angle\nRoster: done researcher/1 · running researcher/2"
+    )
+
+    # Nothing was delivered twice: each typed line is exactly one injected `HumanMessage`.
+    final_turn = head._received_messages[-1]
+    for typed in ("skip the routing angle", "and check the tariff angle"):
+        delivered = [
+            message
+            for message in final_turn
+            if isinstance(message, HumanMessage) and typed in str(message.content)
+        ]
+        assert len(delivered) == 1, f"{typed!r} reached the lead {len(delivered)} times"
+
+    # Each consumed line is echoed to the transcript as it goes to the lead, once.
+    printed = capsys.readouterr().out
+    assert printed.count("> skip the routing angle") == 1
+    assert printed.count("> and check the tariff angle") == 1
+
+
+async def test_a_message_typed_while_idle_starts_a_turn_instead_of_nudging(
+    make_session, three_models
+):
+    """R1: an interactive session with an empty roster and an empty queue WAITS for the
+    developer — it must not fire the headless `_SUBMIT_NOW` nudge, which would end the run
+    while the developer was still typing.
+    """
+    answer = "Acme widgets are cheapest at $4.20 per unit."
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            AIMessage(content="Planning the angles."),
+            _submit_call(answer),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    session = make_session(interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: head._call_count >= 1, "the lead's first turn")
+        # Idle: nothing running, nothing queued, no report. The session stays open.
+        await asyncio.sleep(0.2)
+        assert not run.done(), "the idle interactive session ended instead of waiting"
+        assert head._call_count == 1
+
+        session.events.put_nowait(UserMessage("what do you have so far?"))
+        await _wait_for(lambda: head._call_count >= 2, "the typed message's own turn")
+        await _wait_for(lambda: session.answer is not None, "the lead's report")
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is not None
+    typed_turn = head._received_messages[1][-1]
+    assert isinstance(typed_turn, HumanMessage)
+    assert str(typed_turn.content) == "what do you have so far?\nRoster: done none · running none"
+    assert all(
+        _SUBMIT_NOW not in str(message.content)
+        for batch in head._received_messages
+        for message in batch
+    ), "the headless nudge reached an interactive lead"
+
+
+async def test_after_the_report_chat_continues_and_research_stays_closed(
+    make_session, three_models, monkeypatch, tmp_path
+):
+    """R5/D3: the report is written when the lead submits, and the session keeps answering on
+    the same thread afterwards. `dispatch_researcher` refuses, the report is written exactly
+    once, and quitting after it is a CLEAN exit that still returns the outcome.
+    """
+    answer = "Acme widgets are cheapest at $4.20 per unit."
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            _submit_call(answer),
+            AIMessage(content="Report submitted."),
+            _dispatch_call("tariffs", "call_t"),
+            AIMessage(content="Research is closed — from [S1], the tariff is 12%."),
+        ]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    report_path = tmp_path / "report.md"
+    written: list[Any] = []
+
+    def _capture(outcome: Any, config: Any):
+        written.append(outcome)
+        return report_path
+
+    monkeypatch.setattr("harness.session.write_report", _capture)
+
+    renderer = RecordingRenderer()
+    session = make_session(interactive=True, renderer=renderer)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: written, "the report to be written")
+        session.events.put_nowait(UserMessage("summarise source S1"))
+        await _wait_for(lambda: head._call_count >= 4, "the post-report turn")
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is not None
+    assert outcome.answer == answer
+    assert session.cut_short is None
+    # One report for the session, however long the chat after it runs.
+    assert len(written) == 1
+    # The path reaches the transcript when the report LANDS, and the end-of-run summary comes
+    # only after the chat — `RunFinished` stops the live region, so it cannot precede it (D3).
+    kinds = [type(event).__name__ for event in renderer.events]
+    assert ReportWritten(report_path) in renderer.events
+    assert kinds.index("ReportWritten") < kinds.index("RunFinished")
+    assert kinds.count("RunFinished") == 1
+    # The post-report turn's prose reached the transcript too.
+    assert any(
+        isinstance(event, AgentText) and "Research is closed" in event.text
+        for event in renderer.events
+    )
+
+    refusals = [
+        str(message.content)
+        for message in head._received_messages[-1]
+        if isinstance(message, ToolMessage) and message.name == "dispatch_researcher"
+    ]
+    assert refusals, "the post-report dispatch never reached the tool"
+    assert refusals[-1].startswith("refused:")
+    # A refused dispatch must not re-open the research stage: `_finish` has already closed
+    # every stage out, so an `advance("researching")` here starts a stage nothing will ever
+    # complete — a live "researching" spinner over a run that is done researching.
+    assert not [
+        event
+        for event in renderer.events
+        if isinstance(event, StageStarted) and event.stage == "researching"
+    ], "the refused post-report dispatch re-opened the researching stage"
+    finished = next(event for event in renderer.events if isinstance(event, RunFinished))
+    assert "researching" not in [stage for stage, _ in finished.stage_timings]
+
+
+async def test_a_cancel_after_the_report_still_returns_the_written_outcome(
+    make_session, three_models, monkeypatch, tmp_path
+):
+    """R5: Ctrl+C AFTER the report is a clean exit (0), not a failed run — the report is
+    already on disk, so `run()` hands back the outcome rather than `None`.
+    """
+    answer = "Acme widgets are cheapest at $4.20 per unit."
+    head = _model(ScriptedChatModel, "head-test").script(
+        [_submit_call(answer), AIMessage(content="Report submitted.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    written: list[Any] = []
+    report_path = tmp_path / "report.md"
+
+    def _capture(outcome: Any, config: Any):
+        written.append(outcome)
+        return report_path
+
+    monkeypatch.setattr("harness.session.write_report", _capture)
+
+    session = make_session(interactive=True)
+    run = asyncio.create_task(session.run())
+    await _wait_for(lambda: written, "the report to be written")
+    # Long enough that the cancel lands on the post-report chat's own wait.
+    await asyncio.sleep(0.1)
+    run.cancel()
+    outcome = await run
+
+    assert outcome is not None
+    assert outcome.answer == answer
+    assert session.cut_short is None
+
+
+async def test_quitting_before_the_report_fails_the_run_and_writes_nothing(
+    make_session, three_models, monkeypatch
+):
+    """R5's other half, and the Phase 2 gate unchanged: a quit with no report yet is a FAILED
+    run — `run()` returns None, `cut_short` is `error`, and nothing is written.
+
+    The elapsed assertion is load-bearing: `wait_for`'s own timeout cancels the run task, which
+    the abort clause handles identically, so every assertion below would pass on a
+    `request_quit` that did nothing at all. Only the timing tells a quit from a hang.
+    """
+    parked = asyncio.Event()
+    head = _model(ScriptedChatModel, "head-test").script(
+        [_dispatch_call("pricing", "call_p"), AIMessage(content="The pricing angle is running.")]
+    )
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {"Investigate pricing": (parked, "Pricing findings.")}
+    three_models(head, researcher)
+
+    written: list[Any] = []
+    monkeypatch.setattr("harness.session.write_report", lambda outcome, config: written.append(1))
+
+    session = make_session(interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(
+            lambda: head._call_count >= 2 and len(session.running) == 1,
+            "the lead waiting on its researcher",
+        )
+        await asyncio.sleep(0.05)
+        quit_at = time.monotonic()
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+        elapsed = time.monotonic() - quit_at
+    finally:
+        parked.set()
+        run.cancel()
+
+    assert elapsed < 1.0, f"the quit took {elapsed}s — it waited instead of aborting the turn"
+    assert outcome is None
+    assert written == []
+    assert session.cut_short == "error"
+    assert session.cut_short_detail == "user abort (Ctrl+C)"
+    assert session.running == {}
+
+
+async def test_receive_user_message_queues_a_user_message(make_session):
+    """3F Major 3, session half: the composer's entry point wraps the line as a `UserMessage`
+    on the event queue — the contract the keyboard→queue bridge depends on.
+    """
+    session = make_session()
+
+    session.receive_user_message("check the tariff angle")
+
+    event = session.events.get_nowait()
+    assert isinstance(event, UserMessage)
+    assert event.text == "check the tariff angle"
+
+
+async def test_a_failed_chat_turn_discloses_and_keeps_the_chat_open(
+    make_session, three_models, monkeypatch, tmp_path
+):
+    """3F Major 1: a provider error during a post-report turn must not escape `run()` —
+    that would skip the end-of-run summary and turn a run whose report is already on disk
+    into exit 1 or a traceback, instead of R5's clean exit. The failure is disclosed as an
+    alert, `cut_short` stays None (the run succeeded), and the NEXT chat line still gets
+    its turn.
+    """
+    answer = "Acme widgets are cheapest at $4.20 per unit."
+    head = _model(_FailingChatModel, "head-test").script(
+        [
+            _submit_call(answer),
+            AIMessage(content="Report submitted."),
+            AIMessage(content="unused — this call fails at the model"),
+            AIMessage(content="From [S1]: the tariff is 12%."),
+        ]
+    )
+    head._failures = {2: httpx.ConnectError("502 behind the gateway")}
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    written: list[Any] = []
+    report_path = tmp_path / "report.md"
+
+    def _capture(outcome: Any, config: Any):
+        written.append(outcome)
+        return report_path
+
+    monkeypatch.setattr("harness.session.write_report", _capture)
+
+    renderer = RecordingRenderer()
+    session = make_session(interactive=True, renderer=renderer)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: written, "the report to be written")
+        session.events.put_nowait(UserMessage("what is the tariff?"))
+        await _wait_for(lambda: len(head._received_messages) >= 3, "the failing chat turn")
+        session.events.put_nowait(UserMessage("and in words?"))
+        await _wait_for(lambda: head._call_count >= 4, "the retried chat turn")
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is not None
+    assert outcome.answer == answer
+    assert session.cut_short is None
+    assert len(written) == 1
+    # The failure was disclosed as an alert, and the summary still fired after the chat.
+    kinds = [type(event).__name__ for event in renderer.events]
+    assert any(
+        isinstance(event, Alert) and "chat turn failed" in event.text for event in renderer.events
+    )
+    assert kinds.count("RunFinished") == 1
+    assert kinds.index("Alert") < kinds.index("RunFinished")
+    # The retried line reached the model, and its prose reached the transcript.
+    assert any(
+        isinstance(event, AgentText) and "tariff is 12%" in event.text for event in renderer.events
+    )
+
+
+async def test_a_keyboard_interrupt_during_a_chat_turn_is_a_clean_quit(
+    make_session, three_models, monkeypatch, tmp_path
+):
+    """Round 2, item 1: Ctrl+C during a post-report turn is a QUIT, not a failed turn.
+
+    `_chat_turn` catches `Exception`, which `KeyboardInterrupt` is not, so unless `_chat_loop`
+    names it beside `CancelledError` it escapes `run()` altogether: no `RunFinished`, no
+    returned outcome, and a traceback out of a run whose report is already on disk (R5). It
+    must also NOT be swallowed as a disclosed chat-turn failure — a Ctrl+C is a quit.
+
+    Raised from the turn's own stream pass, not from the scripted model and not from a real
+    signal. A `KeyboardInterrupt` raised inside ANY asyncio task — which is what a langgraph
+    node is — is re-raised by the task machinery into the event loop itself, so it escapes
+    `asyncio.run` no matter who awaits the task, and under pytest that ends the whole session
+    rather than the test (the Phase 2 handoff note). This is also the faithful delivery point:
+    a real Ctrl+C surfaces on the session's OWN coroutine (inside a model call it has been
+    observed as `CancelledError` instead — see `run()`'s abort clause).
+    """
+    answer = "Acme widgets are cheapest at $4.20 per unit."
+    head = _model(ScriptedChatModel, "head-test").script(
+        [_submit_call(answer), AIMessage(content="Report submitted.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    written: list[Any] = []
+    report_path = tmp_path / "report.md"
+
+    def _capture(outcome: Any, config: Any):
+        written.append(outcome)
+        return report_path
+
+    monkeypatch.setattr("harness.session.write_report", _capture)
+
+    renderer = RecordingRenderer()
+    session = make_session(interactive=True, renderer=renderer)
+    real_stream_pass = session._stream_pass
+
+    async def _interrupted_stream_pass(stream_input: Any) -> Any:
+        # Only once the report exists: the research phase runs on the real graph, and the
+        # interrupt lands on the chat turn the developer typed into.
+        if session.answer is not None:
+            raise KeyboardInterrupt
+        return await real_stream_pass(stream_input)
+
+    monkeypatch.setattr(session, "_stream_pass", _interrupted_stream_pass)
+
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: written, "the report to be written")
+        session.events.put_nowait(UserMessage("what is the tariff?"))
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is not None
+    assert outcome.answer == answer
+    assert session.cut_short is None
+    kinds = [type(event).__name__ for event in renderer.events]
+    assert kinds.count("RunFinished") == 1
+    assert not [
+        event
+        for event in renderer.events
+        if isinstance(event, Alert) and "chat turn failed" in event.text
+    ], "the interrupt was disclosed as a failed turn instead of ending the chat"
+
+
+async def test_a_post_report_question_does_not_reopen_the_clarifying_stage(
+    make_session, three_models, monkeypatch, tmp_path
+):
+    """Round 3, item 4: the dispatch guard's twin. `ask_user` stays on the lead toolset all
+    session, so a post-report clarifying question would `advance("clarifying")` after
+    `_finish` ran `_tracker.finish()` — a stage nothing completes, and a stray row in
+    `RunFinished.stage_timings`.
+    """
+    answer = "Acme widgets are cheapest at $4.20 per unit."
+    head = _model(ScriptedChatModel, "head-test").script(
+        [_submit_call(answer), AIMessage(content="Noted."), AIMessage(content="Done.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    written: list[Any] = []
+    monkeypatch.setattr(
+        "harness.session.write_report",
+        lambda outcome, config: (written.append(outcome), tmp_path / "report.md")[1],
+    )
+
+    renderer = RecordingRenderer()
+    session = make_session(interactive=True, renderer=renderer)
+    real_stream_pass = session._stream_pass
+    asked = {"done": False}
+
+    async def _questioning_stream_pass(stream_input: Any) -> Any:
+        # One synthetic interrupt on the first post-report turn; the resume Command and
+        # every research-phase pass run on the real graph.
+        if session.answer is not None and not asked["done"]:
+            asked["done"] = True
+            return {"__interrupt__": [object()]}
+        return await real_stream_pass(stream_input)
+
+    async def _answer(interrupt: Any) -> list[dict[str, Any]]:
+        return [{"type": "respond", "args": "the cheap one"}]
+
+    monkeypatch.setattr(session, "_stream_pass", _questioning_stream_pass)
+    monkeypatch.setattr(session, "_answer_interrupt", _answer)
+
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: written, "the report to be written")
+        session.events.put_nowait(UserMessage("which one should I buy?"))
+        await _wait_for(lambda: asked["done"], "the post-report question")
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is not None
+    post_report_stages = [
+        event
+        for event in renderer.events
+        if isinstance(event, StageStarted) and event.stage == "clarifying"
+    ]
+    assert not post_report_stages, "a post-report question re-opened the clarifying stage"
+    finished = next(event for event in renderer.events if isinstance(event, RunFinished))
+    assert "clarifying" not in [stage for stage, _ in finished.stage_timings]
+
+
+async def test_chat_turns_do_not_count_toward_the_round_cap(
+    make_session, three_models, monkeypatch, tmp_path
+):
+    """3F Major 2: post-report turns are uncapped (R5/R6). Counting them would push
+    `_rounds_used` past `max_rounds`, fire the synthesis pass on a SUCCESSFUL run, stamp
+    `round_cap` onto it, and leave `_overrun` breaking every later chat turn mid-stream.
+    The margin check carries the same `answer is None` guard.
+    """
+    answer = "Acme widgets are cheapest at $4.20 per unit."
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            _submit_call(answer),  # the one counted round (the answer is None here)
+            AIMessage(content="Report submitted."),  # post-submit wrap-up: already uncounted
+            AIMessage(content="chat one"),  # chat turn 1 — uncounted
+            AIMessage(content="chat two"),  # chat turn 2 — would be round 3+: overrun
+        ]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    written: list[Any] = []
+    report_path = tmp_path / "report.md"
+
+    def _capture(outcome: Any, config: Any):
+        written.append(outcome)
+        return report_path
+
+    monkeypatch.setattr("harness.session.write_report", _capture)
+
+    session = make_session(max_rounds=3, interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: written, "the report to be written")
+        session.events.put_nowait(UserMessage("question one"))
+        await _wait_for(lambda: head._call_count >= 3, "the first chat turn")
+        session.events.put_nowait(UserMessage("question two"))
+        await _wait_for(lambda: head._call_count >= 4, "the second chat turn")
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is not None
+    assert session.cut_short is None
+    # Only the submit turn itself counted: the wrap-up call and every chat turn land after
+    # the answer exists, and none of them may push `_rounds_used` toward the cap.
+    assert session._rounds_used == 1
+    assert len(written) == 1
+
+
+async def test_a_quit_after_run_returned_cancels_nothing(make_session, three_models):
+    """3F Minor d: `request_quit` may only cancel the run while `run()` is in flight.
+
+    In production `run()` is awaited by main()'s own task, so a stale `_run_task` would let a
+    quit key landing in the gap after run() returned cancel main()'s `finally` in the middle
+    of `browser.close()`. This test awaits `run()` DIRECTLY, so a stale cancel delivers
+    `CancelledError` into the test itself and fails it at the await below.
+    """
+    head = _model(ScriptedChatModel, "head-test").script(
+        [AIMessage(content="Nothing to add."), AIMessage(content="Still nothing to add.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    session = make_session(interactive=False)
+    outcome = await session.run()
+
+    assert outcome is None
+    assert session.cut_short == "error"
+    session.request_quit()
+    await asyncio.sleep(0)
+    assert session._quit is True

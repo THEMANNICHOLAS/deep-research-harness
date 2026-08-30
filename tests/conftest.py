@@ -627,6 +627,28 @@ def drain_stdout(capsys: pytest.CaptureFixture[str]) -> tuple[str, list[str]]:
     return out, [line for line in out.splitlines() if line.strip()]
 
 
+class RecordingRenderer:
+    """A fake `Renderer` that records emitted events instead of printing them.
+
+    Here rather than in one suite (Phase 3): both the display tests and the session tests
+    assert on the EVENT a run emits rather than on rendered text, and a second copy is a
+    second place the `Renderer` protocol has to be kept in step with.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+        self.closes = 0
+
+    def emit(self, event: Any) -> None:
+        self.events.append(event)
+
+    def suspend(self) -> Any:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        self.closes += 1
+
+
 def _challenge_fixtures() -> list[Path]:
     """Every `challenge_*.txt` fixture, sorted — shared by test_blocklist.py and test_fetch.py."""
     return sorted(CHALLENGE_FIXTURES_DIR.glob("challenge_*.txt"))

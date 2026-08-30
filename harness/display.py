@@ -68,10 +68,19 @@ class Question:
 
 
 @dataclass(frozen=True)
-class AnswerDraft:
-    """One repaint of the `ask_user` overlay's answer field (Phase 5), fired after every
-    buffer-mutating key. `cursor_row`/`cursor_col` are the same per-row coordinates `LineBuffer`
-    tracks -- `cursor_col` is a column WITHIN `cursor_row`, never an offset into `text`."""
+class QuestionAnswered:
+    """Retracts the `ask_user` overlay and resumes the displayed (paused) stage clock."""
+
+
+@dataclass(frozen=True)
+class ComposerDraft:
+    """One repaint of the session composer's input line (Phase 3), fired after every key.
+
+    The one input line the session has: the developer types here for the whole run —
+    ordinary messages, and the answer while an `ask_user` overlay is open (which is why the
+    overlay itself draws no answer row). `cursor_row`/`cursor_col` are the same per-row
+    coordinates `LineBuffer` tracks -- `cursor_col` is a column WITHIN `cursor_row`, never
+    an offset into `text`."""
 
     text: str
     cursor_row: int
@@ -79,8 +88,25 @@ class AnswerDraft:
 
 
 @dataclass(frozen=True)
-class QuestionAnswered:
-    """Retracts the `ask_user` overlay and resumes the displayed (paused) stage clock."""
+class UserTurn:
+    """One line the developer sent to the lead, echoed into the transcript (R1)."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class AgentText:
+    """One piece of lead prose, echoed into the transcript (R2's "narrates in chat")."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class ReportWritten:
+    """The report landed on disk (D3). Emitted where `RunFinished` used to be, because the
+    session keeps chatting after the report and `RunFinished` ends the live region."""
+
+    path: Path
 
 
 @dataclass(frozen=True)
@@ -162,8 +188,11 @@ DisplayEvent = (
     | StageCompleted
     | Activity
     | Question
-    | AnswerDraft
     | QuestionAnswered
+    | ComposerDraft
+    | UserTurn
+    | AgentText
+    | ReportWritten
     | Alert
     | RunFinished
     | TodosUpdated
@@ -303,11 +332,19 @@ class PlainRenderer:
             # the non-TTY CI logs; every other event carries a real, one-time textual meaning
             # worth printing.
             pass
-        elif isinstance(event, AnswerDraft | QuestionAnswered):
-            # Dropped, same reasoning as `RoundsUpdated` above: both are pure live-frame
-            # decoration of the `ask_user` overlay, and one line per keystroke would flood a
-            # non-TTY log. `Question` above already prints the question text itself.
+        elif isinstance(event, QuestionAnswered | ComposerDraft | ReportWritten):
+            # Dropped, same reasoning as `RoundsUpdated` above: the composer draft and the
+            # retraction are pure live-frame decoration, and one line per keystroke would
+            # flood a non-TTY log. `ReportWritten` is dropped for a different reason: it
+            # exists because the TUI keeps chatting after the report, which a headless run
+            # never does — and printing the path here as well as in the summary would put it
+            # on stdout TWICE, which the frozen "the report path is the last line of stdout"
+            # contract does not allow.
             pass
+        elif isinstance(event, UserTurn):
+            out(f"> {event.text}")
+        elif isinstance(event, AgentText):
+            out(event.text)
         elif isinstance(event, ToolCall):
             # Only the completion emit prints: the start emit's `running...` row is live-frame
             # decoration (D-B), and the completed line is the durable fact worth a CI log line.
@@ -315,7 +352,7 @@ class PlainRenderer:
                 retry_suffix = " (retry)" if event.retry else ""
                 out(f"  {event.tool}: {event.arg_summary} -- {event.result_summary}{retry_suffix}")
         elif isinstance(event, ReadersUpdated):
-            # Dropped, same policy as `RoundsUpdated`/`AnswerDraft`/`QuestionAnswered` above:
+            # Dropped, same policy as `RoundsUpdated`/`QuestionAnswered` above:
             # the reader strip is pure live-frame decoration, presence-only, and a line per
             # status tick would flood a non-TTY log.
             pass
@@ -456,7 +493,9 @@ class RichRenderer:
     # first model turn and its initial todo plan, which precede the first `search_web` call.
     _PRE_STAGE_LABEL = "starting"
 
-    _FOOTER_HINT = "Ctrl+C to exit"
+    # The composer made Enter meaningful for the whole session (Phase 3), so the footer names
+    # both keys the developer now has.
+    _FOOTER_HINT = "Enter to send · Ctrl+C to quit"
 
     def __init__(
         self,
@@ -483,7 +522,10 @@ class RichRenderer:
         self._tool_calls: dict[str, ToolCall] = {}
         self._readers: tuple[ReaderItem, ...] = ()
         self._overlay_question: str | None = None
-        self._answer_draft: AnswerDraft | None = None
+        # The composer is ALWAYS rendered, so `None` means "nothing typed yet" rather than
+        # "no composer": `_build_renderable` falls back to an empty draft, which paints the
+        # bare `> ` prompt row.
+        self._composer: ComposerDraft | None = None
         self._closed = False
         # ONE spinner for the renderer's lifetime, never rebuilt per frame: `Spinner.render`
         # derives the animation frame from elapsed time since ITS OWN first render, so a fresh
@@ -587,7 +629,6 @@ class RichRenderer:
 
     def _build_ask_overlay(self) -> Panel:
         assert self._overlay_question is not None
-        draft = self._answer_draft or AnswerDraft("", 0, 0)
         body = Group(
             # `Text(...)`, not the raw string: the question is model-authored, and `Panel`
             # renders console markup -- a bracketed path (`[/var/log]`) would raise
@@ -595,7 +636,9 @@ class RichRenderer:
             # would be parsed as an unknown style and silently dropped from the question the
             # developer is answering.
             Text(self._overlay_question),
-            *_build_answer_rows(draft),
+            # No answer row here (3F Minor b): the answer is typed into the session composer,
+            # which stays live below the overlay — a draft row of its own would sit there
+            # permanently empty, because nothing emits overlay-answering keystrokes as events.
             Text("Enter to submit", style=_MUTED),
             # "clock", not the mockup's "stage clock": what freezes is the RUN elapsed time
             # shown on the stage line, not a per-stage timer. Worth being exact, because the
@@ -644,6 +687,10 @@ class RichRenderer:
             self._build_checklist(),
             Rule(style=_RULE),
             Panel(self._build_activity_group(), border_style=_FG_2),
+            # Between the panel and the footer, and present in EVERY frame (R1): the session is
+            # interactive throughout, so the line being typed is never hidden by whatever the
+            # run is doing above it.
+            *_build_composer_rows(self._composer or ComposerDraft("", 0, 0)),
             Text(self._FOOTER_HINT, style="dim"),
         )
 
@@ -709,20 +756,35 @@ class RichRenderer:
             # as long as the overlay is open (risk #2's OTHER clock -- the wall clock in
             # `__main__` is untouched here).
             self._overlay_question = event.text
-            self._answer_draft = AnswerDraft("", 0, 0)
             self._elapsed.pause()
             if self._live is None:
                 self._start_live()
             else:
                 self._live.refresh()
-        elif isinstance(event, AnswerDraft):
-            self._answer_draft = event
-            if self._live is not None:
-                self._live.refresh()
         elif isinstance(event, QuestionAnswered):
             self._overlay_question = None
-            self._answer_draft = None
             self._elapsed.resume()
+            if self._live is not None:
+                self._live.refresh()
+        elif isinstance(event, ComposerDraft):
+            # Pure decoration of an already-running frame, like `RoundsUpdated`: a keystroke
+            # before the first frame exists must not open the alternate screen on its own.
+            self._composer = event
+            if self._live is not None:
+                self._live.refresh()
+        elif isinstance(event, UserTurn | AgentText | ReportWritten):
+            # All three are transcript lines, so they go where `StageCompleted`'s collapsed
+            # line goes -- INSIDE the frame. Under `screen=True` a `console.print` here would
+            # be overwritten by the next refresh and then discarded with the alternate screen.
+            # `Text(...)`, never markup: the lead's prose and a report path both carry
+            # brackets, which `Console.print` would parse (see the `RunFinished` branch).
+            if isinstance(event, UserTurn):
+                entry = Text(f"> {event.text}", style=_ACCENT)
+            elif isinstance(event, AgentText):
+                entry = Text(event.text)
+            else:
+                entry = Text(f"report written: {event.path}", style=_ACCENT)
+            self._timeline.append(entry)
             if self._live is not None:
                 self._live.refresh()
         elif isinstance(event, Alert):
@@ -892,8 +954,8 @@ _WORDMARK_FRONT_LINE2 = "█▀▄ ██▄ ▄█ ██▄ █▀█ █▀�
 
 _EXAMPLE_QUESTION = '"How does DeepSeek V4 Pro price long-context runs?"'
 _PLACEHOLDER = "Ask anything… "
-# The `ask_user` overlay's input prompt (docs/design/deep-research-tui.html's `answer >`).
-_ANSWER_PROMPT = "answer > "
+# The session composer's prompt (Phase 3), from docs/design/deep-research-tui.html's input row.
+_COMPOSER_PROMPT = "> "
 
 _HINTS: tuple[tuple[str, str], ...] = (
     ("enter", "run"),
@@ -975,12 +1037,12 @@ def _build_cursor_rows(
     return rows
 
 
-def _build_answer_rows(draft: AnswerDraft) -> list[Text]:
-    """The `ask_user` overlay's draft rows, behind the mockup's `answer >` prompt.
+def _build_composer_rows(draft: ComposerDraft) -> list[Text]:
+    """The session composer's rows, behind its `> ` prompt.
 
     The prompt is what marks which line of the panel is the input; without it the draft sits
-    under the question prose as more text (PR #25 review). Continuation rows (Ctrl+J) are
-    padded to the same width so the typed text stays in one column.
+    above the footer as more text. Continuation rows (Ctrl+J) are padded to the same width so
+    the typed text stays in one column.
     """
     rows = _build_cursor_rows(
         draft.text,
@@ -993,9 +1055,9 @@ def _build_answer_rows(draft: AnswerDraft) -> list[Text]:
     for index, row in enumerate(rows):
         out = Text()
         if index == 0:
-            out.append(_ANSWER_PROMPT, style=_CYAN)
+            out.append(_COMPOSER_PROMPT, style=_CYAN)
         else:
-            out.append(" " * len(_ANSWER_PROMPT))
+            out.append(" " * len(_COMPOSER_PROMPT))
         out.append_text(row)
         prefixed.append(out)
     return prefixed

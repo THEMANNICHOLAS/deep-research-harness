@@ -4,7 +4,6 @@ import pathlib
 import re
 import sys
 from collections.abc import Callable
-from contextlib import AbstractContextManager
 from io import StringIO
 from typing import Any
 
@@ -43,6 +42,7 @@ from harness.display import (
 )
 from harness.sources import SourceRegistry
 from tests.conftest import (
+    RecordingRenderer,
     _dispatch_call,
     _FakeMarkdown,
     _FakeResult,
@@ -58,6 +58,10 @@ from tests.conftest import (
 from tests.test_agent import _reader_fetch_call, _task_call
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+# Read off the renderer rather than repeated as a literal: the hint is one string in one place
+# (harness/display.py), and a test pinning its own copy would pass against a stale footer.
+_FOOTER_HINT = RichRenderer._FOOTER_HINT
 
 
 def _strip_ansi(text: str) -> str:
@@ -173,23 +177,6 @@ def test_build_renderer_returns_a_plain_renderer():
     assert isinstance(build_renderer(), PlainRenderer)
 
 
-class _RecordingRenderer:
-    """A fake `Renderer` that records emitted events instead of printing them."""
-
-    def __init__(self) -> None:
-        self.events: list[DisplayEvent] = []
-        self.closes = 0
-
-    def emit(self, event: DisplayEvent) -> None:
-        self.events.append(event)
-
-    def suspend(self) -> AbstractContextManager[None]:
-        raise NotImplementedError
-
-    def close(self) -> None:
-        self.closes += 1
-
-
 def _fake_clock(times: list[float]):
     values = iter(times)
 
@@ -200,7 +187,7 @@ def _fake_clock(times: list[float]):
 
 
 def test_stage_tracker_advancing_to_the_same_stage_twice_emits_one_stage_started():
-    renderer = _RecordingRenderer()
+    renderer = RecordingRenderer()
     tracker = StageTracker(renderer, clock=_fake_clock([0.0, 1.0]))
 
     tracker.advance("researching")
@@ -210,7 +197,7 @@ def test_stage_tracker_advancing_to_the_same_stage_twice_emits_one_stage_started
 
 
 def test_stage_tracker_advancing_to_a_new_stage_completes_the_old_one_first():
-    renderer = _RecordingRenderer()
+    renderer = RecordingRenderer()
     tracker = StageTracker(renderer, clock=_fake_clock([0.0, 5.0]))
 
     tracker.advance("researching")
@@ -224,7 +211,7 @@ def test_stage_tracker_advancing_to_a_new_stage_completes_the_old_one_first():
 
 
 def test_stage_tracker_finish_with_no_current_stage_emits_nothing():
-    renderer = _RecordingRenderer()
+    renderer = RecordingRenderer()
     tracker = StageTracker(renderer, clock=_fake_clock([]))
 
     tracker.finish()
@@ -233,7 +220,7 @@ def test_stage_tracker_finish_with_no_current_stage_emits_nothing():
 
 
 def test_stage_tracker_finish_emits_completion_and_is_safe_to_call_twice():
-    renderer = _RecordingRenderer()
+    renderer = RecordingRenderer()
     tracker = StageTracker(renderer, clock=_fake_clock([0.0, 3.5]))
 
     tracker.advance("writing")
@@ -432,7 +419,7 @@ async def test_todos_meta_refreshes_on_live_reader_count_change_and_only_then(
         {"head": model, "researcher": researcher_model, "reader": reader_model},
     )
 
-    recorder = _RecordingRenderer()
+    recorder = RecordingRenderer()
     monkeypatch.setattr(main_module, "build_renderer", lambda: recorder)
 
     await main_module.main(["a question needing delegation"])
@@ -557,7 +544,7 @@ async def test_the_source_count_is_emitted_only_when_the_registry_grows(
 
     monkeypatch.setattr(SourceRegistry, "count", _counting_count)
 
-    recorder = _RecordingRenderer()
+    recorder = RecordingRenderer()
     monkeypatch.setattr(main_module, "build_renderer", lambda: recorder)
 
     # Pasted URLs are the sanctioned pre-approval route (R2) -- no `search_web` call needed.
@@ -762,13 +749,13 @@ def test_rich_renderer_layout_order_is_checklist_then_rule_then_activity_then_fo
     checklist_index = frame.index("Find sources")
     rule_index = frame.index("─")  # the gray `Rule` separator (R6)
     activity_index = frame.index('search_web: "a query"')
-    footer_index = frame.index("Ctrl+C to exit")
+    footer_index = frame.index(_FOOTER_HINT)
     assert checklist_index < rule_index < activity_index < footer_index
 
     lines = [line for line in frame.splitlines() if line.strip()]
-    footer_lines = [line for line in lines if "Ctrl+C to exit" in line]
+    footer_lines = [line for line in lines if _FOOTER_HINT in line]
     assert footer_lines
-    assert footer_lines[-1].strip() == "Ctrl+C to exit"
+    assert footer_lines[-1].strip() == _FOOTER_HINT
 
 
 # --- ask_user in-place overlay (Phase 5) ---------------------------------------------------
@@ -794,18 +781,6 @@ def test_overlay_renders_in_frame_with_the_ledger_and_stage_line_still_visible()
     assert "clock paused while the agent waits" in text
     assert "Find sources" in text
     assert "researching" in text
-
-
-def test_overlay_echoes_the_typed_answer_draft():
-    renderer, buffer = _rich_renderer()
-
-    renderer.emit(StageStarted("researching"))
-    renderer.emit(Question("Which reading did you mean?"))
-    renderer.emit(harness.display.AnswerDraft("sticker price", 0, 13))
-    text = _strip_ansi(buffer.getvalue())
-    renderer.close()
-
-    assert "sticker price" in text
 
 
 def test_overlay_question_is_not_parsed_as_console_markup():
@@ -869,7 +844,7 @@ def test_rich_renderer_displayed_clock_excludes_the_paused_interval():
 def test_stage_tracker_pause_resume_excludes_the_paused_interval():
     """The recorded `clarifying` timing must exclude the paused interval too — otherwise a
     `clarifying 183.0s` that is mostly human thinking time is a wrong number in the report."""
-    renderer = _RecordingRenderer()
+    renderer = RecordingRenderer()
     now = [0.0]
     tracker = StageTracker(renderer, clock=lambda: now[0])
 
@@ -1476,7 +1451,7 @@ def test_build_model_picker_windows_a_long_list_with_truncation_affordances():
 
 
 def test_stage_tracker_timings_returns_completed_pairs_in_order():
-    renderer = _RecordingRenderer()
+    renderer = RecordingRenderer()
     tracker = StageTracker(renderer, clock=_fake_clock([0.0, 1.0, 4.0]))
 
     tracker.advance("researching")
@@ -1569,7 +1544,7 @@ async def test_a_failing_report_write_still_closes_the_display(
     error escaping `main` left the developer's shell cursorless behind the traceback.
     """
     config = make_config()
-    renderer = _RecordingRenderer()
+    renderer = RecordingRenderer()
     monkeypatch.setattr(main_module, "build_renderer", lambda: renderer)
 
     def _unwritable(outcome: Any, cfg: Any) -> Any:
@@ -1597,7 +1572,7 @@ async def test_failed_run_error_prints_only_after_the_renderer_is_closed(
     ordering instead: the `error:` detail must reach stderr only AFTER `renderer.close()`.
     """
 
-    class _CloseMarkingRenderer(_RecordingRenderer):
+    class _CloseMarkingRenderer(RecordingRenderer):
         def close(self) -> None:
             super().close()
             print("<renderer closed>", file=sys.stderr)
@@ -2366,17 +2341,78 @@ def test_the_welcome_screen_forces_a_repaint_on_every_update():
     assert calls == [True]
 
 
-def test_the_ask_overlay_marks_the_draft_line_with_an_answer_prompt():
-    """PR #25 review, Nit: the mockup's `answer >` prompt marks which line is the input."""
+def test_the_ask_overlay_has_no_answer_row_of_its_own():
+    """3F Minor b: the composer below the overlay is the one input line, so the overlay
+    draws no `answer >` row — nothing emits overlay-answering keystrokes as events, and the
+    row it had sat permanently empty above the live composer.
+    """
     renderer, buffer = _rich_renderer()
 
     renderer.emit(StageStarted("researching"))
     renderer.emit(Question("Which region should I focus on?"))
-    renderer.emit(harness.display.AnswerDraft("euro", 0, 4))
     frame = _strip_ansi(buffer.getvalue())
     renderer.close()
 
-    assert "answer >" in frame
-    draft_lines = [line for line in frame.splitlines() if "euro" in line]
-    assert draft_lines, frame
-    assert all("answer >" in line for line in draft_lines)
+    assert "Which region should I focus on?" in frame
+    assert "answer >" not in frame
+    assert "Enter to submit" in frame
+
+
+# --- Composer and transcript (Phase 3, PLAN-interactive-lead-chat) --------------------------
+
+
+def test_plain_renderer_prints_the_transcript_turns_and_drops_the_composer(capsys):
+    """Non-TTY: a user line and the lead's prose are each one durable log line.
+
+    `ComposerDraft` is dropped like any pure live-frame decoration — one line per keystroke
+    would flood the log. `ReportWritten` is dropped because the summary already
+    ends the run with that path, and printing it twice breaks the frozen "the report path is
+    the last line of stdout" contract (see `test_a_full_run_prints_the_report_block...`).
+    """
+    renderer = PlainRenderer()
+
+    renderer.emit(harness.display.UserTurn("skip the routing angle"))
+    renderer.emit(harness.display.AgentText("Dropping that angle."))
+    renderer.emit(harness.display.ComposerDraft("half a line", 0, 11))
+    renderer.emit(harness.display.ReportWritten(pathlib.Path("reports") / "run.md"))
+
+    _, lines = drain_stdout(capsys)
+    assert lines == ["> skip the routing angle", "Dropping that angle."]
+
+
+def test_the_composer_line_renders_inside_the_live_frame():
+    """R1: the composer is part of the Live renderable, not a separate print — it must be in
+    the same frame as the pinned checklist and the footer hint, so typing never scrolls the
+    run's own output away.
+    """
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(TodosUpdated((TodoItem(content="Find sources", status="pending"),)))
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.ComposerDraft("skip the rout", 0, 13))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "skip the rout" in frame
+    assert "Tasks" in frame
+    assert "Enter to send" in frame
+    # Between the activity panel and the footer, which is where the mockup puts the input.
+    assert frame.index("Find sources") < frame.index("skip the rout") < frame.index("Enter to send")
+
+
+def test_the_transcript_shows_user_and_agent_turns_in_order():
+    """R1/R2: the developer's line and the lead's own prose both land in the timeline, in the
+    order they happened — the lead's narration is shown nowhere else.
+    """
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.UserTurn("skip the routing angle"))
+    renderer.emit(harness.display.AgentText("Dropping that angle."))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "> skip the routing angle" in frame
+    assert "Dropping that angle." in frame
+    assert frame.index("skip the routing angle") < frame.index("Dropping that angle.")

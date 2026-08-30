@@ -239,7 +239,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 ## Progress
 - [x] Phase 1: Session tracer — dispatch tool, return injection, submit_report
 - [x] Phase 2: Budgets, roster data and run exits inside the session
-- [ ] Phase 3: Composer — queued user messages and post-report chat
+- [x] Phase 3: Composer — queued user messages and post-report chat
 - [ ] Phase 4: ask_user with choices
 - [ ] Phase 5: Chat TUI — transcript, task dock, researcher roster
 - [ ] Phase 6: Slash commands — /sources, /model, /new
@@ -352,7 +352,7 @@ through `dispatch_researcher`, receives each return as its own message, and ends
 - [x] Clock arms on the first successful dispatch (not on a refusal) and stops at
   `submit_report`; time passing after the report never cuts short.
 - [x] Answer-less wall-clock expiry and Ctrl-C → `run()` returns None, no report file, exit 1;
-  wall-clock expiry after `submit_report` → report kept.
+  ~~wall-clock expiry after `submit_report` → report kept~~ (see Reconciliations, 2026-08-27).
 - [x] Synthesis margin injects the submit_report instruction once; round cap still cuts short.
 - [x] Roster records transition running → done/failed and the `Roster:` line lists them.
 
@@ -387,8 +387,9 @@ and after the report the session keeps answering over the same sources until qui
 - Pattern to mirror: the welcome screen's key loop (`_run_welcome`) for key handling shape.
 
 **Contracts:**
-- Key thread posts `KeyEvent`s to one `asyncio.Queue` for the whole session (welcome, run,
-  interrupts, post-report all read from it).
+- Key thread posts `KeyEvent`s to one ~~`asyncio.Queue`~~ stdlib `queue.Queue` (see
+  Reconciliations, 2026-08-27) for the whole session (welcome, run, interrupts, post-report
+  all read from it).
 - Quit: Ctrl-C/Ctrl-D before a report → failed run (Phase 2 gate); after → exit 0.
 
 **Out of scope:**
@@ -396,12 +397,12 @@ and after the report the session keeps answering over the same sources until qui
 - Roster view, task dock, styling (Phase 5).
 
 **Tests (write first, confirm red):**
-- [ ] Text entered while a turn runs is delivered in the next turn's `HumanMessage`, after any
+- [x] Text entered while a turn runs is delivered in the next turn's `HumanMessage`, after any
   returns drained in the same batch, in arrival order; nothing is dropped across two turns.
-- [ ] Text entered while idle (roster empty, no report) starts a turn immediately.
-- [ ] After `submit_report`, a message starts a turn and `dispatch_researcher` refuses; quit then
+- [x] Text entered while idle (roster empty, no report) starts a turn immediately.
+- [x] After `submit_report`, a message starts a turn and `dispatch_researcher` refuses; quit then
   exits 0 with the report intact.
-- [ ] Composer renders the in-progress line inside the Live renderable.
+- [x] Composer renders the in-progress line inside the Live renderable.
 
 **Steps:**
 1. Write the tests above; run them; confirm they FAIL (red).
@@ -611,6 +612,19 @@ is marked; prompts read as one coherent contract.
 <!-- Drift amendments written by /implement during execution. Append-only. Outdated phase
 text above is struck through (~~...~~) but preserved; entries here are the authoritative
 correction. Empty at plan creation. -->
+- 2026-08-27 — Phase 2 test bullet "wall-clock expiry after `submit_report` → report kept" is
+  unreachable by construction: `submit_report` disarms the hard clock (Phase 2 Contracts), so
+  the clock can never fire after an answer exists. Replaced by
+  `tests/test_agent.py::test_main_keeps_the_report_when_time_passes_after_submit_report`
+  (time passing after submit never cuts short) and the margin-zero test asserting exit 1 / no
+  report when the clock fires before any answer. R5/R6 semantics unchanged. Approved by the
+  developer on Phase 3 entry.
+- 2026-08-27 — Phase 3 contract "one `asyncio.Queue`" → one stdlib `queue.Queue` fed by the
+  daemon key thread. `_run_welcome` is synchronous and blocks the event loop while it reads, so
+  `call_soon_threadsafe` into an `asyncio.Queue` would never be processed during the welcome
+  screen; async consumers read via `run_in_executor`, with a `None` sentinel on close so no
+  executor thread is left blocked at exit (Risk #3). One thread, one queue — the contract's
+  intent — is preserved. Approved by the developer at Phase 3's 3F gate.
 
 ## Discoveries
 <!-- Non-contradictory findings logged by /implement during execution (act / defer / drop).
@@ -648,6 +662,40 @@ Append-only, empty at plan creation. -->
   the margin-zero test now asserts exit 1 / no report). This is Contracts-vs-Tests drift that
   needs a `## Reconciliations` entry re-approved by the developer → PENDING developer
   re-approval on return (not written unilaterally).
+- 2026-08-27 — Phase 3: the `## Notes` "non-TTY → exit 2" behaviour is deferred to Phase 7 —
+  every headless `main()` test runs non-TTY, so flipping it now would take the whole
+  `test_agent.py` main() suite with it. Phase 3 adds `Session(interactive=...)` instead:
+  `False` keeps the nudge-then-fail idle backstop and returns right after the report.
+  → deferred (Phase 7 decides whether to keep the flag or make TTY mandatory).
+- 2026-08-27 — Phase 3: the report is written when `submit_report` is accepted and a
+  `ReportWritten(path)` timeline event replaces the immediate `RunFinished`, which now fires at
+  session end — `RunFinished` tears down the Live screen, so it cannot precede post-report
+  chat. → acted.
+- 2026-08-30 — Phase 3 review deferrals (developer-approved): (a) raw mode is now held for the
+  whole session, so `\x03` is a key, not SIGINT — after the composer's first `interrupt`
+  triggers a quit, a hung provider call in `_chat_turn` or `_finish`'s verification leaves no
+  keyboard escape (a second Ctrl-C is never read); revisit alongside Phase 6 `/new` teardown.
+  (b) `__main__.py`'s "do not reorder" welcome-teardown invariant and its test now pin only the
+  injected-generator path — production restores raw mode later via `KeyReader.close()`,
+  harmlessly. (c) `RichRenderer._timeline` is unbounded and grows per chat turn, pushing the
+  composer toward the crop edge — Phase 5's transcript bounding owns the fix. (d) `_type` key
+  helper is duplicated in tests/test_ask_user.py and tests/test_main_welcome.py — move to
+  conftest on the next touch. Phase 3 diff landed ~3x the phase budget (1,329 insertions / 11
+  code files vs ~300-450 / 6) — recorded for later budget calibration, like Phase 1.
+- 2026-08-27 — Phase 3 3F review dispositions (4 Majors, 4 Minors): Major 1 (post-report chat
+  outside `run()`'s exception handling) → acted — `_chat_turn` discloses a failed chat turn as
+  an `Alert`, keeps the chat open, leaves `cut_short` None so a report on disk stays a clean
+  exit; Major 2 (round cap counts post-report turns) → acted — `_note_model_turns` gains the
+  same `answer is None` guard the margin check has; Major 3 (keyboard→queue bridge untested) →
+  acted — Enter/empty-line/answer-routing tests in `tests/test_ask_user.py` plus
+  `Session.receive_user_message`'s contract test; Major 4 (diff budget 2.3× over) → deferred
+  to budget calibration like Phase 1. Minor a was already reconciled (queue.Queue entry,
+  approved at the 3F gate); Minor b → acted — `AnswerDraft` deleted and the overlay draws no
+  answer row (the composer is the one input line; Phase 4 reworks the overlay); Minor c →
+  acted — Ctrl+D quits the welcome screen like Ctrl+C; Minor d → acted — `_run_task` is
+  cleared when the turn loop ends, so a quit landing after `run()` returned can no longer
+  cancel `main()`'s `finally`; the second simplification → acted — the function-local
+  `UserMessage` import in `Composer._send` replaced by `Session.receive_user_message`.
 
 ## Phase Handoff Log
 <!-- Written by /implement at each 3G phase gate (Done / Learned / Drift / Watch-next per
@@ -700,3 +748,31 @@ never add a section below it. -->
 - Watch-next: Phase 3 replaces the headless idle backstop (`_SUBMIT_NOW` nudge then fail) with
   wait-for-user; the post-report loop must keep `dispatch`/`submit` refusing. Resolve the
   pending Reconciliation first.
+
+### 2026-08-30 — Phase 3: Composer — queued user messages and post-report chat
+- Done: session-long `KeyReader` (one daemon key thread → stdlib `queue.Queue`, welcome/run/
+  interrupt/post-report all read from it; `eof` KeyKind added) + `Composer` in `__main__.py`
+  (Enter → `Session.receive_user_message`, pending `composer.answer()` future for `ask_user`,
+  interrupt/eof → `request_quit`); `Session(interactive=...)` — interactive idle waits for the
+  user (headless keeps the nudge-then-fail backstop), post-report `_chat_loop`/`_chat_turn`
+  (provider errors disclosed as alerts, KeyboardInterrupt/cancel = clean quit, report survives);
+  report written at submit (`ReportWritten` timeline event), `RunFinished` moved to session end;
+  `ComposerDraft`/`UserTurn`/`AgentText` display events, composer drawn inside the renderable;
+  `AnswerDraft` deleted; orchestrator.md gained `# Messages from the user` / `# After the
+  report`. Three 3F passes (flagged !#3): 4 Majors + 9 Minors found, all fixed except four
+  developer-approved deferrals (see Discoveries 2026-08-30). 870 tests, 96.8% coverage, gates
+  clean.
+- Learned: raw mode now spans the whole session, so Ctrl-C arrives as a KEY, not SIGINT — quit
+  routes through `Composer` → `request_quit()` (cancels the run task pre-report; flips the chat
+  loop post-report), and `_run_task` is cleared in `run()`'s `finally` so a late key cancels
+  nothing. A `KeyboardInterrupt` raised inside a langgraph node task escapes `asyncio.run`
+  regardless of awaiters (kills pytest too) — deliver test interrupts via `session._stream_pass`,
+  never a scripted model. `_abort`/`reader.close()` must run BEFORE `renderer.close()` (restore
+  while the alternate screen still owns the terminal); `KeyReader.close()` is idempotent.
+- Drift: two Reconciliations this phase — the Phase 2 unreachable test bullet (approved on
+  entry) and the key-thread contract `asyncio.Queue` → stdlib `queue.Queue` (welcome blocks the
+  loop; `run_in_executor` + `None` sentinel).
+- Watch-next: the live TTY acceptance criterion (type "skip the routing angle" mid-fan-out)
+  is still unrun — needs real models, along with Phase 1's live pass. Phase 4 moves interrupt
+  handling into `Session` and should fold `composer.answer()` digits; watch Discoveries (a) —
+  no keyboard escape while a post-report turn hangs — when touching that seam.

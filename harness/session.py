@@ -49,10 +49,12 @@ from harness.agent import (
 from harness.config import HarnessConfig
 from harness.display import (
     Activity,
+    AgentText,
     Alert,
     ReaderItem,
     ReadersUpdated,
     Renderer,
+    ReportWritten,
     RoundsUpdated,
     RunFinished,
     SourcesUpdated,
@@ -60,6 +62,7 @@ from harness.display import (
     TodoItem,
     TodosUpdated,
     ToolCall,
+    UserTurn,
 )
 from harness.paragraphs import split_paragraphs
 from harness.report import CutShortReason, RunOutcome, partition_sources, write_report
@@ -132,6 +135,17 @@ class UserMessage:
 
     text: str
 
+
+class _Quit:
+    """The queue's quit sentinel: "the developer asked to stop", posted by `request_quit`.
+
+    A sentinel rather than a public event type (Phase 3): quitting is not something the LEAD
+    is ever told about — every batch builder strips it — so giving it a place in `SessionEvent`
+    would put it in reach of `_batch_message` and, one edit later, in the model's context.
+    """
+
+
+_QUIT = _Quit()
 
 SessionEvent = ResearcherReturn | UserMessage
 
@@ -307,6 +321,7 @@ class Session:
         browser: "BrowserSession | None",
         answer_interrupt: Callable[[Interrupt], Awaitable[list[dict[str, Any]]]],
         started_at: datetime,
+        interactive: bool = False,
     ) -> None:
         self._config = config
         self._registry = registry
@@ -318,11 +333,17 @@ class Session:
         self._browser = browser
         self._answer_interrupt = answer_interrupt
         self._started_at = started_at
+        self._interactive = interactive
 
-        self.events: asyncio.Queue[SessionEvent] = asyncio.Queue()
+        self.events: asyncio.Queue[SessionEvent | _Quit] = asyncio.Queue()
         self.running: dict[str, asyncio.Task[None]] = {}
         self.answer: str | None = None
         self.agent: Runnable
+        # Set by `request_quit`, read by the turn loop and the post-report chat loop.
+        self._quit = False
+        # `run()`'s own task, so a quit before the report can cancel the turn in flight rather
+        # than waiting for it to end (R5: that quit is a FAILED run, and must be immediate).
+        self._run_task: asyncio.Task[Any] | None = None
         # One stable thread for the whole session: the checkpointer requires an id, and every
         # turn — including an interrupt resume — must land on the SAME thread.
         self.thread_id = str(uuid4())
@@ -355,12 +376,45 @@ class Session:
         self._forced_synthesis = False  # inside the bounded pass: `submit` stops refusing
 
         self._final_state: dict[str, Any] | None = None
+        # `_finish` computes both; `_emit_finished` reads them, because the end-of-run summary
+        # is now emitted after the post-report chat rather than inside `_finish`.
+        self._verification: VerificationResult | None = None
+        self._report_path: Path | None = None
+        # Message ids whose prose already reached the transcript: middleware nodes re-emit an
+        # already-seen `AIMessage`, and the same dedupe `_note_model_turns` needs for rounds is
+        # what keeps one narration turn from being printed twice.
+        self._agent_text_ids: set[str] = set()
         self._last_todos: list[dict[str, Any]] | None = None
         self._alerts_emitted = 0
         self._last_source_count = 0
         self._tool_calls_emitted = 0
         self._last_readers: tuple[Any, ...] | None = None
         self._last_in_flight: int | None = None
+
+    def request_quit(self) -> None:
+        """Ctrl+C / Ctrl+D from the composer: end the session at the next safe point (R5).
+
+        Two different endings, decided by whether a report exists yet. BEFORE one does, the
+        quit is a FAILED run and must be immediate, so the turn in flight is cancelled — the
+        `CancelledError` lands in `run()`'s abort clause and does exactly what Ctrl+C has
+        always done (no report, `cut_short = "error"`, exit 1). AFTER the report, the run has
+        already succeeded: nothing is cancelled, the sentinel simply wakes the chat loop, which
+        returns and lets `run()` hand back the outcome it already has (exit 0).
+        """
+        self._quit = True
+        self.events.put_nowait(_QUIT)
+        if self.answer is None and self._run_task is not None:
+            self._run_task.cancel()
+
+    def receive_user_message(self, text: str) -> None:
+        """Queue one developer line for the lead's next turn (the composer's Enter, D5).
+
+        The one production writer of `UserMessage`s: the composer calls this rather than
+        reaching into `events`, which keeps the queue's element type — including the private
+        `_Quit` sentinel — a session-internal concern, and spares `__main__` an import from
+        this heavy module outside `main()`'s deferred block.
+        """
+        self.events.put_nowait(UserMessage(text))
 
     # --- the two lead tools -----------------------------------------------------------------
 
@@ -636,6 +690,15 @@ class Session:
         message id because middleware nodes may re-emit an already-counted message; a
         researcher's own turns run in a separate graph and never reach this stream, so rounds
         are the LEAD's turns.
+
+        Post-report chat turns are uncapped (3F Major 2): the research loop has already
+        exited by then, so no synthesis pass could rescue anything — counting chat turns
+        would only push `_rounds_used` over `max_rounds`, fire that pass on a SUCCESSFUL run,
+        stamp `round_cap` onto it, and leave `_overrun` breaking every later chat turn
+        mid-stream. The margin check carries the same guard. The guard sits on the COUNTING
+        branch, never above the loop: a ToolMessage that arrives after the answer exists —
+        the capped submit's own tool result — must still drain `_awaiting_tool_ids`, or the
+        capped turn's stream would never break for its synthesis pass.
         """
         max_rounds = self._config.agent.max_rounds
         for message in node_update.get("messages") or []:
@@ -643,6 +706,8 @@ class Session:
                 self._awaiting_tool_ids.discard(message.tool_call_id)
                 continue
             if not isinstance(message, AIMessage):
+                continue
+            if self.answer is not None:
                 continue
             if message.id is not None:
                 if message.id in self._counted_turn_ids:
@@ -669,9 +734,28 @@ class Session:
             self._last_todos = todos
             self._last_in_flight = self._sink.live_reader_count()
 
+        # The lead's own prose into the transcript (R2): a narration turn is how the lead tells
+        # the developer what a return meant, and nothing else in the display shows it. Skipped
+        # for tool-call-only messages, whose text content is empty.
+        for message in node_update.get("messages") or []:
+            if not isinstance(message, AIMessage):
+                continue
+            if message.id is not None:
+                if message.id in self._agent_text_ids:
+                    continue
+                self._agent_text_ids.add(message.id)
+            text = _message_text(message)
+            if text:
+                self._renderer.emit(AgentText(text))
+
         calls = _dispatch_tool_calls(node_update)
         if calls:
-            self._tracker.advance("researching")
+            # Not once the answer exists: a post-report dispatch is REFUSED by the tool, and
+            # advancing here would re-open a stage `_finish` already closed out — a live
+            # "researching" stage over a run that has stopped researching, which nothing left
+            # will ever complete. The activity line still shows, so the attempt is visible.
+            if self.answer is None:
+                self._tracker.advance("researching")
             for call in calls:
                 self._renderer.emit(Activity(_describe_tool_call(call)))
 
@@ -826,7 +910,10 @@ class Session:
             pass_state = await self._stream_pass(stream_input)
             interrupts = (pass_state or {}).get("__interrupt__")
             if interrupts:
-                self._tracker.advance("clarifying")
+                # Same guard as the dispatch path: `_finish` has already closed every stage
+                # out, so a post-report question must not re-open one nothing will complete.
+                if self.answer is None:
+                    self._tracker.advance("clarifying")
                 # `interrupts[0]`, not all of them: the lead is a single agent node, so at most
                 # one is ever pending, and `Command(resume=...)` delivers ONE value — fanning
                 # several into one decisions list would mis-pair them.
@@ -856,23 +943,53 @@ class Session:
         running = ", ".join(state.id for state in roster if state.status == "running") or "none"
         return "\n\n".join(parts) + f"\nRoster: done {done} · running {running}"
 
-    def _drain_events(self) -> list[SessionEvent]:
+    def _drain_events(self) -> list[SessionEvent | _Quit]:
         """Everything queued right now, oldest first — never blocking."""
-        batch: list[SessionEvent] = []
+        batch: list[SessionEvent | _Quit] = []
         while True:
             try:
                 batch.append(self.events.get_nowait())
             except asyncio.QueueEmpty:
                 return batch
 
+    async def _next_batch(self) -> list[SessionEvent]:
+        """Block for at least one event, drain the rest, and strip the quit sentinel.
+
+        The one place a batch is built, so `_QUIT` can never reach `_batch_message` from either
+        the turn loop or the post-report chat loop. An EMPTY result means the batch was nothing
+        but quit sentinels — the caller decides what that means, since it is a failed run
+        before the report and a clean end after it.
+        """
+        batch: list[SessionEvent | _Quit] = [await self.events.get()]
+        batch.extend(self._drain_events())
+        return [event for event in batch if not isinstance(event, _Quit)]
+
+    def _next_input(self, batch: list[SessionEvent]) -> dict[str, Any]:
+        """One drained batch as the lead's next input, echoing each user line as it is sent.
+
+        The echo lives here rather than at the call sites so a message cannot reach the model
+        without also reaching the transcript — the developer must be able to see that what they
+        typed was delivered, and on which turn.
+        """
+        for event in batch:
+            if isinstance(event, UserMessage):
+                self._renderer.emit(UserTurn(event.text))
+        return {"messages": [HumanMessage(content=self._batch_message(batch))]}
+
     async def run(self) -> RunOutcome | None:
-        """Drive the session to a written report, or to a failed run.
+        """Drive the session to a written report, then chat over it until the developer quits.
 
         Returns the `RunOutcome` that was written, or `None` when no report was written at all
         (D3/R5: a hard error, a user abort, an answer-less clock, or a lead that never called
         `submit_report`). `__main__` maps that to the exit code; the browser and the renderer
         are its to close, after this returns.
+
+        An INTERACTIVE session does not return the moment the report lands: research ends
+        there, but the chat does not (R5), so `_chat_loop` keeps answering over the same thread
+        and the same sources until `request_quit`. A headless one returns immediately, exactly
+        as before this phase.
         """
+        self._run_task = asyncio.current_task()
         self.agent = build_agent(
             self._config, self._registry, self._run_log, self._sink, self._browser, self
         )
@@ -903,7 +1020,11 @@ class Session:
                         raise self._fatal
                     if self.answer is not None or self.cut_short is not None:
                         break
-                    if not self.running and self.events.empty():
+                    # The nudge is the HEADLESS ending: with no key source there is nobody to
+                    # wait for, so an idle lead is out of moves and the run must end. An
+                    # interactive session falls through to the blocking wait instead — the
+                    # developer is still there, and R1 says a message may arrive at any time.
+                    if not self.running and self.events.empty() and not self._interactive:
                         if nudged:
                             self.cut_short = "error"
                             self.cut_short_detail = (
@@ -913,11 +1034,17 @@ class Session:
                         nudged = True
                         next_input = {"messages": [HumanMessage(content=_SUBMIT_NOW)]}
                         continue
-                    batch: list[SessionEvent] = [await self.events.get()]
-                    batch.extend(self._drain_events())
+                    batch = await self._next_batch()
                     if self._fatal is not None:
                         raise self._fatal
-                    next_input = {"messages": [HumanMessage(content=self._batch_message(batch))]}
+                    if not batch:
+                        # Nothing but the quit sentinel: a quit that landed BETWEEN turns, so
+                        # there was no in-flight turn for `request_quit` to cancel. Same
+                        # ending as the cancelled one — no report exists yet (R5).
+                        self.cut_short = "error"
+                        self.cut_short_detail = "user abort (Ctrl+C)"
+                        break
+                    next_input = self._next_input(batch)
         except TimeoutError as exc:
             # `clock.expired()`, not a bare `except TimeoutError`: a timeout raised INSIDE the
             # run (an `asyncio.wait_for` in a tool, say) would otherwise be reported as "the
@@ -948,9 +1075,87 @@ class Session:
             self.cut_short = "error"
             self.cut_short_detail = "user abort (Ctrl+C)"
         finally:
+            # Cleared before the teardown awaits (3F Minor d): past the turn loop a quit has
+            # nothing left to cancel, and `_run_task` is main()'s own task in production —
+            # leaving it set would let a key landing after run() returned cancel main()'s
+            # `finally` mid-`browser.close()`.
+            self._run_task = None
             await self._cancel_running()
 
-        return await self._finish()
+        outcome = await self._finish()
+        # The report is written at submit time, but the run is only OVER once the chat is:
+        # `RunFinished` stops the live region and prints the summary on the normal terminal, so
+        # it cannot fire until there is nothing left to render (D3).
+        if outcome is not None and self._interactive:
+            await self._chat_loop()
+        self._emit_finished()
+        return outcome
+
+    async def _chat_loop(self) -> None:
+        """Post-report chat: same thread, same sources, no clock, no new research (R5/D3).
+
+        `dispatch_researcher` and `submit_report` already refuse once `self.answer` is set, so
+        nothing here re-implements that gate. A cancellation is a clean end rather than a
+        failure — the report is on disk, and `run()` still returns the outcome.
+
+        `KeyboardInterrupt` beside `CancelledError`, as in `run()`'s own abort clause: a Ctrl+C
+        is a QUIT, not a failed turn, so it must not fall to `_chat_turn`'s disclosure — and
+        being a `BaseException` it is caught by neither that clause nor `run()`'s (which is
+        behind us), so unhandled it escapes `run()` entirely, skipping the end-of-run summary
+        and the outcome on a run whose report is already on disk.
+        """
+        try:
+            while not self._quit:
+                batch = await self._next_batch()
+                if self._quit:
+                    return
+                if batch:
+                    await self._chat_turn(self._next_input(batch))
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            return
+
+    async def _chat_turn(self, next_input: Any) -> None:
+        """One post-report turn, with failed turns disclosed instead of fatal (3F Major 1).
+
+        `run()`'s `except` clauses are behind us — a provider error here must not escape,
+        skip `_emit_finished`, and turn a run whose report is already on disk into exit 1 or
+        a traceback (R5: quitting after the report is a CLEAN exit). `cut_short` stays None
+        because the run already succeeded; the error is disclosed as an alert and the chat
+        stays open, so the developer can retry the line or quit.
+        """
+        try:
+            await self._turn(next_input)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — never `BaseException`, as in `run()`
+            self._renderer.emit(
+                Alert(
+                    f"a chat turn failed ({type(exc).__name__}: {exc}) — the report is safe "
+                    "on disk; the chat is still open, retry or quit"
+                )
+            )
+
+    def _emit_finished(self) -> None:
+        """The end-of-run summary, emitted once both research and any chat are over.
+
+        Reads `_verification`/`_report_path` off the session rather than taking the outcome:
+        a FAILED run has no `RunOutcome` at all, and its verification failures and cut-short
+        reason still belong in the summary.
+        """
+        usable, unusable = partition_sources(self._config, self._registry)
+        self._renderer.emit(
+            RunFinished(
+                stage_timings=self._tracker.timings(),
+                usable_sources=len(usable),
+                unusable_sources=len(unusable),
+                cut_short=self.cut_short,
+                verification_failures=(
+                    len(self._verification.check_failures) if self._verification else 0
+                ),
+                incidents=len(self._run_log.incidents()),
+                report_path=self._report_path,
+            )
+        )
 
     async def _finish(self) -> RunOutcome | None:
         """Verify, assemble and (if the gate allows) write the report."""
@@ -1023,18 +1228,14 @@ class Session:
         if should_write_report:
             path = write_report(outcome, self._config)
         self._tracker.finish()
-        usable, unusable = partition_sources(self._config, self._registry)
-        self._renderer.emit(
-            RunFinished(
-                stage_timings=self._tracker.timings(),
-                usable_sources=len(usable),
-                unusable_sources=len(unusable),
-                cut_short=self.cut_short,
-                verification_failures=len(verification.check_failures) if verification else 0,
-                incidents=len(self._run_log.incidents()),
-                report_path=path,
-            )
-        )
+        # Held for `_emit_finished`, which now runs after any post-report chat rather than here.
+        self._verification = verification
+        self._report_path = path
+        if path is not None:
+            # The path in the transcript, the moment it exists: `RunFinished` no longer follows
+            # this line immediately, and a developer chatting after the report should not have
+            # to quit to find out where it was written.
+            self._renderer.emit(ReportWritten(path))
         return outcome if should_write_report else None
 
 

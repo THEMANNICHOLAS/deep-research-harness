@@ -19,6 +19,7 @@ KeyKind = Literal[
     "up",
     "down",
     "interrupt",
+    "eof",
 ]
 
 # Set by `read_keys()`'s POSIX branch to the closure that restores the saved `termios` mode,
@@ -79,6 +80,11 @@ def decode_posix(
         return KeyEvent("word_backspace")
     if c == "\x03":
         return KeyEvent("interrupt")
+    if c == "\x04":
+        # Ctrl+D. Distinct from `interrupt` because the two differ downstream only in intent,
+        # not in effect: the composer treats both as "quit", but a caller that wants
+        # "end of input" separately from "abort" can tell them apart.
+        return KeyEvent("eof")
     if c == "\x1b":
         if has_pending is not None and not has_pending():
             return None
@@ -117,6 +123,10 @@ def decode_windows(read_char: Callable[[], str]) -> KeyEvent | None:
         return KeyEvent("word_backspace")
     if c == "\x03":
         return KeyEvent("interrupt")
+    if c == "\x04":
+        # `getwch()` returns the same byte for Ctrl+D as a POSIX raw read, so both decoders
+        # agree on this one without a platform branch.
+        return KeyEvent("eof")
     if c in ("\xe0", "\x00"):
         nxt = read_char()
         return {

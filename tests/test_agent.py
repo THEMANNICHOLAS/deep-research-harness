@@ -1870,7 +1870,7 @@ async def test_read_answer_resolves_instead_of_hanging_when_stdin_is_closed(monk
 
     monkeypatch.setattr("builtins.input", fake_input)
 
-    answer = await asyncio.wait_for(main_module._read_answer(PlainRenderer()), timeout=5)
+    answer = await asyncio.wait_for(main_module._read_answer(), timeout=5)
 
     assert answer == ""
 
@@ -1883,7 +1883,7 @@ async def test_read_answer_resolves_when_stdin_raises_oserror(monkeypatch):
 
     monkeypatch.setattr("builtins.input", fake_input)
 
-    assert await asyncio.wait_for(main_module._read_answer(PlainRenderer()), timeout=5) == ""
+    assert await asyncio.wait_for(main_module._read_answer(), timeout=5) == ""
 
 
 async def test_the_clarification_prompt_never_reaches_stdout(monkeypatch, capsys):
@@ -1893,7 +1893,7 @@ async def test_the_clarification_prompt_never_reaches_stdout(monkeypatch, capsys
     """
     monkeypatch.setattr("builtins.input", lambda: "the metal")
 
-    answer = await main_module._read_answer(PlainRenderer(), "> ")
+    answer = await main_module._read_answer("> ")
 
     captured = capsys.readouterr()
     assert answer == "the metal"
@@ -1914,7 +1914,7 @@ async def test_read_answer_runs_on_a_daemon_thread(monkeypatch):
 
     monkeypatch.setattr("builtins.input", fake_input)
 
-    await main_module._read_answer(PlainRenderer())
+    await main_module._read_answer()
 
     assert recorded.get("daemon") is True
 

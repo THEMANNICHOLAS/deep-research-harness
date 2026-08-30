@@ -53,6 +53,18 @@ def test_interrupt_returns_none(make_config):
     assert result is None
 
 
+def test_eof_returns_none_like_interrupt(make_config):
+    """3F Minor c: Ctrl+D is decoded (`KeyEvent("eof")`) and must not be silently ignored —
+    on the welcome screen it quits cleanly, exactly like Ctrl+C, returning no question.
+    """
+    config = make_config()
+    keys = [*_type("something"), KeyEvent("eof")]
+
+    result = main_module._run_welcome(config, keys=keys, console=_console())
+
+    assert result is None
+
+
 def test_the_key_source_is_closed_before_the_live_screen_is_torn_down(make_config, monkeypatch):
     """Risk #1's ordering guarantee, pinned so it does not rest on a manual terminal check.
 
@@ -215,6 +227,10 @@ async def test_main_with_no_argv_question_reaches_the_welcome_loop(make_config, 
     # is nothing to drive it, so `main` falls back to argparse's usage error instead (see
     # the non-tty test below). pytest's captured stdin is not a tty, so say so explicitly.
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    # `main` starts the session key reader as soon as it believes it has a terminal (Phase 3),
+    # and the real `read_keys()` would then put pytest's captured stdin into raw mode — a bare
+    # `termios.error` on the reader thread. A source that ends at once stands in for it.
+    monkeypatch.setattr(main_module, "read_keys", lambda: iter(()))
     calls = {"count": 0}
 
     def _fake_run_welcome(config, *, keys, console):
@@ -250,3 +266,65 @@ async def test_no_argv_question_without_a_tty_errors_instead_of_reading_raw_keys
         await main_module.main([])
 
     assert excinfo.value.code == 2
+
+
+async def test_an_unexpected_failure_after_the_reader_still_restores_the_terminal(
+    make_config, monkeypatch
+):
+    """Round 2, item 3: raw mode is entered with the `KeyReader`, so EVERY exit out of `main`
+    past that point has to release it.
+
+    `_abort` and the run's own `finally` cover the paths anyone anticipated; an unexpected
+    exception in between (here `build_renderer`, standing in for any step after the reader
+    exists) escaped with the developer's shell still in raw mode — no echo, no line editing,
+    on a terminal that also has a traceback on it.
+    """
+    monkeypatch.setattr(main_module, "load_config", lambda: make_config())
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    # The real `read_keys()` would put pytest's captured stdin into raw mode; a source that
+    # ends at once stands in for it, exactly as in the welcome-loop test above.
+    monkeypatch.setattr(main_module, "read_keys", lambda: iter(()))
+
+    closes = {"count": 0}
+
+    class _ClosureRecordingReader(main_module.KeyReader):
+        def close(self) -> None:
+            closes["count"] += 1
+            super().close()
+
+    monkeypatch.setattr(main_module, "KeyReader", _ClosureRecordingReader)
+
+    def _boom():
+        raise RuntimeError("the renderer could not start")
+
+    monkeypatch.setattr(main_module, "build_renderer", _boom)
+
+    with pytest.raises(RuntimeError):
+        await main_module.main(["a question"])
+
+    assert closes["count"] >= 1, "the key reader was never closed — the terminal stayed raw"
+
+
+def test_the_welcome_screen_reads_from_the_session_long_key_readers_iterator(
+    make_config, monkeypatch
+):
+    """Phase 3/D5: the welcome screen no longer owns its key source — `main` starts ONE
+    `KeyReader` for the whole session and hands `_run_welcome` that reader's blocking
+    iterator, so the same thread later feeds the composer.
+
+    The iterator must therefore behave exactly like the raw `read_keys()` generator did:
+    block for each key, and end when the reader closes (its `None` sentinel).
+    """
+    config = make_config()
+
+    def _fake_read_keys():
+        yield from [*_type("q"), KeyEvent("enter")]
+
+    monkeypatch.setattr(main_module, "read_keys", _fake_read_keys)
+    reader = main_module.KeyReader()
+    try:
+        result = main_module._run_welcome(config, keys=reader.blocking(), console=_console())
+    finally:
+        reader.close()
+
+    assert result == "q"
