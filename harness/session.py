@@ -44,9 +44,10 @@ from langgraph.errors import GraphRecursionError
 from langgraph.types import Command, Interrupt
 
 from harness import activity
-from harness.activity import ActivitySink, DisplayError, brief_summary
+from harness.activity import ActivitySink, DisplayError, brief_summary, format_status_elapsed
 from harness.agent import (
     _retry_on_non_search_abort,
+    _summarize_tool_result,
     build_agent,
     build_researcher_graph,
     subagent_failure_text,
@@ -56,14 +57,16 @@ from harness.display import (
     Activity,
     AgentText,
     Alert,
+    LeadToolCall,
     Question,
     QuestionAnswered,
-    ReaderItem,
-    ReadersUpdated,
     Renderer,
     ReportWritten,
+    ResearcherItem,
+    ResearchersUpdated,
     RoundsUpdated,
     RunFinished,
+    RunStarted,
     SourcesUpdated,
     StageTracker,
     TodoItem,
@@ -84,6 +87,10 @@ if TYPE_CHECKING:
     from harness.browser import BrowserSession
 
 _EMPTY_USAGE: UsageMetadata = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+# The session crumb is the opening question's first five words (Preferences) — long enough to
+# tell two runs apart, short enough to leave the source counter its half of the session bar.
+_CRUMB_WORDS = 5
 
 # What the model is told when the developer answers a clarifying question with nothing.
 _NO_ANSWER_GIVEN = "(The developer gave no answer to this question.)"
@@ -299,15 +306,18 @@ def _dispatch_tool_calls(node_update: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _describe_tool_call(call: dict[str, Any]) -> str:
-    """One activity line describing a researcher-dispatch proposal.
+    """The ARG summary of a researcher-dispatch proposal — the transcript line's parentheses.
 
     The label, not the objective: the label is authored to be a 2-5 word roster entry, whereas
     the objective is the model's full delegation brief and painted a paragraph-sized blob that
     pushed the frame past the terminal height (PR #25 review). `brief_summary` still bounds it,
     since the label is model-supplied and nothing enforces its length.
+
+    The tool NAME is no longer prefixed here (Phase 5): `LeadToolCall` carries it as its own
+    field, and repeating it would render as `dispatch_researcher(dispatch_researcher: ...)`.
     """
     args = call.get("args") or {}
-    return f"{DISPATCH_RESEARCHER_TOOL_NAME}: {brief_summary(str(args.get('label', '')))}"
+    return brief_summary(str(args.get("label", "")))
 
 
 def _resolve_answer(answer: str, choices: tuple[str, ...]) -> str:
@@ -418,8 +428,11 @@ class Session:
         self._alerts_emitted = 0
         self._last_source_count = 0
         self._tool_calls_emitted = 0
-        self._last_readers: tuple[Any, ...] | None = None
         self._last_in_flight: int | None = None
+        # The lead's in-flight tool calls, by `tool_call_id`: `(name, arg_summary)` held from
+        # the proposal until the matching `ToolMessage` lets the transcript line be rewritten
+        # with its result (Phase 5).
+        self._pending_lead_calls: dict[str, tuple[str, str]] = {}
 
     def request_quit(self) -> None:
         """Ctrl+C / Ctrl+D from the composer: end the session at the next safe point (R5).
@@ -470,6 +483,7 @@ class Session:
         # Before the task exists, so the roster row is already open when the researcher's very
         # first tool call pushes an activity change through the same sink.
         self._sink.start_researcher(researcher_id, label)
+        self._emit_researchers()
         self.running[researcher_id] = asyncio.create_task(
             self._run_researcher(researcher_id, label, brief)
         )
@@ -578,6 +592,10 @@ class Session:
         """
         try:
             self._sink.finish_researcher(researcher_id, failed=failed)
+            # Inside the same guard as the sink write, deliberately: this is the display call
+            # the docstring above is about, and `_cancel_running` reaches the roster only
+            # through here — one emit site covers both paths that close a row.
+            self._emit_researchers()
         except Exception as exc:  # noqa: BLE001 — nothing may escape; see the docstring
             self._fatal = exc
 
@@ -643,7 +661,6 @@ class Session:
     def _push_activity(self) -> None:
         """`on_activity_change`'s body, split out so the wrapper above has one `try` to guard."""
         self._emit_new_tool_calls()
-        self._emit_readers()
         # The todo LIST dedupe (`_last_todos`) stays untouched -- this only refreshes the ACTIVE
         # row's meta when the live-reader count moved since the last emit, so a reader
         # starting/finishing mid-dispatch is reflected without re-emitting on every mutation.
@@ -670,24 +687,31 @@ class Session:
             )
         self._tool_calls_emitted = len(records)
 
-    def _emit_readers(self) -> None:
-        readers = self._sink.readers()
-        if readers == self._last_readers:
-            return
+    def _emit_researchers(self) -> None:
+        """The roster (R8) as the display sees it, emitted beside every write to the sink.
+
+        Elapsed is rendered HERE, not in the renderer: only this side knows a running row
+        started at `started_at` on the loop's clock. A running row's time is therefore as fresh
+        as the last roster write — deliberately not a ticking timer, since the next dispatch or
+        return refreshes it and a per-frame recount would need the clock in the display layer.
+        """
+        now = time.monotonic()
         self._renderer.emit(
-            ReadersUpdated(
+            ResearchersUpdated(
                 tuple(
-                    ReaderItem(
-                        id=reader.id,
-                        brief=reader.brief,
-                        status_text=reader.status_text,
-                        done=reader.done,
+                    ResearcherItem(
+                        id=state.id,
+                        label=state.label,
+                        status=state.status,
+                        elapsed=format_status_elapsed(
+                            (state.finished_at if state.finished_at is not None else now)
+                            - state.started_at
+                        ),
                     )
-                    for reader in readers
+                    for state in self._sink.researchers()
                 )
             )
         )
-        self._last_readers = readers
 
     def _emit_new_alerts(self) -> None:
         """Live disclosure (best-effort + disclose): every incident a tool records is echoed to
@@ -776,7 +800,7 @@ class Session:
                 self._agent_text_ids.add(message.id)
             text = _message_text(message)
             if text:
-                self._renderer.emit(AgentText(text))
+                self._renderer.emit(AgentText(text, self._config.roles["head"].model))
 
         calls = _dispatch_tool_calls(node_update)
         if calls:
@@ -787,7 +811,18 @@ class Session:
             if self.answer is None:
                 self._tracker.advance("researching")
             for call in calls:
-                self._renderer.emit(Activity(_describe_tool_call(call)))
+                call_id = str(call.get("id") or "")
+                arg_summary = _describe_tool_call(call)
+                self._pending_lead_calls[call_id] = (DISPATCH_RESEARCHER_TOOL_NAME, arg_summary)
+                self._renderer.emit(
+                    LeadToolCall(
+                        call_id=call_id,
+                        name=DISPATCH_RESEARCHER_TOOL_NAME,
+                        arg_summary=arg_summary,
+                    )
+                )
+
+        self._emit_lead_tool_results(node_update)
 
         self._note_model_turns(node_update)
 
@@ -813,6 +848,30 @@ class Session:
                 for message in node_update.get("messages") or []:
                     if isinstance(message, AIMessage):
                         self._awaiting_tool_ids.update(_pending_tool_call_ids(message))
+
+    def _emit_lead_tool_results(self, node_update: dict[str, Any]) -> None:
+        """Re-emit each pending lead tool call once its own `ToolMessage` lands (Phase 5).
+
+        Matched by `tool_call_id`, never by position: one lead turn can propose several
+        dispatches and their results come back in whatever order the tool node finished them.
+        `_summarize_tool_result` is the same first-line-and-cap summarizer the researcher tier's
+        log already uses — the lead tier is uninstrumented, so nothing else would summarize this.
+        """
+        for message in node_update.get("messages") or []:
+            if not isinstance(message, ToolMessage):
+                continue
+            pending = self._pending_lead_calls.pop(message.tool_call_id, None)
+            if pending is None:
+                continue
+            name, arg_summary = pending
+            self._renderer.emit(
+                LeadToolCall(
+                    call_id=message.tool_call_id,
+                    name=name,
+                    arg_summary=arg_summary,
+                    result_summary=_summarize_tool_result(message),
+                )
+            )
 
     async def _stream_pass(self, stream_input: Any) -> dict[str, Any] | None:
         """One `astream` pass over the lead. Returns the pass's own final `values` chunk.
@@ -1065,6 +1124,9 @@ class Session:
         as before this phase.
         """
         self._run_task = asyncio.current_task()
+        # First thing the display is told: the session bar's crumb names WHICH question this
+        # screen belongs to, and a long chat scrolls the opening line itself away.
+        self._renderer.emit(RunStarted(" ".join(self._question.split()[:_CRUMB_WORDS])))
         self.agent = build_agent(
             self._config, self._registry, self._run_log, self._sink, self._browser, self
         )

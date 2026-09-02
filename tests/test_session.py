@@ -22,10 +22,13 @@ from harness.activity import ActivitySink
 from harness.display import (
     AgentText,
     Alert,
+    LeadToolCall,
     PlainRenderer,
     Question,
     ReportWritten,
+    ResearchersUpdated,
     RunFinished,
+    RunStarted,
     StageStarted,
     StageTracker,
 )
@@ -1783,3 +1786,72 @@ async def test_a_quit_after_run_returned_cancels_nothing(make_session, three_mod
     session.request_quit()
     await asyncio.sleep(0)
     assert session._quit is True
+
+
+# --- Phase 5: the chat TUI's transcript, roster and session-bar events ---------------------
+
+
+async def test_a_dispatch_reaches_the_transcript_as_a_tool_call_and_a_roster_row(
+    make_session, three_models
+):
+    """Phase 5: the lead's own tool calls are transcript entries, not free-text activity —
+    emitted once pending and once again, under the SAME `call_id`, carrying the result the
+    tool actually returned. The roster is emitted beside every sink write, so a researcher
+    that starts and returns is two events: running, then done.
+    """
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            _dispatch_call("pricing", "call_p"),
+            AIMessage(content="The pricing angle is running."),
+            _submit_call("Widgets cost $4.20 each."),
+            AIMessage(content="Report submitted."),
+        ]
+    )
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {"Investigate pricing": (None, "Pricing findings.")}
+    three_models(head, researcher)
+
+    renderer = RecordingRenderer()
+    session = make_session(sink=ActivitySink(), renderer=renderer)
+    await session.run()
+
+    calls = [event for event in renderer.events if isinstance(event, LeadToolCall)]
+    assert [call.name for call in calls] == ["dispatch_researcher", "dispatch_researcher"]
+    assert [call.call_id for call in calls] == ["call_p", "call_p"]
+    assert [call.arg_summary for call in calls] == ["pricing", "pricing"]
+    assert calls[0].result_summary is None
+    assert (calls[1].result_summary or "").startswith("researcher/1")
+
+    rosters = [event for event in renderer.events if isinstance(event, ResearchersUpdated)]
+    assert [[row.status for row in event.rows] for event in rosters] == [["running"], ["done"]]
+    assert [event.rows[0].id for event in rosters] == ["researcher/1", "researcher/1"]
+    assert [event.rows[0].label for event in rosters] == ["pricing", "pricing"]
+    # Elapsed is rendered by the session, not the renderer, so the row is displayable as-is.
+    assert all(event.rows[0].elapsed.endswith("s") for event in rosters)
+
+
+async def test_the_transcript_carries_the_head_model_and_the_session_crumb(
+    make_session, three_models, make_config
+):
+    """`AgentText` names the model that spoke (the transcript's byline), read from the head
+    ROLE rather than hardcoded, and the run opens by telling the display its crumb — the
+    first five words of the question, which is what the session bar shows.
+    """
+    head = _model(ScriptedChatModel, "head-test").script(
+        [AIMessage(content="I think that covers it."), AIMessage(content="Still nothing to add.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    renderer = RecordingRenderer()
+    session = make_session(
+        "compare eu us widget prices before the tariff lands",
+        renderer=renderer,
+        config=make_config(head_model="head-model-under-test"),
+    )
+    await session.run()
+
+    assert isinstance(renderer.events[0], RunStarted)
+    assert renderer.events[0].crumb == "compare eu us widget prices"
+    texts = [event for event in renderer.events if isinstance(event, AgentText)]
+    assert texts
+    assert {event.model for event in texts} == {"head-model-under-test"}

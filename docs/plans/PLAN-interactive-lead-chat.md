@@ -241,7 +241,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 2: Budgets, roster data and run exits inside the session
 - [x] Phase 3: Composer — queued user messages and post-report chat
 - [x] Phase 4: ask_user with choices
-- [ ] Phase 5: Chat TUI — transcript, task dock, researcher roster
+- [x] Phase 5: Chat TUI — transcript, task dock, researcher roster
 - [ ] Phase 6: Slash commands — /sources, /model, /new
 - [ ] Phase 7: Prompts, docs and supersession
 - [ ] Final verification
@@ -481,9 +481,9 @@ researcher roster (id, label, status, elapsed), composer.
 - Any change to what the lead is told.
 
 **Tests (write first, confirm red):**
-- [ ] Renderable contains the transcript in order, the dock with todo count "N of M done", the
+- [x] Renderable contains the transcript in order, the dock with todo count "N of M done", the
   roster with elapsed for a running researcher and a done marker for a finished one.
-- [ ] Transcript is bounded (oldest turns scroll out of the Live region) without losing the dock
+- [x] Transcript is bounded (oldest turns scroll out of the Live region) without losing the dock
   or composer.
 
 **Steps:**
@@ -798,3 +798,23 @@ never add a section below it. -->
 - Watch-next: Phase 5 (chat TUI) restructures `_build_renderable` — the transcript bound
   (Discoveries 2026-08-30 (c)) is owed there, and the `clarifying`/`researching` stage
   handoff just added should be re-checked against the new task dock.
+
+### 2026-09-01 — Phase 5: Chat TUI — transcript, task dock, researcher roster
+- Done: chat-TUI frame in display.py (session bar with crumb + `sources: N`, bounded transcript
+  via `deque(maxlen=_TRANSCRIPT_TAIL)`, `Tasks — N of M done` dock, researcher roster from
+  `ActivitySink.researchers()`, composer, footer); Session emits `RunStarted`/`LeadToolCall`/
+  `AgentText`/`ResearchersUpdated` transcript events; lead tool calls rewrite in place on
+  result (keyed by call_id); PlainRenderer one-line-per-event path kept. NOTE: implemented by a
+  prior session that died mid-phase (no handoff); this session adopted the uncommitted diff
+  after 157 targeted tests passed — red-first evidence unavailable, compensated by the full
+  gate (883 tests) and a clean flagged (!#3) judgment review. Phase 3 deferral (c) (unbounded
+  `_timeline`) is paid.
+- Learned: reviewer confirmed Risk #3 discipline — every new event handler mutates state and
+  calls `_live.refresh()`, no direct prints, key-thread seam untouched; a `DisplayError` in
+  `dispatch()`'s `_emit_researchers` rides `_PASS_THROUGH_TASK_FAILURES` to a failed run by
+  design.
+- Drift: none.
+- Watch-next: two live checks owed at final verification alongside the screenshot-vs-mock
+  acceptance criterion: (a) the `clarifying`/`researching` stage handoff against the new task
+  dock (only indirectly evidenced in tests), (b) Phase 6 begins slash commands — the composer's
+  leading-`/` text stops being an ordinary message there.

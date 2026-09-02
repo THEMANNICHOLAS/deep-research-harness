@@ -103,6 +103,61 @@ class AgentText:
     """One piece of lead prose, echoed into the transcript (R2's "narrates in chat")."""
 
     text: str
+    # Required, not defaulted: the transcript's byline names WHICH model spoke, and the one
+    # place that answer exists is the head role's configured model id -- a default here would
+    # silently paint a blank byline the moment a new emit site forgot to pass it.
+    model: str
+
+
+@dataclass(frozen=True)
+class RunStarted:
+    """The session's opening crumb, emitted once at the top of `Session.run()`.
+
+    The first five words of the opening question, rendered on the session bar so the developer
+    can tell WHICH question this screen belongs to after a long chat has scrolled it away.
+    """
+
+    crumb: str
+
+
+@dataclass(frozen=True)
+class LeadToolCall:
+    """One of the LEAD's own tool calls, as a transcript line (R2).
+
+    Emitted twice per call and keyed by `call_id`, exactly like `ToolCall`: once when the lead
+    proposes it (`result_summary is None`) and once when the matching `ToolMessage` comes back,
+    so the renderer rewrites the pending line in place rather than appending a second entry.
+
+    Separate from `ToolCall` despite the shared shape: that one is the researcher/reader tier's
+    structured LOG, wired from `ActivitySink` and cleared at every stage boundary, while this
+    is a transcript entry that scrolls with the conversation. The lead tier is deliberately
+    uninstrumented, so nothing feeds both.
+    """
+
+    call_id: str
+    name: str
+    arg_summary: str
+    result_summary: str | None = None
+
+
+@dataclass(frozen=True)
+class ResearcherItem:
+    """One roster row (R8). `elapsed` is rendered by the emitter, not the renderer, because
+    only the session knows a running row's start time."""
+
+    id: str
+    label: str
+    status: str  # running | done | failed
+    elapsed: str
+
+
+@dataclass(frozen=True)
+class ResearchersUpdated:
+    """Every researcher the lead has dispatched -- a replacement, not a delta (same contract
+    as `TodosUpdated`). The reader tier is deliberately absent: the lead view shows the lead's
+    own roster only (R8)."""
+
+    rows: tuple[ResearcherItem, ...]
 
 
 @dataclass(frozen=True)
@@ -171,22 +226,6 @@ class ToolCall:
     retry: bool = False
 
 
-@dataclass(frozen=True)
-class ReaderItem:
-    id: str
-    brief: str
-    status_text: str
-    done: bool
-
-
-@dataclass(frozen=True)
-class ReadersUpdated:
-    """Every reader dispatched so far this stage -- a replacement, not a delta (same
-    contract as `TodosUpdated`). The strip renders only while at least one is live."""
-
-    readers: tuple[ReaderItem, ...]
-
-
 DisplayEvent = (
     StageStarted
     | StageCompleted
@@ -196,13 +235,15 @@ DisplayEvent = (
     | ComposerDraft
     | UserTurn
     | AgentText
+    | RunStarted
+    | LeadToolCall
+    | ResearchersUpdated
     | ReportWritten
     | Alert
     | RunFinished
     | TodosUpdated
     | RoundsUpdated
     | ToolCall
-    | ReadersUpdated
     | SourcesUpdated
 )
 
@@ -357,11 +398,19 @@ class PlainRenderer:
             if event.result_summary is not None:
                 retry_suffix = " (retry)" if event.retry else ""
                 out(f"  {event.tool}: {event.arg_summary} -- {event.result_summary}{retry_suffix}")
-        elif isinstance(event, ReadersUpdated):
-            # Dropped, same policy as `RoundsUpdated`/`QuestionAnswered` above:
-            # the reader strip is pure live-frame decoration, presence-only, and a line per
-            # status tick would flood a non-TTY log.
-            pass
+        elif isinstance(event, RunStarted):
+            out(f"session: {event.crumb}")
+        elif isinstance(event, LeadToolCall):
+            # Completion only, same policy as `ToolCall` above: the pending line is live-frame
+            # decoration, and the settled one is the durable fact worth a CI log line.
+            if event.result_summary is not None:
+                out(f"  {event.name}({event.arg_summary}) -> {event.result_summary}")
+        elif isinstance(event, ResearchersUpdated):
+            # One line per row, printed on change rather than dropped like the reader strip
+            # was: a roster row is a real research angle starting or ending, not a status tick,
+            # and the emitter only fires beside a roster WRITE.
+            for row in event.rows:
+                out(f"  {row.id} ({row.label}) {row.status} {row.elapsed}")
         elif isinstance(event, SourcesUpdated):
             out(f"sources: {event.count}")
         else:  # Activity
@@ -495,6 +544,11 @@ class RichRenderer:
     # feed are now two distinct regions (Phase 6), not one.
     _TOOL_LOG_TAIL = 8
 
+    # The transcript keeps this many entries; the oldest scroll out (Phase 5). Same intent as
+    # `_ACTIVITY_TAIL`, applied to the chat log a whole session now writes into -- without it
+    # the timeline grew for the life of the run and the frame grew with it.
+    _TRANSCRIPT_TAIL = 40
+
     # The header shown while activity is arriving but no stage has started yet — the agent's
     # first model turn and its initial todo plan, which precede the first `search_web` call.
     _PRE_STAGE_LABEL = "starting"
@@ -515,7 +569,15 @@ class RichRenderer:
         self._live: Live | None = None
         self._stage: Stage | None = None
         self._activities: list[str] = []
-        self._timeline: list[Text] = []
+        # `deque(maxlen=...)` rather than a list: the transcript scrolls, and eviction of the
+        # oldest entry is the whole bound (Phase 5).
+        self._timeline: deque[Text] = deque(maxlen=self._TRANSCRIPT_TAIL)
+        # The lead's own tool-call transcript entries, by `call_id`, so the completion emit can
+        # rewrite the pending line IN PLACE -- mirrors `_tool_calls` below, but holds the
+        # rendered `Text` because the entry's position is owned by `_timeline`.
+        self._lead_calls: dict[str, Text] = {}
+        # The session bar's crumb, empty until `RunStarted` names the question.
+        self._crumb = ""
         # R4: a bounded window, not a list -- `deque(maxlen=...)` evicts the oldest for us.
         self._alerts: deque[Text] = deque(maxlen=_ALERT_WINDOW)
         # Counts every alert this run, including the ones the window has evicted, so the
@@ -526,7 +588,7 @@ class RichRenderer:
         # position, which is what holds the log stable rather than jumping the row to the
         # bottom on completion.
         self._tool_calls: dict[str, ToolCall] = {}
-        self._readers: tuple[ReaderItem, ...] = ()
+        self._researchers: tuple[ResearcherItem, ...] = ()
         self._overlay_question: str | None = None
         self._overlay_choices: tuple[str, ...] = ()
         # The composer is ALWAYS rendered, so `None` means "nothing typed yet" rather than
@@ -549,9 +611,14 @@ class RichRenderer:
         self._source_count: int = 0
 
     def _build_checklist(self) -> Group:
-        heading = Text("Tasks", style=f"bold {_ACCENT_2}")
+        """The persistent task dock (Phase 5): the same rows as before, now under a heading
+        that counts them, and sitting BELOW the transcript rather than above it."""
         if not self._todos:
-            return Group(heading, Text("  (none yet)", style="dim"))
+            return Group(
+                Text("Tasks", style=f"bold {_ACCENT_2}"), Text("  (none yet)", style="dim")
+            )
+        done = sum(1 for item in self._todos if item.status == "completed")
+        heading = Text(f"Tasks — {done} of {len(self._todos)} done", style=f"bold {_ACCENT_2}")
         lines: list[Text] = []
         for item in self._todos:
             if item.status == "completed":
@@ -574,10 +641,6 @@ class RichRenderer:
         if self._rounds is not None:
             rounds_used, max_rounds = self._rounds
             elapsed = f"{elapsed} · round {rounds_used}/{max_rounds}"
-        live_readers = sum(1 for reader in self._readers if not reader.done)
-        if live_readers:
-            noun = "reader" if live_readers == 1 else "readers"
-            elapsed = f"{elapsed} · waiting on {live_readers} {noun}"
         grid = Table.grid(expand=True)
         grid.add_column()
         grid.add_column(justify="right")
@@ -610,27 +673,37 @@ class RichRenderer:
             )
         return grid
 
-    def _build_reader_strip(self) -> Table | None:
-        """The reader strip (D-D): one row per reader dispatched this stage, present ONLY
-        while at least one is LIVE (fix-pass item 2 -- an all-done set renders nothing, even
-        though the done rows themselves still render alongside any still-live ones)."""
-        if not any(not reader.done for reader in self._readers):
+    def _build_roster(self) -> Table | None:
+        """The researcher roster (R8): one row per researcher the lead dispatched, with its
+        id, label, status and elapsed time. Hidden only while the roster is EMPTY.
+
+        Unlike the reader strip this replaces, a finished row stays: the roster is the run's
+        own record of which angles ran, and an all-done roster is the state the report gets
+        written from. The reader tier is not shown at all -- it is the researcher's business.
+        """
+        if not self._researchers:
             return None
         grid = Table.grid(expand=True, padding=(0, 1, 0, 0))
         grid.add_column(no_wrap=True)
-        grid.add_column(no_wrap=True, min_width=9)
+        grid.add_column(no_wrap=True, min_width=13)
         grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
         grid.add_column(justify="right", no_wrap=True)
-        last_index = len(self._readers) - 1
-        for index, reader in enumerate(self._readers):
+        last_index = len(self._researchers) - 1
+        for index, row in enumerate(self._researchers):
             glyph = "└" if index == last_index else "├"
-            id_style = _OK if reader.done else _ACCENT_2
-            status_style = _MUTED if reader.done else _FG_2
+            if row.status == "done":
+                id_style, status_style = _OK, _MUTED
+            elif row.status == "failed":
+                # `_WARN`, not `_OK`: a failed researcher is an angle the report LOST, which
+                # is disclosed elsewhere and must not read as a completed one here.
+                id_style, status_style = _WARN, _WARN
+            else:
+                id_style, status_style = _ACCENT_2, _FG_2
             grid.add_row(
                 _styled_text(glyph, _RULE),
-                _styled_text(reader.id, id_style),
-                _styled_text(reader.brief, _DIM),
-                _styled_text(reader.status_text, status_style),
+                _styled_text(row.id, id_style),
+                _styled_text(row.label, _DIM),
+                _styled_text(f"{row.status} · {row.elapsed}", status_style),
             )
         return grid
 
@@ -672,10 +745,6 @@ class RichRenderer:
 
     def _build_activity_group(self) -> Group:
         header = self._build_stage_header()
-        strip = self._build_reader_strip()
-        # The strip is pinned live state, like the timeline and alerts -- not part of the
-        # log region, so it stays visible even when the overlay below replaces the log.
-        strip_part: tuple[RenderableType, ...] = (strip,) if strip is not None else ()
         # R4: the rolling window plus a running total, shown whenever any alert has fired --
         # not only once eviction starts (D4's example line reads that way, and one steady
         # line is not the flood R3/R4 exist to prevent).
@@ -687,29 +756,44 @@ class RichRenderer:
                     style="yellow",
                 )
             )
-        # R5: the live source counter, always present -- placed AFTER the warnings total so
-        # the alert window stays adjacent to the timeline above it.
-        status_part.append(Text(f"sources: {self._source_count}", style=_MUTED))
         if self._overlay_question is not None:
-            # The overlay REPLACES the activity lines only -- the checklist (outside this
-            # panel), the timeline, the stage header, and the reader strip all stay visible (R4).
-            return Group(
-                *self._timeline, *status_part, header, *strip_part, self._build_ask_overlay()
-            )
+            # The overlay REPLACES the activity lines only -- the transcript, the stage header
+            # and everything outside this panel (session bar, dock, roster) stay visible (R4).
+            return Group(*self._timeline, *status_part, header, self._build_ask_overlay())
         activity_lines = [Text(f"  {text}", style="dim") for text in self._activities]
         log = self._build_tool_log()
         log_or_activity: tuple[RenderableType, ...] = (
             *activity_lines,
             *((log,) if log is not None else ()),
         )
-        return Group(*self._timeline, *status_part, header, *strip_part, *log_or_activity)
+        return Group(*self._timeline, *status_part, header, *log_or_activity)
+
+    def _build_session_bar(self) -> Table:
+        """Row 1 (Phase 5): the session crumb left, the live source counter right.
+
+        The counter moved here out of the activity group so it cannot scroll away with the
+        transcript -- it is run-level state, like the crumb beside it.
+        """
+        grid = Table.grid(expand=True)
+        grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        grid.add_column(justify="right", no_wrap=True)
+        grid.add_row(
+            _styled_text(self._crumb, _ACCENT),
+            _styled_text(f"sources: {self._source_count}", _MUTED),
+        )
+        return grid
 
     def _build_renderable(self) -> Group:
+        roster = self._build_roster()
         return Group(
-            self._build_checklist(),
+            self._build_session_bar(),
             Rule(style=_RULE),
             Panel(self._build_activity_group(), border_style=_FG_2),
-            # Between the panel and the footer, and present in EVERY frame (R1): the session is
+            # Below the transcript, not above it (Phase 5): the dock and the roster are the
+            # frame's persistent state, read alongside the composer rather than the chat.
+            self._build_checklist(),
+            *((roster,) if roster is not None else ()),
+            # Between the roster and the footer, and present in EVERY frame (R1): the session is
             # interactive throughout, so the line being typed is never hidden by whatever the
             # run is doing above it.
             *_build_composer_rows(self._composer or ComposerDraft("", 0, 0)),
@@ -756,10 +840,10 @@ class RichRenderer:
         elif isinstance(event, StageCompleted):
             self._stage = None
             self._activities = []
-            # The log and strip are per-stage: a stale row/strip after this stage ends would
-            # read as a tool still running or a reader still in flight from the PREVIOUS stage.
+            # The log is per-stage: a stale row after this stage ends would read as a tool
+            # still running from the PREVIOUS stage. The roster is NOT cleared with it -- it is
+            # run-level state (R8), and the researchers it names are the ones the report cites.
             self._tool_calls = {}
-            self._readers = ()
             # Collapsed timeline lines live INSIDE the frame: under `screen=True` a
             # `console.print` while the Live runs paints onto the alternate screen at the
             # home position and is overwritten by the next refresh, then discarded on exit.
@@ -805,6 +889,9 @@ class RichRenderer:
             if isinstance(event, UserTurn):
                 entry = Text(f"> {event.text}", style=_ACCENT)
             elif isinstance(event, AgentText):
+                # Two rows, not one: the byline names the model that spoke, which is the only
+                # thing distinguishing lead prose from the developer's own line above it.
+                self._timeline.append(Text(f"research head {event.model}", style=_MUTED))
                 entry = Text(event.text)
             else:
                 entry = Text(f"report written: {event.path}", style=_ACCENT)
@@ -881,8 +968,35 @@ class RichRenderer:
                 self._start_live()
             else:
                 self._live.refresh()
-        elif isinstance(event, ReadersUpdated):
-            self._readers = event.readers
+        elif isinstance(event, RunStarted):
+            # Pure decoration of the frame, like `RoundsUpdated`: the crumb is known before
+            # the agent has done anything, and opening the alternate screen on it would take
+            # the terminal over ahead of the run's first real output.
+            self._crumb = event.crumb
+            if self._live is not None:
+                self._live.refresh()
+        elif isinstance(event, LeadToolCall):
+            existing = self._lead_calls.get(event.call_id)
+            line = f"{event.name}({event.arg_summary}) -> {event.result_summary or '…'}"
+            if existing is None:
+                fresh = Text(line, style=_DIM)
+                self._lead_calls[event.call_id] = fresh
+                self._timeline.append(fresh)
+                # Bounded alongside the transcript itself: an entry the deque has evicted is
+                # no longer rendered, so keeping its `Text` here would leak for the run.
+                while len(self._lead_calls) > self._TRANSCRIPT_TAIL:
+                    del self._lead_calls[next(iter(self._lead_calls))]
+            else:
+                # Rewritten IN PLACE (`Text.plain`), not appended: the pending line and the
+                # settled one are the same call, and the transcript owns where it sits.
+                existing.plain = line
+            # A lead tool call can precede the first stage, exactly as `ToolCall` handles.
+            if self._live is None:
+                self._start_live()
+            else:
+                self._live.refresh()
+        elif isinstance(event, ResearchersUpdated):
+            self._researchers = event.rows
             # Pure decoration of a running frame (same as `RoundsUpdated`): does not start
             # the Live region on its own.
             if self._live is not None:

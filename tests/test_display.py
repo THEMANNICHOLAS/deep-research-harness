@@ -21,13 +21,15 @@ from harness.display import (
     Activity,
     Alert,
     DisplayEvent,
+    LeadToolCall,
     PlainRenderer,
     Question,
-    ReaderItem,
-    ReadersUpdated,
+    ResearcherItem,
+    ResearchersUpdated,
     RichRenderer,
     RoundsUpdated,
     RunFinished,
+    RunStarted,
     StageCompleted,
     StageStarted,
     StageTracker,
@@ -82,7 +84,10 @@ def _span(hex_color: str, value: str) -> str:
 
 
 def _make_console(
-    *, width: int = 80, get_time: Callable[[], float] | None = None
+    *,
+    width: int = 80,
+    height: int | None = None,
+    get_time: Callable[[], float] | None = None,
 ) -> tuple[Console, StringIO]:
     buffer = StringIO()
     # `legacy_windows=False` (rather than relying on auto-detection): the alternate-screen
@@ -98,6 +103,10 @@ def _make_console(
         file=buffer,
         force_terminal=True,
         width=width,
+        # `Live` crops its frame to the console height, so a test about how many transcript
+        # entries the renderer KEEPS has to run on a console tall enough to paint them all --
+        # otherwise it measures Rich's bottom-crop instead of the bound under test.
+        height=height,
         legacy_windows=False,
         color_system="truecolor",
         _environ={},
@@ -108,8 +117,10 @@ def _make_console(
     return console, buffer
 
 
-def _rich_renderer(*, clock: Callable[[], float] | None = None) -> tuple[RichRenderer, StringIO]:
-    console, buffer = _make_console()
+def _rich_renderer(
+    *, clock: Callable[[], float] | None = None, height: int | None = None
+) -> tuple[RichRenderer, StringIO]:
+    console, buffer = _make_console(height=height)
     kwargs: dict[str, Any] = {} if clock is None else {"clock": clock}
     return RichRenderer(console=console, auto_refresh=False, **kwargs), buffer
 
@@ -338,7 +349,7 @@ async def test_a_research_call_and_todo_produce_todos_updated_lines(
     await main_module.main(["a question needing research"])
 
     out, lines = drain_stdout(capsys)
-    assert "  dispatch_researcher: Search for the answer" in out
+    assert "  dispatch_researcher(Search for the answer) -> researcher/1" in out
     assert "  [pending] Search for the answer" in lines
     assert "  [completed] Search for the answer" in lines
     assert lines.count("  [pending] Write the summary") == 2
@@ -743,30 +754,139 @@ def test_rich_renderer_todos_updated_renders_checklist_and_replaces_on_next_upda
     assert "Write summary" not in last_frame
 
 
-def test_rich_renderer_layout_order_is_checklist_then_rule_then_activity_then_footer():
+def test_rich_renderer_layout_order_is_session_bar_transcript_dock_roster_composer_footer():
+    """Phase 5's frame, top to bottom: the session bar (crumb left, source counter right), the
+    scrolling transcript, then the persistent task dock, the researcher roster, the composer
+    and the footer hint.
+
+    The dock moved BELOW the transcript panel in this phase, so this pins the new order rather
+    than the old checklist-first one. Comparing raw indices across the whole cumulative buffer
+    would just find each region's earliest occurrence in the FIRST frame, before the transcript
+    exists at all -- so the order is checked inside ONE isolated frame delta.
+    """
     renderer, buffer = _rich_renderer()
 
-    renderer.emit(TodosUpdated((TodoItem(content="Find sources", status="pending"),)))
-    # Checklist, rule, and footer are part of EVERY frame (Contracts/D1), so comparing raw
-    # indices across the whole cumulative buffer would just find each one's earliest
-    # occurrence in the FIRST frame — before the activity line exists at all. Isolating the
-    # frame delta since just before this update (mirrors the activity-tail test) captures one
-    # single, self-contained screen to check the top-to-bottom order within.
+    renderer.emit(RunStarted("compare eu us widget prices"))
+    renderer.emit(
+        TodosUpdated(
+            (
+                TodoItem(content="Find sources", status="completed"),
+                TodoItem(content="Read them", status="pending"),
+                TodoItem(content="Write it up", status="pending"),
+            )
+        )
+    )
+    renderer.emit(harness.display.SourcesUpdated(3))
+    renderer.emit(harness.display.UserTurn("skip the routing angle"))
+    renderer.emit(harness.display.AgentText("Dropping that angle.", "kimi-k3"))
+    renderer.emit(
+        LeadToolCall(
+            call_id="call_p",
+            name="dispatch_researcher",
+            arg_summary="pricing",
+            result_summary="researcher/1 (pricing) started",
+        )
+    )
     before = len(buffer.getvalue())
-    renderer.emit(Activity('search_web: "a query"'))
+    renderer.emit(
+        ResearchersUpdated(
+            (ResearcherItem(id="researcher/1", label="pricing", status="running", elapsed="12s"),)
+        )
+    )
     frame = _strip_ansi(buffer.getvalue()[before:])
     renderer.close()
 
-    checklist_index = frame.index("Find sources")
-    rule_index = frame.index("─")  # the gray `Rule` separator (R6)
-    activity_index = frame.index('search_web: "a query"')
-    footer_index = frame.index(_FOOTER_HINT)
-    assert checklist_index < rule_index < activity_index < footer_index
+    crumb = frame.index("compare eu us widget prices")
+    rule = frame.index("─")  # the gray `Rule` under the session bar
+    user = frame.index("> skip the routing angle")
+    byline = frame.index("research head kimi-k3")
+    agent = frame.index("Dropping that angle.")
+    tool = frame.index("dispatch_researcher(pricing)")
+    dock = frame.index("Tasks — 1 of 3 done")
+    # Searched from the dock on: `researcher/1` also appears in the tool call's own result
+    # summary above, and the roster row is the occurrence BELOW the dock.
+    roster = frame.index("researcher/1", dock)
+    footer = frame.index(_FOOTER_HINT)
+    assert crumb < rule < user < byline < agent < tool < dock < roster < footer
+    # The counter is right-aligned on the session bar's own row, so it sits between the crumb
+    # and the first transcript entry -- not below the transcript, where it used to be.
+    assert crumb < frame.index("sources: 3") < user
 
     lines = [line for line in frame.splitlines() if line.strip()]
-    footer_lines = [line for line in lines if _FOOTER_HINT in line]
-    assert footer_lines
-    assert footer_lines[-1].strip() == _FOOTER_HINT
+    assert lines[-1].strip() == _FOOTER_HINT
+    # The composer's prompt row is the last thing above the footer (R1).
+    assert lines[-2].strip().startswith(">")
+
+
+def test_the_transcript_is_bounded_but_keeps_the_dock_and_the_composer():
+    """Phase 5: the transcript scrolls -- the oldest turns fall out of `_TRANSCRIPT_TAIL`
+    while the newest stay, and the dock and composer below it are unaffected.
+
+    Rendered on a console tall enough to paint a full transcript: `Live` crops its frame to
+    the terminal height, so a 25-row console would drop the dock for a reason that has
+    nothing to do with the bound this test is about.
+    """
+    total = RichRenderer._TRANSCRIPT_TAIL + 10
+    renderer, buffer = _rich_renderer(height=total + 20)
+
+    renderer.emit(TodosUpdated((TodoItem(content="Find sources", status="pending"),)))
+    for index in range(total - 1):
+        renderer.emit(harness.display.UserTurn(f"turn number {index}"))
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.UserTurn(f"turn number {total - 1}"))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert f"turn number {total - 1}" in frame
+    assert "turn number 0" not in frame
+    assert "Find sources" in frame
+    lines = [line for line in frame.splitlines() if line.strip()]
+    assert lines[-1].strip() == _FOOTER_HINT
+    assert lines[-2].strip().startswith(">")
+
+
+def test_a_lead_tool_call_is_rewritten_in_place_when_its_result_arrives():
+    """Keyed by `call_id`, like the researcher-tier tool log: the second emit replaces the
+    pending line rather than appending a second transcript entry."""
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    renderer.emit(LeadToolCall(call_id="call_p", name="dispatch_researcher", arg_summary="pricing"))
+    pending = _strip_ansi(buffer.getvalue())
+    assert "dispatch_researcher(pricing)" in pending
+
+    before = len(buffer.getvalue())
+    renderer.emit(
+        LeadToolCall(
+            call_id="call_p",
+            name="dispatch_researcher",
+            arg_summary="pricing",
+            result_summary="researcher/1 (pricing) started",
+        )
+    )
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "dispatch_researcher(pricing) -> researcher/1 (pricing) started" in frame
+    assert frame.count("dispatch_researcher") == 1
+
+
+def test_the_session_bar_carries_the_crumb_and_the_source_counter():
+    """R8/Preferences: row 1 is the crumb (first five words of the opening question) with the
+    live source count right-aligned beside it -- both above the transcript."""
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(RunStarted("compare eu us widget prices"))
+    renderer.emit(StageStarted("researching"))
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.SourcesUpdated(3))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    bar = next(line for line in frame.splitlines() if "compare eu us widget prices" in line)
+    # The same visual ROW, not merely both somewhere in the frame: the counter is the session
+    # bar's right-hand cell, which is what moving it off the activity group was for.
+    assert "sources: 3" in bar
 
 
 # --- ask_user in-place overlay (Phase 5) ---------------------------------------------------
@@ -1193,8 +1313,8 @@ def test_rich_renderer_frame_shows_the_source_count():
 
 
 def test_the_source_count_survives_the_ask_user_overlay():
-    """`_build_activity_group` returns from TWO `Group(...)` sites (the overlay branch and
-    the normal branch) -- this fails if the counter line is added to only one of them.
+    """The counter lives on the session bar (Phase 5), which is outside the panel the overlay
+    replaces -- so an open question must not take the run's source count off the screen.
     """
     renderer, buffer = _rich_renderer()
 
@@ -2088,137 +2208,112 @@ def test_rich_renderer_a_second_tool_call_with_the_same_id_replaces_the_running_
     assert frame.count("search_web") == 1
 
 
-def test_rich_renderer_reader_strip_is_absent_with_no_live_readers():
+def test_rich_renderer_roster_is_absent_with_no_researchers():
     renderer, buffer = _rich_renderer()
 
     renderer.emit(StageStarted("researching"))
-    renderer.emit(ReadersUpdated(()))
+    renderer.emit(ResearchersUpdated(()))
     text = _strip_ansi(buffer.getvalue())
     renderer.close()
 
-    assert "reader/1" not in text
+    assert "researcher/1" not in text
 
 
-def test_rich_renderer_reader_strip_renders_a_live_row():
+def test_rich_renderer_roster_shows_elapsed_for_a_running_row_and_a_done_marker():
+    """R8: id, label, status and elapsed, one row per researcher the lead started. The
+    reader tier is deliberately absent -- the lead view shows its OWN roster only."""
     renderer, buffer = _rich_renderer()
 
     renderer.emit(StageStarted("researching"))
     before = len(buffer.getvalue())
     renderer.emit(
-        ReadersUpdated(
+        ResearchersUpdated(
             (
-                ReaderItem(
-                    id="reader/1", brief="Angle A", status_text="fetch_pages . 3s", done=False
-                ),
+                ResearcherItem(id="researcher/1", label="pricing", status="done", elapsed="1m04s"),
+                ResearcherItem(id="researcher/2", label="supply", status="running", elapsed="12s"),
             )
         )
     )
     frame = _strip_ansi(buffer.getvalue()[before:])
     renderer.close()
 
-    assert "reader/1" in frame
-    assert "Angle A" in frame
-    assert "fetch_pages . 3s" in frame
+    assert "researcher/1" in frame
+    assert "pricing" in frame
+    assert "done" in frame
+    assert "1m04s" in frame
+    assert "researcher/2" in frame
+    assert "supply" in frame
+    assert "running" in frame
+    assert "12s" in frame
+    assert "reader/" not in frame
 
 
-def test_rich_renderer_reader_strip_uses_ok_for_a_done_row():
+def test_rich_renderer_roster_marks_a_done_row_and_keeps_a_running_one_live():
     renderer, buffer = _rich_renderer()
 
     renderer.emit(StageStarted("researching"))
     renderer.emit(
-        ReadersUpdated(
+        ResearchersUpdated(
             (
-                ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),
-                ReaderItem(id="reader/2", brief="Angle B", status_text="dispatched", done=False),
+                ResearcherItem(id="researcher/1", label="pricing", status="running", elapsed="3s"),
+                ResearcherItem(id="researcher/2", label="supply", status="running", elapsed="3s"),
             )
         )
     )
     before = len(buffer.getvalue())
-    # reader/1 finishes but reader/2 is still live -- per fix-pass item 2 the strip only
-    # disappears once EVERY reader is done, so this is the mockup's "a finished row beside a
-    # live one" shape, not the all-done case (covered by its own test below).
     renderer.emit(
-        ReadersUpdated(
+        ResearchersUpdated(
             (
-                ReaderItem(id="reader/1", brief="Angle A", status_text="done . 8s", done=True),
-                ReaderItem(id="reader/2", brief="Angle B", status_text="dispatched", done=False),
+                ResearcherItem(id="researcher/1", label="pricing", status="done", elapsed="8s"),
+                ResearcherItem(id="researcher/2", label="supply", status="running", elapsed="9s"),
             )
         )
     )
     raw = buffer.getvalue()[before:]
     renderer.close()
 
-    assert _span(harness.display._OK, "reader/1") in raw
+    assert _span(harness.display._OK, "researcher/1") in raw
 
 
-def test_rich_renderer_reader_strip_is_absent_once_every_reader_is_done():
-    """Fix-pass item 2: `ReadersUpdated(())` (no readers at all) is already covered above, but
-    that emits no strip for a trivial reason. An all-DONE, non-empty tuple is the real gap: the
-    strip must vanish here too, not linger until `StageCompleted`."""
-    renderer, buffer = _rich_renderer()
-
-    renderer.emit(StageStarted("researching"))
-    renderer.emit(
-        ReadersUpdated(
-            (ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),)
-        )
-    )
-    before = len(buffer.getvalue())
-    renderer.emit(
-        ReadersUpdated(
-            (ReaderItem(id="reader/1", brief="Angle A", status_text="done . 8s", done=True),)
-        )
-    )
-    frame = _strip_ansi(buffer.getvalue()[before:])
-    renderer.close()
-
-    assert "reader/1" not in frame
-
-
-def test_rich_renderer_stage_line_shows_waiting_on_n_readers_while_live():
+def test_rich_renderer_roster_stays_visible_once_every_researcher_is_done():
+    """Unlike the reader strip it replaces, the roster is the run's own record of which
+    angles ran (R8) -- an all-done roster is the state the report is written from, so it must
+    not vanish the moment the last researcher returns."""
     renderer, buffer = _rich_renderer()
 
     renderer.emit(StageStarted("researching"))
     before = len(buffer.getvalue())
     renderer.emit(
-        ReadersUpdated(
-            tuple(
-                ReaderItem(
-                    id=f"reader/{i}", brief=f"Angle {i}", status_text="dispatched", done=False
-                )
-                for i in (1, 2, 3)
-            )
+        ResearchersUpdated(
+            (ResearcherItem(id="researcher/1", label="pricing", status="done", elapsed="8s"),)
         )
     )
     frame = _strip_ansi(buffer.getvalue()[before:])
     renderer.close()
 
-    # The count is READ from the live readers, not a value a stub could hardcode as "2".
-    assert "waiting on 3 readers" in frame
+    assert "researcher/1" in frame
 
 
-def test_rich_renderer_stage_line_omits_waiting_on_readers_when_none_are_live():
+def test_rich_renderer_roster_marks_a_failed_row():
+    """`failed` is its own status, not a second flavour of `done`: a cancelled or crashed
+    researcher's angle is coverage the report LOST, and the roster is where that shows."""
     renderer, buffer = _rich_renderer()
 
     renderer.emit(StageStarted("researching"))
-    renderer.emit(
-        ReadersUpdated(
-            (ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),)
-        )
-    )
     before = len(buffer.getvalue())
     renderer.emit(
-        ReadersUpdated(
-            (ReaderItem(id="reader/1", brief="Angle A", status_text="done . 8s", done=True),)
+        ResearchersUpdated(
+            (ResearcherItem(id="researcher/1", label="pricing", status="failed", elapsed="4s"),)
         )
     )
-    frame = _strip_ansi(buffer.getvalue()[before:])
+    raw = buffer.getvalue()[before:]
     renderer.close()
 
-    assert "waiting on" not in frame
+    assert "failed" in _strip_ansi(raw)
+    assert _span(harness.display._WARN, "researcher/1") in raw
 
 
-def test_rich_renderer_stage_completed_clears_the_tool_log_and_the_reader_strip():
+def test_rich_renderer_stage_completed_clears_the_tool_log():
     renderer, buffer = _rich_renderer()
 
     renderer.emit(StageStarted("researching"))
@@ -2231,18 +2326,12 @@ def test_rich_renderer_stage_completed_clears_the_tool_log_and_the_reader_strip(
             elapsed_seconds=1.0,
         )
     )
-    renderer.emit(
-        ReadersUpdated(
-            (ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),)
-        )
-    )
     before = len(buffer.getvalue())
     renderer.emit(StageCompleted("researching", 2.0))
     frame = _strip_ansi(buffer.getvalue()[before:])
     renderer.close()
 
     assert "search_web" not in frame
-    assert "reader/1" not in frame
 
 
 def test_plain_renderer_tool_call_prints_one_line_on_completion_only(capsys):
@@ -2268,18 +2357,48 @@ def test_plain_renderer_tool_call_prints_one_line_on_completion_only(capsys):
     assert "11 results" in lines[0]
 
 
-def test_plain_renderer_readers_updated_produces_no_output(capsys):
+def test_plain_renderer_prints_one_line_for_each_new_lead_event(capsys):
+    """R5: every event the chat TUI added still has a one-line, non-TTY form -- and none of
+    them may fall through to the `Activity` branch, which would crash on the missing `.text`.
+    """
     renderer = PlainRenderer()
 
+    renderer.emit(RunStarted("compare eu us widget prices"))
+    _, crumb_lines = drain_stdout(capsys)
+    assert crumb_lines == ["session: compare eu us widget prices"]
+
+    renderer.emit(LeadToolCall(call_id="call_p", name="dispatch_researcher", arg_summary="pricing"))
+    _, pending_lines = drain_stdout(capsys)
+    # The pending emit is live-frame decoration, like a running `ToolCall` row: only the
+    # completed line is a durable fact worth a log line.
+    assert pending_lines == []
+
     renderer.emit(
-        ReadersUpdated(
-            (ReaderItem(id="reader/1", brief="Angle A", status_text="dispatched", done=False),)
+        LeadToolCall(
+            call_id="call_p",
+            name="dispatch_researcher",
+            arg_summary="pricing",
+            result_summary="researcher/1 (pricing) started",
         )
     )
+    _, call_lines = drain_stdout(capsys)
+    assert call_lines == [
+        "  dispatch_researcher(pricing) -> researcher/1 (pricing) started",
+    ]
 
-    out, lines = drain_stdout(capsys)
-    assert lines == []
-    assert out == ""
+    renderer.emit(
+        ResearchersUpdated(
+            (
+                ResearcherItem(id="researcher/1", label="pricing", status="done", elapsed="8s"),
+                ResearcherItem(id="researcher/2", label="supply", status="running", elapsed="3s"),
+            )
+        )
+    )
+    _, roster_lines = drain_stdout(capsys)
+    assert roster_lines == [
+        "  researcher/1 (pricing) done 8s",
+        "  researcher/2 (supply) running 3s",
+    ]
 
 
 def test_rich_renderer_ignores_an_event_emitted_after_close():
@@ -2408,11 +2527,13 @@ def test_plain_renderer_prints_the_transcript_turns_and_drops_the_composer(capsy
     renderer = PlainRenderer()
 
     renderer.emit(harness.display.UserTurn("skip the routing angle"))
-    renderer.emit(harness.display.AgentText("Dropping that angle."))
+    renderer.emit(harness.display.AgentText("Dropping that angle.", "kimi-k3"))
     renderer.emit(harness.display.ComposerDraft("half a line", 0, 11))
     renderer.emit(harness.display.ReportWritten(pathlib.Path("reports") / "run.md"))
 
     _, lines = drain_stdout(capsys)
+    # No byline: the model is frame decoration for the TUI's transcript, and a headless log
+    # already names its models nowhere else.
     assert lines == ["> skip the routing angle", "Dropping that angle."]
 
 
@@ -2445,10 +2566,13 @@ def test_the_transcript_shows_user_and_agent_turns_in_order():
     renderer.emit(StageStarted("researching"))
     before = len(buffer.getvalue())
     renderer.emit(harness.display.UserTurn("skip the routing angle"))
-    renderer.emit(harness.display.AgentText("Dropping that angle."))
+    renderer.emit(harness.display.AgentText("Dropping that angle.", "kimi-k3"))
     frame = _strip_ansi(buffer.getvalue()[before:])
     renderer.close()
 
     assert "> skip the routing angle" in frame
     assert "Dropping that angle." in frame
-    assert frame.index("skip the routing angle") < frame.index("Dropping that angle.")
+    # The agent turn carries its own byline naming the model that spoke (Preferences).
+    assert "research head kimi-k3" in frame
+    assert frame.index("skip the routing angle") < frame.index("research head kimi-k3")
+    assert frame.index("research head kimi-k3") < frame.index("Dropping that angle.")

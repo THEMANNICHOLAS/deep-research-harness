@@ -4,11 +4,11 @@ The producer is `harness/agent.py`'s `_ToolActivityMiddleware`, wrapping every r
 reader-tier tool call -- plus `harness/session.py` for the researcher roster, which no
 middleware can see because the lead tier is deliberately uninstrumented and the session owns
 dispatch itself; the consumer is `harness/session.py`, which builds `ToolCall`/
-`ReadersUpdated` events (`harness/display.py`) from `records()`/`readers()`. Lives in its own
-module, mirroring `harness/runlog.py`, for the same reason that one does: neither producer nor
-consumer needs to import the other, and — since `harness/agent.py`'s docstring says it is "the
-ONLY module that imports `deepagents`" — a plain data collector living there would drag that
-~2s import cost into every consumer and test that only wants the sink.
+`ResearchersUpdated` events (`harness/display.py`) from `records()`/`researchers()`. Lives in
+its own module, mirroring `harness/runlog.py`, for the same reason that one does: neither
+producer nor consumer needs to import the other, and — since `harness/agent.py`'s docstring
+says it is "the ONLY module that imports `deepagents`" — a plain data collector living there
+would drag that ~2s import cost into every consumer and test that only wants the sink.
 
 PUSHED, not drained (fix-pass item 1): the middleware writes from inside the lead's `task` tool
 NODE, and one node is one superstep, so no top-level `astream` chunk arrives until the whole
@@ -103,9 +103,10 @@ def brief_summary(text: str, limit: int = 80) -> str:
     return first_line
 
 
-def _format_status_elapsed(seconds: float) -> str:
+def format_status_elapsed(seconds: float) -> str:
     """`{n}s` under a minute, `{m}m{s:02d}s` past it — the one home for BOTH reader status
-    shapes (live and done), so those two cannot drift apart.
+    shapes (live and done) AND the researcher roster's elapsed column, so they cannot drift
+    apart. Public since Phase 5, when `harness/session.py` became the second caller.
 
     Deliberately not named `_format_elapsed`: `harness/display.py` has its own function of
     that name producing a different shape (`MM:SS`, for the stage line), and two same-named
@@ -222,7 +223,7 @@ class ActivitySink:
         # Indexed for the same reason as `finish_call`: `start_reader` writes `_readers` and
         # `_started` together, and both callers already guard on the `_readers` lookup.
         started = self._started[reader_id]
-        return _format_status_elapsed(self._clock() - started)
+        return format_status_elapsed(self._clock() - started)
 
     def note_reader_tool(self, reader_id: str, tool: str) -> None:
         current = self._readers.get(reader_id)
