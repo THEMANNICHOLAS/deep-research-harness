@@ -99,6 +99,37 @@ class BrowserSession:
             ) from exc
         self._http = http_crawler
 
+    async def rebind_run(self, run_log: RunLog | None, run_id: str) -> None:
+        """Point this (unchanged-lifetime) session at a NEW run, for `/new` (D6).
+
+        `main()` keeps ONE `BrowserSession` across every `/new` restart -- its own start/close
+        lifecycle is untouched by a restart -- but two things it holds ARE per-run and must
+        not go stale across one: `arun_many`'s relaunch incidents, which must reach the
+        CURRENT run's `RunLog` rather than a previous (or the bootstrap) one nothing reads
+        anymore, and the browser-free HTTP crawler's downloads directory, which
+        `_build_http_crawler` (`harness.tools.fetch`) bakes in at CONSTRUCTION time -- simply
+        reassigning `run_id` would leave every download still landing under the OLD run's
+        `<workspace_dir>/<run_id>/downloads`. The Chromium crawler is left untouched: it
+        carries no run-scoped state, and a restart is not the crash `arun_many`'s own relaunch
+        machinery exists for.
+        """
+        self._run_log = or_default(run_log)
+        self._run_id = run_id
+        if self._http is None:
+            # Nothing warm to rebuild yet -- `start()` (or the next relaunch) will construct
+            # the HTTP crawler against this `run_id` itself.
+            return
+        from harness.tools.fetch import _build_http_crawler
+
+        old_http = self._http
+        new_http = _build_http_crawler(self._config, run_id)
+        await new_http.start()
+        self._http = new_http
+        try:
+            await old_http.close()
+        except Exception:
+            pass
+
     async def close(self) -> None:
         """Idempotent teardown: a teardown error must never mask the run's real outcome."""
         for attr in ("_http", "_crawler"):

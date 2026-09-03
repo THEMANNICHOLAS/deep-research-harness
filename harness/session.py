@@ -57,6 +57,7 @@ from harness.display import (
     Activity,
     AgentText,
     Alert,
+    CommandReply,
     LeadToolCall,
     Question,
     QuestionAnswered,
@@ -153,6 +154,19 @@ class UserMessage:
     text: str
 
 
+@dataclass(frozen=True)
+class ModelSwitch:
+    """A validated `/model <role> <choice>` command, queued for the NEXT turn boundary (D4).
+
+    Like `_Quit`, this never reaches `_batch_message` — `_next_batch` applies it (rebuilding
+    whatever graph the switched role belongs to) and strips it before the batch is handed to
+    `_next_input`, so the lead is never told "a ModelSwitch happened" as text.
+    """
+
+    role: str
+    choice: str
+
+
 class _Quit:
     """The queue's quit sentinel: "the developer asked to stop", posted by `request_quit`.
 
@@ -164,7 +178,24 @@ class _Quit:
 
 _QUIT = _Quit()
 
+# What can end up as TEXT in the lead's next turn (R2) -- `ModelSwitch` is deliberately not a
+# member: it is applied and stripped inside `_next_batch` before a batch is ever handed to
+# `_batch_message`/`_next_input`, so those stay typed against exactly what they may read.
 SessionEvent = ResearcherReturn | UserMessage
+
+# Everything that can sit on the raw event queue (Phase 6): `SessionEvent` plus the two things
+# that never reach `_batch_message` -- `ModelSwitch`, applied and stripped in `_next_batch`,
+# and `_Quit`, filtered there too.
+_QueueEvent = SessionEvent | ModelSwitch
+
+# The three slash commands the session loop handles itself (Phase 6, D4/D6) -- never sent to
+# the model. A data table, not an if/elif chain, so the unknown-command and bare-`/` replies
+# (both list every command) can never drift out of step with what `_handle_command` accepts.
+_SESSION_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/sources", "List every source captured so far."),
+    ("/model <role> <choice>", "Switch a role's model at the next turn boundary."),
+    ("/new", "End this session and return to the welcome screen."),
+)
 
 
 def _pending_tool_call_ids(message: AIMessage) -> set[str]:
@@ -375,12 +406,16 @@ class Session:
         self._started_at = started_at
         self._interactive = interactive
 
-        self.events: asyncio.Queue[SessionEvent | _Quit] = asyncio.Queue()
+        self.events: asyncio.Queue[_QueueEvent | _Quit] = asyncio.Queue()
         self.running: dict[str, asyncio.Task[None]] = {}
         self.answer: str | None = None
         self.agent: Runnable
         # Set by `request_quit`, read by the turn loop and the post-report chat loop.
         self._quit = False
+        # Set by `/new` (D6), read by `__main__` after `run()` returns: a restart is not a
+        # failure, so `__main__` must not print the failed-run stderr line before looping back
+        # to the welcome screen.
+        self.restart_requested = False
         # `run()`'s own task, so a quit before the report can cancel the turn in flight rather
         # than waiting for it to end (R5: that quit is a FAILED run, and must be immediate).
         self._run_task: asyncio.Task[Any] | None = None
@@ -456,8 +491,167 @@ class Session:
         reaching into `events`, which keeps the queue's element type — including the private
         `_Quit` sentinel — a session-internal concern, and spares `__main__` an import from
         this heavy module outside `main()`'s deferred block.
+
+        A line whose STRIPPED text starts with `/` (Phase 6, Contracts) is a command, handled
+        here in the session loop and never turned into a `UserMessage` — so it can never reach
+        the model, whatever the command turns out to be.
         """
+        stripped = text.strip()
+        if stripped.startswith("/"):
+            self._handle_command(stripped)
+            return
         self.events.put_nowait(UserMessage(text))
+
+    # --- slash commands (Phase 6, D4/D6) ----------------------------------------------------
+
+    def _command_list_text(self) -> str:
+        return "\n".join(f"{name} — {summary}" for name, summary in _SESSION_COMMANDS)
+
+    def _handle_command(self, stripped: str) -> None:
+        """Dispatch one already-slash-prefixed, already-stripped line (Contracts).
+
+        Table-driven for the recognized three; a bare `/` (nothing after it) and any other
+        `/x` both reply with the command list, differing only in whether an "unknown command"
+        line precedes it — there is no command name to call unknown when nothing was typed
+        after the slash.
+        """
+        name = stripped.split()[0]
+        if name == "/sources":
+            self._renderer.emit(CommandReply(self._sources_reply()))
+        elif name == "/model":
+            self._handle_model_command(stripped.split()[1:])
+        elif name == "/new":
+            self._handle_new_command()
+        elif name == "/":
+            self._renderer.emit(CommandReply(self._command_list_text()))
+        else:
+            self._renderer.emit(
+                CommandReply(f"unknown command {name}\n{self._command_list_text()}")
+            )
+
+    def _sources_reply(self) -> str:
+        """`/sources`' reply text -- one line per `SourceRegistry.all()` entry (Reuse: binding).
+
+        Never touches the model: this is a pure read of the registry, rendered straight into a
+        local `CommandReply`.
+        """
+        sources = self._registry.all()
+        if not sources:
+            return "none captured yet"
+        return "\n".join(
+            f"[{source.id}] {source.title or source.url} — {source.url} ({source.read_mode})"
+            for source in sources
+        )
+
+    def _handle_model_command(self, args: list[str]) -> None:
+        """Validate `/model <role> <choice>` and, if valid, queue a `ModelSwitch` (D4).
+
+        Every rejection is an immediate `CommandReply` -- no rebuild, no event queued, no
+        model traffic -- so a typo can never silently rebuild the wrong role's graph.
+        """
+        if len(args) != 2:
+            self._renderer.emit(CommandReply("usage: /model <role> <choice>"))
+            return
+        role, choice = args
+        role_config = self._config.roles.get(role)
+        if role_config is None:
+            self._renderer.emit(CommandReply(f"unknown role: {role}"))
+            return
+        if not role_config.choices:
+            self._renderer.emit(
+                CommandReply(f"role {role!r} has no configured model choices to switch between")
+            )
+            return
+        if choice not in role_config.choices:
+            self._renderer.emit(CommandReply(f"unknown choice {choice!r} for role {role!r}"))
+            return
+        self.events.put_nowait(ModelSwitch(role, choice))
+
+    def _handle_new_command(self) -> None:
+        """`/new` (D6): end this run and ask `__main__` to return to the welcome screen.
+
+        Reuses `request_quit`'s own teardown (Reuse: binding) -- the running researchers are
+        cancelled through the same `_cancel_running` an ordinary Ctrl+C uses, and `run()` exits
+        exactly as a pre-report quit does. `restart_requested` is the one thing that tells
+        `__main__` this was a developer-requested restart rather than a failure, so it must be
+        set BEFORE the quit -- `request_quit` may cancel `run()`'s own task immediately.
+        """
+        self.restart_requested = True
+        self.request_quit()
+
+    async def _apply_model_switch(self, switch: ModelSwitch) -> None:
+        """Apply one validated `ModelSwitch` at the turn boundary (D4).
+
+        `config.roles[role].model` is session-config-only (never written to disk, Out of
+        scope). Only `head` and the researcher tier's own two roles own a compiled graph this
+        session holds -- `verifier` is resolved fresh from `self._config` at verification time
+        (`harness.verify.verify_paragraphs`), so switching it needs no rebuild here at all.
+        """
+        self._config.roles[switch.role].model = switch.choice
+        if switch.role == "head":
+            # `aget_state`/`aupdate_state` are the compiled graph's own checkpointer methods,
+            # not part of the generic `Runnable` interface `self.agent` is typed against
+            # elsewhere in this module (matching `tests/test_session.py:259`'s existing
+            # pattern of reaching through the same untyped seam).
+            old_state = await self.agent.aget_state(self._run_config)  # type: ignore[attr-defined]
+            old_messages = old_state.values["messages"]
+            # The todos channel too (3F Minor a): carrying `messages` alone left the checklist
+            # reset to empty on the new thread while the transcript above it still showed the
+            # old plan. `.get(..., [])` because a switch before the lead ever wrote any todos
+            # has no such channel in `old_state.values` yet.
+            old_todos = old_state.values.get("todos", [])
+            self.agent = build_agent(
+                self._config, self._registry, self._run_log, self._sink, self._browser, self
+            )
+            self.thread_id = str(uuid4())
+            self._run_config = {
+                "configurable": {"thread_id": self.thread_id},
+                "recursion_limit": _recursion_backstop(self._config),
+            }
+            await self.agent.aupdate_state(  # type: ignore[attr-defined]
+                self._run_config, {"messages": old_messages}
+            )
+            if old_todos:
+                await self._seed_todos(old_todos)
+        elif switch.role in ("researcher", "reader"):
+            self._graph = build_researcher_graph(
+                self._config, self._registry, self._run_log, self._sink, self._browser
+            )
+        self._renderer.emit(CommandReply(f"switched {switch.role} to {switch.choice}"))
+
+    async def _seed_todos(self, old_todos: list[dict[str, Any]]) -> None:
+        """Seed the todos channel onto the freshly rebuilt agent's brand-new thread.
+
+        Discoveries: plain `aupdate_state({"messages": ..., "todos": ...})` on a thread with
+        NO prior checkpoint resolves an unspecified `as_node` to the graph's own input node
+        (`"__start__"`), and THAT node's writers only cover the graph's input schema
+        (`messages`) -- any other key in the SAME call, `todos` included, is silently dropped,
+        not an error. A SEPARATE call naming the deepagents middleware node that actually owns
+        the todos channel (`as_node="TodoListMiddleware.after_model"`, found by introspecting
+        `agent.nodes` at runtime -- no public seam names it) does persist it correctly. Tied to
+        `deepagents==0.7.5` (pyproject.toml): a version bump that renames, removes, or changes
+        that node's behavior degrades to "no todos carried across the switch" -- verified by
+        re-reading the state after the attempt (this node's writer has been observed to fail
+        SILENTLY as well as by raising, so a bare `except` alone would miss that case), and
+        disclosed as a `RunLog` incident rather than crashing the switch outright.
+        """
+        detail: str | None = None
+        try:
+            await self.agent.aupdate_state(  # type: ignore[attr-defined]
+                self._run_config,
+                {"todos": old_todos},
+                as_node="TodoListMiddleware.after_model",
+            )
+            seeded = await self.agent.aget_state(self._run_config)  # type: ignore[attr-defined]
+            if not seeded.values.get("todos"):
+                detail = "the seed attempt completed without persisting the todos channel"
+        except Exception as exc:  # noqa: BLE001 — best-effort; see the docstring above
+            detail = f"{type(exc).__name__}: {exc}"
+        if detail is not None:
+            self._run_log.record(
+                "model_switch_todos_not_carried",
+                f"the todos channel could not be reseeded across the model switch: {detail}",
+            )
 
     # --- the two lead tools -----------------------------------------------------------------
 
@@ -1077,9 +1271,9 @@ class Session:
         running = ", ".join(state.id for state in roster if state.status == "running") or "none"
         return "\n\n".join(parts) + f"\nRoster: done {done} · running {running}"
 
-    def _drain_events(self) -> list[SessionEvent | _Quit]:
+    def _drain_events(self) -> list[_QueueEvent | _Quit]:
         """Everything queued right now, oldest first — never blocking."""
-        batch: list[SessionEvent | _Quit] = []
+        batch: list[_QueueEvent | _Quit] = []
         while True:
             try:
                 batch.append(self.events.get_nowait())
@@ -1087,16 +1281,32 @@ class Session:
                 return batch
 
     async def _next_batch(self) -> list[SessionEvent]:
-        """Block for at least one event, drain the rest, and strip the quit sentinel.
+        """Block for at least one event, drain the rest, strip the quit sentinel, and apply
+        any `ModelSwitch` in arrival order BEFORE returning what is left (Design: "ModelSwitch
+        first, then the normal message build").
 
         The one place a batch is built, so `_QUIT` can never reach `_batch_message` from either
-        the turn loop or the post-report chat loop. An EMPTY result means the batch was nothing
-        but quit sentinels — the caller decides what that means, since it is a failed run
-        before the report and a clean end after it.
+        the turn loop or the post-report chat loop, and a `ModelSwitch` can never reach it
+        either — applying it here, not in `_batch_message`, is what keeps the model from ever
+        being told "a ModelSwitch happened" as text. An EMPTY result with NO quit sentinel in
+        the drained batch means only `ModelSwitch`es arrived: looped back for the next wakeup
+        rather than returned, so `run()`'s own `if not batch` (a failed pre-report quit) is
+        never mistaken for a `/model` command that had nothing else to send yet.
         """
-        batch: list[SessionEvent | _Quit] = [await self.events.get()]
-        batch.extend(self._drain_events())
-        return [event for event in batch if not isinstance(event, _Quit)]
+        while True:
+            batch: list[_QueueEvent | _Quit] = [await self.events.get()]
+            batch.extend(self._drain_events())
+            saw_quit = any(isinstance(event, _Quit) for event in batch)
+            remaining: list[SessionEvent] = []
+            for event in batch:
+                if isinstance(event, _Quit):
+                    continue
+                if isinstance(event, ModelSwitch):
+                    await self._apply_model_switch(event)
+                else:
+                    remaining.append(event)
+            if remaining or saw_quit:
+                return remaining
 
     def _next_input(self, batch: list[SessionEvent]) -> dict[str, Any]:
         """One drained batch as the lead's next input, echoing each user line as it is sent.

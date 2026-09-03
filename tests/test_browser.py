@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from harness.browser import BrowserPreflightError, BrowserSession
+from harness.config import run_downloads_dir
 from harness.runlog import RunLog
 from tests.conftest import _FakeMarkdown, _FakeResult
 
@@ -207,6 +208,48 @@ async def test_a_failed_http_half_of_start_closes_the_already_launched_browser(
     # And the session is fully reset: a later `close()` (e.g. `__main__`'s finally) is a no-op.
     await session.close()
     assert len(fake_cls.closed) == 1
+
+
+async def test_rebind_run_updates_the_run_log_and_the_downloads_dir(install_crawler, make_config):
+    """3F Minor b/c: `/new` keeps ONE `BrowserSession` for the whole process (D6), but a
+    mid-run relaunch incident must reach the CURRENT run's `RunLog`, not a previous run's
+    (or the bootstrap's, `harness/__main__.py`), and the HTTP crawler's downloads dir --
+    baked in at construction, `harness/tools/fetch.py`'s `_build_http_crawler` -- must follow
+    the CURRENT run's id, not the one the session originally started with.
+    """
+    config = make_config()
+    fake_cls = install_crawler([])
+    first_log = RunLog()
+    session = BrowserSession(config, first_log, run_id="run-one")
+    await session.start()
+    first_http = session._http
+
+    second_log = RunLog()
+    await session.rebind_run(second_log, "run-two")
+
+    assert session._run_log is second_log
+    # A second HTTP crawler was constructed for the new run_id; the first was closed, not
+    # left dangling.
+    assert fake_cls.constructed_kinds.count("http") == 2
+    assert session._http is not first_http
+    assert first_http in fake_cls.closed
+    http_config = fake_cls.http_strategies[-1].kwargs["browser_config"]
+    assert http_config.kwargs["downloads_path"] == str(run_downloads_dir(config, "run-two"))
+
+    await session.close()
+
+
+async def test_rebind_run_before_start_only_updates_state(install_crawler, make_config):
+    """No HTTP crawler exists yet to rebuild -- `rebind_run` must not require one; `start()`
+    (or the next relaunch) picks up the new `run_id` on its own."""
+    config = make_config()
+    install_crawler([])
+    session = BrowserSession(config, run_id="run-one")
+
+    await session.rebind_run(RunLog(), "run-two")
+
+    assert session._run_id == "run-two"
+    assert session._http is None
 
 
 async def test_start_failure_raises_browser_preflight_error_naming_chromium(

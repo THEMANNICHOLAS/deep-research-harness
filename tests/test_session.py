@@ -18,7 +18,9 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.types import Interrupt
 from pydantic import PrivateAttr, SecretStr
 
+import harness.session as session_module
 from harness.activity import ActivitySink
+from harness.config import RoleConfig
 from harness.display import (
     AgentText,
     Alert,
@@ -1855,3 +1857,447 @@ async def test_the_transcript_carries_the_head_model_and_the_session_crumb(
     texts = [event for event in renderer.events if isinstance(event, AgentText)]
     assert texts
     assert {event.model for event in texts} == {"head-model-under-test"}
+
+
+# --- Phase 6: slash commands (/sources, /model, /new) --------------------------------------
+
+
+async def test_slash_sources_lists_the_registry_and_never_reaches_the_model(
+    make_session, three_models
+):
+    """Contracts: a `/` command is handled in the session loop and never sent to the model;
+    `/sources` renders every registered source with its read_mode from `SourceRegistry.all()`.
+    """
+    from harness.display import CommandReply
+
+    head = _model(ScriptedChatModel, "head-test").script(
+        [AIMessage(content="Nothing to add."), AIMessage(content="Still nothing to add.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    registry = SourceRegistry(run_id="test-run")
+    id_a = registry.add("https://a.test/page", title="Page A")
+    registry.mark_read(id_a, "digested")
+    id_b = registry.add("https://b.test/page", title="Page B")
+    registry.mark_read(id_b, "fetched")
+    id_c = registry.add("https://c.test/page")  # left unread
+
+    renderer = RecordingRenderer()
+    session = make_session(registry=registry, renderer=renderer, interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: head._call_count >= 1, "the lead's first idle turn")
+        session.receive_user_message("/sources")
+        await asyncio.sleep(0.05)
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    # No report was ever submitted -- quitting before one exists is a failed run (R5).
+    assert outcome is None
+    replies = [event for event in renderer.events if isinstance(event, CommandReply)]
+    assert len(replies) == 1
+    text = replies[0].text
+    assert f"[{id_a}]" in text and "Page A" in text and "digested" in text
+    assert f"[{id_b}]" in text and "fetched" in text
+    assert f"[{id_c}]" in text and "unread" in text
+    # Never reached the model as a turn: no new HumanMessage carrying the command text.
+    assert all(
+        "/sources" not in str(message.content)
+        for batch in head._received_messages
+        for message in batch
+    )
+    assert head._call_count == 1
+
+
+async def test_slash_sources_reports_none_captured_yet_when_the_registry_is_empty(
+    make_session, three_models
+):
+    from harness.display import CommandReply
+
+    head = _model(ScriptedChatModel, "head-test").script(
+        [AIMessage(content="Nothing to add."), AIMessage(content="Still nothing to add.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    renderer = RecordingRenderer()
+    session = make_session(renderer=renderer, interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: head._call_count >= 1, "the lead's first idle turn")
+        session.receive_user_message("/sources")
+        await asyncio.sleep(0.05)
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is None
+    replies = [event for event in renderer.events if isinstance(event, CommandReply)]
+    assert len(replies) == 1
+    assert "none captured yet" in replies[0].text
+
+
+async def test_unknown_and_bare_slash_reply_with_the_command_list_and_reach_no_model(
+    make_session, three_models
+):
+    from harness.display import CommandReply
+
+    head = _model(ScriptedChatModel, "head-test").script(
+        [AIMessage(content="Nothing to add."), AIMessage(content="Still nothing to add.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    renderer = RecordingRenderer()
+    session = make_session(renderer=renderer, interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: head._call_count >= 1, "the lead's first idle turn")
+        session.receive_user_message("/nope")
+        await asyncio.sleep(0.05)
+        session.receive_user_message("/")
+        await asyncio.sleep(0.05)
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is None
+    replies = [event for event in renderer.events if isinstance(event, CommandReply)]
+    assert len(replies) == 2
+    assert replies[0].text.splitlines()[0] == "unknown command /nope"
+    for reply in replies:
+        assert "/sources" in reply.text
+        assert "/model" in reply.text
+        assert "/new" in reply.text
+    assert head._call_count == 1
+
+
+async def test_slash_model_switch_at_the_turn_boundary_rebuilds_the_agent_and_seeds_history(
+    make_session, three_models, make_config, make_agent_settings, monkeypatch
+):
+    """D4: `/model <role> <choice>` takes effect at the NEXT turn boundary -- the agent is
+    rebuilt on a fresh thread seeded with the old thread's history, and `build_agent` is
+    called again with the switched model in place (the no-shell profile registers per model
+    at `build_agent`'s own call site, so a fresh call is what re-registers it).
+
+    3F Major: the history reseeded across the switch is not just plain narration -- a
+    `dispatch_researcher` tool call precedes it, so the seeded `messages` list carries a real
+    `tool_calls`/`ToolMessage` pair. `aupdate_state` must reseed that pairing intact (a
+    langgraph checkpoint is invalid with a dangling tool call or an orphaned tool result), not
+    only flat text turns.
+    """
+    # The researcher is GATED, not scripted to reply immediately: released only after the
+    # switch is verified, so its return can never race the switch by folding an extra turn
+    # onto the OLD thread between the checkpoint snapshot below and the switch reading it.
+    gate = asyncio.Event()
+    head = _model(ScriptedChatModel, "head-test").script(
+        [_dispatch_call("a", "call_a"), AIMessage(content="Dispatched.")]
+    )
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {"Investigate a": (gate, "Angle findings.")}
+    three_models(head, researcher)
+
+    config = make_config(agent=make_agent_settings())
+    config.roles["head"] = RoleConfig(
+        provider="opencode", model="head-model-a", choices=["head-model-a", "head-model-b"]
+    )
+
+    build_calls: list[Any] = []
+    real_build_agent = session_module.build_agent
+
+    def _spy_build_agent(cfg, *args, **kwargs):
+        build_calls.append(cfg)
+        return real_build_agent(cfg, *args, **kwargs)
+
+    monkeypatch.setattr(session_module, "build_agent", _spy_build_agent)
+
+    session = make_session(config=config, interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        # `session.agent` is only assigned inside `run()`'s own first lines -- waited for
+        # here so the checkpoint poll below never races a `Session` that has not built one yet.
+        await _wait_for(lambda: head._call_count >= 1, "the lead's first turn")
+        old_thread_id = session.thread_id
+        # `head._call_count` increments INSIDE `_agenerate`, before the graph's own checkpoint
+        # write for that superstep lands -- poll the checkpoint itself, not just the call
+        # count, so the snapshot below is not raced against either turn's write. Waits for
+        # BOTH the dispatch's own tool call/result pair and the narration that follows it.
+        old_messages: list[Any] = []
+
+        async def _dispatch_turn_checkpointed() -> bool:
+            nonlocal old_messages
+            state = await session.agent.aget_state({"configurable": {"thread_id": old_thread_id}})
+            old_messages = state.values["messages"]
+            return any(isinstance(m, ToolMessage) for m in old_messages) and any(
+                isinstance(m, AIMessage) and m.content == "Dispatched." for m in old_messages
+            )
+
+        deadline = asyncio.get_running_loop().time() + _WAIT_TIMEOUT
+        while not await _dispatch_turn_checkpointed():
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("timed out waiting for: the dispatch turn's checkpoint write")
+            await asyncio.sleep(0.01)
+        old_agent = session.agent
+        # The seeded history carries a real tool_calls/ToolMessage pair, not just narration.
+        assert any(isinstance(m, AIMessage) and m.tool_calls for m in old_messages), (
+            "the dispatch's own tool call never landed in the checkpoint"
+        )
+        assert any(isinstance(m, ToolMessage) for m in old_messages)
+
+        session.receive_user_message("/model head head-model-b")
+        await _wait_for(lambda: session.thread_id != old_thread_id, "the rebuild after the switch")
+
+        new_state = await session.agent.aget_state(
+            {"configurable": {"thread_id": session.thread_id}}
+        )
+        assert new_state.values["messages"] == old_messages
+        assert session.agent is not old_agent
+        assert len(build_calls) == 2
+        assert build_calls[-1].roles["head"].model == "head-model-b"
+        assert config.roles["head"].model == "head-model-b"
+
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        gate.set()
+        run.cancel()
+
+    assert outcome is None
+
+
+async def test_slash_model_switch_carries_the_todos_channel_across_the_reseed(
+    make_session, three_models, make_config, make_agent_settings
+):
+    """3F Minor a: `aupdate_state` seeded only `messages` -- the todos channel reset to empty
+    on the new thread while the transcript above it still showed the old plan. The new
+    thread's state must still carry whatever todos the lead had already written.
+
+    The switch's own `CommandReply` confirmation is `_apply_model_switch`'s LAST line, AFTER
+    `_seed_todos` -- waited for here rather than just `thread_id` changing (which happens
+    BEFORE `_seed_todos` runs), or the `request_quit()` below races that still-in-flight
+    attempt and cancels it out from under the test (an earlier version of this test read
+    state and quit right after the thread swap, and intermittently observed the todos channel
+    missing for exactly this reason -- not because the seed itself does not work).
+    """
+    from harness.display import CommandReply
+
+    todos_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_todos",
+                "args": {"todos": [{"content": "Find sources", "status": "pending"}]},
+                "id": "call_todos",
+            }
+        ],
+    )
+    head = _model(ScriptedChatModel, "head-test").script(
+        [todos_call, AIMessage(content="Noted the plan.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    config = make_config(agent=make_agent_settings())
+    config.roles["head"] = RoleConfig(
+        provider="opencode", model="head-model-a", choices=["head-model-a", "head-model-b"]
+    )
+
+    run_log = RunLog()
+    renderer = RecordingRenderer()
+    session = make_session(config=config, run_log=run_log, renderer=renderer, interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        # `session.agent` is only assigned inside `run()`'s own first lines -- waited for
+        # here so the checkpoint poll below never races a `Session` that has not built one yet.
+        await _wait_for(lambda: head._call_count >= 1, "the lead's first turn")
+        old_thread_id = session.thread_id
+
+        # Waits for BOTH turns -- the todos write itself and the narration that follows it --
+        # so the snapshot below is not raced against the second turn's own checkpoint write
+        # (the same race the dispatch-turn test guards against).
+        old_messages: list[Any] = []
+        old_todos: list[dict[str, Any]] = []
+
+        async def _both_turns_checkpointed() -> bool:
+            nonlocal old_messages, old_todos
+            state = await session.agent.aget_state({"configurable": {"thread_id": old_thread_id}})
+            old_messages = state.values["messages"]
+            old_todos = state.values.get("todos") or []
+            return bool(old_todos) and any(
+                isinstance(m, AIMessage) and m.content == "Noted the plan." for m in old_messages
+            )
+
+        deadline = asyncio.get_running_loop().time() + _WAIT_TIMEOUT
+        while not await _both_turns_checkpointed():
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("timed out waiting for: both turns to be checkpointed")
+            await asyncio.sleep(0.01)
+
+        session.receive_user_message("/model head head-model-b")
+        # The switch's own `CommandReply` confirmation is its LAST line (`_apply_model_switch`)
+        # -- after `_seed_todos` -- so waiting for it (rather than just `thread_id` changing,
+        # which happens BEFORE `_seed_todos` runs) is what keeps the `request_quit()` below
+        # from cancelling that still-in-flight attempt out from under it.
+        await _wait_for(
+            lambda: any(isinstance(event, CommandReply) for event in renderer.events),
+            "the switch's own confirmation reply",
+        )
+
+        new_state = await session.agent.aget_state(
+            {"configurable": {"thread_id": session.thread_id}}
+        )
+        assert new_state.values["messages"] == old_messages
+        assert new_state.values.get("todos") == old_todos
+
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is None
+    # The seed succeeded, so `_seed_todos`'s own graceful-degradation incident never fires.
+    assert [incident.kind for incident in run_log.incidents()] == []
+
+
+async def test_a_user_message_before_a_model_switch_in_the_same_batch_still_reaches_the_new_agent(
+    make_session, three_models, make_config, make_agent_settings
+):
+    """Design: `ModelSwitch` is processed FIRST within a drained batch, then the normal
+    message build -- so a user line typed just before the switch still reaches the rebuilt
+    agent's own turn rather than being lost or delivered to the agent about to be replaced.
+    """
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            AIMessage(content="First turn."),
+            AIMessage(content="Second turn."),
+            AIMessage(content="Third turn."),
+        ]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    config = make_config(agent=make_agent_settings())
+    config.roles["head"] = RoleConfig(
+        provider="opencode", model="head-model-a", choices=["head-model-a", "head-model-b"]
+    )
+
+    session = make_session(config=config, interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: head._call_count >= 1, "the lead's first turn")
+        old_thread_id = session.thread_id
+        session.receive_user_message("check the tariff angle")
+        session.receive_user_message("/model head head-model-b")
+        await _wait_for(lambda: session.thread_id != old_thread_id, "the rebuild after the switch")
+        await _wait_for(lambda: head._call_count >= 2, "the new agent's own turn")
+
+        state = await session.agent.aget_state({"configurable": {"thread_id": session.thread_id}})
+        delivered = [
+            message
+            for message in state.values["messages"]
+            if isinstance(message, HumanMessage)
+            and "check the tariff angle" in str(message.content)
+        ]
+        assert len(delivered) == 1
+
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is None
+
+
+async def test_slash_model_validation_errors_never_rebuild_or_reach_the_model(
+    make_session, three_models, make_config, make_agent_settings
+):
+    """Unknown role; a role with no `choices` list; a choice not in that list -- each a
+    `CommandReply` error, with no rebuild and no model traffic.
+    """
+    from harness.display import CommandReply
+
+    head = _model(ScriptedChatModel, "head-test").script(
+        [AIMessage(content="Nothing to add."), AIMessage(content="Still nothing to add.")]
+    )
+    three_models(head, _model(ScriptedChatModel, "researcher-test").script([]))
+
+    config = make_config(agent=make_agent_settings())
+    config.roles["head"] = RoleConfig(
+        provider="opencode", model="head-model-a", choices=["head-model-a", "head-model-b"]
+    )
+
+    renderer = RecordingRenderer()
+    session = make_session(config=config, renderer=renderer, interactive=True)
+    run = asyncio.create_task(session.run())
+    old_thread_id = session.thread_id
+    try:
+        await _wait_for(lambda: head._call_count >= 1, "the lead's first idle turn")
+        session.receive_user_message("/model researcher deepseek-x")  # no choices on that role
+        await asyncio.sleep(0.05)
+        session.receive_user_message("/model nope head-model-a")  # unknown role
+        await asyncio.sleep(0.05)
+        session.receive_user_message("/model head not-a-choice")  # choice not offered
+        await asyncio.sleep(0.05)
+        session.request_quit()
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        run.cancel()
+
+    assert outcome is None
+    replies = [event for event in renderer.events if isinstance(event, CommandReply)]
+    assert len(replies) == 3
+    assert session.thread_id == old_thread_id
+    assert head._call_count == 1
+    assert config.roles["head"].model == "head-model-a"
+
+
+async def test_slash_new_cancels_running_researchers_and_requests_a_restart(
+    make_session, three_models, monkeypatch
+):
+    """D6: `/new` cancels every running researcher (reusing `_cancel_running`), `run()`
+    returns with no report written, and `session.restart_requested` is True.
+    """
+    gate_a, gate_b = asyncio.Event(), asyncio.Event()
+    head = _model(ScriptedChatModel, "head-test").script(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _dispatch_call("a", "call_a").tool_calls[0],
+                    _dispatch_call("b", "call_b").tool_calls[0],
+                ],
+            ),
+            AIMessage(content="Both angles are running."),
+        ]
+    )
+    researcher = _model(_KeyedResearcherModel, "researcher-test")
+    researcher._plans = {
+        "Investigate a": (gate_a, "Angle a findings."),
+        "Investigate b": (gate_b, "Angle b findings."),
+    }
+    three_models(head, researcher)
+
+    written: list[Any] = []
+    monkeypatch.setattr("harness.session.write_report", lambda outcome, config: written.append(1))
+
+    sink = ActivitySink()
+    run_log = RunLog()
+    session = make_session(sink=sink, run_log=run_log, interactive=True)
+    run = asyncio.create_task(session.run())
+    try:
+        await _wait_for(lambda: len(session.running) == 2, "both researchers dispatched")
+        session.receive_user_message("/new")
+        outcome = await asyncio.wait_for(run, timeout=_WAIT_TIMEOUT)
+    finally:
+        gate_a.set()
+        gate_b.set()
+        run.cancel()
+
+    assert outcome is None
+    assert written == []
+    assert session.restart_requested is True
+    assert session.running == {}
+    cancelled = [
+        incident for incident in run_log.incidents() if incident.kind == "researcher_cancelled"
+    ]
+    assert len(cancelled) == 2

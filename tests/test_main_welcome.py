@@ -305,6 +305,93 @@ async def test_an_unexpected_failure_after_the_reader_still_restores_the_termina
     assert closes["count"] >= 1, "the key reader was never closed — the terminal stayed raw"
 
 
+async def test_a_restart_returns_to_welcome_once_then_a_quit_exits(make_config, monkeypatch):
+    """Phase 6 D6: a session that requests a restart sends control back to the welcome
+    screen exactly once -- the browser is created/started/closed once each across BOTH
+    iterations (it lives outside the loop), and the second run's registry gets a fresh
+    `run_id`.
+    """
+    monkeypatch.setattr(main_module, "load_config", lambda: make_config())
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(main_module, "read_keys", lambda: iter(()))
+
+    # Neutralize the preflights (as `patch_run` does for a `main()` test), since a fake
+    # `Session` never reaches the model or search backends this run would otherwise probe.
+    async def _noop_preflight(cfg, role):
+        return None
+
+    monkeypatch.setattr("harness.models.preflight", _noop_preflight)
+
+    async def _noop_search_preflight(cfg):
+        return None
+
+    monkeypatch.setattr(main_module, "preflight_search", _noop_search_preflight)
+
+    # Two questions: the first session requests a restart, so the welcome screen is shown a
+    # SECOND time and hands back a second question -- that second session ends in an ordinary
+    # quit-after-report (R5: `run()` returns the outcome, exit 0), not a further restart.
+    welcome_calls = {"count": 0}
+
+    def _fake_run_welcome(config, *, keys, console):
+        welcome_calls["count"] += 1
+        return "question one" if welcome_calls["count"] == 1 else "question two"
+
+    monkeypatch.setattr(main_module, "_run_welcome", _fake_run_welcome)
+
+    browser_calls = {"start": 0, "close": 0}
+
+    async def _counting_start(self):
+        browser_calls["start"] += 1
+
+    async def _counting_close(self):
+        browser_calls["close"] += 1
+
+    monkeypatch.setattr(main_module.BrowserSession, "start", _counting_start)
+    monkeypatch.setattr(main_module.BrowserSession, "close", _counting_close)
+
+    run_ids: list[str] = []
+    session_calls = {"count": 0}
+
+    class _FakeSession:
+        def __init__(
+            self,
+            config,
+            registry,
+            run_log,
+            renderer,
+            tracker,
+            question,
+            *,
+            sink,
+            browser,
+            answer_source,
+            started_at,
+            interactive,
+        ):
+            session_calls["count"] += 1
+            run_ids.append(registry.run_id)
+            self._is_first = session_calls["count"] == 1
+            self.restart_requested = self._is_first
+            self.cut_short = None
+            self.cut_short_detail = None
+
+        async def run(self):
+            # The first session's `/new` never wrote a report (`None`, D6); the second is an
+            # ordinary successful run whose outcome `run()` hands back (R5).
+            return None if self._is_first else "outcome-sentinel"
+
+    monkeypatch.setattr("harness.session.Session", _FakeSession)
+
+    exit_code = await main_module.main([])
+
+    assert welcome_calls["count"] == 2
+    assert session_calls["count"] == 2
+    assert browser_calls["start"] == 1
+    assert browser_calls["close"] == 1
+    assert len(set(run_ids)) == 2
+    assert exit_code == 0
+
+
 def test_the_welcome_screen_reads_from_the_session_long_key_readers_iterator(
     make_config, monkeypatch
 ):

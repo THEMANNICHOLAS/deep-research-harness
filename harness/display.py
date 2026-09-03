@@ -99,6 +99,19 @@ class UserTurn:
 
 
 @dataclass(frozen=True)
+class CommandReply:
+    """A local reply to a `/` command (Phase 6, D4/D6) -- never sent to the model.
+
+    Multi-line allowed (e.g. `/sources`' one-row-per-source listing, or the command list shown
+    for an unknown command). Distinct from `AgentText`, which always carries a model byline,
+    and from `Alert`, which is bounded to one line and semantically degraded-coverage rather
+    than a direct reply to something the developer typed.
+    """
+
+    text: str
+
+
+@dataclass(frozen=True)
 class AgentText:
     """One piece of lead prose, echoed into the transcript (R2's "narrates in chat")."""
 
@@ -234,6 +247,7 @@ DisplayEvent = (
     | QuestionAnswered
     | ComposerDraft
     | UserTurn
+    | CommandReply
     | AgentText
     | RunStarted
     | LeadToolCall
@@ -390,6 +404,11 @@ class PlainRenderer:
             pass
         elif isinstance(event, UserTurn):
             out(f"> {event.text}")
+        elif isinstance(event, CommandReply):
+            # One durable log line per line of the reply (Phase 6), the same
+            # one-line-per-event convention `ResearchersUpdated` below uses.
+            for line in event.text.splitlines():
+                out(line)
         elif isinstance(event, AgentText):
             out(event.text)
         elif isinstance(event, ToolCall):
@@ -880,8 +899,8 @@ class RichRenderer:
             self._composer = event
             if self._live is not None:
                 self._live.refresh()
-        elif isinstance(event, UserTurn | AgentText | ReportWritten):
-            # All three are transcript lines, so they go where `StageCompleted`'s collapsed
+        elif isinstance(event, UserTurn | AgentText | ReportWritten | CommandReply):
+            # All four are transcript lines, so they go where `StageCompleted`'s collapsed
             # line goes -- INSIDE the frame. Under `screen=True` a `console.print` here would
             # be overwritten by the next refresh and then discarded with the alternate screen.
             # `Text(...)`, never markup: the lead's prose and a report path both carry
@@ -893,6 +912,15 @@ class RichRenderer:
                 # thing distinguishing lead prose from the developer's own line above it.
                 self._timeline.append(Text(f"research head {event.model}", style=_MUTED))
                 entry = Text(event.text)
+            elif isinstance(event, CommandReply):
+                # Dim, no byline (Phase 6 Design) -- distinct from `AgentText`, which always
+                # names the model that spoke. Multi-line: each line is its own timeline row,
+                # so a long `/sources` listing scrolls like any other transcript entry rather
+                # than being squashed into one wrapped block.
+                lines = event.text.split("\n")
+                for line in lines[:-1]:
+                    self._timeline.append(Text(line, style=_DIM))
+                entry = Text(lines[-1], style=_DIM)
             else:
                 entry = Text(f"report written: {event.path}", style=_ACCENT)
             self._timeline.append(entry)

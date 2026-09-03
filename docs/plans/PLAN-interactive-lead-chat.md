@@ -242,7 +242,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 3: Composer — queued user messages and post-report chat
 - [x] Phase 4: ask_user with choices
 - [x] Phase 5: Chat TUI — transcript, task dock, researcher roster
-- [ ] Phase 6: Slash commands — /sources, /model, /new
+- [x] Phase 6: Slash commands — /sources, /model, /new
 - [ ] Phase 7: Prompts, docs and supersession
 - [ ] Final verification
 
@@ -525,10 +525,10 @@ conversation; `/new` tears the run down and returns to the welcome screen.
 - Persisting a switched model to `harness.toml`.
 
 **Tests (write first, confirm red):**
-- [ ] `/sources` lists every registry entry with read_mode and never reaches the model.
-- [ ] `/model head <choice>` rebuilds the agent; the new thread's message list equals the old;
+- [x] `/sources` lists every registry entry with read_mode and never reaches the model.
+- [x] `/model head <choice>` rebuilds the agent; the new thread's message list equals the old;
   the no-shell profile is registered for the new model; a queued user message is preserved.
-- [ ] `/new` with two running researchers cancels both, disarms the clock, and the next run has
+- [x] `/new` with two running researchers cancels both, disarms the clock, and the next run has
   a different `run_id`; the browser session object is the same.
 
 **Steps:**
@@ -818,3 +818,31 @@ never add a section below it. -->
   acceptance criterion: (a) the `clarifying`/`researching` stage handoff against the new task
   dock (only indirectly evidenced in tests), (b) Phase 6 begins slash commands — the composer's
   leading-`/` text stops being an ordinary message there.
+
+### 2026-09-03 — Phase 6: Slash commands — /sources, /model, /new
+- Done: slash parsing in `Session.receive_user_message` (a `/` line never becomes a
+  `UserMessage`); `CommandReply` display event (dim, no byline, Plain + Rich); `/sources`
+  from `SourceRegistry.all()`; `/model <role> <choice>` as a `ModelSwitch` event applied at
+  the turn boundary in `_next_batch` — head switches rebuild the agent, mint a new
+  `thread_id`, and reseed messages AND todos via `aget_state`/`aupdate_state`
+  (`as_node="TodoListMiddleware.after_model"` for todos); researcher/reader switches
+  recompile the researcher graph; `/new` sets `restart_requested`, reuses
+  `request_quit`/`_cancel_running`, and `__main__.main()` now loops welcome↔session with the
+  `BrowserSession`, key reader, config and preflights held outside the loop; new public
+  `BrowserSession.rebind_run(run_log, run_id)` re-points incidents and the downloads dir at
+  the current run (replaces a private poke); `run_id` gained a random suffix against
+  same-second `/new` collisions. 897 tests + gates clean. 3F (flagged !#4): Major fixed —
+  the reseed test now carries tool_call/ToolMessage pairs across the switch.
+- Learned: an `aupdate_state` targeting a fresh thread with unspecified `as_node` resolves
+  to `__start__`, whose writers cover only the input schema (`messages`) — other channels
+  are silently dropped, not errored; seeding `todos` requires targeting the owning node
+  (`TodoListMiddleware.after_model`). A first report that this was impossible turned out to
+  be a test race (the switch was declared done at `thread_id` change, before `_seed_todos`
+  ran) — wait for the switch's `CommandReply` in tests. `_seed_todos` keeps a
+  verify-and-disclose safety net (`model_switch_todos_not_carried` incident) for future
+  deepagents changes.
+- Drift: none.
+- Watch-next: Phase 7 is docs/prompts only. Live checks stacked for final verification:
+  the `/model` cross-provider switch (risk #4's only untestable half), the stage-handoff
+  and screenshot-vs-mock items from Phase 5, and the phase acceptance one-liners on live
+  runs. Phase 7 must also reconcile the docs' downloads-dir wording with `rebind_run`.

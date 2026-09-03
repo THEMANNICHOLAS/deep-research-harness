@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import queue
+import secrets
 import sys
 import threading
 import tomllib
@@ -449,7 +450,14 @@ def _run_welcome(
 
 
 async def main(argv: list[str] | None = None) -> int:
-    """Run one research question end to end. Returns the process exit code."""
+    """Run one research question end to end. Returns the process exit code.
+
+    Phase 6 (D6) wraps the welcome->session flow in a `while True:` loop so `/new` can send
+    control back to the welcome screen without re-running the config load, the preflights, or
+    the browser lifecycle — those stay outside the loop, unchanged for the whole process. A
+    run that never uses `/new` executes the loop body exactly once, preserving the prior
+    single-run behavior byte for byte (exit codes, report path printing).
+    """
     parser = argparse.ArgumentParser(
         prog="python -m harness", description="Answer one research question with cited sources."
     )
@@ -465,16 +473,17 @@ async def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    question = args.question
+    question: str | None = args.question
     if not question and not sys.stdin.isatty():
         # No question AND no interactive terminal (piped stdin, cron, nohup): the welcome
         # screen cannot be driven, and `read_keys()` would raise a bare `termios.error`
         # putting stdin in raw mode. Restore the pre-welcome behavior for this case — the
         # same usage message argparse produced when `question` was a required positional.
         parser.error("the following arguments are required: question")
-    # ONE key source for the whole session, started before the welcome screen and handed to
-    # every consumer after it (D5). `None` without a terminal: there are no raw keys to read,
-    # the welcome screen is unreachable, and `_read_answer`'s stdin path answers questions.
+    # ONE key source for the whole process, started before the welcome screen and handed to
+    # every consumer after it, across every `/new` restart (D5/D6). `None` without a terminal:
+    # there are no raw keys to read, the welcome screen is unreachable, and `_read_answer`'s
+    # stdin path answers questions.
     reader = KeyReader() if sys.stdin.isatty() else None
 
     # One `try/finally` around everything past the reader's construction: raw mode is
@@ -495,10 +504,16 @@ async def main(argv: list[str] | None = None) -> int:
                 # report. The outer `finally` closes the reader.
                 return 0
 
-        # The renderer starts BEFORE the heavy imports and the preflight call: together they are
-        # several silent seconds, and a terminal that shows nothing through them reads as hung.
+        # The renderer starts BEFORE the heavy imports and the preflight call: together they
+        # are several silent seconds, and a terminal that shows nothing through them reads as
+        # hung. Built ONCE here, outside the `while` loop below: the FIRST loop iteration
+        # reuses this very renderer (so preflight progress and that iteration's running pane
+        # share one frame, exactly as before this phase), and only a `/new` restart's SECOND
+        # (and later) iteration builds a fresh one (D6) -- `RunFinished` leaves a renderer
+        # reusable (it stops the `Live` region without closing it), but this run's own
+        # `finally` below closes it every iteration, so a reused-without-rebuilding renderer
+        # on iteration 2 would already be closed and silently drop every emit.
         renderer = build_renderer()
-        tracker = StageTracker(renderer)
 
         def _abort(message: str) -> int:
             """Every pre-session failure exit: release the terminal, then print (never before).
@@ -540,99 +555,152 @@ async def main(argv: list[str] | None = None) -> int:
         except SearchPreflightError as exc:
             return _abort(f"error: {exc}")
 
-        # Stamped before the agent can write anything: a cut-short report uses it to tell THIS
-        # run's workspace notes from a previous run's leftovers (`report._notes_section`), and it
-        # names this run's `<workspace_dir>/<run_id>/` directory, which keeps a previous run's
-        # captures out of this run's verification.
-        started_at = datetime.now()
-
-        registry = SourceRegistry(run_id=started_at.strftime("%Y-%m-%d-%H%M%S"))
-        # Phase 4 strict provenance (D2/R2): a pasted "read this page" URL is the only other
-        # sanctioned way a URL becomes fetchable (no `--url` flag) — approved here, before the
-        # agent runs, so it is fetchable from the run's very first tool call.
-        for url in extract_urls(question):
-            registry.approve(url)
-        run_log = RunLog()
-
-        # After `run_log`, not beside the other preflights above: `BrowserSession` records its OWN
-        # relaunch incident onto it (Phase 1 Discoveries) rather than taking a caller-supplied hook,
-        # so it cannot be constructed any earlier.
+        # A `RunLog`/`run_id` of the browser's OWN, distinct from any research run's: its
+        # lifetime now spans every `/new` restart (D6), so it cannot be tied to a single run's
+        # registry the way it was before this phase. Rebound to each iteration's own `run_log`
+        # below (Discoveries), so a mid-run relaunch incident still reaches THAT run's report.
+        browser_run_log = RunLog()
         renderer.emit(Activity("preflight: launching the browser"))
-        browser = BrowserSession(config, run_log, run_id=registry.run_id)
+        browser = BrowserSession(
+            config, browser_run_log, run_id=datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        )
         try:
             await browser.start()
         except BrowserPreflightError as exc:
             return _abort(f"error: {exc}")
 
-        # `ActivitySink` PUSHES via `on_change` rather than being drained from the turn loop: the
-        # middleware writes from inside a researcher's own graph, and one node is one superstep, so
-        # no top-level chunk arrives until the whole researcher->reader pipeline has finished. The
-        # thunk exists because the sink must be constructed BEFORE the `Session` that services it
-        # (it is a constructor argument) while the callback is a method ON that session; `session`
-        # is only read at call time, and nothing can push into the sink before it exists.
-        session: Session | None = None
-
-        def _on_activity_change() -> None:
-            if session is not None:
-                session.on_activity_change()
-
-        # Same thunk trick as `_on_activity_change`, for the same reason: the composer needs the
-        # session it drives, and the session needs the composer's `answer()` for `ask_user`.
-        composer: Composer | None = None
-
-        sink = ActivitySink(on_change=_on_activity_change)
-        session = Session(
-            config,
-            registry,
-            run_log,
-            renderer,
-            tracker,
-            question,
-            sink=sink,
-            browser=browser,
-            # A thunk, not `composer.answer` itself, for the same reason as the sink above:
-            # the composer does not exist yet. `_read_answer` is looked up on this module at
-            # call time too, which is the seam the headless tests patch.
-            answer_source=lambda: composer.answer() if composer is not None else _read_answer(),
-            started_at=started_at,
-            # A key source is what makes a session interactive: with one, an idle lead waits for
-            # the developer and the chat continues past the report; without one, the run is
-            # headless and ends at the report exactly as before (Phase 3).
-            interactive=reader is not None,
-        )
-        if reader is not None:
-            composer = Composer(reader, renderer, session)
-
-        # Same close/print/exit-1 shape as the preflight loop: the session resolves every role
-        # through `build_chat_model`, so a missing or TODO role raises `ModelError` on the first
-        # line of `run()` — unhandled it would escape as a traceback under the alternate screen
-        # (PR #18 review).
         outcome: RunOutcome | None = None
         model_error: str | None = None
-        composer_task: asyncio.Task[None] | None = None
-        # `finally`, because the live region owns terminal state: `Live.start` hides the
-        # cursor and rich registers no atexit restore, so a `write_report` OSError (an
-        # unwritable or full reports dir) escaping `run()` would leave the developer's shell
-        # with no cursor after the traceback.
+        session: Session | None = None
+        first_iteration = True
         try:
-            # Two tasks, not one: the composer reads keys for as long as the session lives, so
-            # neither ever waits on the other (R1). The SESSION decides when the run is over —
-            # the composer is torn down after it, never the other way round.
-            if composer is not None:
-                composer_task = asyncio.create_task(composer.run())
-            outcome = await session.run()
-        except ModelError as exc:
-            model_error = f"error: {exc}"
+            while True:
+                if not first_iteration:
+                    # A `/new` restart (D6): the previous iteration's renderer was already
+                    # closed in this loop's own `finally` below, so it must not be reused.
+                    renderer = build_renderer()
+                first_iteration = False
+
+                # Stamped before the agent can write anything: a cut-short report uses it to
+                # tell THIS run's workspace notes from a previous run's leftovers
+                # (`report._notes_section`), and it names this run's
+                # `<workspace_dir>/<run_id>/` directory, which keeps a previous (or, after a
+                # `/new` restart, an abandoned) run's captures out of this run's verification.
+                started_at = datetime.now()
+
+                # A random suffix, not the bare second-resolution stamp a single-run process
+                # used before this phase (Discoveries): a `/new` restart can land a second
+                # iteration's `started_at` in the SAME second as the first's within one
+                # process, and two iterations sharing a `run_id` would collide on the same
+                # `<workspace_dir>/<run_id>/` subtree -- exactly what `SourceRegistry`'s own
+                # default generator (`sources.py`) already avoids by pairing the stamp with one.
+                registry = SourceRegistry(
+                    run_id=f"{started_at.strftime('%Y-%m-%d-%H%M%S')}-{secrets.token_hex(4)}"
+                )
+                # Phase 4 strict provenance (D2/R2): a pasted "read this page" URL is the only
+                # other sanctioned way a URL becomes fetchable (no `--url` flag) — approved
+                # here, before the agent runs, so it is fetchable from the run's very first
+                # tool call.
+                for url in extract_urls(question):
+                    registry.approve(url)
+                run_log = RunLog()
+                # A relaunch incident during THIS run's fetches must reach THIS run's report,
+                # not the bootstrap log nothing ever reads (see `browser_run_log` above), and
+                # the HTTP crawler's downloads dir must follow THIS run's id too (D6) --
+                # `rebind_run` is the one seam that keeps both in step (`harness/browser.py`).
+                await browser.rebind_run(run_log, registry.run_id)
+
+                tracker = StageTracker(renderer)
+
+                # `ActivitySink` PUSHES via `on_change` rather than being drained from the turn
+                # loop: the middleware writes from inside a researcher's own graph, and one
+                # node is one superstep, so no top-level chunk arrives until the whole
+                # researcher->reader pipeline has finished. The thunk exists because the sink
+                # must be constructed BEFORE the `Session` that services it (it is a
+                # constructor argument) while the callback is a method ON that session;
+                # `session` is only read at call time, and nothing can push into the sink
+                # before it exists.
+                session = None
+
+                def _on_activity_change() -> None:
+                    if session is not None:
+                        session.on_activity_change()
+
+                # Same thunk trick as `_on_activity_change`, for the same reason: the composer
+                # needs the session it drives, and the session needs the composer's `answer()`
+                # for `ask_user`.
+                composer: Composer | None = None
+
+                sink = ActivitySink(on_change=_on_activity_change)
+                session = Session(
+                    config,
+                    registry,
+                    run_log,
+                    renderer,
+                    tracker,
+                    question,
+                    sink=sink,
+                    browser=browser,
+                    # A thunk, not `composer.answer` itself, for the same reason as the sink
+                    # above: the composer does not exist yet. `_read_answer` is looked up on
+                    # this module at call time too, which is the seam the headless tests patch.
+                    answer_source=lambda: (
+                        composer.answer() if composer is not None else _read_answer()
+                    ),
+                    started_at=started_at,
+                    # A key source is what makes a session interactive: with one, an idle lead
+                    # waits for the developer and the chat continues past the report; without
+                    # one, the run is headless and ends at the report exactly as before
+                    # (Phase 3).
+                    interactive=reader is not None,
+                )
+                if reader is not None:
+                    composer = Composer(reader, renderer, session)
+
+                # Same close/print/exit-1 shape as the preflight loop: the session resolves
+                # every role through `build_chat_model`, so a missing or TODO role raises
+                # `ModelError` on the first line of `run()` — unhandled it would escape as a
+                # traceback under the alternate screen (PR #18 review).
+                outcome = None
+                model_error = None
+                composer_task: asyncio.Task[None] | None = None
+                # `finally`, because the live region owns terminal state: `Live.start` hides
+                # the cursor and rich registers no atexit restore, so a `write_report` OSError
+                # (an unwritable or full reports dir) escaping `run()` would leave the
+                # developer's shell with no cursor after the traceback.
+                try:
+                    # Two tasks, not one: the composer reads keys for as long as the session
+                    # lives, so neither ever waits on the other (R1). The SESSION decides when
+                    # the run is over — the composer is torn down after it, never the other
+                    # way round.
+                    if composer is not None:
+                        composer_task = asyncio.create_task(composer.run())
+                    outcome = await session.run()
+                except ModelError as exc:
+                    model_error = f"error: {exc}"
+                finally:
+                    if composer_task is not None:
+                        composer_task.cancel()
+                        # Awaited, not just cancelled: an un-retrieved cancelled task is
+                        # reported as "Task was destroyed but it is pending" when the loop
+                        # closes.
+                        await asyncio.gather(composer_task, return_exceptions=True)
+                    renderer.close()
+
+                if not session.restart_requested:
+                    break
+
+                # `/new` (D6): back to the welcome screen for the next question, on the SAME
+                # key reader and browser. Ctrl+C/EOF out of it is the same clean exit as the
+                # very first welcome screen.
+                assert reader is not None  # restart is only reachable through a composer
+                question = _run_welcome(config, keys=reader.blocking(), console=Console())
+                if question is None:
+                    return 0
         finally:
-            if composer_task is not None:
-                composer_task.cancel()
-                # Awaited, not just cancelled: an un-retrieved cancelled task is reported as
-                # "Task was destroyed but it is pending" when the loop closes.
-                await asyncio.gather(composer_task, return_exceptions=True)
-            if reader is not None:
-                reader.close()
             await browser.close()
-            renderer.close()
+
+        assert session is not None  # the `while True:` loop always runs at least once
 
         # Error prints belong AFTER close(): under `Live(screen=True)` anything written to the
         # terminal — stderr included, it shares the device — while the Live runs lands on the

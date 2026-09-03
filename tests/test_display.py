@@ -2576,3 +2576,56 @@ def test_the_transcript_shows_user_and_agent_turns_in_order():
     assert "research head kimi-k3" in frame
     assert frame.index("skip the routing angle") < frame.index("research head kimi-k3")
     assert frame.index("research head kimi-k3") < frame.index("Dropping that angle.")
+
+
+# --- Slash-command replies (Phase 6, PLAN-interactive-lead-chat) ---------------------------
+
+
+def test_plain_renderer_prints_command_reply_lines_one_per_line(capsys):
+    """`PlainRenderer` follows the Phase 5 one-line-per-event convention: a multi-line
+    `CommandReply` prints as one durable log line per line of text."""
+    renderer = PlainRenderer()
+
+    renderer.emit(harness.display.CommandReply("[S1] Page A -- https://a.test (digested)"))
+    renderer.emit(harness.display.CommandReply("line one\nline two"))
+
+    _, lines = drain_stdout(capsys)
+    assert lines == [
+        "[S1] Page A -- https://a.test (digested)",
+        "line one",
+        "line two",
+    ]
+
+
+def test_rich_renderer_renders_command_reply_without_a_model_byline():
+    """`CommandReply` renders as a dim, no-byline transcript block -- distinct from
+    `AgentText`, which always carries the model byline."""
+    renderer, buffer = _rich_renderer()
+
+    renderer.emit(StageStarted("researching"))
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.CommandReply("no sources captured yet"))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert "no sources captured yet" in frame
+    assert "research head" not in frame
+
+
+def test_the_transcript_bound_holds_with_command_reply_entries_mixed_in():
+    """The `CommandReply` entries share the same bounded transcript deque as every other
+    transcript event -- the oldest still falls out of `_TRANSCRIPT_TAIL`."""
+    total = RichRenderer._TRANSCRIPT_TAIL + 10
+    renderer, buffer = _rich_renderer(height=total + 20)
+
+    renderer.emit(TodosUpdated((TodoItem(content="Find sources", status="pending"),)))
+    for index in range(total - 1):
+        renderer.emit(harness.display.CommandReply(f"reply number {index}"))
+    before = len(buffer.getvalue())
+    renderer.emit(harness.display.CommandReply(f"reply number {total - 1}"))
+    frame = _strip_ansi(buffer.getvalue()[before:])
+    renderer.close()
+
+    assert f"reply number {total - 1}" in frame
+    assert "reply number 0" not in frame
+    assert "Find sources" in frame
