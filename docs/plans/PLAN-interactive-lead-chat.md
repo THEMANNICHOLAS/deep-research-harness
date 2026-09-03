@@ -1,6 +1,7 @@
 # PLAN: Interactive Lead Chat
 
-**Status:** In Progress
+**Status:** Code complete — all seven phases landed; the live end-to-end walkthrough under
+`## Verification` is pending (developer, needs real models and a TTY)
 **Created:** 2026-08-25
 **Type:** Single plan
 
