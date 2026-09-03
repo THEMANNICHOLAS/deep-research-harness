@@ -72,7 +72,7 @@ not the ceiling).
   declared today. The DeepSeek line required a region opt-in on the OpenCode
   workspace dashboard for the `-flash` tier — without it the endpoint 403s (see
   docs/decisions.md); `-pro` worked without a fresh opt-in in a live check.
-- Deployment: homelab Linux machine, operated over SSH.
+- Deployment: developer's local laptop, single user; the homelab machine is a future step.
 
 ## Patterns
 

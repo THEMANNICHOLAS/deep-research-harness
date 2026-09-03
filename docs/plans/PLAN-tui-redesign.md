@@ -1,6 +1,6 @@
 # PLAN: TUI Redesign
 
-**Status:** In Progress
+**Status:** Superseded by PLAN-interactive-lead-chat.md (2026-09-03)
 **Created:** 2026-08-17
 **Type:** Single plan
 

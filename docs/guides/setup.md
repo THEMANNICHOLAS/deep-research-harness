@@ -239,10 +239,14 @@ report. This costs real tokens, so it is not part of `uv run pytest`.
 uv run --env-file .env python -m harness "What changed in Python 3.14's free-threading support?"
 ```
 
-Expect the research plan to echo at the terminal as the agent works, and the final line of
-stdout to be the path of a timestamped report under `~/deep-research/reports/` (created on
-first run). `[agent] workspace_dir` / `reports_dir` in `harness.toml` are optional overrides
-that still win when present. Open that file: it should answer the question as clean prose —
+The positional question skips the welcome screen (`uv run --env-file .env python -m harness`
+alone opens it instead) and lands in the chat TUI, where the lead narrates each researcher
+return and its task dock tracks the plan. When the lead calls `submit_report`, the path of a
+timestamped report under `~/deep-research/reports/` (created on first run) appears in the
+transcript; chat stays open over the same sources until Ctrl-C or Ctrl-D, and that path is
+then the final line of stdout. `[agent] workspace_dir` / `reports_dir` in `harness.toml` are
+optional overrides that still win when present. Open that file: it should answer the question
+as clean prose —
 each citing paragraph is followed by a `Sources:` line of links and a `Verdict:` line, with
 no inline `[Sn]` markers — and list its sources. Every source consulted also leaves a file
 under `~/deep-research/workspace/<run_id>/sources/`. Each run owns a `<run_id>` subdirectory

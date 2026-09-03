@@ -243,7 +243,7 @@ Inherits every `## Intent` non-goal — not re-listed.
 - [x] Phase 4: ask_user with choices
 - [x] Phase 5: Chat TUI — transcript, task dock, researcher roster
 - [x] Phase 6: Slash commands — /sources, /model, /new
-- [ ] Phase 7: Prompts, docs and supersession
+- [x] Phase 7: Prompts, docs and supersession
 - [ ] Final verification
 
 ## Phases
@@ -563,15 +563,15 @@ is marked; prompts read as one coherent contract.
 - Code changes of any kind other than prompt wording.
 
 **Manual verification:**
-- [ ] `grep -rn "homelab" CLAUDE.md docs/INDEX.md` shows only the "future" mention.
-- [ ] `docs/plans/PLAN-tui-redesign.md` line 3 reads a superseded status naming this plan.
+- [x] `grep -rn "homelab" CLAUDE.md docs/INDEX.md` shows only the "future" mention.
+- [x] `docs/plans/PLAN-tui-redesign.md` line 3 reads a superseded status naming this plan.
 
 **Steps:**
 1. Update each listed doc; mark the TUI plan superseded.
 2. Run the quality gate (see Verification).
 
 **Acceptance criteria:**
-- [ ] `docs/INDEX.md` Shared Resources lists `harness/session.py` and `harness/tools/dispatch.py`.
+- [x] `docs/INDEX.md` Shared Resources lists `harness/session.py` and `harness/tools/dispatch.py`.
 
 ## Verification
 - [ ] Live end-to-end on a TTY: question → dispatches → per-return narration → mid-run steer →
@@ -846,3 +846,23 @@ never add a section below it. -->
   the `/model` cross-provider switch (risk #4's only untestable half), the stage-handoff
   and screenshot-vs-mock items from Phase 5, and the phase acceptance one-liners on live
   runs. Phase 7 must also reconcile the docs' downloads-dir wording with `rebind_run`.
+
+### 2026-09-03 — Phase 7: Prompts, docs and supersession
+- Done: CLAUDE.md/INDEX.md deployment = local laptop (homelab future); INDEX.md status
+  paragraph rewritten for the chat session, Shared Resources rows for `session.py`,
+  `dispatch.py`, `rebind_run`, and the researcher-wiring row re-pointed from the deleted
+  `_researcher_spec` to `build_researcher_graph`; architecture.md gained `## Session Loop`
+  (D1-D4, D6, `interactive=False` seam) and a current Directory Structure; decisions.md
+  D1-D6 headlines + the non-TTY-guard deferral; backlog.md entries for PlainRenderer
+  removal, `/budget`/`/report`, the non-TTY startup guard (half exists: no-question
+  non-TTY already exits 2 via argparse) and orchestrator.md's hardcoded researcher cap;
+  setup.md live-check paragraph describes the chat flow; PLAN-tui-redesign.md superseded.
+  orchestrator.md unchanged (reviewer confirmed every behavioural claim against the code).
+  Adopted a dead session's uncommitted diff (adopt-and-verify), then fixed all 2 Majors +
+  4 Minors from the 3F quality scan in place. 897 tests, gates clean.
+- Learned: `python -m harness "<question>"` still works and skips the welcome screen; on a
+  piped stdin it runs headless (`Session(interactive=False)`) — "no non-TTY mode" is a
+  support statement, not a code fact, and the docs now say so consistently.
+- Drift: none.
+- Watch-next: Final verification is entirely live checks — see the Phase 6 Watch-next list
+  plus the plan's `## Verification` walkthrough; nothing left for scripted tests.

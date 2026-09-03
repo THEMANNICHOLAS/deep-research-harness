@@ -240,6 +240,56 @@ not observed failures — none has been reproduced against a live run.
   eviction path at all is a design question R6 does not settle. Evidence in the Phase 4 entry
   of @docs/plans/PLAN-tool-feedback-and-domain-blocklist.md `## Discoveries`.
 
+- **`PlainRenderer` is dead weight now that chat is the only mode.**
+  @harness/display.py still carries the non-TTY renderer and its tests
+  (deliberately kept, per @docs/plans/PLAN-interactive-lead-chat.md `## Non-Goals`,
+  which excludes deleting it or its tests from that plan). This bites the next
+  session that has to maintain two renderer implementations for a mode
+  (one-shot/non-TTY output) the plan already declared gone. To address: delete
+  `PlainRenderer` and its dedicated tests once headless invocation gets its own
+  answer (see the non-TTY CLI guard entry below) — a single removal PR, no
+  design work.
+
+- **`/budget` and `/report` slash commands were never built.**
+  @docs/plans/PLAN-interactive-lead-chat.md lists both as negotiable
+  Preferences — `/budget` would show rounds used and wall clock remaining,
+  `/report` would force the report immediately — and Phase 6 (the phase that
+  built `/sources`/`/model`/`/new`) left them out as not-yet-needed. This bites
+  a developer mid-run who wants to know how much runway is left, or wants to
+  cut research short deliberately rather than waiting for the lead to call
+  `submit_report`. To address: extend `Session`'s command parsing
+  (@harness/session.py) with two more cases — `/budget` reads the existing
+  clock/round-cap state and prints it as a `CommandReply`; `/report` is closer
+  to the synthesis-margin injection than a new mechanism, since both want the
+  lead to call `submit_report` now.
+
+- **No non-TTY startup guard — `python -m harness` piped or scripted still
+  runs, just headless.** @docs/plans/PLAN-interactive-lead-chat.md's Non-Goals
+  drop one-shot/non-TTY invocation as a supported mode, and its `## Notes`
+  originally called for "requires an interactive terminal", exit 2 on a
+  non-TTY invocation — deferred to Phase 7, which kept
+  `Session(interactive=False)` instead (developer decision, 2026-09-03; see
+  @docs/decisions.md). The caveat: every offline `main()` test in
+  `tests/test_agent.py` currently runs non-TTY under `interactive=False`
+  (Discoveries, 2026-08-27), so adding the guard means rewriting that whole
+  suite to run interactively (or to inject a fake TTY) rather than a small
+  patch. This bites nobody today — headless runs are only ever tests or a
+  developer error — but leaves piped/scripted invocation silently running
+  instead of failing fast. Half the guard already exists: `__main__.main` refuses a
+  no-question non-TTY invocation through argparse (exit 2) because the welcome
+  screen cannot be driven there — only the question-supplied piped case is open.
+  To address: extend that existing check to refuse any non-TTY invocation, and
+  rescript the affected tests to drive `Session` directly instead of through
+  `main()`.
+
+- **The lead prompt hardcodes the researcher cap.** @harness/prompts/orchestrator.md
+  tells the lead "Up to four may run at once", but the cap is `[agent] max_researchers`
+  in `harness.toml` (default 4) and the template receives only `$current_date`
+  (@harness/agent.py). This bites the first time the knob moves: the lead plans
+  around the wrong number until a `refused:` reply corrects it. To address: render the
+  cap into the prompt as a template variable alongside `$current_date` — a small code
+  change, out of scope for the docs-only Phase 7 that noticed it.
+
 - **No in-run `/`-command to tune the research knobs.** Every parameter added by
   @docs/plans/PLAN-tool-feedback-and-domain-blocklist.md (`max_reader_dispatches`,
   `synthesis_margin_seconds`, the blocklist path) lands in `harness.toml` specifically so a

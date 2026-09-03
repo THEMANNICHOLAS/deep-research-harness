@@ -262,3 +262,58 @@ sentences each, append-only, newest last.
   `gpt-5.6-luna` preflight chat call (`Internal server error`), surfaced as a
   fail-fast startup abort. `qwen3.7-plus` was already a listed `[roles.head]`
   `choices` slug; swapped in with no other config changes.
+
+- **2026-08-25 — D1 (PLAN-interactive-lead-chat): researcher dispatch is a
+  harness-owned async tool, not deepagents' `task`.** The lead loses `task` and
+  gets `dispatch_researcher`, which starts the compiled researcher graph as a
+  session-owned `asyncio.Task` and returns at once, enabling per-return
+  narration and mid-fan-out steering that `task`'s atomic-per-tool-node
+  behaviour cannot give; deepagents' `AsyncSubAgentMiddleware` was rejected too
+  — it needs a remote LangGraph Platform server. See
+  @docs/plans/PLAN-interactive-lead-chat.md D1.
+
+- **2026-08-25 — D2 (PLAN-interactive-lead-chat): one lead turn per drained
+  event batch, owned by a new `Session`.** `harness/session.py` awaits at least
+  one event (a researcher return or a queued user message), drains everything
+  pending into one `HumanMessage` closed by a roster line, and runs one
+  `agent.astream` turn — chosen over one turn per event (more head-model calls,
+  a roster stale by one event) and over growing `__main__.py` in place. See
+  @docs/plans/PLAN-interactive-lead-chat.md D2.
+
+- **2026-08-25 — D3 (PLAN-interactive-lead-chat): research ends only when the
+  lead calls `submit_report(answer)`.** Rejected a heuristic "roster empty +
+  final-answer-shaped message" as indistinguishable from ordinary narration;
+  the explicit tool call disarms the wall clock, writes the report, and opens
+  unclocked post-report chat where `dispatch_researcher`/`submit_report` both
+  refuse. See @docs/plans/PLAN-interactive-lead-chat.md D3.
+
+- **2026-08-25 — D4 (PLAN-interactive-lead-chat): `/model` rebuilds the agent
+  and reseeds the thread from the checkpointer.** `aget_state`/`aupdate_state`
+  carry the full message list onto a fresh `thread_id` built against the new
+  model, since deepagents resolves models at compile time and hot-swapping
+  inside a compiled graph isn't possible; a switch mid-turn applies at the next
+  turn boundary. See @docs/plans/PLAN-interactive-lead-chat.md D4.
+
+- **2026-08-25 — D5 (PLAN-interactive-lead-chat): the composer generalizes the
+  existing daemon-thread key reader rather than adding Textual/prompt_toolkit.**
+  One daemon thread runs `read_keys()` for the whole session; Rich
+  `Live(screen=True)` stays, consistent with Textual already being rejected
+  elsewhere in this log. See @docs/plans/PLAN-interactive-lead-chat.md D5.
+
+- **2026-08-25 — D6 (PLAN-interactive-lead-chat): `/new` cancels the session's
+  own researcher tasks and rebuilds the run in place.** Chosen over exiting the
+  process and relaunching, which would lose the warm browser and the TUI;
+  `/new` cancels and awaits every running researcher, disarms the clock, mints
+  a new `run_id`, and reuses the same `BrowserSession`. See
+  @docs/plans/PLAN-interactive-lead-chat.md D6.
+
+- **2026-09-03 — non-TTY invocation stays `Session(interactive=False)`; the
+  "requires an interactive terminal, exit 2" guard is deferred, not built
+  (developer decision, PLAN-interactive-lead-chat Phase 7).** `interactive=False`
+  is kept as the headless/test seam every offline `main()` test already runs
+  under — flipping it to a hard guard now would need every one of those tests
+  rewritten for no behavior change the developer asked for. Half the guard
+  already exists: a non-TTY invocation with NO question is refused by argparse
+  (exit 2) because the welcome screen cannot run there; only the
+  question-supplied piped case still runs headless, and that half moves to
+  docs/backlog.md.

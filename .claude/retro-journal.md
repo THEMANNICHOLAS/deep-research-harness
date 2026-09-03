@@ -50,3 +50,10 @@
 - gotcha: crawl4ai's HTTP strategy writes any non-`text/html` response body to `downloads_path`, defaulting to `~/.crawl4ai/downloads` — outside the workspace, unbounded.
 - gotcha: a Bash heredoc on a `&&` chain binds to the wrong command (`python -c "..." && git commit -F - <<'EOF'` silently skipped the python), and piping a quality gate to `tail` masks its exit code.
 - gotcha: `Live(screen=True)` redirects `sys.stdout` via a FileProxy until `close()`, silently swallowing print-debugging and capsys assertions in mixed-renderer tests.
+
+## 2026-09-03 18:44 — /handoff — interactive-lead-chat Phases 5-7
+- correction: orphaned uncommitted worker output (dead session/rate-limit kill): adopt-and-verify — keep the diff if targeted tests pass, compensate missing red-first with full gate + judgment review; never reset blind
+- dead-end: `aupdate_state({"messages":...,"todos":...})` on a fresh thread silently drops non-input channels (`as_node` -> `__start__`); seed todos with a targeted `as_node="TodoListMiddleware.after_model"` call
+- dead-end: asserting a /model switch done at `thread_id` change races `_seed_todos` — wait for the switch's `CommandReply`; the race masqueraded as an API limitation
+- gotcha: uv auto-updated to 0.12.9 mid-session tripping `required-version ==0.12.3`; fixed via `uv self update 0.12.3`
+- gotcha: langchain middleware lists nest LATER entries INNER — converters (ToolError/ToolRetry) must sit LATER in the list than anything needing their outputs

@@ -2,23 +2,27 @@
 
 ## Overview
 
-One command — `python -m harness "<question>"` (@harness/__main__.py) — takes a
-research question and writes one timestamped, cited markdown report. A
-`deepagents` lead agent (@harness/agent.py) plans research angles and dispatches
-them over the substrate's tools, streaming its todo plan to the terminal; Python
+One command — `python -m harness` (@harness/__main__.py) — opens a welcome
+screen, then a live chat session (@harness/session.py) with a `deepagents` lead
+agent (@harness/agent.py) that plans research angles, dispatches them as
+background researchers, and narrates each return in chat. The lead writes one
+timestamped, cited markdown report only when it calls `submit_report`; Python
 then verifies the draft's claims (@harness/verify.py) and assembles the report
-(@harness/report.py). Model roles are config-declared, never literal:
+(@harness/report.py), and chat continues afterwards over the same sources.
+Model roles are config-declared, never literal:
 `[roles.head]` plans and synthesizes, `[roles.researcher]` works one angle each,
 `[roles.reader]` digests pages, and `[roles.verifier]` checks the draft's claims
 against their cited sources.
 
 ## Agent Topology
 
-The hierarchy is three tiers deep (Phase 2): the lead delegates each research
-angle to a declared `researcher` subagent through deepagents' own `task` tool, and
-each researcher — which owns `search_web` and the `fetch_raw` recovery fallback —
-delegates page reading to its own nested `reader` subagent, so `fetch_pages` lives
-only on the reader's toolset (@harness/agent.py, @harness/tools/__init__.py). The
+The hierarchy is three tiers deep (Phase 2): the lead dispatches each research
+angle to its own researcher through the harness-owned `dispatch_researcher` tool
+(D1, PLAN-interactive-lead-chat — not deepagents' `task`, which the lead no
+longer has), and each researcher — which owns `search_web` and the `fetch_raw`
+recovery fallback — still delegates page reading to its own nested `reader`
+subagent through deepagents' own `task` tool, so `fetch_pages` lives only on the
+reader's toolset (@harness/agent.py, @harness/tools/__init__.py). The
 researcher's live system prompt is @harness/prompts/subagent.md, the reader's is
 @harness/prompts/reader.md. A nested subagent receives NONE of deepagents'
 auto-injected middleware — `_reader_spec` re-adds the filesystem, summarization
@@ -48,16 +52,80 @@ Runs are therefore isolated by construction rather than by filtering: two starte
 once cannot read each other's notes, which a timestamp filter cannot prevent because
 a concurrent run's files are newer than this run's start.
 
+## Session Loop
+
+`harness/session.py`'s `Session` (PLAN-interactive-lead-chat D2) owns what the
+one-shot CLI loop used to: an `asyncio.Queue` of events (`ResearcherReturn`,
+`UserMessage`), the round cap, wall clock, synthesis margin, and the report
+gate. It awaits at least one event, drains everything pending, and folds it —
+researcher returns in arrival order, then any queued user text — into one
+`HumanMessage` closed by a `Roster:` line, then runs one `agent.astream` turn
+on the session's single `thread_id`. One lead turn per drained batch keeps the
+roster no staler than the batch that produced it, at the cost of one more
+head-model call per return than a single accumulate-everything turn would need.
+
+The lead never dispatches a researcher through deepagents' own `task` tool
+(D1): @harness/tools/dispatch.py's `dispatch_researcher` starts the compiled
+researcher graph as a session-owned `asyncio.Task` and returns at once, so
+several researchers can run in parallel and each return narrates as its own
+turn — `task` stays how the *researcher* delegates to its nested reader; only
+the lead's tier moved. A config cap (`[agent] max_researchers`) refuses a
+dispatch past the limit rather than queuing it. Because the session started
+every researcher task, the session is also what cancels them: `/new` and
+Ctrl-C cancel and await the running set directly, rather than trusting
+deepagents' checkpointer or graph to unwind them, since whether cancelling
+`astream` propagates into a `task`-run subagent is undocumented.
+
+The lead ends research by calling `submit_report(answer)` (D3), never by
+shape-sniffing its own prose. Accepting it disarms the wall clock, runs
+verification and `write_report` exactly as the one-shot loop did, and opens
+post-report chat on the same thread — `dispatch_researcher`/`submit_report`
+both refuse from then on, and no clock governs the remaining turns. A quit
+before `submit_report` is a failed run (no report, nonzero exit); after, it is
+a clean exit with the report intact.
+
+`/model <role> <choice>` (D4) applies at the next turn boundary: it reads the
+current thread's messages via `agent.aget_state`, builds a fresh agent against
+the new model, mints a new `thread_id`, and reseeds the message list via
+`agent.aupdate_state` — targeting the owning middleware node
+(`TodoListMiddleware.after_model`) to carry the todo list across, since an
+unspecified `as_node` resolves to `__start__`, whose writers cover only the
+`messages` channel and silently drop everything else. `/new` (D6) cancels
+every running researcher task (awaiting their `CancelledError`), disarms the
+clock, drops the agent and thread, mints a fresh `run_id`, and returns to the
+welcome screen; `BrowserSession.rebind_run` keeps the one warm Chromium
+instance untouched (it carries no run-scoped state) and re-points only the two
+per-run pieces — the `RunLog` that relaunch incidents reach, and the
+browser-free HTTP crawler, rebuilt against the new run's downloads directory
+with the old one closed.
+
+Every headless invocation — every offline test, and any future
+non-interactive path — runs with `Session(interactive=False)`, which keeps the
+old nudge-then-fail idle backstop instead of waiting on a keyboard that isn't
+there; `interactive=True` is the TTY chat path. There is deliberately no
+separate one-shot CLI mode (Non-Goals, PLAN-interactive-lead-chat) — a non-TTY
+invocation WITH a positional question still runs, just headless, pending a
+startup guard tracked in docs/backlog.md; without a question, argparse already
+refuses it (exit 2), since the welcome screen cannot be driven there.
+
 ## Directory Structure
 
 `harness/` holds the source: @harness/config.py (TOML config models),
 @harness/models.py (role → chat client, with preflight and bounded retry),
-@harness/agent.py (the deepagents lead), @harness/sources.py (per-run source
-registry), @harness/paragraphs.py (the shared paragraph unit), @harness/verify.py
-(per-paragraph pooled check), @harness/report.py (report
-assembly), @harness/__main__.py (the CLI and its resume loop),
-@harness/prompts.py (prompt loader) with its `.md` files in @harness/prompts/,
-and @harness/tools/ (the tool registry and one module per tool). Tests live in
+@harness/agent.py (the deepagents lead and the standalone researcher graph),
+@harness/session.py (the chat session: event queue, lead turns, budgets, slash
+commands, report gate), @harness/__main__.py (CLI, welcome screen, key thread
+and composer, the welcome↔session loop), @harness/browser.py (the one
+`BrowserSession` per process), @harness/sources.py (per-run source registry),
+@harness/runlog.py (degraded-coverage incidents), @harness/activity.py (live
+researcher/reader state for the TUI), @harness/display.py (Rich and plain
+renderers), @harness/input.py (key decoding and the line editor),
+@harness/blocklist.py (cross-session hostname blocklist), @harness/guard.py
+(prompt-injection scanner), @harness/paragraphs.py (the shared paragraph
+unit), @harness/verify.py (per-paragraph pooled check), @harness/report.py
+(report assembly), @harness/prompts.py (prompt loader) with its `.md` files in
+@harness/prompts/, and @harness/tools/ (the tool registry and one module per
+tool). Tests live in
 `tests/`, mirroring the source modules. `harness.toml` sits at the repo root.
 Reports are timestamped markdown files under the configured reports directory.
 
@@ -120,7 +188,7 @@ bug that was fixed and forgotten — the fix is named so it stays visible.
   `AttributeError` on the first one. Detection must also be scoped to the current
   pass, or a carried-over state re-asks the same question forever.
 - **A verdict must never be matched back onto text.** The answer is split into
-  paragraphs exactly once, in `harness/__main__.py`, and that one list is handed to both
+  paragraphs exactly once, in `harness/session.py`, and that one list is handed to both
   verification and rendering, so verdicts align with paragraphs by index (D2). The
   earlier scheme located a claim string back inside the answer and silently dropped any
   verdict it could not place. Rendering marks a failing bullet by list-item POSITION for
