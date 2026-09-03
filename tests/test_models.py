@@ -248,6 +248,39 @@ async def test_retry_never_switches_model(make_config, monkeypatch):
     assert models_seen == {"test-model"}
 
 
+async def test_every_request_carries_the_opencode_session_header(make_config, monkeypatch):
+    # OpenCode Go routes a session's requests to one backend for prompt-cache hits and, from
+    # 2026-09-06, may reject requests without the header (provider notice, 2026-09-03).
+    config = make_config()
+    handler = _RecordingResponder(_respond_with(200, _completion_body()))
+    _patch_chat_openai_with_transport(monkeypatch, handler)
+
+    client = build_chat_model(config, "head")
+    await client.ainvoke("hi")
+
+    assert len(handler.requests) == 1
+    assert handler.requests[0].headers["x-opencode-session"].strip() != ""
+
+
+async def test_session_header_is_one_stable_id_across_roles_and_calls(make_config, monkeypatch):
+    # The id must be unique to this process and never change within it: every role's client
+    # and every call it makes must present the same value, or the routing affinity is lost.
+    config = make_config()
+    handler = _RecordingResponder(_respond_with(200, _completion_body()))
+    _patch_chat_openai_with_transport(monkeypatch, handler)
+
+    head = build_chat_model(config, "head")
+    verifier = build_chat_model(config, "verifier")
+    await head.ainvoke("hi")
+    await head.ainvoke("hi again")
+    await verifier.ainvoke("hi")
+
+    values = {request.headers["x-opencode-session"] for request in handler.requests}
+    assert len(handler.requests) == 3
+    assert len(values) == 1
+    assert values == {models.SESSION_ID}
+
+
 async def test_preflight_succeeds_against_a_reachable_endpoint(make_config, monkeypatch):
     config = make_config()
     handler = _RecordingResponder(_respond_with(200, _completion_body()))

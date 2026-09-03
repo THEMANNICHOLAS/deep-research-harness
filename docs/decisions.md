@@ -317,3 +317,13 @@ sentences each, append-only, newest last.
   (exit 2) because the welcome screen cannot run there; only the
   question-supplied piped case still runs headless, and that half moves to
   docs/backlog.md.
+
+- **2026-09-03 — `x-opencode-session` is one random id per process, sent by every
+  model client to every provider.** OpenCode Go emailed that requests from the
+  Python OpenAI client lack the header it uses to route a session's requests to
+  one backend for prompt-cache hits, and that from 2026-09-06 such requests may
+  error. `SESSION_ID` in @harness/models.py is minted at import and passed as
+  `default_headers` on every `ChatOpenAI`; chosen over a per-run id (threading
+  `run_id` through `build_chat_model` and preflight for no affinity gain — `/new`
+  runs share the same prompts) and over gating it on the OpenCode provider (a
+  stray header is harmless; one provider is declared).

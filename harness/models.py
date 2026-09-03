@@ -6,12 +6,23 @@ bounded exponential backoff with jitter (via `max_retries`); callers must not wr
 returned client in another retry layer.
 """
 
+import secrets
+
 import openai
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from harness.config import HarnessConfig
+
+# One id per PROCESS, minted at import and sent on every request as `x-opencode-session`.
+# OpenCode Go uses it to route a session's requests to one backend for prompt-cache hits and
+# announced (2026-09-03) that requests without it may error from 2026-09-06. Per-process rather
+# than per-run: the header's whole purpose is affinity, and `/new` runs share the same system
+# prompts, so a stable id across them is a cache win, not a leak. The header is sent to every
+# provider — a stray header is harmless, and gating it on the provider name would be a second
+# place the OpenCode endpoint is special-cased.
+SESSION_ID = secrets.token_hex(16)
 
 
 class ModelError(Exception):
@@ -58,6 +69,7 @@ def build_chat_model(config: HarnessConfig, role: str) -> BaseChatModel:
         api_key=SecretStr(provider_config.api_key),
         max_retries=config.agent.max_retries,
         timeout=config.agent.request_timeout_seconds,
+        default_headers={"x-opencode-session": SESSION_ID},
     )
 
 
